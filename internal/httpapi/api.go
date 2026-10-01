@@ -70,18 +70,20 @@ type Store interface {
 	Samples() ([]types.Sample, error)
 }
 
-// Scanner 把新账号排进首扫队列。上传请求不等扫描跑完。
+// Scanner 排一次「去找新落点」的裸铸。
+//
+// **刻意没有「上传就扫一遍」那个入口**：九区域首扫 2026-10-01 删掉了——它在没有
+// 任何需求的时候就打九发上游（成本不为零），还顺手烧掉执行者在那九个落点上的窗口。
+// 需要新落点的时刻是「槽位烧完了」，那时候再按 (账号 × 区域) 台账派一发。
 type Scanner interface {
-	Enqueue(accountID int64)
-
-	// EnqueueDiscovery 去找这个账号**从没碰过**的新网关，排一次探索扫描。
+	// EnqueueDiscovery 去找这个账号**从没碰过**的新网关，排一发裸铸。
 	//
-	// exclude 是要票的那个账号：扫描那一发会烧掉执行者在新网关上的窗口，
-	// 让要票的人自己去扫等于白跑一趟（它扫到的每个新网关都当场被它自己烧掉）。
-	// 所以派**别人**去扫，扫出来的 pair 是账号无关的路由，要票的人拿到时
-	// 仍然是对那个网关的首次接触——这才有满血窗口。
+	// exclude 是要票的那个账号（0 = 没有特定的人）：铸票那一发会烧掉执行者在新网关
+	// 上的窗口，让要票的人自己去等于白跑一趟（它找到的每个新网关都当场被它自己烧掉）。
+	// 所以派**别人**去，铸出来的 pair 是账号无关的路由，要票的人拿到时仍然是对那个
+	// 网关的首次接触——这才有满血窗口。
 	//
-	// 实现方负责挑人和限流；没人可派就什么都不做。
+	// 实现方负责挑人（按 (账号 × 区域) 台账）和限流；没人可派就什么都不做。
 	EnqueueDiscovery(exclude int64)
 }
 
@@ -630,9 +632,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "存储失败", http.StatusInternalServerError)
 		return
 	}
-	if s.scan != nil {
-		s.scan.Enqueue(a.ID)
-	}
+	// **不排首扫**：新账号进来时没有任何需求，那九发上游纯属白花，而且会把它在
+	// 九个落点上的首次接触全烧掉。等有人要票时按需去找落点（见 Scanner 的注释）。
 	s.opt.Log.Info("收到新账号", "account", a.ID, "label", a.Label)
 
 	if wantJSON || strings.Contains(r.Header.Get("Accept"), "json") {
@@ -871,30 +872,32 @@ func (s *Server) handleAccountEnabled(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/a/"+url.PathEscape(tok), http.StatusSeeOther)
 }
 
-// handleAdminRescan 把一个账号重新排进首扫。
+// handleAdminRescan 手动踢一发「去找新落点」的裸铸。
 //
-// 为什么需要：首扫只在 /upload 时排一次。那一次要是全军覆没（比如上游换了报文校验、
-// 代理当时全挂），这个账号就**永远**停在零网关，服务里没有任何重试入口，
-// 只能停机改 state.json 或让人重新上传一份凭据。
+// 为什么留着这个端点（而不是跟着首扫一起删）：自动触发只有两条路——交付撞上
+// ErrNoFullSlot、以及保温预铸，而两条都要**先有需求**。一个刚起的空池子
+// （零网关）在没人取票之前永远不会自己去找落点，而那正是最需要踢一脚的时候。
 //
-// 刻意要求显式点名账号、刻意只给管理员：每次重扫都真打上游、真烧 (账号 × 网关)，
-// 不该做成自动重试，更不该让匿名调用方触发。
+// account 可选，语义是「替谁找」⇒ 它自己**不会**被派出去：找到的落点必须对他还是
+// 首次接触，派他自己去等于当场烧掉（见 Scanner.EnqueueDiscovery）。
+// 不给就是「随便派一个有空区域的号」。
+//
+// 刻意只给管理员：每踢一下都真打上游、真烧一个 (账号 × 网关)。
 func (s *Server) handleAdminRescan(w http.ResponseWriter, r *http.Request) {
 	if !s.authAdmin(w, r) {
 		return
 	}
-	ref := r.URL.Query().Get("account")
-	if ref == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "要带 account 参数指明重扫哪个账号"})
-		return
+	var forWhom int64
+	if ref := r.URL.Query().Get("account"); ref != "" {
+		a, ok := s.findAccount(ref)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "没有这个账号"})
+			return
+		}
+		forWhom = a.ID
 	}
-	a, ok := s.findAccount(ref)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "没有这个账号"})
-		return
-	}
-	s.scan.Enqueue(a.ID)
-	writeJSON(w, http.StatusAccepted, map[string]any{"account": a.ID, "queued": true})
+	s.scan.EnqueueDiscovery(forWhom)
+	writeJSON(w, http.StatusAccepted, map[string]any{"account": forWhom, "queued": true})
 }
 
 // handleAdminDeleteAccount 删掉一个账号。管理页上的按钮走这里。

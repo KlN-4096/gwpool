@@ -142,6 +142,25 @@ func (c *Client) spend(acct string, e types.Exit) error {
 	return nil
 }
 
+// refund 把刚占下的那个窗口名额退回去。
+//
+// 只给「根本没碰到上游」用（连不上代理、代理认证被拒）：那一发没动账号的任何额度，
+// 扣着它只是让这个区域的配额凭空少一发，而配额本来就只有 6。
+// 谁调用它由 do 决定——那边已经在区分这几类失败了（熔断只记供应商自己的账），
+// 判据只该有一份。
+//
+// 砍掉的是**最后**一个时间戳而不是精确那一个：单账号并发硬性为 1，所以正常情况下
+// 它就是我们刚加的那一发；真撞上了也只是让窗口里某个时间戳差几百毫秒，而这个闸
+// 看的是发数不是时刻。
+func (c *Client) refund(acct string, e types.Exit) {
+	key := rateKey(acct, e)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w := c.sent[key]; len(w) > 0 {
+		c.sent[key] = w[:len(w)-1]
+	}
+}
+
 // Rate 报某个上游账号当前窗口**各区域**各用掉几发，以及每区的上限。
 //
 // 整个账号一次报完，不是一区一问：挑铸票者要同时看九个区域还剩多少配额
@@ -507,6 +526,10 @@ func (c *Client) do(req *http.Request, e types.Exit, sid, acct string) (*http.Re
 		// 连不上代理本身、认证被拒：这才是供应商的账。
 		// err 里会带 URL，代理用户名在 Transport 里，不会被 net/http 带进来。
 		c.noteFailure(p.Name, acct, err)
+		// 这一发**根本没碰到上游**（连接都没建起来），不该花这个账号的配额。
+		// 和它刻意分开的是上面两支：隧道建起来又断、以及调用方取消——那两种
+		// 请求都可能已经落到上游了，退了就是低报，而这个闸是防封号的安全阀。
+		c.refund(acct, e)
 		return nil, fmt.Errorf("经 %s 请求失败: %w", p.Name, err)
 	}
 	c.noteSuccess(p.Name)

@@ -16,9 +16,14 @@ type configView struct {
 	// AllModels 是页面上给勾选的全集：候选清单 ∪ 几个常见的。
 	AllModels []modelOpt
 
-	UpstreamPerHour int
-	PublicEnabled   bool
-	MinFreeGateways int
+	UpstreamPerRegionHour int
+	VerifyFullAtDeliver   bool
+	RenewPairs            bool
+	SlotCooldownMinutes   int
+	MaxTriesPerDeliver    int
+	SpareTarget           int
+	PublicEnabled         bool
+	MinFreeGateways       int
 
 	// Path 显示配置文件在哪，省得人找不到。
 	Path string
@@ -51,7 +56,12 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	}
 	c := live.Get()
 	v.Models = c.Models
-	v.UpstreamPerHour = c.UpstreamPerHour
+	v.UpstreamPerRegionHour = c.UpstreamPerRegionHour
+	v.VerifyFullAtDeliver = c.VerifyFullAtDeliver
+	v.RenewPairs = c.RenewPairs
+	v.SlotCooldownMinutes = c.SlotCooldownMinutes
+	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
+	v.SpareTarget = c.SpareTarget
 	v.PublicEnabled = c.PublicWhenSurplus.Enabled
 	v.MinFreeGateways = c.PublicWhenSurplus.MinFreeGateways
 	v.Path = live.Path()
@@ -107,7 +117,9 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.opt.Log.Info("管理页改了配置", "models", c.Models,
-		"upstream_per_hour", c.UpstreamPerHour,
+		"upstream_per_region_hour", c.UpstreamPerRegionHour,
+		"verify_full_at_deliver", c.VerifyFullAtDeliver, "renew_pairs", c.RenewPairs,
+		"slot_cooldown", c.SlotCooldown(),
 		"public", c.PublicWhenSurplus.Enabled, "min_free_gateways", c.PublicWhenSurplus.MinFreeGateways)
 	s.adminConfigDone(w, r, "已保存并立即生效", "")
 }
@@ -128,11 +140,26 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	// 顺序即优先级，第一个是默认模型。合法性交给 config.Patch 里的 Load 去判——
 	// 校验规则只该有一份，重复一遍迟早两边不一致。
 
-	perHour, err := atoiField(r, "upstream_per_hour", 0, 100000)
+	perRegionHour, err := atoiField(r, "upstream_per_region_hour", 0, 100000)
 	if err != nil {
 		return nil, err
 	}
 	minFree, err := atoiField(r, "min_free_gateways", 1, 100000)
+	if err != nil {
+		return nil, err
+	}
+	// 0 = 用默认值（types.SlotCooldown）。上限一周：再大就不是「冷却」而是拉黑了。
+	cooldown, err := atoiField(r, "slot_cooldown_minutes", 0, 7*24*60)
+	if err != nil {
+		return nil, err
+	}
+	// 每多试一个网关就多花一发上游，所以上限卡得很死。
+	tries, err := atoiField(r, "max_tries_per_deliver", 0, 10)
+	if err != nil {
+		return nil, err
+	}
+	// 0 是合法值：全按需、不预铸（见 config.Config.SpareTarget）。
+	spare, err := atoiField(r, "spare_target", 0, 100)
 	if err != nil {
 		return nil, err
 	}
@@ -142,9 +169,17 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	pub.MinFreeGateways = minFree
 
 	return map[string]any{
-		"models":              models,
-		"upstream_per_hour":   perHour,
-		"public_when_surplus": pub,
+		"models":                   models,
+		"upstream_per_region_hour": perRegionHour,
+		// 两个开关默认关，理由见 config.Config 上的字段注释（都是「花一个满血窗口
+		// 换一个读数」）。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
+		// 不能靠「缺键不动」。
+		"verify_full_at_deliver": truthy(r.FormValue("verify_full_at_deliver")),
+		"renew_pairs":            truthy(r.FormValue("renew_pairs")),
+		"slot_cooldown_minutes":  cooldown,
+		"max_tries_per_deliver":  tries,
+		"spare_target":           spare,
+		"public_when_surplus":    pub,
 	}, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gwpool/internal/types"
 )
@@ -231,5 +232,83 @@ func TestPatchKeepsEverything(t *testing.T) {
 	}
 	if got := strings.Join(back.Models, ","); got != "m2,m1" {
 		t.Fatalf("回滚没回到上一个好状态: %s", got)
+	}
+}
+
+// 这一批旋钮的默认值就是「最省上游请求」的那一套：两个开关都关、一次交付最多试 2 个。
+func TestSchedulingKnobDefaults(t *testing.T) {
+	cfg, err := Load(writeCfg(t, `{`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpstreamPerRegionHour != 6 {
+		t.Errorf("每区每小时默认该是 6（九区合起来 54 = 原先按账号算的那个数），得到 %d",
+			cfg.UpstreamPerRegionHour)
+	}
+	// 两个开关都是「花一个满血窗口换一个读数」，所以默认关。
+	if cfg.VerifyFullAtDeliver || cfg.RenewPairs {
+		t.Errorf("两个开关默认都该关: verify=%v renew=%v", cfg.VerifyFullAtDeliver, cfg.RenewPairs)
+	}
+	if cfg.MaxTriesPerDeliver != 2 {
+		t.Errorf("一次交付最多试几个网关默认该是 2，得到 %d", cfg.MaxTriesPerDeliver)
+	}
+	if cfg.SpareTarget != types.SpareTarget {
+		t.Errorf("富余张数默认该是 %d，得到 %d", types.SpareTarget, cfg.SpareTarget)
+	}
+	if cfg.SlotCooldown() != types.SlotCooldown {
+		t.Errorf("冷却默认该等于常量 %v，得到 %v", types.SlotCooldown, cfg.SlotCooldown())
+	}
+}
+
+// 冷却从分钟数算出来；0 就退回常量。
+func TestSlotCooldownFromMinutes(t *testing.T) {
+	cfg, err := Load(writeCfg(t, `{"slot_cooldown_minutes":45,`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SlotCooldown() != 45*time.Minute {
+		t.Fatalf("45 分钟算成了 %v", cfg.SlotCooldown())
+	}
+	// 0 = 用默认值。实测冷却 30 分钟到 3 小时都见过，所以这个值必须能手调。
+	cfg.SlotCooldownMinutes = 0
+	if cfg.SlotCooldown() != types.SlotCooldown {
+		t.Fatalf("0 该退回常量，得到 %v", cfg.SlotCooldown())
+	}
+}
+
+// spare_target 的 0 是真的 0（全按需、不预铸），不许被「0 = 用默认值」吃掉。
+func TestSpareTargetZeroIsMeaningful(t *testing.T) {
+	cfg, err := Load(writeCfg(t, `{"spare_target":0,`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpareTarget != 0 {
+		t.Fatalf("显式写 0 被当成「用默认值」了: %d", cfg.SpareTarget)
+	}
+}
+
+// 负数一律拒：它们的症状都和「上游挂了」长得一样，查起来要先怀疑一圈外部。
+func TestSchedulingKnobsRejectNegatives(t *testing.T) {
+	for _, body := range []string{
+		`{"upstream_per_region_hour":-1,` + okProxies + `}`,
+		`{"slot_cooldown_minutes":-1,` + okProxies + `}`,
+		`{"max_tries_per_deliver":-1,` + okProxies + `}`,
+		`{"spare_target":-1,` + okProxies + `}`,
+	} {
+		if _, err := Load(writeCfg(t, body)); err == nil {
+			t.Errorf("该被拒: %s", body)
+		}
+	}
+}
+
+// 改过名的旧键要明着拒。encoding/json 默认静默忽略，而「我以为我改了配额」
+// 和「上游在限流」的现象一模一样。
+func TestRenamedUpstreamPerHourIsRejected(t *testing.T) {
+	_, err := Load(writeCfg(t, `{"upstream_per_hour":54,`+okProxies+`}`))
+	if err == nil {
+		t.Fatal("残留的 upstream_per_hour 被静默忽略了")
+	}
+	if !strings.Contains(err.Error(), "upstream_per_region_hour") {
+		t.Fatalf("报错没告诉人该改成什么: %v", err)
 	}
 }

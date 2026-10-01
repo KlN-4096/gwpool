@@ -131,11 +131,8 @@ func (f *fakeStore) DeleteAccount(id int64) error {
 func (f *fakeStore) Samples() ([]types.Sample, error) { return f.samples, nil }
 
 type fakeScanner struct {
-	queued    []int64
 	discovery []int64
 }
-
-func (s *fakeScanner) Enqueue(id int64) { s.queued = append(s.queued, id) }
 
 func (s *fakeScanner) EnqueueDiscovery(exclude int64) {
 	s.discovery = append(s.discovery, exclude)
@@ -385,8 +382,11 @@ func TestUpload(t *testing.T) {
 	if a.Label != "朋友的号" || a.PlanType != "pro" || a.Creds.AccountID != "acct-friend" {
 		t.Fatalf("字段没落对: label=%q plan=%q acct=%q", a.Label, a.PlanType, a.Creds.AccountID)
 	}
-	if len(sc.queued) != 1 || sc.queued[0] != a.ID {
-		t.Fatalf("没排队首扫: %v", sc.queued)
+	// **上传不扫**：早先这里会立刻扫九个区域，而那九发全打在「没人要票」的时候，
+	// 还把这个新号在九个落点上的首次接触当场烧掉。落点改成要票时按需发现
+	// （见 deliverFailed → EnqueueDiscovery）。
+	if len(sc.discovery) != 0 {
+		t.Fatalf("上传就排了扫描: %v", sc.discovery)
 	}
 
 	// 直接 POST 原始 auth 文件（顶层形状）也要收，回 JSON，并且当场给 key。
@@ -740,30 +740,40 @@ func TestAccountDisableNeedsItsOwnViewToken(t *testing.T) {
 	}
 }
 
-// 首扫只在 /upload 排一次。那一次全败的账号必须有办法重来，否则永远停在零网关。
-func TestAdminRescanRequiresAdminAndAccount(t *testing.T) {
+// /admin/rescan 现在是「手动踢一发发现」：一个刚起的空池子在没人取票之前
+// 不会自己去找落点（两条自动触发都要先有需求），而那正是最需要踢一脚的时候。
+//
+// account 可选，语义是「替谁找」⇒ 它自己**不会**被派出去。
+func TestAdminRescanIsAManualDiscoveryKick(t *testing.T) {
 	_, h, _, st, sc := rig(t, types.ModePool)
 	// 无 key：不许排队。
 	if w := do(h, httptest.NewRequest("POST", "/admin/rescan?account=1", nil)); w.Code != 401 {
 		t.Fatalf("没带 admin key 居然 %d", w.Code)
 	}
-	if len(sc.queued) != 0 {
-		t.Fatalf("没鉴权就排进队列了: %v", sc.queued)
+	if len(sc.discovery) != 0 {
+		t.Fatalf("没鉴权就排进队列了: %v", sc.discovery)
 	}
-	// 带 key 但不点名账号：槽位是 (账号 × 网关)，猜一个就是替别人烧。
-	if w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan", nil), "akey")); w.Code != 400 {
-		t.Fatalf("没带 account 居然 %d", w.Code)
+	// 不点名账号也行：那就是「随便派一个有空区域的号」，exclude=0。
+	if w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan", nil), "akey")); w.Code != 202 {
+		t.Fatalf("不点名账号拿到 %d", w.Code)
 	}
-	if len(sc.queued) != 0 {
-		t.Fatalf("没点名账号也排了队: %v", sc.queued)
+	if len(sc.discovery) != 1 || sc.discovery[0] != 0 {
+		t.Fatalf("不点名时 exclude 应为 0: %v", sc.discovery)
 	}
-	// 点名了就排。
+	// 点名了就把他排除在外——找到的落点必须对他还是首次接触。
 	w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan?account=1", nil), "akey"))
 	if w.Code != 202 {
-		t.Fatalf("正常重扫拿到 %d: %s", w.Code, w.Body.String())
+		t.Fatalf("正常踢一发拿到 %d: %s", w.Code, w.Body.String())
 	}
-	if len(sc.queued) != 1 || sc.queued[0] != st.accounts[0].ID {
-		t.Fatalf("排进队列的不是点名的那个账号: %v", sc.queued)
+	if len(sc.discovery) != 2 || sc.discovery[1] != st.accounts[0].ID {
+		t.Fatalf("点名的账号没被当成 exclude 传下去: %v", sc.discovery)
+	}
+	// 账号不存在就别排：猜一个等于替别人烧一个槽位。
+	if w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan?account=9999", nil), "akey")); w.Code != 404 {
+		t.Fatalf("不存在的账号拿到 %d", w.Code)
+	}
+	if len(sc.discovery) != 2 {
+		t.Fatalf("账号不存在还是排了队: %v", sc.discovery)
 	}
 }
 
@@ -1152,7 +1162,8 @@ func TestAdminWithoutProxyStates(t *testing.T) {
 	}
 }
 
-// /gateways 把清单交给客户端自己挑，并且 used_by_you 必须是**问的那个账号**的历史。
+// /gateways 只列**此刻就有活票**的网关（剩余 ≥ DeliverFloor），used_by_you 必须是
+// **问的那个账号**的历史。字段名和形状一个都不许动——sub2api 拿它给落点起名。
 func TestGatewaysList(t *testing.T) {
 	srv, h, p, st, _ := rig(t, types.ModePool)
 	ka := srv.ConsumerKeyFor(st.accounts[0])
@@ -1167,8 +1178,9 @@ func TestGatewaysList(t *testing.T) {
 	st.pairs = map[string]types.Pair{
 		// 够交付
 		"unified-1": {Gateway: "unified-1", ExpiresAt: now.Add(types.PairLifetime)},
-		// 快死了，不算 ready
+		// 快死了：列出来客户端也拿不到票，只会白跑一次 /cookie
 		"unified-2": {Gateway: "unified-2", ExpiresAt: now.Add(types.DeliverFloor / 2)},
+		"unified-3": {Gateway: "unified-3", ExpiresAt: now.Add(types.PairLifetime)},
 	}
 	// 1 号在 unified-1 上用掉过一张票（full/degraded 只有交付路径写得出来）。
 	st.slots = map[string]types.Slot{
@@ -1198,25 +1210,25 @@ func TestGatewaysList(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Account != "acct-upstream" || got.Target != 7 || got.Live != 1 {
+	if got.Account != "acct-upstream" || got.Target != 7 || got.Live != 2 {
 		t.Fatalf("汇总不对: %+v", got)
 	}
 	// 稳定顺序：客户端按这个列表挑，抖动会让它的选择无端变化。
-	if len(got.Gateways) != 3 || got.Gateways[0].Name != "unified-1" ||
-		got.Gateways[2].Name != "unified-3" {
-		t.Fatalf("没按名字排序: %+v", got.Gateways)
+	// 没活票的 unified-2 直接不出现：列它只会让客户端白跑一次 /cookie。
+	if len(got.Gateways) != 2 || got.Gateways[0].Name != "unified-1" ||
+		got.Gateways[1].Name != "unified-3" {
+		t.Fatalf("清单不对（该只剩有活票的两个、按名字排序）: %+v", got.Gateways)
 	}
-	if !got.Gateways[0].PairReady || got.Gateways[0].ValidForS <= 0 {
-		t.Fatalf("unified-1 该是可交付的: %+v", got.Gateways[0])
-	}
-	if got.Gateways[1].PairReady {
-		t.Fatalf("快到期的 pair 不该算 ready: %+v", got.Gateways[1])
+	for _, g := range got.Gateways {
+		if !g.PairReady || g.ValidForS <= 0 {
+			t.Fatalf("列出来的都该是可交付的: %+v", g)
+		}
 	}
 	if !got.Gateways[0].UsedByYou || got.Gateways[0].LastUsedAt == "" {
 		t.Fatalf("unified-1 该标成用过: %+v", got.Gateways[0])
 	}
-	if got.Gateways[2].UsedByYou {
-		t.Fatalf("2 号的历史串到 1 号头上了: %+v", got.Gateways[2])
+	if got.Gateways[1].UsedByYou {
+		t.Fatalf("2 号的历史串到 1 号头上了: %+v", got.Gateways[1])
 	}
 	// 没有 key 又没开放 ⇒ 401，不许把网关清单白送。
 	if w := do(h, httptest.NewRequest("GET", "/gateways", nil)); w.Code != 401 {
@@ -1260,6 +1272,11 @@ func TestGatewaysListForAnotherUpstreamAccount(t *testing.T) {
 	now := time.Now().UTC()
 
 	st.gws = map[string]types.Gateway{"unified-1": {Name: "unified-1"}, "unified-2": {Name: "unified-2"}}
+	// 两个都得有活票，否则清单里根本不会出现（/gateways 只列此刻拿得到票的）。
+	st.pairs = map[string]types.Pair{
+		"unified-1": {Gateway: "unified-1", ExpiresAt: now.Add(types.PairLifetime)},
+		"unified-2": {Gateway: "unified-2", ExpiresAt: now.Add(types.PairLifetime)},
+	}
 	// 池子给外部账号建的占位行（见 sched.anonAccount）。
 	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 acct-friend",
 		Enabled: true, Creds: types.Creds{AccountID: types.AnonPrefix + "acct-friend"}})

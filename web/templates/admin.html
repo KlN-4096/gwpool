@@ -134,7 +134,7 @@
 
 <section id="tab-slots">
   <div class="card">
-    <header class="card-head"><div><h2>账号×网关</h2><p>每个账号在每个网关上的最近使用时间、校验结果和退避状态。</p></div></header>
+    <header class="card-head"><div><h2>账号×网关 接触记录</h2><p>每个账号在每个网关上的最近使用时间、校验结果和退避状态。</p></div></header>
     {{if .Slots}}
     <div class="table-wrap"><table id="t-slots" data-grid data-natsort data-facets="full:正常:ok|degraded:降级:bad|unknown:未知" data-placeholder="搜索账号或网关">
       <thead><tr><th class="num">账号</th><th>网关</th><th>距上次使用</th><th>最近校验</th><th>退避剩余</th></tr></thead>
@@ -158,6 +158,7 @@
     <p class="empty">暂无数据。</p>
     {{end}}
     <p class="foot">退避剩余：校验未通过或请求失败后，该账号在这个网关上暂停使用的剩余时间。</p>
+    <p class="foot">这是一本<strong>烧账本，不是锁</strong>：每一行记的是「这个账号已经碰过这个网关了」，所以它在冷却完之前不会再被派出去。路由 Cookie 本身不互斥，同一张可以同时发给好几个账号。</p>
   </div>
 </section>
 
@@ -234,13 +235,23 @@
         <div class="fields">
           <label>别的模型名 <span class="hint">上面没列的手打，逗号或换行分隔</span>
             <input name="models_extra" autocomplete="off" spellcheck="false"></label>
-          <label>每账号每小时上游请求上限 <span class="hint">0 = 用默认值 54。安全阀，不是吞吐量目标</span>
-            <input name="upstream_per_hour" inputmode="numeric" value="{{.UpstreamPerHour}}"></label>
+          <label>每账号每区域每小时上限 <span class="hint">0 = 用默认值 6（九个区域合起来 54）。安全阀，不是吞吐量目标</span>
+            <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
+          <label>槽位冷却（分钟） <span class="hint">0 = 用默认值 240。账号×网关 烧掉后要歇多久，实测 30 分钟到 3 小时都见过</span>
+            <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
+          <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。每多试一个就多花一发上游</span>
+            <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>
+          <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2</span>
+            <input name="spare_target" inputmode="numeric" value="{{.SpareTarget}}"></label>
           <label>对外开放门槛 <span class="hint">空闲网关少于这个数就只服务上传者</span>
             <input name="min_free_gateways" inputmode="numeric" value="{{.MinFreeGateways}}"></label>
         </div>
         <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
           <span>票富裕时允许没上传凭据的人取</span></label>
+        <label class="choice"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}>
+          <span>交付前用 state-echo 验一次满血 <span class="hint">多花两发上游，而那两发恰好烧掉要交付的那个窗口</span></span></label>
+        <label class="choice"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}>
+          <span>保温时续期已有的路由 Cookie <span class="hint">关掉则只裸铸：同样一发上游花在摸新落点上</span></span></label>
         <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>
       </form>
       {{end}}

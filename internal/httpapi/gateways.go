@@ -52,26 +52,28 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		Gateways []row  `json:"gateways"`
 	}{Account: upstream, Target: s.pool.PairTarget()}
 
+	cooldown := s.slotCooldown()
 	for name := range s.st.Gateways() {
 		p, hasPair := pairs[name]
 		left := p.ExpiresAt.Sub(now)
-		ready := hasPair && left >= types.DeliverFloor
-		if ready {
-			out.Live++
+		// **只列此刻真能拿到票的网关**：客户端是照这张清单点名的，而点名一个没有活
+		// pair 的网关只会换回一个 503（现铸要先摸到它，那是发现路径的事，不是点名）。
+		// 把「池子知道的所有网关」全列出来等于让它一个个去试。
+		if !hasPair || left < types.DeliverFloor {
+			continue
 		}
-		it := row{Name: name, PairReady: ready}
-		if ready {
-			it.ValidForS = int(left.Seconds())
-		}
+		out.Live++
+		it := row{Name: name, PairReady: true, ValidForS: int(left.Seconds())}
 		if sl, ok := mine[name]; ok && !sl.LastTouch.IsZero() {
 			// 按 LastTouch 算，**不按 LastVerdict**：判定只有上传者那条交付路径写得出来，
 			// 跨账号和匿名的交付一个判定都不落 ⇒ 按判定算的话外部消费者看到的永远是
 			// 「全都没用过」，照这张清单挑等于没挑。LastTouch 两条路都写，扫描和铸票
 			// 也写——那些同样烧了这个账号在这个网关上的窗口。
 			//
-			// 还要卡 SlotCooldown：烧过要出冷却才重新给满血，三天前那一次与现在无关。
+			// 还要卡冷却：烧过要出冷却才重新给满血，三天前那一次与现在无关。
 			// 不卡的话用久了每个网关都是「用过」，客户端永远挑不出落点。
-			it.UsedByYou = now.Sub(sl.LastTouch) < types.SlotCooldown
+			// 读实时配置，别读常量——那个数是运营按当天观测调的（slot_cooldown_minutes）。
+			it.UsedByYou = now.Sub(sl.LastTouch) < cooldown
 			it.LastUsedAt = sl.LastTouch.UTC().Format(time.RFC3339)
 		}
 		out.Gateways = append(out.Gateways, it)
@@ -136,6 +138,14 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (string, int64,
 		return "", 0, false
 	}
 	return ref, s.rowFor(types.AnonPrefix + ref), true
+}
+
+// slotCooldown 是当前生效的槽位冷却时长。没接配置文件（测试）就用默认值。
+func (s *Server) slotCooldown() time.Duration {
+	if s.opt.Live == nil {
+		return types.SlotCooldown
+	}
+	return s.opt.Live.Get().SlotCooldown()
 }
 
 // rowFor 把池内 account_id 换成行 ID。没有对应行就回 0（还没为它建过行，

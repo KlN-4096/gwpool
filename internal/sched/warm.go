@@ -3,7 +3,6 @@ package sched
 import (
 	"context"
 	"errors"
-	"sort"
 	"time"
 
 	"gwpool/internal/types"
@@ -52,14 +51,94 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 		s.opt.Log.Info("所有号在所有已知网关上都还在冷却期，本轮不预铸")
 		return
 	}
-	// 目标活 pair 数 = 最忙那个号碰过的网关数 + SpareTarget。够了就一发不打：
-	// 续期不是免费的，每一发都在烧铸票者的窗口、吃速率预算。
+	// 目标活 pair 数 = 最忙那个号用过的 pair 数 + SpareTarget。够了就一发不打：
+	// 铸票不是免费的，每一发都在烧执行者的窗口、吃它那个区域的速率预算。
 	live, target := s.livePairs(), s.PairTarget()
 	if live >= target {
 		return
 	}
 	s.opt.Log.Info("预铸：补到目标深度", "live", live, "target", target)
+	if s.cfg().RenewPairs {
+		s.renewStalePairs(ctx, live, target)
+		return
+	}
+	s.premintBare(ctx, target-live)
+}
 
+// premintBare 裸铸补深度：经一个还有配额的区域打一发，**落到哪个网关算哪个**。
+//
+// 为什么这是默认而续期是选项：续期能让一张票一直活着，但每续一发都要烧掉执行者在
+// 那个网关上的窗口，换来的只是「同一个落点的新 cookie」——而池子缺的是落点不是票。
+// 同样一发上游花在裸铸上，至少有机会摸到一个没见过的网关。
+//
+// 一轮最多打 n 发（n = 缺口）且不重试：撞上重复落点就下一轮再补——巡检一分钟一轮，
+// 而 pair 有 65 分钟寿命，不急。没有这个上限的话「落点老是重复」会变成一轮里
+// 无限铸票，正好撞在速率闸上。
+//
+// 而且**连续两发没让活 pair 数涨就收手**：裸铸落到哪是随机的，落回一个本来就有活
+// pair 的网关等于白烧一发请求加一个槽位（覆盖面没涨）。连着两发都这样基本就是
+// 「这个号在这个区域只到得了这几个落点」，再打下去是纯损耗，不如等下一轮换个
+// (账号 × 区域) 组合。
+func (s *Scheduler) premintBare(ctx context.Context, n int) {
+	const wasteBudget = 2
+	wasted := 0
+	for i := 0; i < n; i++ {
+		if ctx.Err() != nil {
+			return
+		}
+		before := s.livePairs()
+		// 本小时打得最少的号优先、它终身没走过的区域优先；
+		// 节流同一个号两次铸票至少隔 RenewGap。
+		a, r, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap)
+		if !ok {
+			s.opt.Log.Info("没有可派去裸铸的号（都在节流里，或九个区域本小时都打满了）")
+			return
+		}
+		sid, err := s.mint.NewSID(true)
+		if err != nil {
+			s.opt.Log.Warn("要不到粘性出口，本轮不预铸", "err", err)
+			return
+		}
+		unlock := s.st.LockAccount(a.ID)
+		// want 留空：裸铸就是去看它能落到哪，谈不上「落点漂移」。
+		got, err := s.mintOnce(ctx, a, r.Exit, sid, types.Pair{}, "", "")
+		unlock()
+		switch {
+		case err == nil:
+			s.opt.Log.Info("裸铸拿到落点", "account", a.ID, "label", a.Label,
+				"region", r.Key, "gateway", got.pair.Gateway)
+			if s.livePairs() > before {
+				wasted = 0
+				break
+			}
+			// 落回了一个本来就有活 pair 的网关：请求和槽位都花了，覆盖面没涨。
+			wasted++
+			if wasted >= wasteBudget {
+				s.opt.Log.Info("连续两发裸铸都落回已有落点，本轮不再铸",
+					"gateway", got.pair.Gateway, "live", before, "want", n)
+				return
+			}
+		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
+			// 闸门和出口故障都不是这个号的错，也不是重试能解决的，本轮直接停。
+			s.opt.Log.Warn("预铸撞上闸门，本轮停", "account", a.ID, "region", r.Key, "reason", err)
+			return
+		default:
+			s.opt.Log.Info("裸铸失败", "account", a.ID, "label", a.Label,
+				"region", r.Key, "reason", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(s.opt.MintGap):
+		}
+	}
+}
+
+// renewStalePairs 是 renew_pairs 打开时的保温：带着旧 pair 去续同一个网关。
+//
+// 上游会回一张**同网关**的新 65 分钟 pair（pair 自我续期，SPEC 第 6 节）。
+// 代价是烧掉执行者在那个网关上的窗口——想「稳住已知落点」而不是「多摸落点」时才开它。
+func (s *Scheduler) renewStalePairs(ctx context.Context, live, target int) {
 	for name, gw := range s.st.Gateways() {
 		if ctx.Err() != nil {
 			return
@@ -74,9 +153,10 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		// 铸过 pair 最少的号优先，节流同一个号两次续期至少隔 RenewGap。
+		// 本小时打得最少的号优先，节流同一个号两次续期至少隔 RenewGap。
 		// 都在节流里就跳过这一轮，pair 还有 RenewLead 的余量，等下一轮不迟。
-		sc, ok := s.warmMinter(s.opt.RenewGap)
+		// 出口由这个网关定死，所以只要人、不要它挑的区域。
+		sc, _, ok := s.minterFor(exit, 0, s.opt.RenewGap)
 		if !ok {
 			continue
 		}
@@ -88,15 +168,15 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 		cur, _ := s.st.Pair(name)
 		// 带着旧 pair 打：pair 自我续期，上游会回一张**同网关**的新 65 分钟 pair。
 		unlock := s.st.LockAccount(sc.ID)
-		_, err = s.mintOnce(ctx, sc, exit, sid, cur, name)
+		_, err = s.mintOnce(ctx, sc, exit, sid, cur, name, name)
 		unlock()
 		switch {
 		case err == nil:
 			live++
 			s.clearRenewFails(name)
-		case errors.Is(err, types.ErrRateLimited):
-			// 速率闸不是这个网关的错，别给它记失败预算，也别接着打。
-			s.opt.Log.Warn("预铸撞上速率闸，本轮停", "gateway", name, "reason", err)
+		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
+			// 闸门和基础设施故障不是这个网关的错，别给它记失败预算，也别接着打。
+			s.opt.Log.Warn("续期撞上闸门，本轮停", "gateway", name, "reason", err)
 			return
 		default:
 			s.opt.Log.Info("保温失败", "gateway", name, "scanner", sc.ID, "label", sc.Label, "reason", err)
@@ -156,11 +236,12 @@ func (s *Scheduler) PairTarget() int {
 			busiest = n
 		}
 	}
-	return busiest + types.SpareTarget
+	// 富余张数是配置项：0 就是「全按需，一发预铸都不打」。见 config.Config.SpareTarget。
+	return busiest + s.cfg().SpareTarget
 }
 
 // premintWasted 报告这一轮预铸没人能用：所有托管号在所有已知网关上都还在
-// SlotCooldown 里，铸出来的票发给谁都是降级的。
+// 冷却里，铸出来的票发给谁都是降级的。
 //
 // **只看 LastDeliver，不看 LastTouch**：冷却是「满血窗口被用掉了」才起算的，
 // 而 LastTouch 连失败的续期都记——拿它判会让保温自己把自己关掉（一发失败的续期
@@ -179,8 +260,9 @@ func (s *Scheduler) premintWasted() bool {
 		ids[a.ID] = true
 	}
 	now, cooling := s.now(), 0
+	cooldown := s.cfg().SlotCooldown()
 	for _, sl := range s.st.Slots() {
-		if sl.LastDeliver.IsZero() || now.Sub(sl.LastDeliver) >= types.SlotCooldown {
+		if sl.LastDeliver.IsZero() || now.Sub(sl.LastDeliver) >= cooldown {
 			continue
 		}
 		if _, ok := gws[sl.Gateway]; !ok {
@@ -195,41 +277,8 @@ func (s *Scheduler) premintWasted() bool {
 	return cooling >= len(ids)*len(gws)
 }
 
-// warmMinter 挑铸票者：**铸过的 pair 最少的号**，并列时挑最久没铸的。
+// 「挑谁去铸」只有 minterFor 一份了。
 //
-// 和交付路径上的 minterFor 刻意不同：那边要挑「在这个网关上已经废掉的号」好省下
-// 别人的窗口；预铸没有特定消费者可以让，就只按负载轮，别让一个号替全池扛。
-func (s *Scheduler) warmMinter(throttle time.Duration) (types.Account, bool) {
-	now := s.now()
-	s.mu.Lock()
-	minted := make(map[int64]int, len(s.mintCount))
-	for k, v := range s.mintCount {
-		minted[k] = v
-	}
-	lastUsed := make(map[int64]time.Time, len(s.lastMintedAt))
-	for k, v := range s.lastMintedAt {
-		lastUsed[k] = v
-	}
-	s.mu.Unlock()
-
-	var cs []types.Account
-	for _, a := range s.usable() {
-		if throttle > 0 && now.Sub(lastUsed[a.ID]) < throttle {
-			continue
-		}
-		cs = append(cs, a)
-	}
-	if len(cs) == 0 {
-		return types.Account{}, false
-	}
-	sort.Slice(cs, func(i, j int) bool {
-		if mi, mj := minted[cs[i].ID], minted[cs[j].ID]; mi != mj {
-			return mi < mj
-		}
-		if ui, uj := lastUsed[cs[i].ID], lastUsed[cs[j].ID]; !ui.Equal(uj) {
-			return ui.Before(uj)
-		}
-		return cs[i].ID < cs[j].ID
-	})
-	return cs[0], true
-}
+// 早先保温这边另有一个 warmMinter（按「铸过几张」轮），理由是交付路径那边要专挑
+// 「在这个网关上已经废掉的号」、两套取向相反。2026-10-01 那条规则删掉之后
+// （见 minterFor 的注释），两边要的是同一件事：本小时打得最少、没走过的区域优先。

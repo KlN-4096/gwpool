@@ -161,6 +161,22 @@ type Config struct {
 	// 这个数至今没测准：实测见过 30 分钟就恢复的，也见过 3 小时还没恢复的，
 	// 默认的 4 小时是保守估算。做成配置项就是为了能按当天的观测调。
 	SlotCooldownMinutes int `json:"slot_cooldown_minutes"`
+
+	// MaxTriesPerDeliver 是一次 /cookie 最多试几个网关，0 时按 Defaults（2）。
+	//
+	// 它是**请求数的乘数**：每多试一个网关，失败也要花一发上游（没票就得现铸）。
+	// 2 的意思是「给你一次改口的机会，然后老实认 503」——试不出来就把供给
+	// 留给下一个人，而不是一个倒霉的消费者把整池摸空（2026-10-01 实测连试 5 个、
+	// 耗 90 秒，最后还是 503）。
+	MaxTriesPerDeliver int `json:"max_tries_per_deliver"`
+
+	// SpareTarget 是池子要比「最忙的那个号用过的 pair 数」多留几张活 pair。
+	//
+	// **0 是合法值，意思是全按需、不预铸**（而不是「用默认值」——只有键缺着才回默认 2）。
+	// 这个旋钮买的东西很具体：首次取票不用现等铸票（一发上游要几秒到几十秒）。
+	// 代价同样具体：预铸出来没人取、65 分钟后自然过期的那几张就是纯浪费的请求和槽位。
+	// 想把上游请求压到最低就调 0。
+	SpareTarget int `json:"spare_target"`
 }
 
 // SlotCooldown 是当前生效的槽位冷却时长。
@@ -202,6 +218,8 @@ func Defaults() Config {
 		// 吃不掉别的区域的预算。
 		UpstreamPerRegionHour: 6,
 		SlotCooldownMinutes:   int(types.SlotCooldown / time.Minute),
+		MaxTriesPerDeliver:    2,
+		SpareTarget:           types.SpareTarget,
 		// 这两个开关默认关，理由在字段注释里：两个都是「花一个满血窗口换一个读数」。
 		VerifyFullAtDeliver: false,
 		RenewPairs:          false,
@@ -267,16 +285,41 @@ func Load(path string) (Config, error) {
 	if cfg.SlotCooldownMinutes < 0 {
 		return Config{}, fmt.Errorf("slot_cooldown_minutes 不能为负（0 = 用默认值）")
 	}
+	if cfg.MaxTriesPerDeliver < 0 {
+		return Config{}, fmt.Errorf("max_tries_per_deliver 不能为负（0 = 用默认值）")
+	}
+	if cfg.MaxTriesPerDeliver == 0 {
+		cfg.MaxTriesPerDeliver = Defaults().MaxTriesPerDeliver
+	}
+	// spare_target 的 0 是**真的 0**（全按需、不预铸），所以这里只拦负数——
+	// 负数会让目标深度低于「最忙的号用过的张数」，预铸永远不触发，而那不是
+	// 「不预铸」而是「连已经有人在用的那几张也不补」。
+	if cfg.SpareTarget < 0 {
+		return Config{}, fmt.Errorf("spare_target 不能为负（0 = 不预铸、全按需）")
+	}
+	// 文件里到底显式写了哪些键——两处要用：折 model 时要分清「真写了 models」和
+	// 「这是 Defaults 填的」，以及下面拦改过名的旧键。
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(b, &raw)
+
+	// 改过名的旧键要**明着拒**，不能跟着 encoding/json 的默认行为静默忽略。
+	//
+	// 这个文件是手改的（部署时直接编辑 config.json）：运维把 upstream_per_hour 从 54
+	// 调到 108 以为放宽了配额，实际一直按每区 6 发跑，而「配额没生效」的现象和
+	// 「上游在限流」长得一模一样，查起来要先怀疑一圈上游。启动即拒，一眼就知道改哪。
+	for old, now := range renamedKeys {
+		if _, ok := raw[old]; ok {
+			return Config{}, fmt.Errorf("配置键 %s 已经改名为 %s（语义也变了：现在是**每个区域**每小时的发数，九个区域各一份），请手动改掉", old, now)
+		}
+	}
+
 	// 老配置的单值 model 折进 Models，放在最前面（它原本就是默认值）。
 	//
 	// 只写了 model 的老配置里，Models 还停在 Defaults 填的那个默认值上——不清掉的话
 	// 会凭空多出一个谁都没要的模型。所以得分清「文件里真写了 models」和「这是默认值」。
 	if cfg.Model != "" {
-		var raw map[string]json.RawMessage
-		if json.Unmarshal(b, &raw) == nil {
-			if _, explicit := raw["models"]; !explicit {
-				cfg.Models = nil
-			}
+		if _, explicit := raw["models"]; !explicit {
+			cfg.Models = nil
 		}
 		cfg.Models = append([]string{cfg.Model}, cfg.Models...)
 		cfg.Model = ""
@@ -320,6 +363,14 @@ func Load(path string) (Config, error) {
 			"否则铸票与 state-echo 配不成同一个出口 IP", KindNovproxy, KindWebshare)
 	}
 	return cfg, nil
+}
+
+// renamedKeys 是改过名的配置键：旧名 → 新名。
+//
+// 只收**语义也变了**的那种。单纯挪位置的不用进来——静默忽略一个没人读的键无害，
+// 而静默忽略一个「我以为我改了配额」的键会让人去怀疑上游。
+var renamedKeys = map[string]string{
+	"upstream_per_hour": "upstream_per_region_hour",
 }
 
 // isModelName 卡住能进 JSON 请求体和日志的模型名。上游的拼法只用这几类字符

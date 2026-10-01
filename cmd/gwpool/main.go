@@ -60,17 +60,19 @@ func run(path string, log *slog.Logger) error {
 		Fingerprint: cfg.Fingerprint,
 		Model:       cfg.Model,
 
-		UpstreamPerHour: cfg.UpstreamPerHour,
-		Live:            live,
-		Log:             log, // 只用来记出口熔断的开合
+		UpstreamPerRegionHour: cfg.UpstreamPerRegionHour,
+		Live:                  live,
+		Log:                   log, // 只用来记出口熔断的开合
 	}
 	pool := sched.New(st, minter, sched.Options{
 		Mode:              cfg.Mode,
 		PublicWhenSurplus: cfg.PublicWhenSurplus.Enabled,
 		MinFreeGateways:   cfg.PublicWhenSurplus.MinFreeGateways,
-		Log:               log,
+		// 验满血、续期、槽位冷却三个旋钮由调度现读，改配置不用重启。
+		Live: live,
+		Log:  log,
 	})
-	queue := newScanQueue(&scan.Scanner{Mint: minter, Store: st, Log: log}, st, log)
+	queue := newDiscoveryQueue(&scan.Scanner{Mint: minter, Store: st, Log: log}, pool, log)
 
 	api, err := httpapi.New(pool, st, queue, httpapi.Options{
 		ConsumerKey: cfg.ConsumerKey.Reveal(),
@@ -131,108 +133,90 @@ func run(path string, log *slog.Logger) error {
 	return nil
 }
 
-// scanQueue 把 httpapi 的「排队首扫」接到 scan.Scanner 上。
+// discoveryQueue 把 httpapi 的「去找个新落点」接到 scan.Scanner 上。
 //
-// 为什么要排队：一次首扫是九个区域、每发间隔 3 秒，分钟级，上传请求不能等它。
-// 为什么只有一个 worker：扫描是真打上游，串行跑是最省心的速率纪律
-// （2026-10-01 的教训是高频铸票会把供给打空）。
-type scanQueue struct {
-	ch  chan int64
-	sc  *scan.Scanner
-	st  *store.Store
-	log *slog.Logger
+// 为什么要排队：那一发真打上游，几秒到几十秒，HTTP handler 不能等它
+// （要票的人这一次已经 503 了，这一发是给下一个人备的）。
+// 为什么只有一个 worker：串行跑是最省心的速率纪律（2026-10-01 的教训是
+// 高频铸票会把供给打空）。
+//
+// 派谁去哪个区域由 sched.PickMinter 定（按 (账号 × 区域) 台账 + 本小时配额），
+// 这儿不自己判——那套规则只该有一份。
+type discoveryQueue struct {
+	ch   chan job
+	sc   *scan.Scanner
+	pool *sched.Scheduler
+	log  *slog.Logger
 
 	mu       sync.Mutex
-	lastScan map[int64]time.Time // 账号 → 上次被排进队列的时间
+	lastSent map[int64]time.Time // 账号 → 上次被派出去的时间
 }
 
-// scanCooldown 是同一个账号两次扫描之间的最小间隔。
+// job 是一发裸铸：谁、经哪个区域。
+type job struct {
+	acct types.Account
+	r    types.Region
+}
+
+// discoverCooldown 是同一个账号两次被派去找落点的最小间隔。
 //
-// 一次扫描是九发真实上游请求，而且**会烧掉执行者在它扫到的每个新网关上的窗口**。
-// 没有节流的话一串 503 就能把同一个号反复派出去，把它自己的槽位全烧干。
+// 那一发**会烧掉执行者在它落到的那个网关上的窗口**。没有节流的话一串 503 就能把
+// 同一个号反复派出去，把它自己的槽位烧干。
 // 进程内存态、重启清零：它是速率纪律，不是账本。
-const scanCooldown = 30 * time.Minute
+const discoverCooldown = 30 * time.Minute
 
-func newScanQueue(sc *scan.Scanner, st *store.Store, log *slog.Logger) *scanQueue {
-	return &scanQueue{ch: make(chan int64, 64), sc: sc, st: st, log: log,
-		lastScan: map[int64]time.Time{}}
+func newDiscoveryQueue(sc *scan.Scanner, pool *sched.Scheduler, log *slog.Logger) *discoveryQueue {
+	return &discoveryQueue{ch: make(chan job, 64), sc: sc, pool: pool, log: log,
+		lastSent: map[int64]time.Time{}}
 }
 
-// Enqueue 绝不阻塞：HTTP handler 调它。队列满了宁可丢，记一行，让人手动补扫。
-func (q *scanQueue) Enqueue(id int64) {
-	// 冷却从**入队**算起，不是从开跑算起：队列堵着的时候按开跑计时会让同一个号
-	// 连排三次，等轮到它时三次都已经过了冷却。
-	q.mu.Lock()
-	q.lastScan[id] = time.Now()
-	q.mu.Unlock()
-
-	select {
-	case q.ch <- id:
-	default:
-		q.log.Warn("首扫队列满，丢弃", "account", id)
-	}
-}
-
-// EnqueueDiscovery 见 httpapi.Scanner 的注释：派**别人**去找新网关。
-func (q *scanQueue) EnqueueDiscovery(exclude int64) {
-	id, ok := q.pick(exclude)
+// EnqueueDiscovery 见 httpapi.Scanner 的注释：派**别人**去找新网关。绝不阻塞。
+func (q *discoveryQueue) EnqueueDiscovery(exclude int64) {
+	a, r, ok := q.pool.PickMinter(exclude)
 	if !ok {
-		// 池子里只有要票的这一个号，或者别人都在冷却里。派它自己去扫是净亏：
-		// 扫到的每个新网关都被扫描那一发当场烧掉，它拿到票时已经不是首次接触。
+		// 池子里只有要票的这一个号，或者剩下的号九个区域本小时都打满了。
+		// 派要票的人自己去是净亏：它找到的落点被那一发当场烧掉，拿到票时已经不是首次接触。
 		q.log.Debug("没有可派去找新网关的账号", "asked_by", exclude)
 		return
 	}
-	q.log.Info("槽位烧完，派别的账号去找新网关", "asked_by", exclude, "scanner", id)
-	q.Enqueue(id)
-}
-
-// pick 挑一个歇得最久的别的账号。没有合格的就回 false。
-func (q *scanQueue) pick(exclude int64) (int64, bool) {
-	now := time.Now()
+	// 冷却从**入队**算起，不是从开跑算起：队列堵着的时候按开跑计时会让同一个号
+	// 连排三次，等轮到它时三次都已经过了冷却。
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	var best int64
-	var bestAt time.Time
-	for _, a := range q.st.Accounts() {
-		// 没 token 的是匿名占位行，停用的多半是上游否决过的——派它去只会再废九发。
-		if a.ID == exclude || !a.Enabled || a.Creds.AccessToken == "" {
-			continue
-		}
-		at := q.lastScan[a.ID]
-		if now.Sub(at) < scanCooldown {
-			continue
-		}
-		// 轮着来：扫描对执行者是有成本的，别总挑同一个倒霉蛋。
-		if best == 0 || at.Before(bestAt) {
-			best, bestAt = a.ID, at
-		}
+	cooling := time.Since(q.lastSent[a.ID]) < discoverCooldown
+	if !cooling {
+		q.lastSent[a.ID] = time.Now()
 	}
-	return best, best != 0
+	q.mu.Unlock()
+	if cooling {
+		q.log.Debug("挑中的号还在发现冷却里", "asked_by", exclude, "scanner", a.ID)
+		return
+	}
+
+	q.log.Info("槽位烧完，派别的账号去找新网关",
+		"asked_by", exclude, "scanner", a.ID, "label", a.Label, "region", r.Key)
+	select {
+	case q.ch <- job{acct: a, r: r}:
+	default:
+		q.log.Warn("发现队列满，丢弃", "account", a.ID)
+	}
 }
 
-func (q *scanQueue) run(ctx context.Context) {
+func (q *discoveryQueue) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case id := <-q.ch:
-			q.scan(ctx, id)
+		case j := <-q.ch:
+			q.discover(ctx, j)
 		}
 	}
 }
 
-func (q *scanQueue) scan(ctx context.Context, id int64) {
-	a, ok := q.st.Account(id)
-	if !ok {
-		q.log.Warn("要扫的账号不见了", "account", id)
-		return
-	}
-	res, err := q.sc.ScanAccount(ctx, a)
-	// 日志只记账号 ID 和落点，凭据一个字不进（SPEC 红线 1）。
-	q.log.Info("首扫结束", "account", id, "label", a.Label, "regions", res.Regions, "samples", res.Samples,
-		"new_gateways", res.NewGateways, "failures", res.Failures,
-		"stopped_early", res.StoppedEarly, "err", err)
+func (q *discoveryQueue) discover(ctx context.Context, j job) {
+	landed, err := q.sc.ScanRegion(ctx, j.acct, j.r)
+	// 日志只记账号 ID、备注和落点，凭据一个字不进（SPEC 红线 1）。
+	q.log.Info("发现铸票结束", "account", j.acct.ID, "label", j.acct.Label, "region", j.r.Key,
+		"gateway", landed.Gateway, "is_new", landed.IsNew, "err", err)
 }
 
 // 编译期钉住：这几个具体类型必须满足各包自己定义的窄接口。
@@ -240,7 +224,7 @@ func (q *scanQueue) scan(ctx context.Context, id int64) {
 var (
 	_ sched.Store     = (*store.Store)(nil)
 	_ httpapi.Store   = (*store.Store)(nil)
-	_ httpapi.Scanner = (*scanQueue)(nil)
+	_ httpapi.Scanner = (*discoveryQueue)(nil)
 	_ httpapi.Pool    = (*sched.Scheduler)(nil)
 	_ sched.Minter    = (*mint.Client)(nil)
 	_ types.Minter    = (*mint.Client)(nil)

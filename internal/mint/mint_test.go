@@ -729,6 +729,68 @@ func TestUnreachableProxyTripsBreaker(t *testing.T) {
 	if _, err := c.NewSID(true); !errors.Is(err, ErrNoProxy) {
 		t.Fatalf("连不上的代理失败 %d 次还没熔断，拿到 %v", proxyFailThreshold, err)
 	}
+	// **根本没碰到上游的那几发要把配额退回去**：spend 是发之前占的名额，而每个区域
+	// 一小时只有 6 发。不退的话一次代理故障就能把这个区域的预算吃光，而那一发
+	// 连 TCP 都没建起来，上游那边什么都没发生。
+	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 0 {
+		t.Fatalf("连不上代理的 %d 发没退配额: used=%v", proxyFailThreshold, used)
+	}
+}
+
+// 反过来：隧道建起来又断（住宅死节点）**不许退**——那一发可能已经落到上游了，
+// 退了就是低报，而这个闸是防封号的安全阀。
+func TestDeadExitDoesNotRefundRateWindow(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _, _ = fakeSocks5Handshake(conn)
+			_ = conn.Close()
+		}
+	}()
+
+	p := novProxy
+	p.Host = ln.Addr().String()
+	c := &Client{Proxies: []config.Proxy{p}, StickyMin: 5, Upstream: "http://example.invalid/"}
+
+	sid, err := c.NewSID(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, ""); err == nil {
+		t.Fatal("这个假代理该在握手之后断开")
+	}
+	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
+		t.Fatalf("中途断开的那一发被退了配额（会低报，撞上封号阈值）: used=%v", used)
+	}
+}
+
+// 调用方自己取消的那一发也不退：同理，请求可能已经出站了。
+func TestCallerCancelDoesNotRefundRateWindow(t *testing.T) {
+	// 慢响应：调用方会在它回来之前撤。**不能用 <-r.Context().Done() 吊住**——
+	// 客户端取消不会立刻传到 server 端的 handler，httptest.Server.Close 会一直等它。
+	c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(200)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := c.Mint(ctx, testCreds, types.Exit{Region: "US"}, "sid-cancel", ""); err == nil {
+		t.Fatal("调用方取消了还成功？")
+	}
+	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
+		t.Fatalf("被取消的那一发退了配额: used=%v", used)
+	}
 }
 
 // fakeSocks5Handshake 收一次 SOCKS5 握手，返回 (用户名, "host:port")。

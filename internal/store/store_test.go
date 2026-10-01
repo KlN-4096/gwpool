@@ -636,3 +636,76 @@ func TestSaveKeepsBackups(t *testing.T) {
 		t.Fatalf("修剪后应剩 %d 份，实为 %d", dailyKeep, n)
 	}
 }
+
+// (账号 × 区域) 台账是**终身计数**，必须跟着 state.json 落盘：挑铸票者靠「这个号
+// 哪个区域还没走过」，重启清零的话每次重启都会把九个区域从头摸一遍。
+func TestRegionMintLedgerPersists(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	s := open(t, dir)
+	a, err := s.AddAccount(types.Account{Label: "pro1",
+		Creds: types.Creds{AccessToken: "tok", AccountID: "acc"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 3; i++ {
+		if err := s.NoteRegionMint(a.ID, "us-east", at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.NoteRegionMint(a.ID, "oceania", at); err != nil {
+		t.Fatal(err)
+	}
+	// 反查不到区域的出口（手改 state.json 才有）不记：空 key 会和别的格子串在一起。
+	if err := s.NoteRegionMint(a.ID, "", at); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	s2 := open(t, dir)
+	mints := s2.RegionMints()
+	if len(mints) != 2 {
+		t.Fatalf("重开后台账 %d 格，应为 2: %+v", len(mints), mints)
+	}
+	m := mints[MintKey(a.ID, "us-east")]
+	if m.Count != 3 || !m.LastAt.Equal(at) || m.AccountID != a.ID || m.RegionKey != "us-east" {
+		t.Fatalf("us-east 那一格没持久化对: %+v", m)
+	}
+	// 返回的是副本：调用方改它不该污染库里的那张表。
+	mints[MintKey(a.ID, "us-east")] = types.RegionMint{Count: 99}
+	if again := s2.RegionMints()[MintKey(a.ID, "us-east")]; again.Count != 3 {
+		t.Fatalf("RegionMints 给出去的不是副本: %+v", again)
+	}
+}
+
+// 删号要连它的台账一起删：账号 ID 是 max+1 分配的，会被下一个号复用，
+// 留着就是把前任的终身计数算在新人头上。
+func TestDeleteAccountDropsRegionMints(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "data"))
+	a, err := s.AddAccount(types.Account{Label: "a",
+		Creds: types.Creds{AccessToken: "t1", AccountID: "acc-a"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AddAccount(types.Account{Label: "b",
+		Creds: types.Creds{AccessToken: "t2", AccountID: "acc-b"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, id := range []int64{a.ID, b.ID} {
+		if err := s.NoteRegionMint(id, "us-east", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.DeleteAccount(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	mints := s.RegionMints()
+	if _, ok := mints[MintKey(a.ID, "us-east")]; ok {
+		t.Fatalf("删号没带走它的台账: %+v", mints)
+	}
+	if _, ok := mints[MintKey(b.ID, "us-east")]; !ok {
+		t.Fatalf("把别人的台账一起删了: %+v", mints)
+	}
+}
