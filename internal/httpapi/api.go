@@ -52,6 +52,10 @@ type Pool interface {
 	DeliverAnonymous(ctx context.Context, upstreamAccountID string, req sched.Request, authed bool) (types.Delivery, error)
 	// Release 还原一次「票取了但一发没打」的交付，返回还原了几个槽位。
 	Release(accountID int64, cookieVersion string) (int, error)
+	// DeliveredTo 报告这张票确实被交付给过这一行。/pair/renew 的归属闸用它，
+	// 而那是那条路上**唯一真正的**安全边界（交回来的 cookie 本体验不了签）。
+	// 判据归调度——它和 /release 共用同一份比对，HTTP 这层绝不自己算一份。
+	DeliveredTo(accountID int64, cookieVersion string) bool
 	// HasCandidate 是 wait 轮询的判据：此刻有没有一张**这个账号**拿得到、而且不用铸
 	// 的票。判据必须和交付是同一把尺子，所以归调度（它才看得见冷却），HTTP 这层
 	// 绝不自己算一份。

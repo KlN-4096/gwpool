@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -822,6 +821,16 @@ func renewReq(version, cookie string) *http.Request {
 	return httptest.NewRequest("POST", "/pair/renew", bytes.NewReader(body))
 }
 
+// grantTicket 让归属闸认「这一行确实拿到过池子现持的那张票」。
+//
+// 默认是**谁都没拿到过**（`fakePool.deliveredTo` 为 nil ⇒ 恒假），所以凡是要走到
+// 归属闸之后的用例都得显式开一下 —— 这正是那道闸真的在挡事的证据。
+// 按行而不按票号：好几个用例中途会换掉池子手上那张（票号跟着变），而它们要测的
+// 不是归属闸；归属闸自己由 TestRenewRefusesTicketsNotDeliveredToYou 钉住。
+func grantTicket(p *fakePool, row int64) {
+	p.deliveredTo = func(a int64, _ string) bool { return a == row }
+}
+
 // agePair 把池子手上那张票的剩余寿命改成 left，并把它的 cookie 换成一张解得开的。
 //
 // 两件都必要：rig 默认那张剩一整小时 ⇒ 会命中 RenewAccept 那条「不落盘」的兜底
@@ -864,17 +873,7 @@ func renewed(t *testing.T, w *httptest.ResponseRecorder) struct {
 func TestRenewStoresTheNewCookie(t *testing.T) {
 	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 10*time.Minute)
-	// 槽位账本的快照：续期**一个字节都不许碰它**。
-	//
-	// 这是整组用例里最值钱的一条。槽位记的是「(这个号 × 这个网关) 什么时候被烧过」，
-	// 是整个池子最紧的资源的账（每账号每小时只有 3.5 个左右）；而续期换的只是路由
-	// 寿命，和「谁碰过哪个网关」毫无关系。这里多写一笔的后果是静默的：LastTouch 被
-	// 刷新 ⇒ 这个槽位看起来刚烧过、挑选队列把它排到最后；Prev* 被动过 ⇒ /release
-	// 还原到错的点。两样都不会报错，只会让人以为「冷却变长了」。
-	before := make(map[string]types.Slot, len(st.slots))
-	for k, v := range st.slots {
-		before[k] = v
-	}
+	grantTicket(p, 1)
 	oailbExp := time.Now().Add(types.OailbLifetime).Truncate(time.Second)
 	fresh := routeCookie("NEWCFLB", "unified-142", oailbExp)
 
@@ -910,12 +909,14 @@ func TestRenewStoresTheNewCookie(t *testing.T) {
 		t.Fatalf("动了别的字段: %+v，原来是 gateway=%s mintedBy=%d", put, old.Gateway, old.MintedBy)
 	}
 	// 一发上游都不打、一个槽位都不碰。
+	//
+	// 「不碰槽位账本」这条**不在这儿断言**，因为它是**编译期**保证、比断言强：
+	// 这一层的 Store 接口刻意不暴露任何写槽位的方法（只有 Slots()，见 api.go），
+	// handleRenew 想改 LastTouch / LastDeliver / Prev* 连编译都过不去。
+	// 第一版在这儿放了一条 reflect.DeepEqual(槽位快照)，那是**恒绿**的——
+	// 没有可破的对象。能间接写到槽位的只剩 s.pool，由下面这一条钉住。
 	if p.calls != 0 || len(p.released) != 0 {
 		t.Fatalf("续期动了调度: calls=%d released=%+v", p.calls, p.released)
-	}
-	// 槽位账本逐字段比：LastTouch / LastDeliver / Prev* / 判定一个都不许变。
-	if !reflect.DeepEqual(before, st.slots) {
-		t.Fatalf("续期动了槽位账本:\n续期前 %+v\n续期后 %+v", before, st.slots)
 	}
 	if !strings.Contains(do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(), "续到还剩") {
 		t.Fatal("页面上看不见这次续期")
@@ -925,30 +926,44 @@ func TestRenewStoresTheNewCookie(t *testing.T) {
 // 形状是信任边界：票号定长十六进制、cookie 必须是完整两件而且 __oailb 解得开。
 // 畸形的一律 bad_request（闭集里的码）而且**一个字节都不落盘**；对的那一侧照收。
 func TestRenewValidatesShape(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 10*time.Minute)
+	grantTicket(p, 1)
 	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 	good := routeCookie("NEW", "unified-142", time.Now().Add(types.OailbLifetime))
 
-	for _, c := range []struct{ name, version, cookie string }{
-		{"票号空", "", good},
-		{"票号超长", strings.Repeat("a", 13), good},
-		{"票号非十六进制", "0123456789zz", good},
-		{"cookie 空", ver, ""},
+	// want 是**拒的理由**里必须出现的片段。
+	//
+	// 只断言 400 + bad_request 是**恒绿**的：形状解不开时 landed 是空串，而空串
+	// 永远不等于 cur.Gateway ⇒ 下一道「落点不一致」顺手就把它挡了，把形状闸整段
+	// 删掉这八个子例照样全绿（审查员实跑过）。附带代价也是真的：形状错误会被记成
+	// Warn「落点不一致」、响应说「落在另一个网关上」，把消费端的排查引到错方向。
+	// 所以每一格都要钉住**是哪一道闸**在说话。
+	const shapeMsg = "完整的路由 cookie"
+	const versionMsg = "位十六进制"
+	for _, c := range []struct{ name, version, cookie, want string }{
+		{"票号空", "", good, versionMsg},
+		{"票号超长", strings.Repeat("a", 13), good, versionMsg},
+		{"票号非十六进制", "0123456789zz", good, versionMsg},
+		{"cookie 空", ver, "", shapeMsg},
 		// 钉路由的是 __cflb：没有它那张 cookie 一个网关都钉不住。
-		{"只有 oailb", ver, strings.SplitN(good, "; ", 2)[1]},
-		{"只有 cflb", ver, "__cflb=NEW"},
-		{"oailb 不是 JWT", ver, "__cflb=NEW; __oailb=garbage"},
-		{"oailb 的 host 没有第三段", ver, routeCookie("NEW", "", time.Now().Add(time.Hour))},
+		{"只有 oailb", ver, strings.SplitN(good, "; ", 2)[1], shapeMsg},
+		{"只有 cflb", ver, "__cflb=NEW", shapeMsg},
+		{"oailb 不是 JWT", ver, "__cflb=NEW; __oailb=garbage", shapeMsg},
+		{"oailb 的 host 没有第三段", ver, routeCookie("NEW", "", time.Now().Add(types.OailbLifetime)), shapeMsg},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w := do(h, authed(renewReq(c.version, c.cookie), key))
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("状态 %d，应为 400: %s", w.Code, w.Body.String())
 			}
-			if code := decodeFail(t, w).Error.Code; code != codeBadRequest {
-				t.Fatalf("码 %q，应为 %q（闭集不许留洞）", code, codeBadRequest)
+			got := decodeFail(t, w).Error
+			if got.Code != codeBadRequest {
+				t.Fatalf("码 %q，应为 %q（闭集不许留洞）", got.Code, codeBadRequest)
+			}
+			if !strings.Contains(got.Message, c.want) {
+				t.Fatalf("拒的理由是 %q，没提到 %q —— 说明挡它的是别的闸", got.Message, c.want)
 			}
 			if len(st.puts) != 0 {
 				t.Fatalf("畸形请求也落盘了: %+v", st.puts)
@@ -972,8 +987,9 @@ func TestRenewValidatesShape(t *testing.T) {
 // 票号必须对上池子**此刻持有的**那张。对不上说明这张早被换掉了（或者从来不是池子
 // 发的）⇒ 照它写盘就是用一个来历不明的 cookie 盖掉现役那张。
 func TestRenewRefusesTicketsThePoolNoLongerHolds(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 10*time.Minute)
+	grantTicket(p, 1)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 	fresh := routeCookie("NEW", "unified-142", time.Now().Add(types.OailbLifetime))
 
@@ -1001,8 +1017,9 @@ func TestRenewRefusesTicketsThePoolNoLongerHolds(t *testing.T) {
 // 对不上说明消费端把两张票搞混了，而账本一错，后面所有「这个网关还能不能交付」
 // 都跟着错。要 Warn 不要 Info：这是对方的 bug，不是一次正常的拒绝。
 func TestRenewRefusesACookieFromAnotherGateway(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 10*time.Minute)
+	grantTicket(p, 1)
 	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 	var buf bytes.Buffer
@@ -1029,8 +1046,13 @@ func TestRenewRefusesACookieFromAnotherGateway(t *testing.T) {
 // 必须真的换了一张。一字不差交回来说明它那头根本没续到（上游没补发），
 // 收下只是把同一份内容再落一次盘，而「续期在生效」这个读数会变成假的。
 func TestRenewRefusesAnIdenticalCookie(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
-	old := agePair(st, 10*time.Minute)
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	// 场景得挑在**两道邻居闸之间**，不然原样交回根本走不到这道闸：
+	// 池子手上那张老过 renewExpSkew（5 min）时，它自己的 exp 就偏出「像刚下发的」
+	// 那个窗口 ⇒ 前面那道先拒；而新过 RenewAccept（60 s）时走「跳过落盘」。
+	// 中间这段（1 min ~ 5 min）才是这道闸真正在干活的地方。
+	old := agePair(st, types.PairLifetime-2*time.Minute)
+	grantTicket(p, 1)
 	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 
@@ -1070,7 +1092,8 @@ func TestRenewRefusesAnIdenticalCookie(t *testing.T) {
 //
 // 两侧只有账本能分开：响应都是 200 + ok=true，光看响应区分不出来。
 func TestRenewSkipsTheWriteWhenThePoolsTicketIsStillFresh(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	grantTicket(p, 1)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 	exp := time.Now().Add(types.OailbLifetime)
 	fresh := routeCookie("NEW", "unified-142", exp)
@@ -1106,23 +1129,33 @@ func TestRenewSkipsTheWriteWhenThePoolsTicketIsStillFresh(t *testing.T) {
 // 续不出寿命就不收：交回来一张比现持那张死得更早的 cookie（过期的、或者拿错了一张
 // 旧的），收下就是自己把池子最紧的供给换短。信任边界就在这一层。
 func TestRenewRefusesACookieThatDiesSooner(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 30*time.Minute)
+	grantTicket(p, 1)
 	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 
-	// 一侧：新那张的 __oailb 只剩 10 分钟 ⇒ 倒推出来的路由死期比现持那张早。
-	short := routeCookie("NEW", "unified-142", time.Now().Add(10*time.Minute))
-	if w := do(h, authed(renewReq(ver, short), key)); w.Code != http.StatusBadRequest {
+	// 场景得挑在**容差窗口之内**：明显过期/明显短的 cookie 由前面那道「不像是刚
+	// 下发的」闸挡掉（见 TestRenewRefusesACookieThatIsNotFreshlyIssued），走不到这儿。
+	// 这道闸兜的是剩下那一格：提交的 exp 贴着容差下沿 ⇒ 倒推出的死期仍比现持那张早。
+	//
+	// 算一下（容差 5 min）：提交 exp = now+OailbLifetime−4min ⇒ 路由死期
+	// = now+PairLifetime−4min = now+3360；现持那张剩 3450（低于 RenewAccept 的
+	// 3540 线，所以不会走「跳过落盘」）⇒ 3360 < 3450 ⇒ 这一发白续。
+	old = agePair(st, types.PairLifetime-150*time.Second)
+	ver = types.CookieVersion(old.Cookie)
+	short := routeCookie("NEW", "unified-142",
+		time.Now().Add(types.OailbLifetime-renewExpSkew+time.Minute))
+	w := do(h, authed(renewReq(ver, short), key))
+	if w.Code != http.StatusBadRequest {
 		t.Fatalf("更短的 cookie 却 %d，应为 400: %s", w.Code, w.Body.String())
 	}
-	// 已经过期的同理（这条路上最常见的误交）。
-	dead := routeCookie("NEW", "unified-142", time.Now().Add(-time.Hour))
-	if w := do(h, authed(renewReq(ver, dead), key)); w.Code != http.StatusBadRequest {
-		t.Fatalf("过期的 cookie 却 %d，应为 400", w.Code)
+	// 必须是**这道闸**拒的（前后两道都可能顺手挡住它）。
+	if msg := decodeFail(t, w).Error.Message; !strings.Contains(msg, "死得更早") {
+		t.Fatalf("拒的理由是 %q，不是「死得更早」那道闸", msg)
 	}
 	if len(st.puts) != 0 {
-		t.Fatalf("更短/过期的也落盘了: %+v", st.puts)
+		t.Fatalf("更短的也落盘了: %+v", st.puts)
 	}
 	// 另一侧：真的更长就收。
 	long := routeCookie("NEW", "unified-142", time.Now().Add(types.OailbLifetime))
@@ -1131,11 +1164,210 @@ func TestRenewRefusesACookieThatDiesSooner(t *testing.T) {
 	}
 }
 
+// B1：**归属闸**——只能续自己确实被交付过的那张票。
+//
+// 这是整条路上唯一挡得住人的那道。cookie 本体全是调用方自己写的字符串（`__oailb`
+// 验不了签、`__cflb` 只查得出非空），所以「落点对不对」是拿外部输入校验外部输入。
+// 没有这道闸，任何一把合法 consumer key 两步就能换掉**别人**现役的 pair：
+// GET /cookie 拿票号 → POST /pair/renew 提交伪造的 host + 任意 exp，之后
+// Deliver / redeliver / livePairs 全部只看 ExpiresAt ⇒ 一张路由已死的 cookie 被当
+// 活票发给还没碰过这个网关的账号 ⇒ 他被按出口地理随机路由 ⇒ 降智票当满血票发出去。
+func TestRenewRefusesTicketsNotDeliveredToYou(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	old := agePair(st, 10*time.Minute)
+	ver := types.CookieVersion(old.Cookie)
+	fresh := routeCookie("ATTACKER-CONTROLLED-GARBAGE", "unified-142",
+		time.Now().Add(types.OailbLifetime))
+
+	// 一侧：account 2 是**另一个上传者**，和 unified-142 毫无关系。
+	// 它的 key 完全合法、落点也「对」（host 是它自己写的），只有归属闸能拦住它。
+	other := srv.ConsumerKeyFor(st.accounts[1])
+	w := do(h, authed(renewReq(ver, fresh), other))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("别人的票却 %d，应为 409: %s", w.Code, w.Body.String())
+	}
+	if code := decodeFail(t, w).Error.Code; code != codeBadRequest {
+		t.Fatalf("码 %q，应为 %q", code, codeBadRequest)
+	}
+	if len(st.puts) != 0 {
+		t.Fatalf("别人的票也落盘了: %+v", st.puts)
+	}
+	if got := st.pairs["unified-142"].Cookie; got != old.Cookie {
+		t.Fatalf("现役 cookie 被换成了 %q", got)
+	}
+	// 问的必须是**解出来那一行 + 这张票号**：问错行等于这道闸形同虚设。
+	if want := "2|" + ver; len(p.askedDelivered) == 0 || p.askedDelivered[0] != want {
+		t.Fatalf("归属闸问的是 %+v，应为 %q", p.askedDelivered, want)
+	}
+
+	// 另一侧：这张票确实交付给过这一行 ⇒ 受理。
+	grantTicket(p, 2)
+	if w := do(h, authed(renewReq(ver, fresh), other)); w.Code != 200 {
+		t.Fatalf("自己的票却 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// B1 续：`public_when_surplus` 开着时**一个 header 都不带**也走得到这个端点，
+// 所以匿名那条路上归属闸同样是唯一的边界。
+func TestRenewAnonymousStillNeedsOwnership(t *testing.T) {
+	_, h, p, st, _ := rig(t, types.ModePool)
+	old := agePair(st, 10*time.Minute)
+	ver := types.CookieVersion(old.Cookie)
+	p.public = sched.PublicState{Enabled: true, Open: true}
+	req := func() *http.Request {
+		r := renewReq(ver, routeCookie("GARBAGE", "unified-142", time.Now().Add(types.OailbLifetime)))
+		r.URL.RawQuery = "account=acct-stranger"
+		return r
+	}
+	if w := do(h, req()); w.Code != http.StatusConflict {
+		t.Fatalf("匿名换别人的票却 %d，应为 409: %s", w.Code, w.Body.String())
+	}
+	if len(st.puts) != 0 {
+		t.Fatalf("匿名也落盘了: %+v", st.puts)
+	}
+	if got := st.pairs["unified-142"].Cookie; got != old.Cookie {
+		t.Fatalf("现役 cookie 被匿名请求换成了 %q", got)
+	}
+	// 另一侧：匿名解出来的占位行（夹具里没有这一行 ⇒ 0）确实拿到过这张票就受理。
+	grantTicket(p, 0)
+	if w := do(h, req()); w.Code != 200 {
+		t.Fatalf("匿名续自己的票却 %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// B2 之一：`__oailb` 的 exp 必须落在上游定死的那个跨度上。
+//
+// exp−iat 恒为 OailbLifetime ⇒ 刚下发那张的 exp 必然在 now+OailbLifetime 附近。
+// 偏出去的要么是拿错了旧票，要么是编出来的远期 exp —— 后者正是把 pair 放大成
+// 「永不临期」的那条路。
+func TestRenewRefusesACookieThatIsNotFreshlyIssued(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	grantTicket(p, 1)
+	key := srv.ConsumerKeyFor(st.accounts[0])
+
+	for _, c := range []struct {
+		name string
+		exp  time.Time
+	}{
+		{"远期 48 小时", time.Now().Add(48 * time.Hour)},
+		{"远期 72 小时", time.Now().Add(72 * time.Hour)},
+		{"已经过期", time.Now().Add(-time.Hour)},
+		{"只剩 10 分钟", time.Now().Add(10 * time.Minute)},
+		{"刚超出容差上沿", time.Now().Add(types.OailbLifetime + renewExpSkew + time.Minute)},
+		{"刚超出容差下沿", time.Now().Add(types.OailbLifetime - renewExpSkew - time.Minute)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			// 每格独立重铺：闸拆掉时第一发会真落盘，后面几格就变成 409
+			// 「票号对不上」——那样只有第一格真的在验这道闸。
+			st.puts = nil
+			ver := types.CookieVersion(agePair(st, 10*time.Minute).Cookie)
+			w := do(h, authed(renewReq(ver, routeCookie("NEW", "unified-142", c.exp)), key))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("状态 %d，应为 400: %s", w.Code, w.Body.String())
+			}
+			if msg := decodeFail(t, w).Error.Message; !strings.Contains(msg, "不是刚下发的") {
+				t.Fatalf("拒的理由是 %q，不是这道闸", msg)
+			}
+			if len(st.puts) != 0 {
+				t.Fatalf("落盘了: %+v", st.puts)
+			}
+		})
+	}
+	// 另一侧：容差之内就收（上下沿各一个，防着把窗口钉得比实现窄）。
+	for _, exp := range []time.Time{
+		time.Now().Add(types.OailbLifetime),
+		time.Now().Add(types.OailbLifetime - renewExpSkew + time.Minute),
+		time.Now().Add(types.OailbLifetime + renewExpSkew - time.Minute),
+	} {
+		st.puts = nil
+		ver := types.CookieVersion(agePair(st, 10*time.Minute).Cookie)
+		w := do(h, authed(renewReq(ver, routeCookie("NEW", "unified-142", exp)), key))
+		if w.Code != 200 {
+			t.Fatalf("exp=%v 在容差内却 %d: %s", exp, w.Code, w.Body.String())
+		}
+	}
+}
+
+// B2 之二：死期一律钳到 now+PairLifetime，**而且这个钳位必须在容差窗口内就够得着**。
+//
+// 真实 __cflb 的 Max-Age 死死是 PairLifetime，所以一张票无论怎么续都活不过
+// now+PairLifetime。漏掉钳位就没有回头路：被放大的 pair 永不临期 ⇒
+// renewStalePairs 永不重铸 ⇒ 漂移检测与失败预算全部失效 ⇒ 那个网关从此只发这张
+// 死票，还持久化进 state.json、重启不自愈。
+func TestRenewClampsTheDeadlineToOneLifetime(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	grantTicket(p, 1)
+	key := srv.ConsumerKeyFor(st.accounts[0])
+
+	// 一侧：exp 在容差上沿（比 now+OailbLifetime 还晚几分钟）⇒ 倒推出来的死期
+	// 超过一条命 ⇒ 必须被钳回去。
+	old := agePair(st, 10*time.Minute)
+	exp := time.Now().Add(types.OailbLifetime + renewExpSkew - time.Minute)
+	w := do(h, authed(renewReq(types.CookieVersion(old.Cookie),
+		routeCookie("NEW", "unified-142", exp)), key))
+	if w.Code != 200 {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	if len(st.puts) != 1 {
+		t.Fatalf("落盘 %d 次，应为 1 次", len(st.puts))
+	}
+	put := st.puts[0]
+	// 钳位前这张会是 now+PairLifetime+4min，所以上限必须真的生效。
+	hardCap := time.Now().Add(types.PairLifetime)
+	if put.ExpiresAt.After(hardCap) {
+		t.Fatalf("死期 %v 超过一条命的上限 %v（放大的 pair 永不临期、永不重铸）",
+			put.ExpiresAt.UTC(), hardCap.UTC())
+	}
+	if !put.CflbExpiresAt.Equal(put.ExpiresAt) {
+		t.Fatalf("两个死期不一致: ExpiresAt=%v CflbExpiresAt=%v", put.ExpiresAt, put.CflbExpiresAt)
+	}
+	// 钳完还得是一条**接近满的**命，别钳过头。
+	if left := time.Until(put.ExpiresAt); left < types.PairLifetime-time.Minute {
+		t.Fatalf("钳过头了，只剩 %v", left)
+	}
+	// 顺带钉住 RenewAccept 的等价性：钳住之后「还剩近乎整条命」立刻为真 ⇒
+	// 紧接着再续一次就该走「跳过落盘」。没有钳位的话这条等价性会静默失效。
+	st.puts = nil
+	again := routeCookie("NEWER", "unified-142", time.Now().Add(types.OailbLifetime))
+	if w := do(h, authed(renewReq(types.CookieVersion(put.Cookie), again), key)); w.Code != 200 {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	if len(st.puts) != 0 {
+		t.Fatalf("刚钳满的票又落盘了（RenewAccept 的等价性没救回来）: %+v", st.puts)
+	}
+}
+
+// 落盘失败要回 500，而且**不许回 ok=true**：消费端只认 200+ok，回错了它就把一张
+// 池子根本没记下来的 cookie 当成现役那张。
+func TestRenewWriteFailureIsNotSilent(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	old := agePair(st, 10*time.Minute)
+	grantTicket(p, 1)
+	st.putErr = fmt.Errorf("磁盘满了")
+	w := do(h, authed(renewReq(types.CookieVersion(old.Cookie),
+		routeCookie("NEW", "unified-142", time.Now().Add(types.OailbLifetime))),
+		srv.ConsumerKeyFor(st.accounts[0])))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("状态 %d，应为 500: %s", w.Code, w.Body.String())
+	}
+	if code := decodeFail(t, w).Error.Code; code == "" {
+		t.Fatal("500 也要带闭集里的码")
+	}
+	if strings.Contains(w.Body.String(), `"ok":true`) {
+		t.Fatalf("落盘失败却回了 ok=true: %s", w.Body.String())
+	}
+	// 报错里不许带 cookie 本体或磁盘路径（红线 1）。
+	if strings.Contains(w.Body.String(), "磁盘满了") {
+		t.Fatalf("把底层错误抄进了响应: %s", w.Body.String())
+	}
+}
+
 // 和 /release 刻意相反的两处之一：**占位行照收**。
 //
 // 归还的方向是「少记一次接触」，错了会把别人烧过的槽位还原成没碰过（见
 // types.AnonPrefix）；续期一个槽位都不碰，它改的只是「池子手上这张票的寿命」，
-// 而三道闸要求交回来的东西和池子现持那张同票号、同网关 —— 伪造骗不到别人。
+// 而**归属闸**把占位行锁在它自己的票上（占位行只能续交付给那个占位行的票）。
+// 不是因为 cookie 伪造不出来——那个验不了签，见 handleRenew 头上那段。
 //
 // 同一个请求在两个端点上走出两种结果，这才是「刻意不同」的判据。
 func TestRenewAcceptsPlaceholderRowsUnlikeRelease(t *testing.T) {
@@ -1144,6 +1376,11 @@ func TestRenewAcceptsPlaceholderRowsUnlikeRelease(t *testing.T) {
 	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 	p.relN = 1
+	// 占位行**真的存在**（和 TestReleaseRefusesPlaceholderRows 同一个夹具），
+	// 而且这张票确实交付给过它 —— 占位行能续的前提就是归属闸认它。
+	st.accounts = append(st.accounts, types.Account{ID: 7, Enabled: true,
+		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-friend"}})
+	grantTicket(p, 7)
 
 	// 同一把 key 替**别人的**上游账号办事 ⇒ 解出来的是 anon: 占位行。
 	rel := releaseReq(ver)
@@ -1167,7 +1404,8 @@ func TestRenewAcceptsPlaceholderRowsUnlikeRelease(t *testing.T) {
 // 说谎（见 sched.Release，那一侧由 sched 自己的用例钉住）。续期一个槽位都不碰，
 // 和那个开关无关 —— 这个用例就是防着有人照搬 /release 在这儿补一道闸。
 func TestRenewIsNotBlockedByVerifyAtDeliver(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	grantTicket(p, 1)
 	cfg := config.Defaults()
 	for _, on := range []bool{false, true} {
 		cfg.VerifyFullAtDeliver = on
@@ -1190,8 +1428,9 @@ func TestRenewIsNotBlockedByVerifyAtDeliver(t *testing.T) {
 
 // 鉴权和 /cookie 完全一致，而且排在**读请求体之前**（同 /release，见 F7）。
 func TestRenewNeedsSameAuthAsCookie(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
+	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 10*time.Minute)
+	grantTicket(p, 1)
 	ver := types.CookieVersion(old.Cookie)
 	fresh := routeCookie("NEW", "unified-142", time.Now().Add(types.OailbLifetime))
 

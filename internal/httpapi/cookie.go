@@ -477,6 +477,14 @@ func validCookieVersion(v string) bool {
 // renewBodyMax 封住请求体：一个 12 字符的票号 + 一张完整 cookie 头（几百字节量级）。
 const renewBodyMax = 4 << 10
 
+// renewExpSkew 是「这张 __oailb 是不是刚下发的」那道闸的容差。
+//
+// exp−iat 是上游定死的 OailbLifetime，所以刚下发那张的 exp 必然在
+// now+OailbLifetime 附近；差的只有这一趟的网络延迟（毫秒到秒）和两边时钟的偏差。
+// 5 分钟对 65 分钟的跨度是宽松到不可能误伤正常续期，同时把「编一个远期 exp」
+// 挡在 7% 以内。它不是安全闸（exp 本身来自调用方），真正兜住的是落盘前那个钳位。
+const renewExpSkew = 5 * time.Minute
+
 // renewResponse 是续期的成功响应。
 //
 // **形状和消费端冻结**（2026-10-02，sub2api 侧先落地）：它只在 HTTP 200 **且**
@@ -502,11 +510,30 @@ type renewResponse struct {
 // 所以这个端点只做一件事：**把它交回来的那张记进账本**。不打上游、不验满血、
 // 不动槽位、不动交付记录、不动 MintedBy。
 //
+// # 安全边界在哪儿（别再搞错一次）
+//
+// 交回来的 cookie 本体**全是调用方自己写的字符串**，池子验不了：`__oailb` 是 JWT
+// 但**签名验不了**（上游的公钥不在我们手上，见 mint.parseOailb——它只 base64 解
+// payload），`__cflb` 是 AEAD 密文、只查得出非空。所以「落点对不对」「exp 像不像
+// 真的」这类判据是**拿外部输入校验外部输入**：挡消费端的 bug 够用，挡不住人。
+//
+// 真正的边界只有两条，都不依赖 cookie 的自述：
+//  1. **归属**：这张票必须确实被交付给过这一行（s.pool.DeliveredTo，照 /release
+//     同一份比对）。没有它，任何一把合法 consumer key 都能换掉**别人**现役的 pair：
+//     伪造一个 host 指向那个网关、exp 随便填，池子就把一张路由已死的 cookie 当活票
+//     发给还没碰过那个网关的账号 ⇒ 他被按地理随机路由 ⇒ 降智票当满血票发出去。
+//  2. **钳位**：死期一律不许超过 now+PairLifetime。没有它，一个远期 exp 就能把
+//     这张 pair 放大成「永不临期」⇒ renewStalePairs 永不重铸 ⇒ 漂移检测和失败预算
+//     全部失效 ⇒ 那个网关从此只发这张死票，还持久化进 state.json、重启不自愈。
+//
+// 有了这两条，伪造的影响面被压到「只能把**自己确实拿到过的**那张票换成一串垃圾」，
+// 而那串垃圾会在 3600 秒内自然过期，由 renewStalePairs 和失败预算收走。
+// 没有上游公钥时这是能拿到的最强边界。
+//
 // 和 /release 刻意有两处不同：
 //   - 占位行（跨账号 / 匿名）**照收**。归还的方向是「少记一次接触」，错了会把别人
-//     烧过的槽位还原成没碰过（见 types.AnonPrefix）；续期一个槽位都不碰，它改的是
-//     「池子手上这张票的寿命」，而伪造一张 cookie 骗不到别人——下面三道闸要求它
-//     交回来的东西和池子现持的那张同票号、同网关。
+//     烧过的槽位还原成没碰过（见 types.AnonPrefix）；续期一个槽位都不碰，而上面那条
+//     归属闸把它锁在自己的票上——占位行只能续交付给那个占位行的票。
 //   - verify_full_at_deliver 开着时**不拒**。/release 拒是因为那条路上的槽位是实烧的、
 //     还了就是对池子说谎；续期和槽位无关，和那个开关也就无关。
 //
@@ -550,6 +577,21 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 			"cookie 不是一张完整的路由 cookie（要 __cflb 和能解开的 __oailb 两件）")
 		return
 	}
+	// __oailb 的 exp−iat 是上游定死的 OailbLifetime，所以一张**刚下发的**票的 exp
+	// 必然落在 now+OailbLifetime 附近（差的只是这一趟的延迟和两边时钟的偏差）。
+	// 偏出去就说明它不是刚下发的：要么是旧票拿错了，要么是个编出来的远期 exp——
+	// 后者正是把 pair 放大成「永不临期」的那条路（见上面那段的第 2 条）。
+	//
+	// 这道闸**不是**安全闸（exp 和落点一样来自调用方自己写的字符串），它只是把
+	// 荒唐的数挡在账本外面；真正兜住的是下面的钳位。
+	if off := oailbExp.Sub(time.Now().Add(types.OailbLifetime)); off > renewExpSkew || off < -renewExpSkew {
+		s.opt.Log.Warn("续期交回的 cookie 不像是刚下发的，拒收",
+			"account", acctID, "off_s", int(off/time.Second),
+			"allow_s", int(renewExpSkew/time.Second))
+		s.badRequestFor(w, http.StatusBadRequest, acctID,
+			"cookie 的 __oailb 过期时刻不在上游定死的那个跨度上（这张不是刚下发的）")
+		return
+	}
 	// 票号必须对上池子**此刻持有的**那张。对不上说明这张票早被换掉了（或者从来不是
 	// 池子发的）⇒ 照它写盘就是用一个来历不明的 cookie 盖掉现役那张。
 	// 带码的 409：闭集不许留洞，而唯一不带码的那个 409 是 /release 的（见 apiError）。
@@ -559,9 +601,20 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 			"这张票不是池子此刻持有的那张（已经被换过了，或者从来不是池子发的）")
 		return
 	}
-	// 完整性：交回来那张读出的落点必须就是这张票所在的网关。对不上说明消费端把两张
-	// 票搞混了——而账本一错，后面所有「这个网关还能不能交付」都跟着错。
-	// Warn 不是 Info：这是消费端的 bug，不是一次正常的拒绝。
+	// **归属闸**：这张票必须确实被交付给过这一行。整条路上唯一不依赖 cookie 自述的
+	// 判据，也是唯一挡得住人的那条（完整论证见函数头上那段）。
+	// 判据借调度那一份（和 /release 同一个比对），这儿绝不自己算。
+	if !s.pool.DeliveredTo(acctID, version) {
+		s.opt.Log.Warn("续期的票不是交付给这一行的，拒收",
+			"account", acctID, "gateway", cur.Gateway)
+		s.badRequestFor(w, http.StatusConflict, acctID,
+			"这张票不是交付给你的（只能续你自己拿到过的那张）")
+		return
+	}
+	// 落点一致：交回来那张读出的落点必须就是这张票所在的网关。
+	// **这不是安全闸**（落点是调用方自己写的 host），它挡的是消费端把两张票搞混
+	// 这类 bug——而账本一错，后面所有「这个网关还能不能交付」都跟着错。
+	// Warn 不是 Info：这是对方的 bug，不是一次正常的拒绝。
 	if landed != cur.Gateway {
 		s.opt.Log.Warn("续期交回的 cookie 落点和票所在的网关不一致，拒收",
 			"account", acctID, "ticket_gateway", cur.Gateway, "cookie_gateway", landed)
@@ -591,8 +644,21 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	// 真正的 Max-Age 读不出来（它在消费端那一跳的 Set-Cookie 里，池子没见过），
 	// 所以走 RouteDeadline 的第三级兜底——两件是同一个响应下发的，差值是实测的。
 	route, cflb := types.MintResult{PairExpires: oailbExp}.RouteDeadline(time.Time{})
-	// 续不出寿命就不收：交回来一张比现持那张死得更早的 cookie（过期的、或者消费端
-	// 拿错了一张旧的），收下就是自己把池子最紧的供给换短。信任边界就在这一层。
+	// **钳位**：真实 __cflb 的 Max-Age 死死是 PairLifetime，所以一张票无论怎么续都
+	// 不可能活过 now+PairLifetime。这一层必须自己钳，因为上面那个死期是从调用方写的
+	// exp 推出来的。
+	//
+	// 漏掉它不是「数字难看一点」，而是**没有回头路**：被放大的 pair 永不临期 ⇒
+	// warm.renewStalePairs（只在剩余 ≤ RenewLead 时重铸）永不重铸 ⇒ 漂移检测永不触发
+	// ⇒ RenewFailBudget 永不攒满 ⇒ DeletePair 永不被调用。那个网关从此只发这张死票，
+	// 还计入 livePairs() 压住别的网关的预铸，而且持久化进 state.json、重启不自愈。
+	// 它顺带救回 RenewAccept 的等价性：「> PairLifetime−RenewAccept ⟺ 刚换过不到
+	// 60 秒」只在死期不超过 now+PairLifetime 时成立。
+	if hardCap := time.Now().Add(types.PairLifetime); route.After(hardCap) {
+		route, cflb = hardCap, hardCap
+	}
+	// 续不出寿命就不收：交回来一张比现持那张死得更早的 cookie，收下就是自己把池子
+	// 最紧的供给换短。这条只兜「上面两道闸都放过、但确实更短」那一格。
 	if !route.After(cur.ExpiresAt) {
 		s.opt.Log.Warn("续期交回的 cookie 活不过池子手上那张，拒收",
 			"account", acctID, "gateway", cur.Gateway,

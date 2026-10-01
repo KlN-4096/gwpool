@@ -63,6 +63,11 @@ type fakePool struct {
 	released []string
 	relN     int
 	relErr   error
+
+	// deliveredTo 顶替归属闸的判据，askedDelivered 留住它被问过的 (行|票号)——
+	// 「问的是哪一行」正是这道闸的全部内容，光看状态码看不出来。
+	deliveredTo    func(accountID int64, version string) bool
+	askedDelivered []string
 }
 
 func (p *fakePool) Deliver(_ context.Context, accountID int64, req sched.Request) (types.Delivery, error) {
@@ -88,6 +93,18 @@ func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sche
 func (p *fakePool) Release(accountID int64, version string) (int, error) {
 	p.released = append(p.released, fmt.Sprintf("%d|%s", accountID, version))
 	return p.relN, p.relErr
+}
+
+// DeliveredTo 顶替 sched 那份归属比对。nil = 谁都没拿到过任何票。
+//
+// 这个 fake 必须能分开「这张票是池子现持的」和「这张票交付给过**这一行**」：
+// 两者混成一个，/pair/renew 的归属闸（整条路上唯一挡得住人的那道）就无从检验。
+func (p *fakePool) DeliveredTo(accountID int64, version string) bool {
+	p.askedDelivered = append(p.askedDelivered, fmt.Sprintf("%d|%s", accountID, version))
+	if p.deliveredTo == nil {
+		return false
+	}
+	return p.deliveredTo(accountID, version)
 }
 
 func (p *fakePool) HasCandidate(accountID int64, req sched.Request) bool {

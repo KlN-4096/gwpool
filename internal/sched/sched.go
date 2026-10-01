@@ -1789,16 +1789,11 @@ func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) 
 	now := s.now()
 	n := 0
 	for _, sl := range s.st.Slots() {
-		if sl.AccountID != accountID || sl.LastDeliver.IsZero() {
+		if sl.AccountID != accountID {
 			continue
 		}
-		if now.Sub(sl.LastDeliver) >= types.DeliverTTL {
-			continue // 过了受理窗口
-		}
-		// 按票本身认，不按网关：同一个网关换过一张新 pair 之后，他手上那张已经不是
-		// 这一次交付的票了，还原就成了凭空多给一个槽位。
-		p, ok := s.st.Pair(sl.Gateway)
-		if !ok || types.CookieVersion(p.Cookie) != cookieVersion {
+		// 受理窗口 DeliverTTL：过了他很可能已经用过了，而「他说没用过」池子无从验证。
+		if !s.gotThisTicket(sl, cookieVersion, now, types.DeliverTTL) {
 			continue
 		}
 		prevDeliver, prevTouch := sl.PrevDeliver, sl.PrevTouch
@@ -1816,4 +1811,41 @@ func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) 
 		return 0, ErrNoRelease
 	}
 	return n, nil
+}
+
+// gotThisTicket 报告这个槽位最近那次交付发出去的**就是** cookieVersion 这张票。
+//
+// 按票本身认，不按网关：同一个网关换过一张新 pair 之后，他手上那张已经不是这一次
+// 交付的票了。
+//
+// 两个调用方共用这一份，窗口各自给：/release 用 DeliverTTL（见上），
+// /pair/renew 用 PairLifetime（见 DeliveredTo）。判据写成两份迟早走散，而走散的
+// 后果是静默的——一边认一张票是你的、另一边不认。
+func (s *Scheduler) gotThisTicket(sl types.Slot, cookieVersion string, now time.Time, window time.Duration) bool {
+	if sl.LastDeliver.IsZero() || now.Sub(sl.LastDeliver) >= window {
+		return false
+	}
+	p, ok := s.st.Pair(sl.Gateway)
+	return ok && types.CookieVersion(p.Cookie) == cookieVersion
+}
+
+// DeliveredTo 报告这张票（cookieVersion）**确实被交付给过**这一行。
+//
+// /pair/renew 的归属闸就是它，而它是那条路上**唯一真正的**安全边界：
+// 交回来的 cookie 本体全是调用方自己写的字符串——`__oailb` 是 JWT 但池子**验不了签**
+// （上游的公钥不在我们手上，见 mint.parseOailb），`__cflb` 是密文、只查得出非空。
+// 所以「落点对不对」这类判据是拿外部输入校验外部输入，挡 bug 可以，挡不住人。
+// 能挡住人的只有**池子自己的交付记录**：你只能续你确实拿到过的那张票。
+//
+// 窗口是 PairLifetime 而不是 DeliverTTL（150 s）：消费端的续期发生在业务响应**之后**，
+// 一条长流轻松超过 150 秒，按那个窗口算会把正常续期全拒掉。而一张票本来也活不过
+// PairLifetime，拿它当窗口既够宽又不多给。
+func (s *Scheduler) DeliveredTo(accountID int64, cookieVersion string) bool {
+	now := s.now()
+	for _, sl := range s.st.Slots() {
+		if sl.AccountID == accountID && s.gotThisTicket(sl, cookieVersion, now, types.PairLifetime) {
+			return true
+		}
+	}
+	return false
 }

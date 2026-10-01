@@ -320,6 +320,53 @@ func TestReleaseRefusedAfterWindow(t *testing.T) {
 	}
 }
 
+// DeliveredTo 是 /pair/renew 的归属闸，而那是那条路上**唯一挡得住人的**判据
+// （交回来的 cookie 本体验不了签，见 mint.parseOailb）。
+//
+// 两件事必须同时成立，缺一条那道闸就形同虚设：
+//   - 认**行**：别的号拿着同一个票号来，一律不认
+//   - 窗口用 PairLifetime 而**不是** DeliverTTL（150 s）：续期发生在业务响应之后，
+//     一条长流轻松超过 150 秒，按那个窗口算会把正常续期全拒掉
+func TestDeliveredToAnswersOwnershipNotMerePossession(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	delete(st.gws, "unified-2")
+	delete(st.gws, "unified-3")
+	seedPairs(st, clk)
+	addAccount(st, 2, "acct-2")
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	version := types.CookieVersion(d.Cookie)
+
+	if !s.DeliveredTo(1, version) {
+		t.Fatal("刚交付给 1 的票却不认")
+	}
+	// 另一个号：票号一样（谁都能自己取一张同网关的票看到它），但没交付给它。
+	if s.DeliveredTo(2, version) {
+		t.Fatal("别人的票也认——这道闸形同虚设，任何一把合法 key 都能换掉别人现役的 pair")
+	}
+	// 票号对不上不认：他手上那张可能早被换掉了。
+	if s.DeliveredTo(1, "deadbeefdead") {
+		t.Fatal("票号对不上也认")
+	}
+	// 窗口两侧。DeliverTTL 之后**仍然要认**（这正是不能照抄 /release 窗口的地方），
+	// 而同一时刻 /release 已经拒了。
+	clk.add(types.DeliverTTL + time.Minute)
+	if !s.DeliveredTo(1, version) {
+		t.Fatalf("交付 %v 之后就不认了：续期发生在业务响应之后，长流轻松超过这个数",
+			types.DeliverTTL+time.Minute)
+	}
+	if _, err := s.Release(1, version); !errors.Is(err, ErrNoRelease) {
+		t.Fatalf("同一时刻 /release 该已经拒了（两个窗口刻意不同）: %v", err)
+	}
+	// 过了一张票自己的寿命就不认了：那张票本来也活不到这时候。
+	clk.add(types.PairLifetime)
+	if s.DeliveredTo(1, version) {
+		t.Fatalf("过了 %v 还认", types.PairLifetime)
+	}
+}
+
 // N-5：不验证的那条交付路不许把 degraded 洗成 unknown。
 // 那是花一发 state-echo 换来的唯一读数，而这一发什么都没验。
 func TestUnverifiedDeliveryKeepsDegradedVerdict(t *testing.T) {
