@@ -179,7 +179,7 @@ func (q *scanQueue) EnqueueDiscovery(exclude int64) {
 	if !ok {
 		// 池子里只有要票的这一个号，或者别人都在冷却里。派它自己去扫是净亏：
 		// 扫到的每个新网关都被扫描那一发当场烧掉，它拿到票时已经不是首次接触。
-		q.log.Info("没有可派去找新网关的账号", "asked_by", exclude)
+		q.log.Debug("没有可派去找新网关的账号", "asked_by", exclude)
 		return
 	}
 	q.log.Info("槽位烧完，派别的账号去找新网关", "asked_by", exclude, "scanner", id)
@@ -230,7 +230,7 @@ func (q *scanQueue) scan(ctx context.Context, id int64) {
 	}
 	res, err := q.sc.ScanAccount(ctx, a)
 	// 日志只记账号 ID 和落点，凭据一个字不进（SPEC 红线 1）。
-	q.log.Info("首扫结束", "account", id, "regions", res.Regions, "samples", res.Samples,
+	q.log.Info("首扫结束", "account", id, "label", a.Label, "regions", res.Regions, "samples", res.Samples,
 		"new_gateways", res.NewGateways, "failures", res.Failures,
 		"stopped_early", res.StoppedEarly, "err", err)
 }

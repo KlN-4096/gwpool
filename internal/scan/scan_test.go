@@ -122,39 +122,65 @@ func newScanner(t *testing.T, f *fakeMinter) (*Scanner, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return &Scanner{Mint: f, Store: st, Gap: time.Nanosecond,
-		Backoff: time.Nanosecond, MaxTries: 2}, st
+	return &Scanner{Mint: f, Store: st, Backoff: time.Nanosecond, MaxTries: 2}, st
 }
 
 var acct = types.Account{ID: 1, Label: "pro1",
 	Creds: types.Creds{AccessToken: "tok", AccountID: "acc"}}
 
+// scanAll 把九个区域各打一发。**循环在调用方**：九区域首扫那条路 2026-10-01 删掉了
+// （没需求也打、还顺手烧掉执行者在九个落点上的窗口），scan 只剩单区域入口。
+func scanAll(t *testing.T, s *Scanner) []Landing {
+	t.Helper()
+	var out []Landing
+	for _, r := range types.Regions {
+		l, err := s.ScanRegion(context.Background(), acct, r)
+		if err != nil {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
 func TestScanAllDistinct(t *testing.T) {
 	f := newFake()
 	s, st := newScanner(t, f)
-	res, err := s.ScanAccount(context.Background(), acct)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Regions != len(Regions) || res.StoppedEarly {
-		t.Fatalf("落点全不一样时该跑完九个区域: %+v", res)
+	landed := scanAll(t, s)
+	if len(landed) != len(types.Regions) {
+		t.Fatalf("九个区域都该成功，成了 %d 个", len(landed))
 	}
 	// us-east 和 us-west 的 Exit.Region 都是 US，假 minter 给同一个落点 ⇒ 8 个
-	if len(res.NewGateways) != 8 {
-		t.Errorf("新网关 %d 个: %v", len(res.NewGateways), res.NewGateways)
+	fresh := 0
+	for _, l := range landed {
+		if l.IsNew {
+			fresh++
+		}
+	}
+	if fresh != 8 {
+		t.Errorf("新网关 %d 个: %+v", fresh, landed)
 	}
 	rows, err := st.Samples()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != len(Regions) {
+	if len(rows) != len(types.Regions) {
 		t.Fatalf("样本该一区一行，得到 %d 行", len(rows))
 	}
-	if rows[0].RegionKey != Regions[0].Key || rows[0].Requested != Regions[0].Exit {
-		t.Errorf("样本没带上扫描清单信息: %+v", rows[0])
+	if rows[0].RegionKey != types.Regions[0].Key || rows[0].Requested != types.Regions[0].Exit {
+		t.Errorf("样本没带上区域信息: %+v", rows[0])
 	}
 	if len(st.Gateways()) != 8 {
 		t.Errorf("网关表 %d 条", len(st.Gateways()))
+	}
+	// 台账要按区域各记一格：挑下一个铸票者就看它。
+	mints := st.RegionMints()
+	if len(mints) != len(types.Regions) {
+		t.Fatalf("台账该九格，得到 %d 格: %+v", len(mints), mints)
+	}
+	m := mints[store.MintKey(acct.ID, "east-asia")]
+	if m.Count != 1 || m.LastAt.IsZero() || m.RegionKey != "east-asia" || m.AccountID != acct.ID {
+		t.Errorf("台账那一格不对: %+v", m)
 	}
 	// 每一发都是一次真实接触，槽位必须记上，否则调度会误判它歇着。
 	if sl, ok := st.Slot(acct.ID, "unified-JP"); !ok || sl.LastTouch.IsZero() {
@@ -191,9 +217,7 @@ func TestScanRecordsRequestedExitForReplay(t *testing.T) {
 	f.observed["US"] = types.Observed{IP: "102.0.0.1", Country: "NG", City: "Lagos", ASN: "AS1"}
 	f.observed["BR"] = types.Observed{IP: "1.1.1.1", Country: "DE", City: "Frankfurt am Main"}
 	s, st := newScanner(t, f)
-	if _, err := s.ScanAccount(context.Background(), acct); err != nil {
-		t.Fatal(err)
-	}
+	scanAll(t, s)
 
 	for name, want := range map[string][]types.Exit{
 		"unified-US": {{Region: "US"}, {Region: "US", City: "Seattle"}},
@@ -218,28 +242,21 @@ func TestScanRecordsRequestedExitForReplay(t *testing.T) {
 	}
 }
 
-// 落点开始全部重复 ⇒ 连续 3 个区域没新网关就停，别白烧槽位。
-func TestScanStopsAfterRepeats(t *testing.T) {
+// 同一个网关被多个区域落到时，每个区域请求过的出口都要进 ReachableExits：
+// 那张表的用途是「下次想回到这个网关该怎么请求」。
+func TestRepeatLandingsAccumulateExits(t *testing.T) {
 	f := newFake()
-	for _, r := range Regions[1:] {
-		f.gatewayFor[r.Exit.Region] = "unified-167" // 第二区起全部重复
+	for _, r := range types.Regions {
+		f.gatewayFor[r.Exit.Region] = "unified-167" // 九个区域全落同一个
 	}
 	s, st := newScanner(t, f)
-	res, err := s.ScanAccount(context.Background(), acct)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.StoppedEarly {
-		t.Fatal("该提前停")
-	}
-	if res.Regions != 4 { // 1 发新的 + 3 发重复
-		t.Errorf("该在第 4 个区域停下，实际打了 %d 个", res.Regions)
-	}
+	scanAll(t, s)
 	if len(st.Gateways()) != 1 {
 		t.Errorf("网关表该只有 1 条，得到 %d", len(st.Gateways()))
 	}
-	if exits := st.Gateways()["unified-167"].ReachableExits; len(exits) != 4 {
-		t.Errorf("四次落点请求过的出口都该记进可达出口，得到 %+v", exits)
+	// 九个区域、九种请求参数（us-east 和 us-west 国家相同但城市不同，算两种）。
+	if exits := st.Gateways()["unified-167"].ReachableExits; len(exits) != len(types.Regions) {
+		t.Errorf("每个区域请求过的出口都该记进可达出口，得到 %+v", exits)
 	}
 }
 
@@ -250,9 +267,11 @@ func TestScanIgnoresLandingFromNon200(t *testing.T) {
 	f.statusFor["BR"] = 429
 	f.statusFor["JP"] = 403
 	s, st := newScanner(t, f)
-	res, err := s.ScanAccount(context.Background(), acct)
-	if err != nil {
-		t.Fatal(err)
+	fails := 0
+	for _, r := range types.Regions {
+		if _, err := s.ScanRegion(context.Background(), acct, r); err != nil {
+			fails++
+		}
 	}
 	if _, ok := st.Gateways()["unified-BR"]; ok {
 		t.Error("429 的落点进了网关表")
@@ -266,8 +285,12 @@ func TestScanIgnoresLandingFromNon200(t *testing.T) {
 	if _, ok := st.Slot(acct.ID, "unified-BR"); ok {
 		t.Error("429 的槽位被记上了")
 	}
-	if res.Failures != 2 {
-		t.Errorf("两个区域该算失败，得到 %d", res.Failures)
+	if fails != 2 {
+		t.Errorf("两个区域该算失败，得到 %d", fails)
+	}
+	// 失败的那一发不进台账：记上去会把一个打不通的区域标成「走过了」，于是再也不去试。
+	if n := len(st.RegionMints()); n != len(types.Regions)-2 {
+		t.Errorf("台账该只有成功的 %d 格，得到 %d", len(types.Regions)-2, n)
 	}
 	// 但样本要留：那一发是真打出去的，状态码是后面排查供给的关键读数。
 	rows, _ := st.Samples()
@@ -289,9 +312,7 @@ func TestCoarseScanSkipsGeo(t *testing.T) {
 	f.nonSticky = true
 	s, st := newScanner(t, f)
 	s.Coarse = true
-	if _, err := s.ScanAccount(context.Background(), acct); err != nil {
-		t.Fatal(err)
-	}
+	scanAll(t, s)
 	if len(f.geoSIDs) != 0 {
 		t.Errorf("非粘性出口不该查 geo，查了 %d 次", len(f.geoSIDs))
 	}
@@ -318,21 +339,20 @@ func TestCoarseScanSkipsGeo(t *testing.T) {
 	}
 }
 
-// 失败的区域：样本仍要落盘（那一发是真打出去的），但不参与「重复」计数。
+// 失败的区域：样本仍要落盘，那一发是真打出去的。
 func TestScanFailureStillRecordsSample(t *testing.T) {
 	f := newFake()
 	f.failMint["BR"] = errors.New("429 挡了")
 	f.failGeo["AU"] = errors.New("ipinfo 超时")
 	s, st := newScanner(t, f)
-	res, err := s.ScanAccount(context.Background(), acct)
-	if err != nil {
-		t.Fatal(err)
+	fails := 0
+	for _, r := range types.Regions {
+		if _, err := s.ScanRegion(context.Background(), acct, r); err != nil {
+			fails++
+		}
 	}
-	if res.Failures != 2 {
-		t.Errorf("该有 2 个区域彻底失败，得到 %d", res.Failures)
-	}
-	if res.StoppedEarly {
-		t.Error("失败不该被当成「落点重复」而触发提前停")
+	if fails != 2 {
+		t.Errorf("该有 2 个区域彻底失败，得到 %d", fails)
 	}
 	rows, _ := st.Samples()
 	// MaxTries=2：BR 的两次重试都落了样本行；AU 连 geo 都没过，落不了行。
@@ -362,8 +382,10 @@ func TestSingleAccountConcurrencyIsOne(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := s.ScanAccount(context.Background(), acct); err != nil {
-				t.Error(err)
+			for _, r := range types.Regions[:3] {
+				if _, err := s.ScanRegion(context.Background(), acct, r); err != nil {
+					t.Error(err)
+				}
 			}
 		}()
 	}
@@ -398,8 +420,10 @@ func TestDifferentAccountsRunInParallel(t *testing.T) {
 			<-start
 			a := acct
 			a.ID = id
-			if _, err := s.ScanAccount(context.Background(), a); err != nil {
-				t.Error(err)
+			for _, r := range types.Regions[:3] {
+				if _, err := s.ScanRegion(context.Background(), a, r); err != nil {
+					t.Error(err)
+				}
 			}
 		}(id)
 	}
@@ -415,30 +439,37 @@ func TestScanCanceled(t *testing.T) {
 	s, _ := newScanner(t, f)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := s.ScanAccount(ctx, acct); !errors.Is(err, context.Canceled) {
+	if _, err := s.ScanRegion(ctx, acct, types.Regions[0]); !errors.Is(err, context.Canceled) {
 		t.Fatalf("取消该原样冒出来，得到 %v", err)
 	}
 }
 
 func TestScannerNeedsDeps(t *testing.T) {
-	if _, err := (&Scanner{}).ScanAccount(context.Background(), acct); err == nil {
+	if _, err := (&Scanner{}).ScanRegion(context.Background(), acct, types.Regions[0]); err == nil {
 		t.Fatal("没配 Mint/Store 该报错")
 	}
 }
 
-func TestRegionsMatchSpecTable(t *testing.T) {
-	want := []string{"us-east:US", "us-west:US/Seattle", "south-america:BR", "west-europe:ES",
-		"europe:IT", "east-asia:JP", "oceania:AU", "south-asia:IN", "middle-east:SA"}
-	if len(Regions) != len(want) {
-		t.Fatalf("区域数 %d，SPEC 第 4 节是 %d 个", len(Regions), len(want))
+// 上游否决这个账号（400/401/403）就当场停用：再派它去别的区域只是把同一句话
+// 再听八遍（2026-10-01 的二十七发就是这么浪费掉的）。
+func TestRejectedAccountIsDisabledOnTheSpot(t *testing.T) {
+	f := newFake()
+	f.statusFor["US"] = 400
+	s, st := newScanner(t, f)
+	a, err := st.AddAccount(types.Account{Label: "free 号", Enabled: true,
+		Creds: types.Creds{AccessToken: "tok", AccountID: "acc"}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for i, r := range Regions {
-		got := r.Key + ":" + r.Exit.Region
-		if r.Exit.City != "" {
-			got += "/" + r.Exit.City
-		}
-		if got != want[i] {
-			t.Errorf("第 %d 项 %q，SPEC 是 %q", i, got, want[i])
-		}
+	if _, err := s.ScanRegion(context.Background(), a, types.Regions[0]); !errors.Is(err, ErrAccountRejected) {
+		t.Fatalf("400 该认成「上游否决这个账号」，得到 %v", err)
+	}
+	// 只打一发就认命：MaxTries=2，但否决不重试。
+	if len(f.sids) != 1 {
+		t.Errorf("否决后还重试了，共打了 %d 发", len(f.sids))
+	}
+	got, _ := st.Account(a.ID)
+	if got.Enabled || got.DisabledReason == "" {
+		t.Fatalf("没停用或没记原因: enabled=%v reason=%q", got.Enabled, got.DisabledReason)
 	}
 }

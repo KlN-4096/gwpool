@@ -99,7 +99,7 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 			s.opt.Log.Warn("预铸撞上速率闸，本轮停", "gateway", name, "reason", err)
 			return
 		default:
-			s.opt.Log.Info("保温失败", "gateway", name, "scanner", sc.ID, "reason", err)
+			s.opt.Log.Info("保温失败", "gateway", name, "scanner", sc.ID, "label", sc.Label, "reason", err)
 			s.noteRenewFail(name, err)
 		}
 		select {

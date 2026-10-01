@@ -375,7 +375,7 @@ func TestProxyBreaker(t *testing.T) {
 	c := &Client{Proxies: []config.Proxy{novProxy,
 		{Name: "nov2", Kind: config.KindNovproxy, Host: "h", User: "u2", Pass: "p", Enabled: true}}}
 	for i := 0; i < proxyFailThreshold; i++ {
-		c.noteFailure("nov", errors.New("认证被拒"))
+		c.noteFailure("nov", "acc", errors.New("认证被拒"))
 	}
 	for i := 0; i < 5; i++ {
 		sid, err := c.NewSID(true)
@@ -828,7 +828,7 @@ func TestUpstreamRateGate(t *testing.T) {
 		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-9", time.Now().Add(time.Hour))+"; Path=/")
 		w.WriteHeader(http.StatusOK)
 	})
-	c.UpstreamPerHour = 3
+	c.UpstreamPerRegionHour = 3
 
 	cr := types.Creds{AccessToken: "tok", AccountID: "acc"}
 	for i := 0; i < 3; i++ {
@@ -847,8 +847,17 @@ func TestUpstreamRateGate(t *testing.T) {
 	if hits != 3 {
 		t.Fatalf("被拦的那两发还是发出去了：上游收到 %d 发", hits)
 	}
-	if used, limit := c.Rate("acc"); used != 3 || limit != 3 {
-		t.Fatalf("读数不对: used=%d limit=%d", used, limit)
+	// 闸是**按区域**分桶的：us-east 打满了，另外八个区域各有自己的一整份预算——
+	// 而那八个区域才是能发现新落点的地方。
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "JP"}, "sid-x", ""); err != nil {
+		t.Fatalf("east-asia 被 us-east 的配额拖累了: %v", err)
+	}
+	if used, limit := c.Rate("acc"); used["us-east"] != 3 || used["east-asia"] != 1 || limit != 3 {
+		t.Fatalf("读数不对: used=%v limit=%d", used, limit)
+	}
+	// 没在表上的出口（手改 state.json 才会有）挤同一个空桶，不凭空多出一份配额。
+	if used, _ := c.Rate("acc"); used[""] != 0 {
+		t.Fatalf("野出口的桶不该有读数: %v", used)
 	}
 	// 闸是按上游账号算的：另一个号自己有一整份预算，不该被这个号打满而挨饿。
 	other := types.Creds{AccessToken: "tok", AccountID: "acc-2"}

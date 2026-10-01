@@ -45,12 +45,6 @@ const (
 	proxyFailThreshold = 3
 	proxySkipBase      = 10 * time.Second
 	proxySkipMax       = time.Minute
-
-	// **单个上游账号**每小时的上游请求上限（Mint + VerifyFull 共用这一个预算）。
-	// 一次九区域扫描是 9 发、一次取票最多 6 发，54 发留得下一次扫描加几次取票。
-	// 它是安全阀不是吞吐量目标：2026-09-29 的事故（5~6 并发 20~30 分钟废掉一个通道）
-	// 说明任何路径上的 bug 导致疯狂重铸，都得在这里被兜住而不是变成封号。
-	defaultUpstreamPerHour = 54
 )
 
 // ErrNoLanding 是「没下发新 __oailb，本次又没发 pair」——读不出落点，按失败处理。
@@ -78,9 +72,10 @@ type Client struct {
 	// （SPEC 红线 8：测试不许打真实上游）。
 	HTTP *http.Client
 
-	// UpstreamPerHour 是**每个上游账号**每小时最多打多少发上游（Mint + VerifyFull）。
-	// 0 时按 defaultUpstreamPerHour。Geo 不算在内：它打的是 ipinfo，不是上游。
-	UpstreamPerHour int
+	// UpstreamPerRegionHour 是**每个上游账号、每个区域**每小时最多打多少发上游
+	// （Mint + VerifyFull）。0 时按 config.Defaults。
+	// Geo 不算在内：它打的是 ipinfo，不是上游。
+	UpstreamPerRegionHour int
 
 	// Live 非 nil 时，模型和速率上限每次**现读**它，于是改配置不用重启。
 	// 为空就用上面那两个字段（测试走这条路，不必搭一份配置）。
@@ -100,26 +95,36 @@ type Client struct {
 	fails     map[string]int         // 供应商 -> 连续失败次数
 	skipUntil map[string]time.Time   // 供应商 -> 跳到什么时候
 	sids      map[string]sidBind     // sid -> 绑定的供应商
-	sent      map[string][]time.Time // 上游账号 -> 过去一小时每一发请求的时刻
+	sent      map[string][]time.Time // 账号|区域 -> 过去一小时每一发请求的时刻
+}
+
+// rateKey 是速率闸的分桶键：(上游账号 × 区域)。
+//
+// 区域反查不到（出口不在 types.Regions 里，只可能来自手改的 state.json）时
+// 整批挤进同一个空桶：宁可让它们互相挤，也不要每个野出口凭空多出一整份配额。
+func rateKey(acct string, e types.Exit) string {
+	return acct + "|" + types.RegionKeyOf(e)
 }
 
 // spend 过速率闸。满了就回 types.ErrRateLimited，一发都不发。
 //
-// **按上游账号算，不是全局**：一个号打太猛不该让别的号跟着挨饿，而要防的那件事
-// （把一个通道打废）本来就是账号级的。
+// **按 (上游账号 × 区域) 算，不是全局、也不是只按账号**：一个号打太猛不该让别的号
+// 跟着挨饿，而一个区域打不通时的重试更不该吃掉另外八个区域的预算——那八个区域才是
+// 发现新落点的地方。九个区域各 6 发合起来正好是原先按账号算的 54 发/小时。
 //
-// 滑动窗口而不是漏桶：「每小时 54 发」就按字面实现，几十个时间戳扫一遍不值得优化。
-func (c *Client) spend(acct string) error {
-	lim := c.perHour()
+// 滑动窗口而不是漏桶：「每小时 6 发」就按字面实现，几十个时间戳扫一遍不值得优化。
+func (c *Client) spend(acct string, e types.Exit) error {
+	lim := c.perRegionHour()
 	now := time.Now()
 	cut := now.Add(-time.Hour)
+	key := rateKey(acct, e)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.sent == nil {
 		c.sent = map[string][]time.Time{}
 	}
-	win := c.sent[acct]
+	win := c.sent[key]
 	kept := win[:0]
 	for _, t := range win {
 		if t.After(cut) {
@@ -127,24 +132,39 @@ func (c *Client) spend(acct string) error {
 		}
 	}
 	if len(kept) >= lim {
-		c.sent[acct] = kept
+		c.sent[key] = kept
 		// 说出「还要等多久」：没有它的话调用方只知道被拒，不知道该等 3 秒还是 50 分钟。
 		wait := kept[0].Add(time.Hour).Sub(now).Round(time.Second)
-		return fmt.Errorf("%w（上限 %d/小时，%s 后腾出一发）", types.ErrRateLimited, lim, wait)
+		return fmt.Errorf("%w（区域 %s 每小时上限 %d，%s 后腾出一发）",
+			types.ErrRateLimited, types.RegionKeyOf(e), lim, wait)
 	}
-	c.sent[acct] = append(kept, now)
+	c.sent[key] = append(kept, now)
 	return nil
 }
 
-// Rate 报某个上游账号当前窗口用掉几发、上限几发。只给页面读数用。
-func (c *Client) Rate(acct string) (used, limit int) {
-	limit = c.perHour()
+// Rate 报某个上游账号当前窗口**各区域**各用掉几发，以及每区的上限。
+//
+// 整个账号一次报完，不是一区一问：挑铸票者要同时看九个区域还剩多少配额
+// （见 sched.minterFor），而页面上那张格子也是九个一起画。
+// key 是区域 key；没打过的区域不出现在 map 里。
+func (c *Client) Rate(acct string) (used map[string]int, limit int) {
+	limit = c.perRegionHour()
 	cut := time.Now().Add(-time.Hour)
+	used = map[string]int{}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, t := range c.sent[acct] {
-		if t.After(cut) {
-			used++
+	for key, ts := range c.sent {
+		// 从**最后**一个竖线切：区域 key 里没有竖线，而上游 account_id 是外面贴进来的
+		// 自由文本，从前面切会把带竖线的账号整个读错行。
+		i := strings.LastIndex(key, "|")
+		if i < 0 || key[:i] != acct {
+			continue
+		}
+		region := key[i+1:]
+		for _, t := range ts {
+			if t.After(cut) {
+				used[region]++
+			}
 		}
 	}
 	return used, limit
@@ -231,7 +251,7 @@ func (c *Client) bindLocked(sid string, idx int, now time.Time) {
 
 // Mint 经 e 指定的出口打一发最小 ping。sentPair 为空表示裸打。
 func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, sentPair string) (types.MintResult, error) {
-	if err := c.spend(cr.AccountID); err != nil {
+	if err := c.spend(cr.AccountID, e); err != nil {
 		return types.MintResult{}, err
 	}
 	body, header := buildWire(c.fingerprint(), c.model(), cr, sentPair, "")
@@ -239,7 +259,7 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 	if err != nil {
 		return types.MintResult{}, err
 	}
-	resp, err := c.do(req, e, sid)
+	resp, err := c.do(req, e, sid, cr.AccountID)
 	if err != nil {
 		return types.MintResult{}, err
 	}
@@ -288,7 +308,8 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 		// 不带活票上游必回一个 state，一律判成「降级」，判据直接失效。
 		return nil, errors.New("state-echo 必须带一张活票")
 	}
-	if err := c.spend(cr.AccountID); err != nil {
+	// 和铸票那一发共用同一个 (账号 × 区域) 预算：两条路各算一套就等于把上限翻倍。
+	if err := c.spend(cr.AccountID, e); err != nil {
 		return nil, err
 	}
 	body, header := buildWire(c.fingerprint(), c.model(), cr, pair, ticket)
@@ -296,7 +317,7 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.do(req, e, sid)
+	resp, err := c.do(req, e, sid, cr.AccountID)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +376,7 @@ func (c *Client) geoOnce(ctx context.Context, e types.Exit, sid string) (types.O
 	if err != nil {
 		return types.Observed{}, err
 	}
-	resp, err := c.do(req, e, sid)
+	resp, err := c.do(req, e, sid, "")
 	if err != nil {
 		return types.Observed{}, err
 	}
@@ -408,17 +429,20 @@ func (c *Client) model() string {
 	return defaultModel
 }
 
-// perHour 是当前的单账号每小时上限。
-func (c *Client) perHour() int {
+// perRegionHour 是当前的「每账号每区域每小时」上限。
+//
+// 兜底值去 config.Defaults 要，不在这儿再留一个常量：两处各写一个数，
+// 迟早只改一处。
+func (c *Client) perRegionHour() int {
 	if c.Live != nil {
-		if n := c.Live.Get().UpstreamPerHour; n > 0 {
+		if n := c.Live.Get().UpstreamPerRegionHour; n > 0 {
 			return n
 		}
 	}
-	if c.UpstreamPerHour > 0 {
-		return c.UpstreamPerHour
+	if c.UpstreamPerRegionHour > 0 {
+		return c.UpstreamPerRegionHour
 	}
-	return defaultUpstreamPerHour
+	return config.Defaults().UpstreamPerRegionHour
 }
 
 func (c *Client) upstream() string {
@@ -444,7 +468,7 @@ func (c *Client) newRequest(ctx context.Context, method, url string, body []byte
 }
 
 // do 发请求。HTTP 字段注入时直接用它，否则按 (sid 绑定的供应商, 出口) 临时拼一个客户端。
-func (c *Client) do(req *http.Request, e types.Exit, sid string) (*http.Response, error) {
+func (c *Client) do(req *http.Request, e types.Exit, sid, acct string) (*http.Response, error) {
 	if c.HTTP != nil {
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
@@ -482,14 +506,16 @@ func (c *Client) do(req *http.Request, e types.Exit, sid string) (*http.Response
 	case err != nil:
 		// 连不上代理本身、认证被拒：这才是供应商的账。
 		// err 里会带 URL，代理用户名在 Transport 里，不会被 net/http 带进来。
-		c.noteFailure(p.Name, err)
+		c.noteFailure(p.Name, acct, err)
 		return nil, fmt.Errorf("经 %s 请求失败: %w", p.Name, err)
 	}
 	c.noteSuccess(p.Name)
 	return resp, nil
 }
 
-func (c *Client) noteFailure(name string, cause error) {
+// noteFailure 记一次供应商失败。acct 只进日志：出问题时第一个要回答的问题是
+// 「是谁在打」——一条没有账号的熔断记录，事后对着 20 个账号的池子没有指向性。
+func (c *Client) noteFailure(name, acct string, cause error) {
 	c.mu.Lock()
 	if c.fails == nil {
 		c.fails, c.skipUntil = map[string]int{}, map[string]time.Time{}
@@ -509,7 +535,7 @@ func (c *Client) noteFailure(name string, cause error) {
 	if c.Log != nil && skip > 0 {
 		// 一条粘性供应商熔断就等于整池停摆（非粘性的那条顶不上 sticky 请求），
 		// 所以这行是 WARN 不是 INFO。
-		c.Log.Warn("出口熔断", "proxy", name, "fails", n, "skip", skip, "cause", cause)
+		c.Log.Warn("出口熔断", "proxy", name, "upstream", acct, "fails", n, "skip", skip, "cause", cause)
 	}
 }
 

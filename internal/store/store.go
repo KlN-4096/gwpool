@@ -51,6 +51,11 @@ type State struct {
 	Gateways map[string]types.Gateway `json:"gateways"` // key = "unified-142"
 	Slots    map[string]types.Slot    `json:"slots"`    // key = SlotKey()
 	Pairs    map[string]types.Pair    `json:"pairs"`    // key = gateway
+	// Mints 是 (账号 × 区域) 的终身铸票台账，key = MintKey()。
+	// 必须落盘：它是「这个号还有哪个区域没走过」的唯一依据，而那正是发现新网关的
+	// 全部线索。记在内存里的话每次重启所有号的九个格子一起归零，于是重启后的
+	// 头几发又全打在已经走烂了的区域上。
+	Mints map[string]types.RegionMint `json:"mints"`
 }
 
 // Store 是并发安全的状态句柄。
@@ -73,6 +78,11 @@ func SlotKey(accountID int64, gateway string) string {
 	return fmt.Sprintf("%d|%s", accountID, gateway)
 }
 
+// MintKey 是 mints 表的键：(账号 × 区域)。
+func MintKey(accountID int64, regionKey string) string {
+	return fmt.Sprintf("%d|%s", accountID, regionKey)
+}
+
 // Open 打开 dir 下的两个文件。文件不存在就建空的，不报错退出（SPEC 第 9 节）。
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
@@ -85,6 +95,7 @@ func Open(dir string) (*Store, error) {
 		Gateways: map[string]types.Gateway{},
 		Slots:    map[string]types.Slot{},
 		Pairs:    map[string]types.Pair{},
+		Mints:    map[string]types.RegionMint{},
 	}}
 
 	b, err := os.ReadFile(filepath.Join(dir, stateFile))
@@ -105,6 +116,9 @@ func Open(dir string) (*Store, error) {
 		}
 		if s.st.Pairs == nil {
 			s.st.Pairs = map[string]types.Pair{}
+		}
+		if s.st.Mints == nil {
+			s.st.Mints = map[string]types.RegionMint{}
 		}
 	}
 
@@ -466,10 +480,22 @@ func (s *Store) DeleteAccount(id int64) error {
 			dropped[k] = sl
 		}
 	}
+	// 台账跟着删，理由和槽位一样，而且更要紧：ID 是「现有最大 +1」算的，
+	// 删掉末尾那个号之后下一个新号会**接上同一个 ID**，留着的九个格子会让它
+	// 一进来就以为自己已经把那些区域走遍了，于是再也不去试。
+	droppedMints := map[string]types.RegionMint{}
+	for k, m := range s.st.Mints {
+		if m.AccountID == id {
+			droppedMints[k] = m
+		}
+	}
 
 	s.st.Accounts = append(s.st.Accounts[:idx:idx], s.st.Accounts[idx+1:]...)
 	for k := range dropped {
 		delete(s.st.Slots, k)
+	}
+	for k := range droppedMints {
+		delete(s.st.Mints, k)
 	}
 	if err := s.save(); err != nil {
 		// 没落盘就把内存复原，否则进程还活着的这段时间里账号凭空消失了。
@@ -478,6 +504,9 @@ func (s *Store) DeleteAccount(id int64) error {
 		s.st.Accounts[idx] = acct
 		for k, sl := range dropped {
 			s.st.Slots[k] = sl
+		}
+		for k, m := range droppedMints {
+			s.st.Mints[k] = m
 		}
 		return err
 	}
@@ -654,6 +683,51 @@ func (s *Store) LongestRestedSlot(accountID int64, candidates []string) (types.S
 		}
 	}
 	return best, found
+}
+
+// ---------- 区域铸票台账 ----------
+
+// RegionMints 返回整张 (账号 × 区域) 台账的副本，key = MintKey。
+//
+// 整张给出去而不是一格一格取：挑铸票者要同时看一个号的九个格子，
+// 九次加锁换不来任何东西（这张表是几十行量级）。
+func (s *Store) RegionMints() map[string]types.RegionMint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]types.RegionMint, len(s.st.Mints))
+	for k, v := range s.st.Mints {
+		out[k] = v
+	}
+	return out
+}
+
+// NoteRegionMint 记一次**成功**的铸票：计数 +1，记下时刻。
+//
+// 只记成功的，见 types.RegionMint 的注释。regionKey 为空（出口反查不到区域，
+// 只可能来自手改的 state.json）时什么都不做：那一格画不到九宫格上去，
+// 记了也只是让 state.json 长出一行谁都不读的垃圾。
+func (s *Store) NoteRegionMint(accountID int64, regionKey string, at time.Time) error {
+	if regionKey == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := MintKey(accountID, regionKey)
+	old, had := s.st.Mints[k]
+	m := old
+	m.AccountID, m.RegionKey = accountID, regionKey
+	m.Count++
+	m.LastAt = at
+	s.st.Mints[k] = m
+	if err := s.save(); err != nil {
+		if had {
+			s.st.Mints[k] = old
+		} else {
+			delete(s.st.Mints, k)
+		}
+		return err
+	}
+	return nil
 }
 
 // ---------- pair ----------

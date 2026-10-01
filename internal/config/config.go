@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gwpool/internal/types"
 )
@@ -131,9 +132,43 @@ type Config struct {
 	// **不要手写它**——写了也会被 Models[0] 盖掉。Save 也不会把它写回文件。
 	Model string `json:"model,omitempty"`
 
-	// UpstreamPerHour 是**每个上游账号**每小时最多打多少发上游。0 时按 mint 的默认值 54。
-	// 它是安全阀：任何路径上的 bug 导致疯狂重铸，都在这里被兜住，而不是在上游变成封号。
-	UpstreamPerHour int `json:"upstream_per_hour"`
+	// UpstreamPerRegionHour 是**每个上游账号、每个区域**每小时最多打多少发上游。
+	// 0 时按 Defaults。它是安全阀：任何路径上的 bug 导致疯狂重铸，都在这里被兜住，
+	// 而不是在上游变成封号。
+	//
+	// 按区域分桶而不是按账号算总量：九个区域各 6 发合起来正好是原先的 54 发/小时，
+	// 但一个区域打不通时的疯狂重试再也吃不掉另外八个区域的预算了——而那八个区域
+	// 才是发现新网关的地方。
+	UpstreamPerRegionHour int `json:"upstream_per_region_hour"`
+
+	// VerifyFullAtDeliver 决定交付前要不要用 state-echo 验一次满血。**默认关**。
+	//
+	// 关掉的理由不是「不想验」，是**验不起**：账号在一个它没碰过的网关上本来就是满血，
+	// 而验证那一发是用它自己的凭据打的 ⇒ 验证动作自己就把要交付的那个窗口烧掉了。
+	// 加上 state-echo 有假阴无假阳（SPEC 第 3 节），关掉只损失一个读数，
+	// 换回来的是一个真正没被碰过的落点。
+	VerifyFullAtDeliver bool `json:"verify_full_at_deliver"`
+
+	// RenewPairs 决定保温要不要「带着旧 pair 去续同一个网关」。**默认关**。
+	//
+	// 续期能让一张 pair 一直活着，但每续一发都要烧掉执行者在那个网关上的窗口，
+	// 而池子真正缺的是**落点**不是票。关掉之后保温只做裸铸（落到哪个网关算哪个），
+	// 同样的上游预算花在扩大触达面上。
+	RenewPairs bool `json:"renew_pairs"`
+
+	// SlotCooldownMinutes 是 (账号 × 网关) 烧掉之后要歇多久，0 时按 types.SlotCooldown。
+	//
+	// 这个数至今没测准：实测见过 30 分钟就恢复的，也见过 3 小时还没恢复的，
+	// 默认的 4 小时是保守估算。做成配置项就是为了能按当天的观测调。
+	SlotCooldownMinutes int `json:"slot_cooldown_minutes"`
+}
+
+// SlotCooldown 是当前生效的槽位冷却时长。
+func (c Config) SlotCooldown() time.Duration {
+	if c.SlotCooldownMinutes > 0 {
+		return time.Duration(c.SlotCooldownMinutes) * time.Minute
+	}
+	return types.SlotCooldown
 }
 
 // PublicWhenSurplus：票富裕时自动对没上传凭据的人开放 /cookie，供给回落自动关上。
@@ -161,7 +196,15 @@ func Defaults() Config {
 		// 默认不对外开放：开放是运营决策，不该由默认值替人做主。
 		// 门槛取「一个账号能不停转」所需的网关数（冷却 ÷ 单张可用时长），
 		// 不是随手填一个小数字让它看起来开着。
-		PublicWhenSurplus: PublicWhenSurplus{MinFreeGateways: types.GatewaysForContinuous()},
+		PublicWhenSurplus: PublicWhenSurplus{
+			MinFreeGateways: types.GatewaysForContinuous(types.SlotCooldown)},
+		// 九个区域各 6 发 = 原先按账号算的 54 发/小时，拆开之后一个区域的重试
+		// 吃不掉别的区域的预算。
+		UpstreamPerRegionHour: 6,
+		SlotCooldownMinutes:   int(types.SlotCooldown / time.Minute),
+		// 这两个开关默认关，理由在字段注释里：两个都是「花一个满血窗口换一个读数」。
+		VerifyFullAtDeliver: false,
+		RenewPairs:          false,
 	}
 }
 
@@ -217,8 +260,12 @@ func Load(path string) (Config, error) {
 	}
 	// 负数会让速率闸变成「一发都不许打」，而那看起来和「上游全挂了」一模一样。
 	// 0 是合法的「用默认值」。
-	if cfg.UpstreamPerHour < 0 {
-		return Config{}, fmt.Errorf("upstream_per_hour 不能为负（0 = 用默认值）")
+	if cfg.UpstreamPerRegionHour < 0 {
+		return Config{}, fmt.Errorf("upstream_per_region_hour 不能为负（0 = 用默认值）")
+	}
+	// 负数冷却会让「出冷却了吗」恒为真，于是刚烧过的槽位立刻又被挑出来发。
+	if cfg.SlotCooldownMinutes < 0 {
+		return Config{}, fmt.Errorf("slot_cooldown_minutes 不能为负（0 = 用默认值）")
 	}
 	// 老配置的单值 model 折进 Models，放在最前面（它原本就是默认值）。
 	//

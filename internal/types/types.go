@@ -63,6 +63,60 @@ type Observed struct {
 	ISP     string
 }
 
+// Region 是一个区域及其代表出口。
+//
+// 区域划分本身随 cohort 变（账号B 把南亚和中东合并了），所以这只是**清单**，
+// 不是数据模型里的强约束（SPEC 第 4 节）。
+type Region struct {
+	Key  string
+	Exit Exit
+}
+
+// Regions 是 SPEC 第 4 节那张表，代表出口照抄，不要换成「更有代表性」的国家：
+// 这些是 2026-10-01 的 170+ 样本里跑出来的，换一个国家可能落到同一个网关、白打一发。
+//
+// 放在 types 而不是 scan：铸票者的选择、速率闸的分桶、台账的格子都按区域算，
+// 它早就不只是扫描清单了。
+var Regions = []Region{
+	{"us-east", Exit{Region: "US"}},
+	{"us-west", Exit{Region: "US", City: "Seattle"}},
+	{"south-america", Exit{Region: "BR"}},
+	{"west-europe", Exit{Region: "ES"}},
+	{"europe", Exit{Region: "IT"}},
+	{"east-asia", Exit{Region: "JP"}},
+	{"oceania", Exit{Region: "AU"}},
+	{"south-asia", Exit{Region: "IN"}},
+	{"middle-east", Exit{Region: "SA"}},
+}
+
+// RegionKeyOf 把一个出口反查成区域 key，对不上回空串。
+//
+// **精确匹配 Region+City**，不按国家模糊归并：us-east 和 us-west 的国家都是 US，
+// 只有城市分得开它们，而那两个区域在实测里落的是不同网关（167 / 126）。
+//
+// 续期型铸票的出口取自网关的 ReachableExits，区域 key 就靠它反查出来（配额记到那一格上）。
+func RegionKeyOf(e Exit) string {
+	for _, r := range Regions {
+		if r.Exit == e {
+			return r.Key
+		}
+	}
+	return ""
+}
+
+// RegionMint 是 (账号 × 区域) 铸票台账的一格。
+//
+// **终身计数不是滑窗**：它回答的是「这个号在这个区域铸过没有」，用来让铸票者优先去
+// 没走过的区域（新区域才可能发现新网关）。本小时的配额是另一回事，归 mint 的速率闸。
+type RegionMint struct {
+	AccountID int64
+	RegionKey string
+	// Count 只数**成功**的那几发：失败什么都没告诉我们，记上去会把一个打不通的
+	// 区域标成「走过了」，于是永远不再去试。
+	Count  int
+	LastAt time.Time
+}
+
 // MintResult 是一次铸票的结果。
 //
 // Gateway 的语义是本项目最容易写错的地方，照 SPEC.md 第 2 节：
@@ -243,7 +297,12 @@ const (
 	FullWindow   = 183 * time.Second  // 首次接触后的满血窗口，静默失效
 	DeliverTTL   = 150 * time.Second  // 交付给消费者的有效期，FullWindow 留 18% 余量
 	RenewLead    = 600 * time.Second  // pair 剩余不足这么多就续
-	DeliverFloor = 600 * time.Second  // pair 剩余不足这么多不交付
+	// DeliverFloor 是交付的最低 pair 剩余量。
+	//
+	// 比 RenewLead 低一截是刻意的：两个数相等时，一张低于门槛的票同时意味着
+	// 「不能发」和「该续了」，于是供给紧的时候交付路径只能原地等保温。
+	// 300 s 的含义是「消费者手上这张至少还能活过两个交付窗口」。
+	DeliverFloor = 300 * time.Second
 )
 
 // AnonPrefix 是外部消费者占位行的 account_id 前缀。
@@ -285,16 +344,17 @@ var ErrRateLimited = errors.New("速率闸：这个账号这一小时的上游�
 // （2026-10-01 现网实测：出口恢复了，账号 3 的 19 个槽位还全躺在退避里）。
 var ErrNoExit = errors.New("没有可用的出口代理")
 
-// SlotCooldown 是一个 (账号 × 网关) 烧掉之后要歇多久才重新给满血。
+// SlotCooldown 是一个 (账号 × 网关) 烧掉之后要歇多久才重新给满血的**默认值**。
 //
-// **这是估算值，至今没测准**（只知道 ≥4h）。它只用来算下面那个开放门槛，
-// 不参与任何调度决策——调度看的是 Slot.LastTouch 和实测判定，不看这个数。
+// **至今没测准**：用户实测见过 30 分钟就好了的，也见过 3 小时还没好的，4h 是保守估算。
+// 所以真正生效的是配置项 slot_cooldown_minutes，这个常量只当它的默认值用
+// （以及测试里没接配置时的兜底）。要调就调配置，别改这里。
 const SlotCooldown = 4 * time.Hour
 
 // GatewaysForContinuous 是「一个账号要不停转」所需的网关数。
 //
 //	每张票只给 DeliverTTL 这么长的可用时间，用完这个 (账号 × 网关) 就得歇
-//	SlotCooldown。所以要连续供上，手里的网关数 = 冷却 ÷ 单张可用时长。
+//	cooldown。所以要连续供上，手里的网关数 = 冷却 ÷ 单张可用时长。
 //
 // 按 4h ÷ 150s 算是 96 个。这就是「门槛」该有的量级——之前写死的 6 是个
 // 随手填的数，6 个网关只够一个账号转 6×150s = 15 分钟，远不是「稳定使用」。
@@ -302,9 +362,14 @@ const SlotCooldown = 4 * time.Hour
 // 它同时也解释了这个项目的结构性难点：实际只摸到个位数到十几个网关，
 // 离连续供应差一个量级。所以门槛的意义更像是一道**诚实的闸门**——
 // 够不到就别对外开放，而不是「调一个小点的数好让它看起来开着」。
-func GatewaysForContinuous() int {
-	n := int(SlotCooldown / DeliverTTL)
-	if SlotCooldown%DeliverTTL != 0 {
+//
+// 冷却是参数而不是常量：它是实测没定下来的那个数，改一次门槛就得跟着动。
+func GatewaysForContinuous(cooldown time.Duration) int {
+	if cooldown <= 0 {
+		cooldown = SlotCooldown
+	}
+	n := int(cooldown / DeliverTTL)
+	if cooldown%DeliverTTL != 0 {
 		n++
 	}
 	return n
