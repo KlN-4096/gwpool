@@ -47,9 +47,14 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 		s.opt.Log.Warn("可用账号不足两个，暂不保温（保温会烧掉这个号自己要用的窗口）", "accounts", n)
 		return
 	}
+	// 全员在全部已知网关上都还在冷却里 ⇒ 预铸出来的票交给谁都是降级的，白烧一发。
+	if s.premintWasted() {
+		s.opt.Log.Info("所有号在所有已知网关上都还在冷却期，本轮不预铸")
+		return
+	}
 	// 目标活 pair 数 = 最忙那个号碰过的网关数 + SpareTarget。够了就一发不打：
-	// 续期不是免费的，每一发都在烧铸票者的窗口、吃全局速率预算。
-	live, target := s.livePairs(), s.pairTarget()
+	// 续期不是免费的，每一发都在烧铸票者的窗口、吃速率预算。
+	live, target := s.livePairs(), s.PairTarget()
 	if live >= target {
 		return
 	}
@@ -125,25 +130,69 @@ func (s *Scheduler) livePairs() int {
 	return n
 }
 
-// pairTarget 是目标活 pair 数：最忙那个号碰过的网关数 + SpareTarget。
+// PairTarget 是目标活 pair 数：最忙那个号**真的用过**几张 pair，再加 SpareTarget。
 //
-// 「碰过」= slot 表里 LastTouch 非零。它天然被已知网关数封顶，所以当最忙的号把所有
-// 网关都碰过之后，目标会高于网关总数——那个缺口**铸票补不上**（pair 是路由，烧掉的
-// 是槽位），只能靠发现新网关。差值就是「还差几个新落点」，日志里看得见。
-func (s *Scheduler) pairTarget() int {
-	touched := map[int64]int{}
+// 「用过」= 槽位上有 LastDeliver，也就是真的有人在这个网关上取走过一张票。
+// **两条交付路径都算**：上传者自己取（验过满血的）和外部账号拿一把 key 替自己取
+// （池子没它的凭据、答不了它的满血，但它确实用掉了一张票，一样是供给压力）。
+// 早先按 LastVerdict 判，那会漏掉整条外部消费者的路——池子对外服务得越多，
+// 目标深度反而不涨。
+//
+// **刻意不用 LastTouch**：铸票本身也是一次 touch，拿它当基数就成了自激——预铸一张
+// 让目标 +1、于是再铸一张、再 +1，一路把所有网关铸满，+2 的闸等于不存在。
+//
+// 目标天然被已知网关数封顶，所以当最忙的号把所有网关都用过之后，目标会高于网关总数
+// ——那个缺口**铸票补不上**（pair 是路由，烧掉的是槽位），只能靠发现新网关。
+func (s *Scheduler) PairTarget() int {
+	used := map[int64]int{}
 	for _, sl := range s.st.Slots() {
-		if !sl.LastTouch.IsZero() {
-			touched[sl.AccountID]++
+		if !sl.LastDeliver.IsZero() {
+			used[sl.AccountID]++
 		}
 	}
 	busiest := 0
 	for _, a := range s.usable() {
-		if n := touched[a.ID]; n > busiest {
+		if n := used[a.ID]; n > busiest {
 			busiest = n
 		}
 	}
 	return busiest + types.SpareTarget
+}
+
+// premintWasted 报告这一轮预铸没人能用：所有托管号在所有已知网关上都还在
+// SlotCooldown 里，铸出来的票发给谁都是降级的。
+//
+// **只看 LastDeliver，不看 LastTouch**：冷却是「满血窗口被用掉了」才起算的，
+// 而 LastTouch 连失败的续期都记——拿它判会让保温自己把自己关掉（一发失败的续期
+// 把槽位标成刚碰过 ⇒ 下一轮不预铸 ⇒ 死 pair 永远攒不满失败预算）。
+//
+// **有外部消费者在取票就不算白烧**：pair 是纯路由，拿一把 key 替自己取票的外部账号
+// 在这些网关上大概率还是首次接触（2026-10-01 实测一张 pair 能同时服务多个账号），
+// 池子答不了它的满血，但不该替它判死。
+func (s *Scheduler) premintWasted() bool {
+	gws, hosted := s.st.Gateways(), s.usable()
+	if len(gws) == 0 || len(hosted) == 0 {
+		return false
+	}
+	ids := make(map[int64]bool, len(hosted))
+	for _, a := range hosted {
+		ids[a.ID] = true
+	}
+	now, cooling := s.now(), 0
+	for _, sl := range s.st.Slots() {
+		if sl.LastDeliver.IsZero() || now.Sub(sl.LastDeliver) >= types.SlotCooldown {
+			continue
+		}
+		if _, ok := gws[sl.Gateway]; !ok {
+			continue // 已经被遗忘的网关，不算在冷却里
+		}
+		if !ids[sl.AccountID] {
+			return false
+		}
+		cooling++
+	}
+	// 槽位按 (账号 × 网关) 唯一，所以数够这个积就是全员都在冷却里。
+	return cooling >= len(ids)*len(gws)
 }
 
 // warmMinter 挑铸票者：**铸过的 pair 最少的号**，并列时挑最久没铸的。

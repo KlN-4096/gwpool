@@ -98,14 +98,34 @@ type Config struct {
 	// StickyMinutes 是 novproxy 的 -t-，同 sid 在这么多分钟内固定同一出口 IP。
 	StickyMinutes int `json:"sticky_minutes"`
 
-	// Model 是铸票那一发用的模型。
+	// Models 是铸票/验满血可以用的模型，**第一个是默认**。
 	//
 	// **不写死**：路由 cookie 钉的是网关 host，里面没有一个字节和模型有关，所以
-	// 换模型理论上不影响池子的产出。而账号能用哪些模型是上游随时在动的——2026-10-01
+	// 换模型不影响池子的产出——2026-10-01 实测过了：gpt-6-astra 铸的 pair 带着去打
+	// gpt-5.6-sol，两个号各一次（pro#1 → unified-126、plus#2 → unified-123）都是
+	// 200、仍落在那张 pair 的网关上、上游**一个新 __oailb 都没下发**；而同 sid（同出口
+	// IP）裸打 gpt-5.6-sol 作对照，每次都下发了新 __oailb。也就是「没换路由」是那张
+	// cookie 起的作用，不是 IP 碰巧落回去。⇒ pair 不用按模型分开存。
+	// 而账号能用哪些模型是上游随时在动的——2026-10-01
 	// 实测 pro1 的 /backend-api/codex/models 里已经没有 gpt-6-astra，打它只会换回
 	// 400 "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT
 	// account."，二十个区域全军覆没。拿账号自己清单里有的填这里。
-	Model string `json:"model"`
+	//
+	// 多个的意义是**候选**，不是并存：同一时刻池子只用一个（第一个），其余是给你在
+	// 管理页上随手切、以及给消费者点名用的。槽位**不按模型分**——它仍然是
+	// (账号 × 网关)，所以别指望「astra 烧了但 luna 还满血」这种粒度。
+	Models []string `json:"models"`
+
+	// Model 是默认模型（= Models[0]）的**派生镜像**，Load 结束时由它自己填。
+	//
+	// 为什么留着它：老配置文件写的是单值 `"model"`，Load 会把它折进 Models；而代码里
+	// 已经有几处直接读 Model。两边都兼容掉比全局改名更省事。
+	// **不要手写它**——写了也会被 Models[0] 盖掉。Save 也不会把它写回文件。
+	Model string `json:"model,omitempty"`
+
+	// UpstreamPerHour 是**每个上游账号**每小时最多打多少发上游。0 时按 mint 的默认值 54。
+	// 它是安全阀：任何路径上的 bug 导致疯狂重铸，都在这里被兜住，而不是在上游变成封号。
+	UpstreamPerHour int `json:"upstream_per_hour"`
 }
 
 // PublicWhenSurplus：票富裕时自动对没上传凭据的人开放 /cookie，供给回落自动关上。
@@ -129,7 +149,7 @@ func Defaults() Config {
 		Fingerprint:   FingerprintSub2api,
 		StickyMinutes: 5,
 		// pro1 清单里的头一个。换账号多半要改，所以 Load 里会校验它非空。
-		Model: "gpt-6-luna",
+		Models: []string{"gpt-6-luna"},
 		// 默认不对外开放：开放是运营决策，不该由默认值替人做主。
 		// 门槛取「一个账号能不停转」所需的网关数（冷却 ÷ 单张可用时长），
 		// 不是随手填一个小数字让它看起来开着。
@@ -187,12 +207,38 @@ func Load(path string) (Config, error) {
 	if cfg.StickyMinutes <= 0 {
 		return Config{}, fmt.Errorf("sticky_minutes 必须为正")
 	}
+	// 负数会让速率闸变成「一发都不许打」，而那看起来和「上游全挂了」一模一样。
+	// 0 是合法的「用默认值」。
+	if cfg.UpstreamPerHour < 0 {
+		return Config{}, fmt.Errorf("upstream_per_hour 不能为负（0 = 用默认值）")
+	}
+	// 老配置的单值 model 折进 Models，放在最前面（它原本就是默认值）。
+	//
+	// 只写了 model 的老配置里，Models 还停在 Defaults 填的那个默认值上——不清掉的话
+	// 会凭空多出一个谁都没要的模型。所以得分清「文件里真写了 models」和「这是默认值」。
+	if cfg.Model != "" {
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(b, &raw) == nil {
+			if _, explicit := raw["models"]; !explicit {
+				cfg.Models = nil
+			}
+		}
+		cfg.Models = append([]string{cfg.Model}, cfg.Models...)
+		cfg.Model = ""
+	}
+	cfg.Models = dedup(cfg.Models)
 	// 空模型名会让上游回 400，而那是扫完二十个区域之后才看得见的。
 	// 顺手卡住能进 JSON 请求体的内容：它来自配置文件，是系统边界。
-	if !isModelName(cfg.Model) {
-		return Config{}, fmt.Errorf("model %q 不像模型名（只允许字母数字和 .-_，不能为空）；"+
-			"账号能用哪些看 https://chatgpt.com/backend-api/codex/models?client_version=<版本>", cfg.Model)
+	if len(cfg.Models) == 0 {
+		return Config{}, fmt.Errorf("models 不能为空；" +
+			"账号能用哪些看 https://chatgpt.com/backend-api/codex/models?client_version=<版本>")
 	}
+	for _, m := range cfg.Models {
+		if !isModelName(m) {
+			return Config{}, fmt.Errorf("models 里的 %q 不像模型名（只允许字母数字和 .-_）", m)
+		}
+	}
+	cfg.Model = cfg.Models[0] // 派生镜像，见字段注释
 	if cfg.PublicWhenSurplus.Enabled && cfg.PublicWhenSurplus.MinFreeGateways <= 0 {
 		return Config{}, fmt.Errorf("public_when_surplus.min_free_gateways 必须为正，" +
 			"否则一张空闲票都没有也会放匿名进来")
@@ -236,4 +282,95 @@ func isModelName(s string) bool {
 		}
 	}
 	return true
+}
+
+// Model 是默认模型：Models 的第一个。
+func (c Config) DefaultModel() string {
+	if len(c.Models) == 0 {
+		return ""
+	}
+	return c.Models[0]
+}
+
+// AllowsModel 报这个模型在不在候选清单里。消费者点名的模型要过这一关：
+// 它来自 HTTP 查询串，是系统边界，不能直接塞进发给上游的请求体。
+func (c Config) AllowsModel(m string) bool {
+	for _, x := range c.Models {
+		if x == m {
+			return true
+		}
+	}
+	return false
+}
+
+// dedup 去重且保序。配置文件是人手写的，重复项不该变成「同一个模型排两次」。
+func dedup(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// Patch 只改配置文件里指定的那几个键，别的**原样留着**，然后校验一遍。
+//
+// **刻意不是 Save(Config)**：Secret 的 MarshalJSON 会把密钥打码成 "***"，把整个
+// Config 序列化回文件等于第一次保存就抹掉 admin key、consumer key 和每一条 socks
+// 口令。按键打补丁的话那些字段根本不经过 Secret——它们以 json.RawMessage 的形式
+// 原封不动待在那儿。顺带也修掉了「页面上没出现的字段被一次保存抹掉」整类问题。
+//
+// 校验不过就把原内容写回去：绝不在磁盘上留一份启动不起来的配置。
+func Patch(path string, changes map[string]any) error {
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读配置: %w", err)
+	}
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(orig, &raw); err != nil {
+		return fmt.Errorf("解析配置: %w", err)
+	}
+	for k, v := range changes {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("序列化 %s: %w", k, err)
+		}
+		raw[k] = b
+	}
+	// 派生字段不该留在文件里：它是 Models[0] 的镜像，下次 Load 会把它当成「又排一次」。
+	delete(raw, "model")
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, out); err != nil {
+		return err
+	}
+	if _, err := Load(path); err != nil {
+		// 回滚。回滚本身再失败就只能把两件事都说出来——这时候磁盘上那份是坏的。
+		if rerr := writeFileAtomic(path, orig); rerr != nil {
+			return fmt.Errorf("新配置不合法（%w），而且回滚也失败了：%v", err, rerr)
+		}
+		return fmt.Errorf("新配置不合法，已回滚: %w", err)
+	}
+	return nil
+}
+
+// writeFileAtomic 写临时文件再改名。配置文件里有密钥和 socks 口令，权限收到 0600。
+func writeFileAtomic(path string, b []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

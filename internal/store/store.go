@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ const (
 	// 文件里有 access_token，目录和文件都只给自己（SPEC 第 9 节）。
 	dirPerm  fs.FileMode = 0o700
 	filePerm fs.FileMode = 0o600
+
+	// dailyKeep 是带日期的备份留几份。七天够覆盖「上周末改坏的、周一才发现」，
+	// 而一份 state.json 是几十 KB 量级，留七份的代价可以忽略。
+	dailyKeep = 7
 
 	// maxAccounts 封住托管账号数。每加一个账号都要全量重写 state.json，
 	// 不设上限的话「谁都能上传」这条路会把写放大推成 O(n²)。
@@ -152,6 +157,7 @@ func (s *Store) save() error {
 		return err
 	}
 	dst := filepath.Join(s.dir, stateFile)
+	s.backup(dst)
 	// Windows 上有人正打开着 state.json（cat、编辑器、备份）时 Rename 会 Access denied，
 	// 这是秒级的瞬时冲突，重试几次就过去了；Linux 上第一次就成。
 	for try := 0; try < 5; try++ {
@@ -162,6 +168,57 @@ func (s *Store) save() error {
 	}
 	_ = os.Remove(tmp)
 	return err
+}
+
+// backup 在覆盖 state.json 之前留两份副本。
+//
+// 为什么值得做：这个文件里的十几个网关和全部槽位历史是**几百发上游请求**换来的，
+// 而每一发都烧掉一个 (账号 × 网关) 的窗口。丢了不是「重跑一下」，是重新烧一遍供给。
+//
+// 两份是因为要防的是两种事：
+//   - `.bak` 是上一次保存的内容，防的是这一次写坏（进程被杀、磁盘满、JSON 写到一半）
+//   - `.daily-YYYYMMDD` 每天只落第一次，防的是「三天前被改坏了，现在才发现」——
+//     只留 `.bak` 的话它早被后面成千次保存刷掉了
+//
+// 失败一律忽略：备份失败不该让保存失败，那会把一次磁盘小毛病升级成池子停摆。
+// 凭据在这几份文件里是明文，和 state.json 本身一样——目录权限是 0700，与正本同级。
+func (s *Store) backup(cur string) {
+	b, err := os.ReadFile(cur)
+	if err != nil || len(b) == 0 {
+		return // 首次保存，或者正本已经没了：没什么可备份的
+	}
+	_ = os.WriteFile(cur+".bak", b, filePerm)
+
+	daily := cur + ".daily-" + time.Now().UTC().Format("20060102")
+	if _, err := os.Stat(daily); err == nil {
+		return // 今天这份已经有了，别让它被当天后面的保存刷掉
+	}
+	_ = os.WriteFile(daily, b, filePerm)
+	s.pruneDaily(filepath.Base(cur) + ".daily-")
+}
+
+// pruneDaily 只留最近 dailyKeep 份带日期的备份。
+//
+// 文件名里的日期是 YYYYMMDD，字典序 = 时间序，所以排个序砍尾巴就行，不用去读 mtime
+// （mtime 会被 rsync、备份工具、换机器碰掉，文件名不会）。
+func (s *Store) pruneDaily(prefix string) {
+	ents, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	var names []string
+	for _, e := range ents {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) <= dailyKeep {
+		return
+	}
+	sort.Strings(names)
+	for _, n := range names[:len(names)-dailyKeep] {
+		_ = os.Remove(filepath.Join(s.dir, n))
+	}
 }
 
 // ---------- 账号 ----------
@@ -637,6 +694,22 @@ func (s *Store) PutPair(p types.Pair) error {
 // ---------- 样本 ----------
 
 // AppendSample 追加一行样本。samples.jsonl 只追加、永不重写（SPEC 第 9 节）。
+// DeletePair 丢掉一张票。连续续不上的死票留着只会让下一轮又拿它去续一次。
+func (s *Store) DeletePair(gateway string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.st.Pairs[gateway]
+	if !ok {
+		return nil
+	}
+	delete(s.st.Pairs, gateway)
+	if err := s.save(); err != nil {
+		s.st.Pairs[gateway] = old
+		return err
+	}
+	return nil
+}
+
 func (s *Store) AppendSample(sm types.Sample) error {
 	b, err := json.Marshal(sm)
 	if err != nil {

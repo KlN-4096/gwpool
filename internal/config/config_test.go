@@ -123,3 +123,104 @@ func TestSecretNeverPrinted(t *testing.T) {
 		t.Error("空密码不该打印成 ***，否则分不清「没配」和「配了」")
 	}
 }
+
+// models 是候选清单，第一个是默认；老配置的单值 model 要能读懂。
+func TestModelsList(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	const base = `"mode":"pool","listen":"127.0.0.1:1","admin_key":"a","consumer_key":"c",` +
+		`"proxies":[{"name":"nov","kind":"novproxy","host":"h:1","user":"u","pass":"p","enabled":true}]`
+
+	// 老写法：单值 model 折进 Models 的最前面。
+	c, err := Load(write(t, `{`+base+`,"model":"gpt-6-astra"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Models) != 1 || c.Models[0] != "gpt-6-astra" {
+		t.Fatalf("老配置没折进 Models: %v", c.Models)
+	}
+	if c.DefaultModel() != "gpt-6-astra" || c.Model != "gpt-6-astra" {
+		t.Fatalf("派生镜像没填: %q / %q", c.DefaultModel(), c.Model)
+	}
+
+	// 新写法 + 两种混写：单值排最前，重复项去掉，顺序保持。
+	c, err = Load(write(t, `{`+base+`,"model":"gpt-6-astra","models":["gpt-5.6-sol","gpt-6-astra"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.Models, ","); got != "gpt-6-astra,gpt-5.6-sol" {
+		t.Fatalf("合并/去重不对: %s", got)
+	}
+	if !c.AllowsModel("gpt-5.6-sol") || c.AllowsModel("gpt-6-luna") {
+		t.Fatal("AllowsModel 判错")
+	}
+
+	// 清单里的每一项都要过模型名校验：它会原样进发给上游的 JSON 请求体。
+	if _, err := Load(write(t, `{`+base+`,"models":["ok","坏 名字"]}`)); err == nil {
+		t.Fatal("非法模型名没被拦住")
+	}
+	if _, err := Load(write(t, `{`+base+`,"models":[]}`)); err == nil {
+		t.Fatal("空 models 没被拦住")
+	}
+}
+
+// 按键打补丁：页面上没出现的字段（代理、密钥）必须原样留着。
+// 整个 Config 序列化回去会被 Secret.MarshalJSON 打码成 "***"，一次保存就毁掉所有密钥。
+func TestPatchKeepsEverything(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(p, []byte(`{"mode":"pool","listen":"127.0.0.1:1",
+		"admin_key":"ak","consumer_key":"ck","models":["m1"],
+		"proxies":[{"name":"nov","kind":"novproxy","host":"h:1","user":"u","pass":"p","enabled":true}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err != nil {
+		t.Fatal(err)
+	}
+	// 页面上只改了这一个
+	if err := Patch(p, map[string]any{"models": []string{"m2", "m1"}}); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(back.Models, ","); got != "m2,m1" {
+		t.Fatalf("改动没存住: %s", got)
+	}
+	if len(back.Proxies) != 1 || back.Proxies[0].Name != "nov" {
+		t.Fatalf("保存把代理抹了: %+v", back.Proxies)
+	}
+	if back.AdminKey.Reveal() != "ak" || back.ConsumerKey.Reveal() != "ck" {
+		t.Fatal("保存把密钥抹了")
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 派生镜像不许写回文件，否则下次 Load 会把它当成「又排一次」。
+	if strings.Contains(string(b), `"model"`) {
+		t.Fatalf("派生的 model 被写回文件了:\n%s", b)
+	}
+	// 口令必须留原文，不是 Secret.String() 的 ***。
+	if !strings.Contains(string(b), `"p"`) || strings.Contains(string(b), `***`) {
+		t.Fatalf("密钥/口令被打码写回去了:\n%s", b)
+	}
+
+	// 不合法的改动必须回滚，绝不在磁盘上留一份启动不起来的配置。
+	if err := Patch(p, map[string]any{"models": []string{}}); err == nil {
+		t.Fatal("空 models 居然存住了")
+	}
+	if back, err = Load(p); err != nil {
+		t.Fatalf("回滚后配置读不出来了: %v", err)
+	}
+	if got := strings.Join(back.Models, ","); got != "m2,m1" {
+		t.Fatalf("回滚没回到上一个好状态: %s", got)
+	}
+}

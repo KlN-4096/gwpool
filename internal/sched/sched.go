@@ -45,6 +45,9 @@ type Store interface {
 	// 同一个槽位，各读各写会丢更新，丢掉 LastTouch 就等于把烧过的槽位当新鲜的发出去。
 	UpdateSlot(accountID int64, gateway string, f func(*types.Slot)) error
 
+	// DeletePair 丢掉某网关的 pair（连续续不上的死票）。网关不存在时不算错。
+	DeletePair(gateway string) error
+
 	// Pair 取某网关当前的 pair；新鲜度由调用方按 ExpiresAt 自己判断。
 	Pair(gateway string) (types.Pair, bool)
 	PutPair(p types.Pair) error
@@ -188,9 +191,11 @@ func (s *Scheduler) now() time.Time { return s.opt.Now() }
 // **账号必须是参数，不能由调度器自己挑**：槽位是 (账号 × 网关) 二元组，
 // 拿 A 算出来的槽位发给 B，「取歇得最久的」就整个失效了——B 可能刚在那儿烧过。
 //
-// 流程照 SPEC 第 8 节：选歇得最久的槽位（跳过别人租着的）→ 确保有剩余 ≥ DeliverFloor
-// 的 pair → state-echo 验一次 → 满血则交付并打上租约、降级则退避换下一个 →
-// 全降级返回 ErrNoFullSlot。
+// 流程照 SPEC 第 8 节：选歇得最久的槽位 → 确保有剩余 ≥ DeliverFloor 的 pair →
+// state-echo 验一次 → 满血则交付、降级则退避换下一个 → 全降级返回 ErrNoFullSlot。
+//
+// **不做任何跨消费者的互斥**：同一张 pair 同时发给几个账号是上游允许的，
+// 2026-10-01 实测见 types.Pair 的注释。
 //
 // force = 「他手上那张不行了，换一个」。换不换由客户端决定：池子猜客户端什么时候
 // 该换本来就是在猜，只有客户端知道自己那一发对不对劲。force 时**必须**换一个网关，
@@ -206,12 +211,8 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 
 	gws := s.st.Gateways()
 	cands := make([]string, 0, len(gws))
-	for name, gw := range gws {
+	for name := range gws {
 		if gatewayHint != "" && name != gatewayHint {
-			continue
-		}
-		// 停摆的网关连 pair 都续不上，去试它必然是白打一发上游。
-		if gw.Parked(s.now()) {
 			continue
 		}
 		cands = append(cands, name)
@@ -220,11 +221,10 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 		return types.Delivery{}, fmt.Errorf("池子里没有可用网关（hint=%q）", gatewayHint)
 	}
 
-	now := s.now()
 	if force {
 		kept := make([]string, 0, len(cands))
 		for _, name := range cands {
-			if p, ok := s.st.Pair(name); ok && p.LeasedBy == consumer.ID && now.Before(p.LeaseUntil) {
+			if s.holding(consumer.ID, name) {
 				continue
 			}
 			kept = append(kept, name)
@@ -233,24 +233,6 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 			return types.Delivery{}, ErrNoFullSlot
 		}
 		cands = kept
-	}
-
-	// 租约过滤：同一张 pair 同一时刻只交给一个消费者。
-	// 两个账号**同时**带着同一张路由 cookie 到同一个网关，这个形状本身就是跨账号
-	// 共享的特征，并发做等于把它亮出来。自己续租不算占用，Leased 已经处理了。
-	total := len(cands)
-	free := make([]string, 0, total)
-	for _, name := range cands {
-		if p, ok := s.st.Pair(name); ok && p.Leased(now, consumer.ID) {
-			continue
-		}
-		free = append(free, name)
-	}
-	// 全部在租 ⇒ 池子深度不够，退化成共享（宁可共享也不空手而归），
-	// 但交付时必须吼一声，否则「池子太浅」会被静默当成「一切正常」。
-	shared := len(free) == 0
-	if !shared {
-		cands = free
 	}
 
 	// 一次请求最多试这么多个网关。**每试一个都要真打一发上游去验满血**，试到的
@@ -267,13 +249,7 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 		d, err := s.tryGateway(ctx, consumer, gws[sl.Gateway])
 		if err == nil {
 			s.clearBackoff(consumer.ID, sl.Gateway)
-			if shared {
-				prev, _ := s.st.Pair(sl.Gateway)
-				s.opt.Log.Warn("池子深度不足，退化成共享",
-					"gateways", total, "account", consumer.ID,
-					"shared_with", prev.LeasedBy, "gateway", sl.Gateway)
-			}
-			s.setLease(sl.Gateway, consumer.ID)
+			s.noteDeliver(consumer.ID, sl.Gateway)
 			return d, nil
 		}
 		// 客户端自己断了（超时、取消）不算槽位的错：否则反复重试的客户端
@@ -302,7 +278,10 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	return types.Delivery{}, ErrNoFullSlot
 }
 
-// FreeGateways 现算空闲网关数：有活 pair（剩余 ≥ DeliverFloor）且当前没被租走的。
+// FreeGateways 现算空闲网关数：有活 pair（剩余 ≥ DeliverFloor）的网关数。
+//
+// 「空闲」不再扣掉正在被人用的那些：一张 pair 可以同时给几个号用（types.Pair 注释里
+// 的 2026-10-01 实测），所以「有人在用」不占名额。
 //
 // 每次请求现算、不缓存：供给是秒级变化的，缓存一个「充足」状态就等于拿着过期的
 // 结论放匿名请求进来，而他们正是最该被挡在门外的那一拨。
@@ -310,15 +289,9 @@ func (s *Scheduler) FreeGateways() int {
 	now := s.now()
 	n := 0
 	for name := range s.st.Gateways() {
-		p, ok := s.st.Pair(name)
-		if !ok || p.ExpiresAt.Sub(now) < types.DeliverFloor {
-			continue
+		if p, ok := s.st.Pair(name); ok && p.ExpiresAt.Sub(now) >= types.DeliverFloor {
+			n++
 		}
-		// 0 表示「问的是有没有被任何人租走」。
-		if p.Leased(now, 0) {
-			continue
-		}
-		n++
 	}
 	return n
 }
@@ -351,8 +324,8 @@ var ErrPublicClosed = errors.New("池子此刻不对外开放")
 //  1. **不做 state-echo**——判据要用他自己的凭据打一发，池子没有 ⇒ VerifiedFull=false。
 //     满血窗口也从他自己第一次用起算：池子一次都没替他碰过这个网关。
 //  2. **不现铸**——铸票要烧某个上传者的窗口，不为匿名花这个钱，只发现成的。
-//  3. **严格低优先级**——上传者在租的一律跳过，**不退化共享**（共享只对上传者生效）；
-//     空闲数跌破门槛就拒，哪怕还剩一张。
+//  3. **严格低优先级**——空闲数跌破门槛就拒，哪怕还剩一张。门槛是给上传者留的余量，
+//     也是匿名这条路唯一的让路机制（pair 本身不互斥，见 types.Pair 的注释）。
 func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHint string, force bool) (types.Delivery, error) {
 	ps := s.Public()
 	if !ps.Open {
@@ -371,11 +344,11 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 			continue
 		}
 		p, ok := s.st.Pair(name)
-		if !ok || p.ExpiresAt.Sub(now) < types.DeliverFloor || p.Leased(now, a.ID) {
+		if !ok || p.ExpiresAt.Sub(now) < types.DeliverFloor {
 			continue
 		}
-		// force：他手上那张不行了，排掉他自己正租着的。
-		if force && p.LeasedBy == a.ID && now.Before(p.LeaseUntil) {
+		// force：他手上那张不行了，排掉他正在用的。
+		if force && s.holding(a.ID, name) {
 			continue
 		}
 		cands = append(cands, name)
@@ -386,14 +359,16 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 			break
 		}
 		p, ok := s.st.Pair(sl.Gateway)
-		// 现算一遍：从选候选到这儿之间，上传者可能已经把它租走了。上传者优先。
-		if !ok || p.ExpiresAt.Sub(s.now()) < types.DeliverFloor || p.Leased(s.now(), a.ID) {
+		// 现算一遍：从选候选到这儿之间，那张 pair 可能已经到点了。
+		if !ok || p.ExpiresAt.Sub(s.now()) < types.DeliverFloor {
 			cands = drop(cands, sl.Gateway)
 			continue
 		}
 		at := s.now()
 		s.touch(sl.Gateway, a.ID, at)
-		s.setLease(sl.Gateway, a.ID)
+		// 外部消费者的用量也要进账本，否则「池子该备多深」这个目标永远看不见他们：
+		// 池子对外服务得越多，目标深度反而不涨。
+		s.noteDeliver(a.ID, sl.Gateway)
 		// 运营方靠这行判断门槛设得对不对。
 		s.opt.Log.Info("匿名交付", "upstream", upstreamID, "account", a.ID,
 			"gateway", sl.Gateway, "free_gateways", ps.Free, "threshold", ps.Threshold)
@@ -414,7 +389,7 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 // 就能把那个上传者的槽位标成「刚烧过」，白白糟蹋别人的调度。前缀一隔，
 // 匿名最多只能糟蹋自己那条账本。占位账号没有 access_token，永远不会被选去铸票。
 func (s *Scheduler) anonAccount(upstreamID string) (types.Account, error) {
-	id := "anon:" + upstreamID
+	id := types.AnonPrefix + upstreamID
 	for _, a := range s.st.Accounts() {
 		if a.Creds.AccountID == id {
 			return a, nil
@@ -608,10 +583,6 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		// 上游下发了新 cookie，顶掉旧的。没下发则说明它接受了送进去的 pair，
 		// 网关没变，旧记录照旧有效（SPEC 第 2 节，别当失败）。
 		p = types.Pair{Gateway: res.Gateway, Cookie: res.NewPair, ExpiresAt: res.PairExpires, MintedBy: a.ID}
-		if cur.Gateway == res.Gateway {
-			// 续期不该把别人的租约抹掉：换的是 cookie，占用的还是同一个网关。
-			p.LeasedBy, p.LeaseUntil = cur.LeasedBy, cur.LeaseUntil
-		}
 		if err := s.st.PutPair(p); err != nil {
 			s.opt.Log.Warn("写 pair 失败", "gateway", p.Gateway, "err", err)
 		}
@@ -720,16 +691,19 @@ func (s *Scheduler) freshPair(gateway string) (types.Pair, bool) {
 	return p, p.ExpiresAt.Sub(s.now()) >= types.DeliverFloor
 }
 
-// setLease 给这张 pair 打上租约。到期自然失效、不需要显式归还——消费者可能崩了。
-func (s *Scheduler) setLease(gateway string, by int64) {
-	p, ok := s.st.Pair(gateway)
-	if !ok {
-		return
+// holding 报告这个账号此刻是不是正拿着这个网关的票。
+//
+// 只看槽位的 LastTouch，**不记额外状态**：交付路径上写 LastTouch 的正是用这个账号自己
+// 的凭据碰这个网关的那一发，而一次交付只活 DeliverTTL 那么久，所以「DeliverTTL 内碰过」
+// 就是「他手上那张」。force 要排掉的就是它——原来这件事靠 pair 的租约字段做，
+// 而那套互斥 2026-10-01 被实测推翻删掉了（见 types.Pair 的注释），
+// 但 force 必须换一个网关的承诺还在，所以改用这个现成的读数。
+func (s *Scheduler) holding(accountID int64, gateway string) bool {
+	sl, ok := s.st.Slot(accountID, gateway)
+	if !ok || sl.LastTouch.IsZero() {
+		return false
 	}
-	p.LeasedBy, p.LeaseUntil = by, s.now().Add(types.DeliverTTL)
-	if err := s.st.PutPair(p); err != nil {
-		s.opt.Log.Warn("写租约失败", "gateway", gateway, "err", err)
-	}
+	return s.now().Sub(sl.LastTouch) < types.DeliverTTL
 }
 
 // ---------- 槽位账本 ----------
@@ -849,31 +823,48 @@ func drop(ss []string, v string) []string {
 	return out
 }
 
-// noteRenewFail 给这个网关记一次续期失败，连败到预算就停摆。
+// noteRenewFail 给这张 pair 记一次续期失败。连败到预算就**丢掉这张票**，
+// 下一轮改成裸铸。
+//
+// 刻意**不拉黑网关**：续不上的是这张具体的票，网关本身照旧——别的号随时可能在它
+// 上面铸出一张新的，拉黑会把那条路也一起堵了。
 func (s *Scheduler) noteRenewFail(name string, cause error) {
-	parked := false
+	drop := false
 	if err := s.st.UpdateGateway(name, func(g *types.Gateway) {
 		g.RenewFails++
 		if g.RenewFails >= types.RenewFailBudget {
-			g.ParkedUntil = s.now().Add(types.GatewayParkFor)
-			parked = true
+			g.RenewFails = 0
+			drop = true
 		}
 	}); err != nil {
 		s.opt.Log.Error("记续期失败没落盘", "gateway", name, "err", err)
 		return
 	}
-	if parked {
-		s.opt.Log.Warn("网关连续续期失败，停摆", "gateway", name,
-			"budget", types.RenewFailBudget, "for", types.GatewayParkFor, "last", cause)
+	if !drop {
+		return
+	}
+	s.opt.Log.Warn("这张 pair 连续续不上，丢掉改裸铸", "gateway", name,
+		"budget", types.RenewFailBudget, "last", cause)
+	if err := s.st.DeletePair(name); err != nil {
+		s.opt.Log.Error("丢弃死票失败", "gateway", name, "err", err)
 	}
 }
 
 // clearRenewFails 续上了就把预算还回去。
 func (s *Scheduler) clearRenewFails(name string) {
-	if err := s.st.UpdateGateway(name, func(g *types.Gateway) {
-		g.RenewFails = 0
-		g.ParkedUntil = time.Time{}
-	}); err != nil {
+	if err := s.st.UpdateGateway(name, func(g *types.Gateway) { g.RenewFails = 0 }); err != nil {
 		s.opt.Log.Error("清续期失败计数没落盘", "gateway", name, "err", err)
+	}
+}
+
+// noteDeliver 记一次「这个账号在这个网关上真的拿到票了」。
+//
+// 两条交付路径都要记：上传者自己取（验过满血）和外部账号取（池子答不了它的满血，
+// 但它确实用掉了一张票）。目标深度靠这个读数算，漏记就等于对外服务不算供给压力。
+func (s *Scheduler) noteDeliver(accountID int64, gateway string) {
+	if err := s.st.UpdateSlot(accountID, gateway, func(sl *types.Slot) {
+		sl.LastDeliver = s.now()
+	}); err != nil {
+		s.opt.Log.Warn("记交付失败", "account", accountID, "gateway", gateway, "err", err)
 	}
 }

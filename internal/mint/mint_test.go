@@ -839,7 +839,12 @@ func TestUpstreamRateGate(t *testing.T) {
 	if hits != 3 {
 		t.Fatalf("被拦的那两发还是发出去了：上游收到 %d 发", hits)
 	}
-	if used, limit := c.Rate(); used != 3 || limit != 3 {
+	if used, limit := c.Rate("acc"); used != 3 || limit != 3 {
 		t.Fatalf("读数不对: used=%d limit=%d", used, limit)
+	}
+	// 闸是按上游账号算的：另一个号自己有一整份预算，不该被这个号打满而挨饿。
+	other := types.Creds{AccessToken: "tok", AccountID: "acc-2"}
+	if _, err := c.Mint(context.Background(), other, types.Exit{Region: "US"}, "sid-y", ""); err != nil {
+		t.Fatalf("另一个账号被别人的配额拖累了: %v", err)
 	}
 }

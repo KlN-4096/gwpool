@@ -40,9 +40,11 @@ const (
 	proxySkipBase      = 30 * time.Second
 	proxySkipMax       = 10 * time.Minute
 
-	// 全局每小时上游请求上限。50 发很紧（一次九区域扫描就是 9 发，一次取票最多 6 发），
-	// 这是故意的：它是安全阀，不是吞吐量目标。
-	defaultUpstreamPerHour = 50
+	// **单个上游账号**每小时的上游请求上限（Mint + VerifyFull 共用这一个预算）。
+	// 一次九区域扫描是 9 发、一次取票最多 6 发，54 发留得下一次扫描加几次取票。
+	// 它是安全阀不是吞吐量目标：2026-09-29 的事故（5~6 并发 20~30 分钟废掉一个通道）
+	// 说明任何路径上的 bug 导致疯狂重铸，都得在这里被兜住而不是变成封号。
+	defaultUpstreamPerHour = 54
 )
 
 // ErrNoLanding 是「没下发新 __oailb，本次又没发 pair」——读不出落点，按失败处理。
@@ -69,59 +71,65 @@ type Client struct {
 	// （SPEC 红线 8：测试不许打真实上游）。
 	HTTP *http.Client
 
-	// UpstreamPerHour 是**全局**每小时最多打多少发上游（Mint + VerifyFull）。
+	// UpstreamPerHour 是**每个上游账号**每小时最多打多少发上游（Mint + VerifyFull）。
 	// 0 时按 defaultUpstreamPerHour。Geo 不算在内：它打的是 ipinfo，不是上游。
 	UpstreamPerHour int
 
+	// Live 非 nil 时，模型和速率上限每次**现读**它，于是改配置不用重启。
+	// 为空就用上面那两个字段（测试走这条路，不必搭一份配置）。
+	//
+	// 代理清单刻意**不**走它：Proxies 的下标编进了 sid，运行中换顺序会让已经发出去的
+	// sid 指向另一条出口，铸票和 state-echo 就配不成同一个 IP 了。改代理要重启。
+	Live *config.Live
+
 	mu        sync.Mutex
-	cursor    int                  // 轮询游标
-	fails     map[string]int       // 供应商 -> 连续失败次数
-	skipUntil map[string]time.Time // 供应商 -> 跳到什么时候
-	sids      map[string]sidBind   // sid -> 绑定的供应商
-	sent      []time.Time          // 过去一小时每一发上游请求的时刻
+	cursor    int                    // 轮询游标
+	fails     map[string]int         // 供应商 -> 连续失败次数
+	skipUntil map[string]time.Time   // 供应商 -> 跳到什么时候
+	sids      map[string]sidBind     // sid -> 绑定的供应商
+	sent      map[string][]time.Time // 上游账号 -> 过去一小时每一发请求的时刻
 }
 
 // spend 过速率闸。满了就回 types.ErrRateLimited，一发都不发。
 //
-// 滑动窗口而不是漏桶：「每小时 50 发」就按字面实现，50 个时间戳扫一遍不值得优化。
-// 它是最后一道闸，挡的是 2026-09-29 那种事故（5~6 并发 20~30 分钟废掉一个通道）：
-// 任何路径上的 bug 导致疯狂重铸，都在这里被兜住，而不是在上游那边变成封号。
-func (c *Client) spend() error {
-	lim := c.UpstreamPerHour
-	if lim <= 0 {
-		lim = defaultUpstreamPerHour
-	}
+// **按上游账号算，不是全局**：一个号打太猛不该让别的号跟着挨饿，而要防的那件事
+// （把一个通道打废）本来就是账号级的。
+//
+// 滑动窗口而不是漏桶：「每小时 54 发」就按字面实现，几十个时间戳扫一遍不值得优化。
+func (c *Client) spend(acct string) error {
+	lim := c.perHour()
 	now := time.Now()
 	cut := now.Add(-time.Hour)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	kept := c.sent[:0]
-	for _, t := range c.sent {
+	if c.sent == nil {
+		c.sent = map[string][]time.Time{}
+	}
+	win := c.sent[acct]
+	kept := win[:0]
+	for _, t := range win {
 		if t.After(cut) {
 			kept = append(kept, t)
 		}
 	}
-	c.sent = kept
-	if len(c.sent) >= lim {
+	if len(kept) >= lim {
+		c.sent[acct] = kept
 		// 说出「还要等多久」：没有它的话调用方只知道被拒，不知道该等 3 秒还是 50 分钟。
-		wait := c.sent[0].Add(time.Hour).Sub(now).Round(time.Second)
+		wait := kept[0].Add(time.Hour).Sub(now).Round(time.Second)
 		return fmt.Errorf("%w（上限 %d/小时，%s 后腾出一发）", types.ErrRateLimited, lim, wait)
 	}
-	c.sent = append(c.sent, now)
+	c.sent[acct] = append(kept, now)
 	return nil
 }
 
-// Rate 报当前窗口用掉几发、上限几发。只给页面读数用。
-func (c *Client) Rate() (used, limit int) {
-	limit = c.UpstreamPerHour
-	if limit <= 0 {
-		limit = defaultUpstreamPerHour
-	}
+// Rate 报某个上游账号当前窗口用掉几发、上限几发。只给页面读数用。
+func (c *Client) Rate(acct string) (used, limit int) {
+	limit = c.perHour()
 	cut := time.Now().Add(-time.Hour)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, t := range c.sent {
+	for _, t := range c.sent[acct] {
 		if t.After(cut) {
 			used++
 		}
@@ -210,7 +218,7 @@ func (c *Client) bindLocked(sid string, idx int, now time.Time) {
 
 // Mint 经 e 指定的出口打一发最小 ping。sentPair 为空表示裸打。
 func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, sentPair string) (types.MintResult, error) {
-	if err := c.spend(); err != nil {
+	if err := c.spend(cr.AccountID); err != nil {
 		return types.MintResult{}, err
 	}
 	body, header := buildWire(c.fingerprint(), c.model(), cr, sentPair, "")
@@ -267,7 +275,7 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 		// 不带活票上游必回一个 state，一律判成「降级」，判据直接失效。
 		return nil, errors.New("state-echo 必须带一张活票")
 	}
-	if err := c.spend(); err != nil {
+	if err := c.spend(cr.AccountID); err != nil {
 		return nil, err
 	}
 	body, header := buildWire(c.fingerprint(), c.model(), cr, pair, ticket)
@@ -376,10 +384,28 @@ func (c *Client) fingerprint() config.Fingerprint {
 // model 是铸票用的模型。为空时兜底，不报错：mint 包被裸用（测试、一次性脚本）时
 // 不该先要一份配置。生产的值由 config.Load 校验过。
 func (c *Client) model() string {
+	if c.Live != nil {
+		if m := c.Live.Get().DefaultModel(); m != "" {
+			return m
+		}
+	}
 	if c.Model != "" {
 		return c.Model
 	}
 	return defaultModel
+}
+
+// perHour 是当前的单账号每小时上限。
+func (c *Client) perHour() int {
+	if c.Live != nil {
+		if n := c.Live.Get().UpstreamPerHour; n > 0 {
+			return n
+		}
+	}
+	if c.UpstreamPerHour > 0 {
+		return c.UpstreamPerHour
+	}
+	return defaultUpstreamPerHour
 }
 
 func (c *Client) upstream() string {

@@ -156,15 +156,11 @@ type Gateway struct {
 	FirstSeenAt    time.Time
 	ReachableExits []Exit
 
-	// RenewFails 是这个网关的 pair **连续**续期失败次数，续上一次就清零。
-	// 连败到 RenewFailBudget 就停摆到 ParkedUntil：一个续不上的网关每轮都重试，
-	// 等于拿全局速率预算去喂一个已经不通的落点。
-	RenewFails  int
-	ParkedUntil time.Time
+	// RenewFails 是这个网关当前那张 pair **连续**续期失败几次了，续上一次就清零。
+	// 连败到 RenewFailBudget 就把那张票丢掉，下一轮改成裸铸——**不拉黑这个网关**：
+	// 续不上的是那张具体的票，网关本身照旧，别的号随时可能在它上面铸出一张新的。
+	RenewFails int
 }
-
-// Parked 报这个网关此刻是不是在停摆里。
-func (g Gateway) Parked(now time.Time) bool { return now.Before(g.ParkedUntil) }
 
 // 槽位判定的三个取值。VerdictUnknown 不只是「还没验」，也是客户端回报里**唯一
 // 合法的无信息值**：转发路径上没有可用的降智判据，所以它不许覆盖已有判定。
@@ -176,6 +172,14 @@ const (
 
 // Slot 是 (账号 × 网关)，降智的作用单位。调度就是在这张表上取歇得最久的。
 type Slot struct {
+	// LastDeliver 是这个账号上次在这个网关上**拿到票**的时刻（两条交付路径都记）。
+	//
+	// 和 LastTouch 刻意分开：LastTouch 什么接触都记——扫描、保温、失败的续期，
+	// 因为那些都真的烧了窗口。而「有人真的用掉了一张票」是另一件事，它才是
+	// 「池子该备多深」的依据。拿 LastTouch 当依据会自激：保温自己也 touch，
+	// 于是铸一张让目标 +1、再铸一张再 +1，一路把所有网关铸满。
+	LastDeliver time.Time
+
 	AccountID    int64
 	Gateway      string
 	LastTouch    time.Time
@@ -187,27 +191,26 @@ type Slot struct {
 //
 // __oailb 的 exp-iat 恒为 3900s（65 分钟），硬过期。
 // 剩余不足 RenewLead 就续；剩余不足 DeliverFloor 不交付。
+//
+// **刻意没有租约字段。** 曾经有过 LeasedBy/LeaseUntil，理由是「两个不同账号同时带着
+// 同一张路由 cookie 到同一个网关」这个形状本身就是跨账号共享的特征，所以同一张 pair
+// 同一时刻只许交给一个消费者。2026-10-01 实测把这个假设推翻了：
+//
+//	一张票 + 一个出口 IP（同 sid，并发两查 ipinfo 确认两发真是同一个 IP）
+//	+ 两个账号（pro#1 和已知降智的 plus#2）真并发各打一发。
+//	两次独立试验（票分别由 pro 和 plus 铸，落 unified-126 / unified-123，
+//	连接重叠 2.0s / 3.0s）：4 发全部 HTTP 200、全部**没有**下发新 __oailb、
+//	全部仍落在那张 pair 的网关上；31 个响应头的名字集合 10/10 发逐项一致，
+//	x-codex-* 的差异只按账号走（plan-type / credits / limits），没有 retry-after，
+//	没有任何只在并发那两发里出现的头。随后两个号各自单打一发做对照，读数一模一样。
+//
+// 也就是说上游不介意一张 pair 被几个号同时用，互斥只是白白把池子深度砍半。
+// 要加回来先拿出比这个更强的实测。
 type Pair struct {
 	Gateway   string
 	Cookie    string
 	ExpiresAt time.Time
 	MintedBy  int64
-
-	// 租约：同一张 pair 同一时刻只交给一个消费者。
-	//
-	// 两个不同账号**同时**带着同一张路由 cookie 到同一个网关，这个模式本身就是
-	// 异常特征——跨账号共享 cookie 正是本项目在做的事，并发做就把它暴露出来了。
-	// 所以交付时优先挑没被租走的网关；只有池子深度不够（全部在租）才退化成共享，
-	// 并且必须 log 出来，否则「池子太浅」会被当成「一切正常」。
-	//
-	// 租约到期即失效，不需要显式归还（消费者可能崩了）。LeasedBy == 0 表示空闲。
-	LeasedBy   int64
-	LeaseUntil time.Time
-}
-
-// Leased 报告这张 pair 此刻是否被别人占着。by 传调用方账号；自己续租不算占用。
-func (p Pair) Leased(now time.Time, by int64) bool {
-	return p.LeasedBy != 0 && p.LeasedBy != by && now.Before(p.LeaseUntil)
 }
 
 // 时间常量，依据 2026-10-01 实测。改之前先看 SPEC.md。
@@ -218,6 +221,14 @@ const (
 	RenewLead    = 600 * time.Second  // pair 剩余不足这么多就续
 	DeliverFloor = 600 * time.Second  // pair 剩余不足这么多不交付
 )
+
+// AnonPrefix 是外部消费者占位行的 account_id 前缀。
+//
+// 跨账号取票（一把 key 替别的上游账号取）和匿名取票的槽位都记在 AnonPrefix + 他报的
+// account_id 那一行上。加前缀是为了隔开：直接拿他报的 ID 当键，他只要填一个上传者的 ID
+// 就能把那个上传者的槽位标成「刚烧过」。**读这本账的地方必须照同一个键找**，不然
+// used_by_you 永远是 false。
+const AnonPrefix = "anon:"
 
 // SpareTarget 是池子要比「最忙的那个号」多留几张活 pair。
 //
@@ -232,19 +243,16 @@ const (
 // httpapi 在 ErrNoFullSlot 上挂的探索扫描。
 const SpareTarget = 2
 
-// RenewFailBudget 是一个网关的 pair 连续续期失败几次就停摆。
-// GatewayParkFor 是停摆多久——按 pair 的寿命算：一小时之后那张旧 pair 本来也死了，
-// 再碰它是一次全新的尝试，而不是同一场失败的第四次重试。
-const (
-	RenewFailBudget = 3
-	GatewayParkFor  = time.Hour
-)
+// RenewFailBudget 是一张 pair 连续续期失败几次就放弃它（丢掉，下一轮裸铸）。
+// 预算花在「别再拿同一张死票去续」上，不花在拉黑网关上。
+const RenewFailBudget = 3
 
-// ErrRateLimited 是全局速率闸拦下来的。
+// ErrRateLimited 是速率闸拦下来的。闸是**按上游账号**算的，不是全局：
+// 一个号打太猛不该让别的号跟着挨饿。
 //
-// 必须能被单独认出来：它**不是这个槽位的错**，也不是这个账号的错。当成普通失败处理
-// 会把一次限流变成「给所有试过的槽位各记一次退避」，等于拿速率纪律去惩罚供给。
-var ErrRateLimited = errors.New("全局速率闸：这一小时的上游请求配额用完了")
+// 必须能被单独认出来：它**不是这个槽位的错**。当成普通失败处理会把一次限流变成
+// 「给所有试过的槽位各记一次退避」，等于拿速率纪律去惩罚供给。
+var ErrRateLimited = errors.New("速率闸：这个账号这一小时的上游请求配额用完了")
 
 // SlotCooldown 是一个 (账号 × 网关) 烧掉之后要歇多久才重新给满血。
 //

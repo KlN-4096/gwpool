@@ -50,11 +50,18 @@ func run(path string, log *slog.Logger) error {
 	// 传**全集**，不是只传粘性的：Client.NewSID(true) 自己会挑粘性出口，
 	// 而只传粘性的会让 webshare 那批接入点永远走不到——unified-121 / 71 只有它能摸到，
 	// 那正是它存在的理由。
+	// 配置的活引用：管理页改旋钮、或者有人直接编辑文件，都当场生效，不用重启。
+	// 重启会丢掉进程里的速率窗口、铸票计数、需求时间戳——而调度正依据那些。
+	live := config.NewLive(path, cfg)
+
 	minter := &mint.Client{
 		Proxies:     cfg.EnabledProxies(),
 		StickyMin:   cfg.StickyMinutes,
 		Fingerprint: cfg.Fingerprint,
 		Model:       cfg.Model,
+
+		UpstreamPerHour: cfg.UpstreamPerHour,
+		Live:            live,
 	}
 	pool := sched.New(st, minter, sched.Options{
 		Mode:              cfg.Mode,
@@ -69,6 +76,7 @@ func run(path string, log *slog.Logger) error {
 		AdminKey:    cfg.AdminKey.Reveal(),
 		SiteKey:     cfg.SiteKey.Reveal(),
 		Model:       cfg.Model,
+		Live:        live,
 		ProxyStates: minter.ProxyStates,
 		Log:         log,
 	})
@@ -93,6 +101,7 @@ func run(path string, log *slog.Logger) error {
 	defer stop()
 	go pool.Run(ctx) // ModeSingle 时立刻返回：单账号模式绝不保温
 	go queue.run(ctx)
+	go live.Watch(ctx, 0, log)   // 配置文件变了就热重载
 	go refreshLoop(ctx, st, log) // access_token 只活约九天，有 refresh 的号自己续
 
 	log.Info("启动", "listen", cfg.Listen, "mode", cfg.Mode, "data", cfg.DataDir,

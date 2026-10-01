@@ -67,6 +67,17 @@ type accountView struct {
 	Effort         string
 	Rows           []sampleRow
 	Truncated      int
+	// Fails 是最近几次没给出票的交付：客户端那头只看到一个 502/503。
+	Fails []failRow
+}
+
+// failRow 是「为什么没给票」。Detail 只在管理页填。
+type failRow struct {
+	At        string
+	AccountID int64
+	Gateway   string
+	Reason    string
+	Detail    string
 }
 
 type sampleRow struct {
@@ -79,6 +90,9 @@ type sampleRow struct {
 // ---------- 管理页 ----------
 
 type adminView struct {
+	// Config 是「能改的旋钮」那一节。
+	Config configView
+
 	base
 	Proxies      []proxyRow
 	Accounts     []accountRow
@@ -87,6 +101,7 @@ type adminView struct {
 	Slots        []slotRow
 	Samples      []adminSampleRow
 	TotalSamples int
+	Fails        []failRow
 }
 
 type accountRow struct {

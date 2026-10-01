@@ -574,3 +574,65 @@ func TestAddAccountDedupesByUpstreamID(t *testing.T) {
 		t.Fatalf("槽位历史丢了: %+v", sl)
 	}
 }
+
+// 备份：覆盖 state.json 之前先留两份。这个文件里的网关和槽位历史是几百发上游请求
+// 换来的，每一发都烧掉一个窗口，丢了不是「重跑一下」。
+func TestSaveKeepsBackups(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+
+	first, err := s.AddAccount(types.Account{Label: "一号",
+		Creds: types.Creds{AccessToken: "tok", AccountID: "acct-1"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 第一次保存时正本还不存在 ⇒ 没有 .bak 可留，但当天那份该在。
+	daily := filepath.Join(dir, "state.json.daily-"+time.Now().UTC().Format("20060102"))
+	if _, err := os.Stat(filepath.Join(dir, "state.json.bak")); err == nil {
+		t.Fatal("首次保存不该有 .bak（那时正本还不存在）")
+	}
+
+	if _, err := s.AddAccount(types.Account{Label: "二号",
+		Creds: types.Creds{AccessToken: "tok", AccountID: "acct-2"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	// .bak 必须是**上一次**的内容：只有一号，没有二号。
+	b, err := os.ReadFile(filepath.Join(dir, "state.json.bak"))
+	if err != nil {
+		t.Fatalf("没留 .bak: %v", err)
+	}
+	if !strings.Contains(string(b), "一号") || strings.Contains(string(b), "二号") {
+		t.Fatal(".bak 不是上一次保存的内容")
+	}
+	// 当天那份只落第一次，不该被后续保存刷掉。
+	d, err := os.ReadFile(daily)
+	if err != nil {
+		t.Fatalf("没留当天备份: %v", err)
+	}
+	if strings.Contains(string(d), "二号") {
+		t.Fatal("当天备份被后面的保存刷掉了")
+	}
+	_ = first
+
+	// 超过 dailyKeep 份就砍最老的：文件名里的日期字典序 = 时间序。
+	for i := 1; i <= dailyKeep+3; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("state.json.daily-2026010%d", i%10))
+		if err := os.WriteFile(name, []byte("{}"), filePerm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.pruneDaily("state.json.daily-")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "state.json.daily-") {
+			n++
+		}
+	}
+	if n != dailyKeep {
+		t.Fatalf("修剪后应剩 %d 份，实为 %d", dailyKeep, n)
+	}
+}

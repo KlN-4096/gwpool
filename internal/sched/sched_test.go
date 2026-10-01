@@ -127,6 +127,13 @@ func (f *fakeStore) Slots() map[string]types.Slot {
 	return out
 }
 
+func (f *fakeStore) DeletePair(gateway string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.pairs, gateway)
+	return nil
+}
+
 func (f *fakeStore) UpdateGateway(name string, fn func(*types.Gateway)) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -597,13 +604,13 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	// 需求停了：即便 pair 快过期也不续。
 	clk.add(types.PairLifetime - types.RenewLead + time.Minute)
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != 3 {
+	if n := len(mn.mintedGateways()); n != types.SpareTarget {
 		t.Fatalf("静默期还在续，共 %d 发", n)
 	}
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != 6 {
-		t.Fatalf("需求回来后该续三发，共 %d 发", n)
+	if n := len(mn.mintedGateways()); n != 2*types.SpareTarget {
+		t.Fatalf("需求回来后该把深度补回 %d，共 %d 发", types.SpareTarget, n)
 	}
 }
 
@@ -869,34 +876,10 @@ func TestUnrenewedStalePairIsNotDelivered(t *testing.T) {
 	}
 }
 
-// 租约：A 拿走一个网关后，B 必须拿别的。
-func TestLeaseKeepsConsumersApart(t *testing.T) {
-	s, st, _, clk := rig(t, types.ModeSingle)
-	addAccount(st, 2, "acct-2")
-	delete(st.gws, "unified-3")
-
-	a := mustDeliver(t, s, 1, "")
-	b := mustDeliver(t, s, 2, "")
-	if a.Gateway == b.Gateway {
-		t.Fatalf("两个账号同时拿到同一个网关 %s", a.Gateway)
-	}
-	p, _ := st.Pair(a.Gateway)
-	if p.LeasedBy != 1 || !p.LeaseUntil.After(clk.now()) {
-		t.Fatalf("交付后没打租约: %+v", p)
-	}
-	// 自己续租不算占用：A 再要一次还该拿回同一张。
-	if again := mustDeliver(t, s, 1, ""); again.Gateway != a.Gateway {
-		t.Fatalf("A 被自己的租约挡住了：先 %s 后 %s", a.Gateway, again.Gateway)
-	}
-	// 租约到期后 B 就能拿了。
-	clk.add(types.DeliverTTL + time.Second)
-	if got := mustDeliver(t, s, 2, a.Gateway); got.Gateway != a.Gateway {
-		t.Fatalf("租约过期后 B 还是拿不到 %s", a.Gateway)
-	}
-}
-
-// 租约：池子只有一个网关时退化成共享，但必须留下那行扩容信号。
-func TestLeaseFallbackSharesWithLog(t *testing.T) {
+// 一张 pair 同时发给两个账号是允许的，而且不该有任何「池子深度不足」的告警：
+// 这条是 2026-10-01 实测的结论（两个号真并发带同一张票各打一发，4/4 都 200、
+// 都没被换路由），详见 types.Pair 的注释。曾经的租约互斥就是按这个结论删掉的。
+func TestPairIsSharedAcrossConsumers(t *testing.T) {
 	s, st, _, _ := rig(t, types.ModeSingle)
 	addAccount(st, 2, "acct-2")
 	delete(st.gws, "unified-2")
@@ -907,13 +890,17 @@ func TestLeaseFallbackSharesWithLog(t *testing.T) {
 	a := mustDeliver(t, s, 1, "")
 	b := mustDeliver(t, s, 2, "")
 	if a.Gateway != "unified-1" || b.Gateway != "unified-1" {
-		t.Fatalf("唯一的网关没共享出去: %s / %s", a.Gateway, b.Gateway)
+		t.Fatalf("唯一的网关没能同时发给两个号: %s / %s", a.Gateway, b.Gateway)
 	}
-	log := buf.String()
-	for _, want := range []string{"池子深度不足", "gateways=1", "account=2", "shared_with=1", "gateway=unified-1"} {
-		if !strings.Contains(log, want) {
-			t.Fatalf("共享日志缺了 %q，实际: %s", want, log)
-		}
+	if a.Cookie != b.Cookie {
+		t.Fatalf("两个号拿到的不是同一张票: %q / %q", a.Cookie, b.Cookie)
+	}
+	// 同一个号再要一次也照样拿得到：没有任何东西在互斥。
+	if again := mustDeliver(t, s, 1, ""); again.Gateway != "unified-1" {
+		t.Fatalf("A 第二次拿到了 %s", again.Gateway)
+	}
+	if log := buf.String(); strings.Contains(log, "池子深度不足") {
+		t.Fatalf("共享是正常状态，不该再告警: %s", log)
 	}
 }
 
@@ -1076,14 +1063,15 @@ func TestAnonymousRefusedBelowThreshold(t *testing.T) {
 	}
 }
 
-// 匿名拿不到上传者正在租的网关，而且**不退化共享**。
-func TestAnonymousNeverTakesLeasedGateway(t *testing.T) {
+// 匿名只认「有活 pair」这一条，而门槛是它唯一的让路机制：
+// 租约互斥按实测删掉之后（见 types.Pair），供给紧张时挡住匿名的就只剩 MinFreeGateways。
+func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 	s, st, clk, _ := anonRig(t, 6, 1)
-	// 上传者把 5 个租走，只剩 unified-6。
+	// 让 5 张票剩余跌破 DeliverFloor，只剩 unified-6 还够交付。
 	for i := 1; i <= 5; i++ {
 		gw := fmt.Sprintf("unified-%d", i)
 		p := st.pairs[gw]
-		p.LeasedBy, p.LeaseUntil = 1, clk.now().Add(types.DeliverTTL)
+		p.ExpiresAt = clk.now().Add(types.DeliverFloor - time.Minute)
 		st.pairs[gw] = p
 	}
 	if free := s.FreeGateways(); free != 1 {
@@ -1094,31 +1082,30 @@ func TestAnonymousNeverTakesLeasedGateway(t *testing.T) {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	if d.Gateway != "unified-6" {
-		t.Fatalf("匿名拿到了在租的 %s", d.Gateway)
+		t.Fatalf("匿名拿到了票不够新鲜的 %s", d.Gateway)
 	}
-	// 全部在租 ⇒ 匿名直接没得拿，绝不像上传者那样退化成共享。
+	// 最后一张也跌破门槛 ⇒ 空闲数 0 < 门槛 1 ⇒ 直接拒，哪怕池子里还有行。
 	p := st.pairs["unified-6"]
-	p.LeasedBy, p.LeaseUntil = 1, clk.now().Add(types.DeliverTTL)
+	p.ExpiresAt = clk.now().Add(types.DeliverFloor - time.Minute)
 	st.pairs["unified-6"] = p
-	if _, err := s.DeliverAnonymous(context.Background(), "y", "", false); err == nil {
-		t.Fatal("全部在租时匿名居然还拿到了")
+	if _, err := s.DeliverAnonymous(context.Background(), "y", "", false); !errors.Is(err, ErrPublicClosed) {
+		t.Fatalf("err=%v，空闲跌破门槛时应 ErrPublicClosed", err)
 	}
 }
 
 // 匿名占了一张之后，上传者照样拿得到槽位。
+//
+// **刻意不要求换一张**：匿名和上传者拿到同一个网关是允许的（一张 pair 可以同时给几个号
+// 用，见 types.Pair 的 2026-10-01 实测）。这里要守的是「上传者不会因为匿名先到而拿不到」。
 func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1)
 	addAccount(st, 2, "acct-2")
-	d, err := s.DeliverAnonymous(context.Background(), "x", "", false)
-	if err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", "", false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	up, err := s.Deliver(context.Background(), 2, "", false)
 	if err != nil {
 		t.Fatalf("上传者被匿名挤掉了: %v", err)
-	}
-	if up.Gateway == d.Gateway {
-		t.Fatalf("上传者拿到了匿名正租着的 %s", up.Gateway)
 	}
 	if !up.VerifiedFull {
 		t.Fatal("上传者那条路还是要验满血的")
@@ -1152,28 +1139,32 @@ func TestNoStickyExitFails(t *testing.T) {
 
 // ---------- 强制刷新 ----------
 
-// 普通路径：自己的租约不挡自己，歇得最久的那张照发。
-func TestOwnLeaseDoesNotBlockNormalPath(t *testing.T) {
+// 普通路径发歇得最久的那张，不管他手上正拿着谁。
+func TestNormalPathPicksLongestRested(t *testing.T) {
 	s, st, _, clk := rig(t, types.ModeSingle)
-	seedOwnLease(st, clk)
-	if d := mustDeliver(t, s, 1, ""); d.Gateway != "unified-1" {
-		t.Fatalf("普通路径给了 %s，应是歇得最久的 unified-1", d.Gateway)
+	seedHeldGateway(st, clk)
+	if d := mustDeliver(t, s, 1, ""); d.Gateway != "unified-2" {
+		t.Fatalf("普通路径给了 %s，应是歇得最久的 unified-2", d.Gateway)
 	}
 }
 
 // force=1 必须换一个网关：调用方就是因为手上那张不行了才来的。
-// 关键在于「他正租着的那张同时也是歇得最久的」——普通路径会发它，force 必须让开。
-func TestForceSwitchesGateway(t *testing.T) {
+// 「手上那张」靠槽位 LastTouch 认（租约字段已按 2026-10-01 的实测删掉，见 types.Pair）。
+func TestForceSkipsHeldGateway(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedOwnLease(st, clk)
+	seedHeldGateway(st, clk)
 
+	// 点名他正拿着的那个 + force ⇒ 没得换，只能 503。这一条只有 holding() 真生效才过。
+	if _, err := s.Deliver(context.Background(), 1, "unified-1", true); !errors.Is(err, ErrNoFullSlot) {
+		t.Fatalf("err=%v，force 点名自己手上那张时应 ErrNoFullSlot", err)
+	}
 	echoesBefore := mn.echoes
 	forced, err := s.Deliver(context.Background(), 1, "", true)
 	if err != nil {
 		t.Fatalf("force: %v", err)
 	}
 	if forced.Gateway != "unified-2" {
-		t.Fatalf("force 给了 %s，应让开自己租着的 unified-1、换到 unified-2", forced.Gateway)
+		t.Fatalf("force 给了 %s，应让开他手上的 unified-1、换到 unified-2", forced.Gateway)
 	}
 	// 换来的那张照样验过满血——force 不是「不验了」的意思。
 	if !forced.VerifiedFull || mn.echoes != echoesBefore+1 {
@@ -1182,14 +1173,14 @@ func TestForceSwitchesGateway(t *testing.T) {
 	}
 }
 
-// seedOwnLease 让 unified-1 既是歇得最久的、又正被 1 号自己租着。
-func seedOwnLease(st *fakeStore, clk *clock) {
+// seedHeldGateway 让 1 号手上正拿着 unified-1（刚碰过），unified-2 则歇了三小时。
+func seedHeldGateway(st *fakeStore, clk *clock) {
 	now := clk.now()
 	delete(st.gws, "unified-3")
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now.Add(-3 * time.Hour)}
-	st.slots[slotKey(1, "unified-2")] = types.Slot{AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-time.Hour)}
+	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
+	st.slots[slotKey(1, "unified-2")] = types.Slot{AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-3 * time.Hour)}
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: now.Add(time.Hour), MintedBy: 1, LeasedBy: 1, LeaseUntil: now.Add(types.DeliverTTL)}
+		ExpiresAt: now.Add(time.Hour), MintedBy: 1}
 }
 
 // 没得换就 503：把原来那张再发一遍等于没换，客户端会死循环。
@@ -1198,15 +1189,9 @@ func TestForceWithNothingElseFails(t *testing.T) {
 	delete(st.gws, "unified-2")
 	delete(st.gws, "unified-3")
 
-	first := mustDeliver(t, s, 1, "")
-	_, err := s.Deliver(context.Background(), 1, "", true)
-	if !errors.Is(err, ErrNoFullSlot) {
+	mustDeliver(t, s, 1, "")
+	if _, err := s.Deliver(context.Background(), 1, "", true); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v，没得换时应 ErrNoFullSlot", err)
-	}
-	// 而且不许把那张又租一遍、把租期往后顺延。
-	p, _ := st.Pair(first.Gateway)
-	if p.LeaseUntil.After(first.ExpiresAt.Add(time.Second)) {
-		t.Fatalf("force 失败却把租约续了: %v", p.LeaseUntil)
 	}
 }
 
@@ -1271,7 +1256,7 @@ func TestRenewSpreadsAcrossAccounts(t *testing.T) {
 	// 目标深度 = 最忙的号碰过的网关数 + SpareTarget。让 1 号碰过一个，目标就是 3，
 	// 三个网关各要一发，正好看得出摊不摊得开。
 	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3",
-		LastTouch: clk.now()}
+		LastTouch: clk.now(), LastDeliver: clk.now()}
 
 	// 三个网关、三个号：每个号各领一个，不该全压在一个号上。
 	s.warmOnce(context.Background())
@@ -1292,6 +1277,9 @@ func TestRenewThrottlePerAccount(t *testing.T) {
 	addAccount(st, 2, "acct-2")
 	s.opt.RenewGap = 30 * time.Second
 	s.markDemand()
+	// 目标深度要够三个网关才看得出「第三个等下一轮」：让 1 号拿过一张票，目标 = 1+2。
+	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3",
+		LastTouch: clk.now(), LastDeliver: clk.now()}
 
 	// 两个号、三个网关：节流下这一轮最多续两发，第三个网关要等下一轮。
 	s.warmOnce(context.Background())
@@ -1399,5 +1387,133 @@ func TestPublicThresholdIsDerivedFromCooldown(t *testing.T) {
 	if n := types.GatewaysForContinuous(); n < 20 {
 		t.Fatalf("门槛 %d 太小了：%v 的冷却除以 %v 的票长不该得出个位数",
 			n, types.SlotCooldown, types.DeliverTTL)
+	}
+}
+
+// 目标深度 = 最忙那个号**用过**的 pair 数 + SpareTarget，而且不能自激：
+// 预铸那一发本身也会 touch 槽位，拿 LastTouch 当基数就会一路把所有网关铸满。
+func TestPairTargetTracksBusiestConsumer(t *testing.T) {
+	s, st, mn, clk := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	s.markDemand()
+
+	if got := s.PairTarget(); got != types.SpareTarget {
+		t.Fatalf("没人用过票时目标应是 %d，实为 %d", types.SpareTarget, got)
+	}
+	s.warmOnce(context.Background())
+	first := len(mn.mintedGateways())
+	if first != types.SpareTarget {
+		t.Fatalf("第一轮铸了 %d 张，目标 %d", first, types.SpareTarget)
+	}
+	// 关键的一条：铸票写的是 LastTouch，目标**不许**因此上涨。
+	if got := s.PairTarget(); got != types.SpareTarget {
+		t.Fatalf("预铸把目标顶高到 %d，自激了", got)
+	}
+
+	// 1 号真的拿到过一张票，目标才该 +1。
+	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1",
+		LastTouch: clk.now(), LastDeliver: clk.now()}
+	if got, want := s.PairTarget(), types.SpareTarget+1; got != want {
+		t.Fatalf("用掉一张后目标应是 %d，实为 %d", want, got)
+	}
+}
+
+// 续期失败预算：同一张 pair 连败 RenewFailBudget 次就把它丢掉，下一轮改裸铸。
+// **网关不许被拉黑**——续不上的是这张票，别的号随时可能在这个网关上铸出新的。
+func TestDeadPairDroppedAfterRenewFailures(t *testing.T) {
+	s, st, mn, clk := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	s.markDemand()
+
+	// 先给每个网关一张快到期的票，这样保温走的是「续期」而不是裸铸。
+	for name := range st.gws {
+		st.pairs[name] = types.Pair{Gateway: name, Cookie: "__cflb=x; __oailb=y",
+			ExpiresAt: clk.now().Add(types.RenewLead / 2)}
+	}
+	mn.mintErr = errors.New("上游不理")
+
+	for i := 0; i < types.RenewFailBudget; i++ {
+		s.warmOnce(context.Background())
+		clk.add(2 * time.Minute)
+		s.markDemand()
+	}
+	if n := len(st.pairs); n != 0 {
+		t.Fatalf("连败 %d 轮后死票还留着 %d 张: %+v", types.RenewFailBudget, n, st.pairs)
+	}
+	// 预算用掉就归零，别让它一路累加到下一张票头上。
+	for name, gw := range st.gws {
+		if gw.RenewFails != 0 {
+			t.Fatalf("%s 的失败计数没归零: %d", name, gw.RenewFails)
+		}
+	}
+	// 网关本身照旧是候选：这里只要求它不被静默排除，交付成不成是满血判定的事。
+	mn.mintErr = nil
+	if _, err := s.Deliver(context.Background(), 1, "unified-1", false); err != nil {
+		t.Fatalf("网关被拉黑了: %v", err)
+	}
+}
+
+// 全员冷却就不预铸：两个号在三个网关上都刚取过票，铸出来的票发给谁都是降级的。
+func TestNoPremintWhileEveryoneCooling(t *testing.T) {
+	s, st, mn, clk := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	var buf bytes.Buffer
+	s.opt.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	s.markDemand()
+	for _, id := range []int64{1, 2} {
+		for gw := range st.gws {
+			st.slots[slotKey(id, gw)] = types.Slot{AccountID: id, Gateway: gw,
+				LastDeliver: clk.now().Add(-types.SlotCooldown + time.Minute)}
+		}
+	}
+
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("全员冷却却预铸了 %d 发", n)
+	}
+	if !strings.Contains(buf.String(), "都还在冷却") {
+		t.Fatalf("没留下为什么不预铸的记录: %s", buf.String())
+	}
+	// 一个槽位出了冷却就该恢复预铸。
+	st.slots[slotKey(2, "unified-2")] = types.Slot{AccountID: 2, Gateway: "unified-2",
+		LastDeliver: clk.now().Add(-types.SlotCooldown)}
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n == 0 {
+		t.Fatal("有号出了冷却却还是不预铸")
+	}
+}
+
+// 失败的续期不该把预铸闸关掉：它写 LastTouch 不写 LastDeliver。
+// 这是 TestDeadPairDroppedAfterRenewFailures 偶发失败的根因，单独钉一遍。
+func TestFailedRenewDoesNotCloseThePremintGate(t *testing.T) {
+	s, st, mn, _ := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	s.markDemand()
+	mn.mintErr = errors.New("上游 500")
+
+	s.warmOnce(context.Background())
+	if s.premintWasted() {
+		t.Fatal("一轮失败的续期就把预铸闸关了，死 pair 永远攒不满失败预算")
+	}
+}
+
+// 外部消费者在取票时冷却闸不适用：pair 是纯路由，它在这些网关上多半还是首次接触。
+func TestPremintKeepsServingExternalConsumers(t *testing.T) {
+	s, st, mn, clk := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	s.markDemand()
+	for _, id := range []int64{1, 2} {
+		for gw := range st.gws {
+			st.slots[slotKey(id, gw)] = types.Slot{AccountID: id, Gateway: gw,
+				LastDeliver: clk.now()}
+		}
+	}
+	// 99 号不在 usable() 里（没凭据的外部/匿名占位行），但它确实在取票。
+	st.slots[slotKey(99, "unified-1")] = types.Slot{AccountID: 99, Gateway: "unified-1",
+		LastDeliver: clk.now()}
+
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n == 0 {
+		t.Fatal("有外部消费者在取票却停了预铸")
 	}
 }

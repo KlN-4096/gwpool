@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"gwpool/internal/config"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
 	"gwpool/internal/sched"
@@ -48,6 +49,8 @@ type Pool interface {
 	DeliverAnonymous(ctx context.Context, upstreamAccountID, gateway string, force bool) (types.Delivery, error)
 	// Public 是此刻的对外开放状态，现算不缓存。
 	Public() sched.PublicState
+	// PairTarget 是目标活 pair 数，只给 /gateways 的读数用。
+	PairTarget() int
 	Mode() types.Mode
 }
 
@@ -102,6 +105,9 @@ type Options struct {
 	// parseCreds 里唯一会出网的一步。生产永远不设它。
 	Refresh func(ctx context.Context, refreshToken string) (access, newRefresh string, err error)
 
+	// Live 非 nil 时管理页可以改配置并热重载；为空则那一节只读（测试走这条路）。
+	Live *config.Live
+
 	// Model 是铸票那一发用的模型，照 config.Model 传进来。
 	// 上传者视图要向托管者如实交代用了他的凭据打什么，所以不能写死。
 	Model string
@@ -121,6 +127,9 @@ type Server struct {
 	smu  sync.Mutex
 	sm   []types.Sample
 	smAt time.Time
+
+	// 最近的交付失败，给页面回答「为什么客户端报 502」。
+	fails failLog
 
 	tplPool, tplAccount, tplAdmin, tplGate *template.Template
 }
@@ -180,8 +189,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /a/{token}", s.gate(http.HandlerFunc(s.handleAccount)))
 	mux.Handle("POST /a/{token}/enabled", s.gate(http.HandlerFunc(s.handleAccountEnabled)))
 	mux.HandleFunc("GET /cookie", s.handleCookie)
+	mux.HandleFunc("GET /gateways", s.handleGateways)
 	mux.HandleFunc("POST /admin/rescan", s.handleAdminRescan)
 	mux.HandleFunc("POST /admin/accounts/{id}/delete", s.handleAdminDeleteAccount)
+	mux.HandleFunc("POST /admin/config", s.handleAdminConfig)
 	mux.HandleFunc("GET /admin/", s.handleAdmin)
 	return noStore(mux)
 }
@@ -679,6 +690,8 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 			Gateway: dash(sm.Gateway), Status: sm.Status,
 		})
 	}
+	// Detail 不给上传者：里面是出口名、上游状态码这类内部读数。
+	v.Fails = s.fails.failRows(a.ID, 20, false)
 	// 新的在上面，太长就截断——这是给人看的凭证，不是日志系统。
 	reverse(v.Rows)
 	if len(v.Rows) > 500 {
@@ -703,10 +716,10 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	acct := c.acct
+	ref := strings.TrimSpace(r.URL.Query().Get("account"))
 	if c.admin {
 		// 管理员兜底必须显式说替谁取：槽位是 (账号 × 网关)，替谁取决定了取哪个槽位，
 		// 猜一个账号就等于把 A 的槽位发给 B。
-		ref := r.URL.Query().Get("account")
 		if ref == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "管理员调用必须带 account 参数指明替谁取"})
 			return
@@ -715,8 +728,24 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "没有这个账号"})
 			return
 		}
+		ref = ""
 	}
 	gw := gwParam
+	// 一把 key 可以替**别的**上游账号取票（上传一份凭据换一把 key，拿它给自己手上好几个
+	// 号用）。那种票的槽位必须按报上来的那个账号记：A 烧掉一个网关和 B 在同一个网关上
+	// 是不是满血毫无关系。
+	//
+	// 代价说在明处：池子**验不了**那张票——state-echo 要用那个账号的凭据打一发，池子
+	// 手上只有上传者的。所以走和匿名同一条路，回去的 verified_full 是 false。
+	if ref != "" && !accountRefMatches(acct, ref) {
+		d, err := s.pool.DeliverAnonymous(r.Context(), ref, gw, force)
+		if err != nil {
+			s.deliverFailed(w, err, acct.ID, gw)
+			return
+		}
+		writeJSON(w, http.StatusOK, delivered(d))
+		return
+	}
 	d, err := s.pool.Deliver(r.Context(), acct.ID, gw, force)
 	if err != nil {
 		// 没有验过满血的槽位就 503。宁可 503，也不把降智的东西发出去。
@@ -796,7 +825,12 @@ func (s *Server) deliverFailed(w http.ResponseWriter, err error, accountID int64
 		}
 	case errors.Is(err, sched.ErrPublicClosed):
 		msg = "池子此刻不对外开放"
+	case errors.Is(err, types.ErrRateLimited):
+		msg = "这个账号这一小时的上游请求用完了，等窗口滑过去"
 	}
+	// 页面上要看得见：客户端那头只有一个 502/503，上传者对着它猜不出是哪种。
+	s.fails.add(deliverFail{At: time.Now(), AccountID: accountID, Gateway: gateway,
+		Reason: msg, Detail: err.Error()})
 	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": msg})
 }
 
@@ -902,6 +936,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode()}}
+	v.Config = buildConfigView(s.opt.Live,
+		r.URL.Query().Get("cfg_note"), r.URL.Query().Get("cfg_err"))
+	v.Fails = s.fails.failRows(0, failLogKeep, true)
 
 	if s.opt.ProxyStates != nil {
 		for _, p := range s.opt.ProxyStates() {
