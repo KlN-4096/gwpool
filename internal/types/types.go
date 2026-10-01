@@ -6,6 +6,8 @@ package types
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"strings"
@@ -263,6 +265,18 @@ type Slot struct {
 	LastTouch    time.Time
 	LastVerdict  string // VerdictFull / VerdictDegraded / VerdictUnknown
 	BackoffUntil time.Time
+
+	// PrevDeliver / PrevTouch 是交付那一刻存下的**交付之前**那两个时刻，
+	// 供「票取了但一发没打」的归还（/release）还原用。
+	//
+	// 为什么是存旧值而不是归还时清零：清零会把一次真实的历史接触抹成「从没碰过」，
+	// 而那个槽位可能在更早的某轮里真的被烧过——抹掉之后它会被当成首次接触再发一遍。
+	//
+	// 两个字段必须在**同一次**读-改-写里和 LastDeliver / LastTouch 一起写
+	// （见 sched.noteDeliver）：分两次写就会把这次交付自己写进去的值当成旧值存下来，
+	// 还原完槽位看起来还是刚烧过的。
+	PrevDeliver time.Time
+	PrevTouch   time.Time
 }
 
 // Pair 是池子里一张活的路由 cookie。
@@ -289,6 +303,28 @@ type Pair struct {
 	Cookie    string
 	ExpiresAt time.Time
 	MintedBy  int64
+}
+
+// CookieVersionLen 是 cookie_version 的长度（十六进制字符数）。
+//
+// 12 个字符 = 48 bit。池子里同时活着的票是十几张量级，撞一次的概率在这个量级下
+// 可以忽略，而这个值要被人贴进 exclude_versions 里，短一点好用。
+const CookieVersionLen = 12
+
+// CookieVersion 是一张具体的票的不透明稳定身份：sha256(cookie) 的前 12 个十六进制字符。
+//
+// **算出来的，不存状态**：调用方拿它做 exclude_versions 和 /release 的引用，所以
+// 重启后必须还是同一个值；而池子里唯一稳定标识一张票的东西就是 cookie 本体，
+// 而 cookie 本体一个字都不许出现在响应、页面、日志里（SPEC 红线 1）——
+// 哈希正好两边都满足。
+//
+// 空 cookie 回空串：没有票就没有身份，让调用方自己判，别给它一个「空串的哈希」。
+func CookieVersion(cookie string) string {
+	if cookie == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(cookie))
+	return hex.EncodeToString(sum[:])[:CookieVersionLen]
 }
 
 // 时间常量，依据 2026-10-01 实测。改之前先看 SPEC.md。

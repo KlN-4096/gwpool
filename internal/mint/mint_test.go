@@ -773,23 +773,56 @@ func TestDeadExitDoesNotRefundRateWindow(t *testing.T) {
 }
 
 // 调用方自己取消的那一发也不退：同理，请求可能已经出站了。
+//
+// **必须走真实的代理路径**：注入 HTTP 客户端时 do 在第一行就返回了，
+// 那三支「谁的账」的判断（调用方取消 / 出口中途断开 / 连不上代理）一支都走不到，
+// refund 根本不可达 —— 那样这个用例无论怎么改实现都是绿的。
+// 所以照 TestDeadExitDoesNotRefundRateWindow 起一个假 socks 端口：握手照收，
+// 之后把连接吊住，让调用方在响应回来之前撤。
 func TestCallerCancelDoesNotRefundRateWindow(t *testing.T) {
-	// 慢响应：调用方会在它回来之前撤。**不能用 <-r.Context().Done() 吊住**——
-	// 客户端取消不会立刻传到 server 端的 handler，httptest.Server.Close 会一直等它。
-	c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(300 * time.Millisecond)
-		w.WriteHeader(200)
-	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _, _ = fakeSocks5Handshake(conn)
+				<-done // 隧道建好之后什么都不回：这一发就卡在等响应上
+			}()
+		}
+	}()
+
+	p := novProxy
+	p.Host = ln.Addr().String()
+	c := &Client{Proxies: []config.Proxy{p}, StickyMin: 5, Upstream: "http://example.invalid/"}
+	sid, err := c.NewSID(true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		cancel()
 	}()
-	if _, err := c.Mint(ctx, testCreds, types.Exit{Region: "US"}, "sid-cancel", ""); err == nil {
+	if _, err := c.Mint(ctx, testCreds, types.Exit{Region: "US"}, sid, ""); err == nil {
 		t.Fatal("调用方取消了还成功？")
 	}
 	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
-		t.Fatalf("被取消的那一发退了配额: used=%v", used)
+		t.Fatalf("被取消的那一发退了配额（会低报，撞上封号阈值）: used=%v", used)
+	}
+	// 也不该记成供应商的账：客户端的重试风暴会把一条好供应商熔断掉
+	// （2026-10-01 两次全池 502 就毁在这上面）。
+	if st := c.ProxyStates(); len(st) != 1 || st[0].Fails != 0 || !st[0].SkipUntil.IsZero() {
+		t.Fatalf("调用方取消被记成供应商故障: %+v", st)
 	}
 }
 
@@ -917,9 +950,23 @@ func TestUpstreamRateGate(t *testing.T) {
 	if used, limit := c.Rate("acc"); used["us-east"] != 3 || used["east-asia"] != 1 || limit != 3 {
 		t.Fatalf("读数不对: used=%v limit=%d", used, limit)
 	}
-	// 没在表上的出口（手改 state.json 才会有）挤同一个空桶，不凭空多出一份配额。
-	if used, _ := c.Rate("acc"); used[""] != 0 {
-		t.Fatalf("野出口的桶不该有读数: %v", used)
+	// 没在表上的出口（手改 state.json 才会有）**挤同一个空桶**，不凭空多出一份配额。
+	// 要真的往那个桶里花钱才测得到：只用表上的出口时 used[""] 恒为 0，断言恒真。
+	wild := []types.Exit{{Region: "NG"}, {Region: "US", City: "Dallas"}}
+	for i, e := range wild {
+		if _, err := c.Mint(context.Background(), cr, e, "sid-w", ""); err != nil {
+			t.Fatalf("野出口第 %d 发被拦了: %v", i+1, err)
+		}
+	}
+	if used, _ := c.Rate("acc"); used[""] != len(wild) {
+		t.Fatalf("两个野出口没挤进同一个空桶（各自多出一份配额）: %v", used)
+	}
+	// 挤满了就一起被拦：limit=3，上面已经花了 2 发。
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "ZZ"}, "sid-w", ""); err != nil {
+		t.Fatalf("空桶第 3 发就被拦了: %v", err)
+	}
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "QQ"}, "sid-w", ""); !errors.Is(err, types.ErrRateLimited) {
+		t.Fatalf("空桶打满了还放行，实为 %v", err)
 	}
 	// 闸是按上游账号算的：另一个号自己有一整份预算，不该被这个号打满而挨饿。
 	other := types.Creds{AccessToken: "tok", AccountID: "acc-2"}

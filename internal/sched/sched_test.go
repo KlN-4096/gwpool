@@ -202,6 +202,9 @@ func (f *fakeStore) UpdateSlot(accountID int64, gateway string, fn func(*types.S
 	k := slotKey(accountID, gateway)
 	sl := f.slots[k]
 	fn(&sl)
+	// 照真实 store：键是由参数算的，两个身份字段也由参数定，不让改写函数把行写到
+	// 别人名下，也不会留下一行没有网关名的槽位（那行会被当候选挑中，而它谁也不是）。
+	sl.AccountID, sl.Gateway = accountID, gateway
 	f.slots[k] = sl
 	return nil
 }
@@ -360,6 +363,9 @@ func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid,
 		gw = gwOf(sentPair) // 带 pair 就留在那个网关上
 	}
 	m.mints = append(m.mints, types.Sample{AccountID: id, Gateway: gw, RegionKey: exitKey(e)})
+	// 借 Err 这一列记「这一发带没带 pair 进去」：裸铸和续期的区别只在这个参数上，
+	// 而「交付路径不许带着一张快到点的 pair 去续」正是要钉住的那条（S-2）。
+	m.mints[len(m.mints)-1].Err = sentPair
 	err := m.mintErr
 	noNew := m.noNewPair
 	m.mu.Unlock()
@@ -512,7 +518,7 @@ func addAccount(st *fakeStore, id int64, upstream string) {
 
 func mustDeliver(t *testing.T, s *Scheduler, acctID int64, hint string) types.Delivery {
 	t.Helper()
-	d, err := s.Deliver(context.Background(), acctID, hint, false)
+	d, err := s.Deliver(context.Background(), acctID, Request{Gateway: hint})
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
@@ -598,7 +604,7 @@ func TestAllDegradedReturnsNoFullSlot(t *testing.T) {
 	for gw := range st.gws {
 		mn.full[gw] = false
 	}
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err = %v，应为 ErrNoFullSlot", err)
 	}
 	// 三个槽位都该试过一遍，都该进退避。
@@ -616,7 +622,7 @@ func TestAllDegradedReturnsNoFullSlot(t *testing.T) {
 func TestMintFailureBacksOff(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("socks5 连不上")
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err = %v，应为 ErrNoFullSlot", err)
 	}
 	if mn.echoes != 0 {
@@ -637,19 +643,23 @@ func TestBackoffDoublesAndCaps(t *testing.T) {
 		backoffMax, backoffMax}
 	for i, w := range want {
 		at := clk.now()
-		if _, err := s.Deliver(context.Background(), 1, "unified-1", false); !errors.Is(err, ErrNoFullSlot) {
+		if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
 			t.Fatalf("第 %d 轮 err = %v", i, err)
 		}
 		sl, _ := st.Slot(1, "unified-1")
 		if got := sl.BackoffUntil.Sub(at); got != w {
 			t.Fatalf("第 %d 轮退避 %v，应为 %v", i, got, w)
 		}
-		clk.add(w + time.Second) // 等退避过期再来一轮
+		// 等退避过期**再加一个满血窗口**：失败那一发按保守方向记了触碰
+		// （mintOnce 读不出落点时按想去的地方记），而窗口闸会把这个槽位按住
+		// types.FullWindow —— 不等它过去的话下一轮根本走不到铸票，
+		// 退避也就不会翻倍（见 coolingSet 闸 2）。
+		clk.add(types.FullWindow + w + time.Second)
 	}
 	// 退避期内不该再选它：唯一候选在退避中 ⇒ 直接 ErrNoFullSlot，一发都不打。
 	before := len(mn.mintedGateways())
 	s.bumpBackoff(1, "unified-1")
-	if _, err := s.Deliver(context.Background(), 1, "unified-1", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err = %v", err)
 	}
 	if after := len(mn.mintedGateways()); after != before {
@@ -782,7 +792,7 @@ func TestPoolModeConsumerMintsOwnTicket(t *testing.T) {
 	}
 	// 窗口过完：这个 (账号 × 网关) 进冷却，而池子里只有这一个网关 ⇒ 老实 503。
 	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.Deliver(context.Background(), 2, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 2, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("窗口过完、唯一的网关在冷却里，却还发得出票: %v", err)
 	}
 }
@@ -796,7 +806,7 @@ func TestOneInFlightPerAccount(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = s.Deliver(context.Background(), 1, "", false)
+			_, _ = s.Deliver(context.Background(), 1, Request{})
 		}()
 	}
 	wg.Wait()
@@ -815,7 +825,7 @@ func TestLandingDriftIsFailureButPairKept(t *testing.T) {
 	delete(st.gws, "unified-3")
 	mn.land["1"] = "unified-77" // 想去 unified-1，实际落到 77
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err = %v，漂移该算失败", err)
 	}
 	if _, ok := st.Pair("unified-77"); !ok {
@@ -897,7 +907,7 @@ func TestDeliverRejectsUnusableAccount(t *testing.T) {
 		types.Account{ID: 3, Label: "只回报", Enabled: true,
 			Creds: types.Creds{AccountID: "acct-3"}})
 	for _, id := range []int64{0, 2, 3, 99} {
-		if _, err := s.Deliver(context.Background(), id, "", false); err == nil {
+		if _, err := s.Deliver(context.Background(), id, Request{}); err == nil {
 			t.Fatalf("账号 %d 不该能交付", id)
 		}
 	}
@@ -933,7 +943,7 @@ func TestExhaustedWindowIsNotDelivered(t *testing.T) {
 	delete(st.gws, "unified-3")
 	mn.mintCost = 140 * time.Second // 剩 10 s，低于 minDeliverWindow
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v，窗口烧光了还交付", err)
 	}
 }
@@ -981,7 +991,7 @@ func TestNoDeadlockBetweenAccounts(t *testing.T) {
 	done := make(chan error, 2)
 	for _, id := range []int64{1, 2} {
 		go func(id int64) {
-			_, err := s.Deliver(context.Background(), id, "", false)
+			_, err := s.Deliver(context.Background(), id, Request{})
 			done <- err
 		}(id)
 	}
@@ -994,8 +1004,14 @@ func TestNoDeadlockBetweenAccounts(t *testing.T) {
 	}
 }
 
-// B4：上游接受了旧 pair 就不下发新 cookie ⇒「续期」根本没发生，不许照样交付。
-func TestUnrenewedStalePairIsNotDelivered(t *testing.T) {
+// S-2：交付的回落路径**不带**那张快到点的 pair 去续，改成裸铸。
+//
+// 为什么非这样不行：走到回落的前提是「所有票都低于交付门槛」，也就是剩余在
+// 0~floor 之间、**仍然有效**——而有效的 pair 上游会接受且不下发新 cookie
+// （SPEC 第 2 节），于是手里还是那张快到点的，finish 拒发 ⇒ 消费者 503，
+// 而请求和铸票者的一个槽位已经花掉了，还顺手给消费者记一次不属于它的退避。
+// 裸铸则一定拿回一张新的 65 分钟票（SPEC 第 6 节说的就是这种情形）。
+func TestFallbackMintGoesBareNotRenew(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModeSingle)
 	delete(st.gws, "unified-2")
 	delete(st.gws, "unified-3")
@@ -1004,8 +1020,20 @@ func TestUnrenewedStalePairIsNotDelivered(t *testing.T) {
 		Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
 		ExpiresAt: clk.now().Add(30 * time.Second), MintedBy: 1,
 	}
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v，没续上的 pair 还是发出去了", err)
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("回落该裸铸出一张新票，却 %v", err)
+	}
+	for _, m := range mn.mints {
+		if m.Err != "" {
+			t.Fatalf("回落那一发带了 pair 进去（%q）：带有效 pair 上游不下发新 cookie，必然续不上", m.Err)
+		}
+	}
+	if left := st.pairs["unified-1"].ExpiresAt.Sub(clk.now()); left < types.DeliverFloor {
+		t.Fatalf("裸铸之后 pair 只剩 %v，没拿回新的 65 分钟票", left)
+	}
+	if d.ValidForS <= 0 {
+		t.Fatalf("交付的有效期不对: %+v", d)
 	}
 }
 
@@ -1044,7 +1072,7 @@ func TestClientCancelDoesNotBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := s.Deliver(ctx, 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(ctx, 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v", err)
 	}
 	for gw := range st.gws {
@@ -1064,7 +1092,7 @@ func TestDegradedUsesShortHold(t *testing.T) {
 	mn.full["unified-1"] = false
 	for i := 0; i < 3; i++ {
 		at := clk.now()
-		if _, err := s.Deliver(context.Background(), 1, "unified-1", false); !errors.Is(err, ErrNoFullSlot) {
+		if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
 			t.Fatalf("第 %d 轮 err=%v", i, err)
 		}
 		sl, _ := st.Slot(1, "unified-1")
@@ -1079,7 +1107,7 @@ func TestDegradedUsesShortHold(t *testing.T) {
 func TestMintErrorStillRecordsTouch(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("i/o timeout")
-	if _, err := s.Deliver(context.Background(), 1, "unified-1", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v", err)
 	}
 	sl, ok := st.Slot(1, "unified-1")
@@ -1127,8 +1155,13 @@ func anonRig(t *testing.T, n, min int) (*Scheduler, *fakeStore, *clock, *bytes.B
 		mn.full[gw] = true
 	}
 	var buf bytes.Buffer
+	// 开关和门槛在**配置**里，不在 Options：Public() 现读它，于是管理页改完立即生效。
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
-		PublicWhenSurplus: true, MinFreeGateways: min, Live: liveCfg(verifyOn),
+		Live: liveCfg(func(c *config.Config) {
+			c.VerifyFullAtDeliver = true
+			c.PublicWhenSurplus.Enabled = true
+			c.PublicWhenSurplus.MinFreeGateways = min
+		}),
 		Log: slog.New(slog.NewTextHandler(&buf, nil))})
 	return s, st, clk, &buf
 }
@@ -1139,7 +1172,7 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 	if ps := s.Public(); !ps.Open || ps.Free != 6 {
 		t.Fatalf("应开放: %+v", ps)
 	}
-	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", "", false)
+	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{})
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -1170,7 +1203,7 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 	}
 	// 他再要一次，应该换一个没烧过的网关。
 	clk.add(types.DeliverTTL + time.Second)
-	d2, err := s.DeliverAnonymous(context.Background(), "acct-outsider", "", false)
+	d2, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{})
 	if err != nil || d2.Gateway == d.Gateway {
 		t.Fatalf("第二次又给了同一个网关 %s (err=%v)", d2.Gateway, err)
 	}
@@ -1182,16 +1215,18 @@ func TestAnonymousRefusedBelowThreshold(t *testing.T) {
 	if ps := s.Public(); ps.Open {
 		t.Fatalf("不该开放: %+v", ps)
 	}
-	if _, err := s.DeliverAnonymous(context.Background(), "x", "", false); !errors.Is(err, ErrPublicClosed) {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}); !errors.Is(err, ErrPublicClosed) {
 		t.Fatalf("err=%v，应为 ErrPublicClosed", err)
 	}
-	// 开关没开时，再富裕也不开放。
+	// 开关没开时，再富裕也不开放。改的是**活配置**：Public() 现读它。
 	off, _, _, _ := anonRig(t, 9, 1)
-	off.opt.PublicWhenSurplus = false
+	offCfg := off.opt.Live.Get()
+	offCfg.PublicWhenSurplus.Enabled = false
+	off.opt.Live = config.NewLive("", offCfg)
 	if ps := off.Public(); ps.Open || ps.Enabled {
 		t.Fatalf("开关关着却开放了: %+v", ps)
 	}
-	if _, err := off.DeliverAnonymous(context.Background(), "x", "", false); !errors.Is(err, ErrPublicClosed) {
+	if _, err := off.DeliverAnonymous(context.Background(), "x", Request{}); !errors.Is(err, ErrPublicClosed) {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -1210,7 +1245,7 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 	if free := s.FreeGateways(); free != 1 {
 		t.Fatalf("空闲数算成了 %d，应为 1", free)
 	}
-	d, err := s.DeliverAnonymous(context.Background(), "x", "", false)
+	d, err := s.DeliverAnonymous(context.Background(), "x", Request{})
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -1221,7 +1256,7 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 	p := st.pairs["unified-6"]
 	p.ExpiresAt = clk.now().Add(types.DeliverFloor - time.Minute)
 	st.pairs["unified-6"] = p
-	if _, err := s.DeliverAnonymous(context.Background(), "y", "", false); !errors.Is(err, ErrPublicClosed) {
+	if _, err := s.DeliverAnonymous(context.Background(), "y", Request{}); !errors.Is(err, ErrPublicClosed) {
 		t.Fatalf("err=%v，空闲跌破门槛时应 ErrPublicClosed", err)
 	}
 }
@@ -1233,10 +1268,10 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1)
 	addAccount(st, 2, "acct-2")
-	if _, err := s.DeliverAnonymous(context.Background(), "x", "", false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
-	up, err := s.Deliver(context.Background(), 2, "", false)
+	up, err := s.Deliver(context.Background(), 2, Request{})
 	if err != nil {
 		t.Fatalf("上传者被匿名挤掉了: %v", err)
 	}
@@ -1248,7 +1283,7 @@ func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 // 匿名报一个上传者的上游 ID，不能污染那个上传者的账本。
 func TestAnonymousCannotPolluteUploaderLedger(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1)
-	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", "", false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", Request{}); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	for _, sl := range st.slots {
@@ -1262,7 +1297,7 @@ func TestAnonymousCannotPolluteUploaderLedger(t *testing.T) {
 func TestNoStickyExitFails(t *testing.T) {
 	s, _, mn, _ := rig(t, types.ModeSingle)
 	mn.sidErr = errors.New("没有可用的粘性供应商")
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v", err)
 	}
 	if n := len(mn.mintedGateways()); n != 0 {
@@ -1288,11 +1323,11 @@ func TestForceSkipsHeldGateway(t *testing.T) {
 	seedHeldGateway(st, clk)
 
 	// 点名他正拿着的那个 + force ⇒ 没得换，只能 503。这一条只有 holding() 真生效才过。
-	if _, err := s.Deliver(context.Background(), 1, "unified-1", true); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1", Force: true}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v，force 点名自己手上那张时应 ErrNoFullSlot", err)
 	}
 	echoesBefore := mn.echoes
-	forced, err := s.Deliver(context.Background(), 1, "", true)
+	forced, err := s.Deliver(context.Background(), 1, Request{Force: true})
 	if err != nil {
 		t.Fatalf("force: %v", err)
 	}
@@ -1323,7 +1358,7 @@ func TestForceWithNothingElseFails(t *testing.T) {
 	delete(st.gws, "unified-3")
 
 	mustDeliver(t, s, 1, "")
-	if _, err := s.Deliver(context.Background(), 1, "", true); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{Force: true}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v，没得换时应 ErrNoFullSlot", err)
 	}
 }
@@ -1331,11 +1366,11 @@ func TestForceWithNothingElseFails(t *testing.T) {
 // 匿名那条路也认 force。
 func TestForceForAnonymous(t *testing.T) {
 	s, _, _, _ := anonRig(t, 6, 1)
-	first, err := s.DeliverAnonymous(context.Background(), "x", "", false)
+	first, err := s.DeliverAnonymous(context.Background(), "x", Request{})
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
-	forced, err := s.DeliverAnonymous(context.Background(), "x", "", true)
+	forced, err := s.DeliverAnonymous(context.Background(), "x", Request{Force: true})
 	if err != nil {
 		t.Fatalf("force: %v", err)
 	}
@@ -1343,7 +1378,7 @@ func TestForceForAnonymous(t *testing.T) {
 		t.Fatalf("匿名 force 还是给了同一个网关 %s", forced.Gateway)
 	}
 	// 指名要自己正租着的那张 + force ⇒ 没得换，老实失败。
-	if _, err := s.DeliverAnonymous(context.Background(), "x", forced.Gateway, true); err == nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{Gateway: forced.Gateway, Force: true}); err == nil {
 		t.Fatal("指名自己租着的那张还 force，居然成功了")
 	}
 }
@@ -1513,7 +1548,7 @@ func TestUpstreamRejectionDisablesAccount(t *testing.T) {
 	mn.mintStatus = 400
 	mn.mintBody = `{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}`
 
-	if _, err := s.Deliver(context.Background(), 1, "unified-1", false); err == nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err == nil {
 		t.Fatal("上游回 400 居然交付成功了")
 	}
 	if len(st.disabled) != 1 {
@@ -1536,7 +1571,7 @@ func TestRateLimitDoesNotDisableAccount(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintStatus = 429
 
-	if _, err := s.Deliver(context.Background(), 1, "unified-1", false); err == nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err == nil {
 		t.Fatal("上游回 429 居然交付成功了")
 	}
 	if len(st.disabled) != 0 {
@@ -1564,7 +1599,7 @@ func TestDeliverStopsAfterMaxTries(t *testing.T) {
 	seedPairs(st, clk)
 	s.opt.MaxTriesPerDeliver = 3
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v", err)
 	}
 	// 每试一个网关 = 一发铸票。试了 3 个就该停，不该把六个全摸一遍。
@@ -1650,7 +1685,7 @@ func TestDeadPairDroppedAfterRenewFailures(t *testing.T) {
 	}
 	// 网关本身照旧是候选：这里只要求它不被静默排除，交付成不成是满血判定的事。
 	mn.mintErr = nil
-	if _, err := s.Deliver(context.Background(), 1, "unified-1", false); err != nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err != nil {
 		t.Fatalf("网关被拉黑了: %v", err)
 	}
 }
@@ -1710,7 +1745,11 @@ func TestPremintKeepsServingExternalConsumers(t *testing.T) {
 				LastDeliver: clk.now()}
 		}
 	}
-	// 99 号不在 usable() 里（没凭据的外部/匿名占位行），但它确实在取票。
+	// 99 号是匿名占位行（sched.anonAccount 建的那种：带 AnonPrefix、没凭据），
+	// 它确实在取票。判据必须按**前缀**认它，不能按「在不在 usable() 里」——
+	// 后者会把被自动停用的托管号也算成外部消费者，于是整条成本闸失效。
+	st.accounts = append(st.accounts, types.Account{ID: 99, Label: "匿名 outsider",
+		Enabled: true, Creds: types.Creds{AccountID: types.AnonPrefix + "outsider"}})
 	st.slots[slotKey(99, "unified-1")] = types.Slot{AccountID: 99, Gateway: "unified-1",
 		LastDeliver: clk.now()}
 
@@ -1727,7 +1766,7 @@ func TestDeliverCarriesTheRealCause(t *testing.T) {
 	s, _, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("要不到粘性出口: 没有可用的出口代理（sticky=true，共 2 条）")
 
-	_, err := s.Deliver(context.Background(), 1, "", false)
+	_, err := s.Deliver(context.Background(), 1, Request{})
 	if !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("调用方认不出该回 503: %v", err)
 	}
@@ -1745,7 +1784,7 @@ func TestFailedMintRecordsCauseInSample(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("经 novproxy 请求失败: socks connect refused")
 
-	_, _ = s.Deliver(context.Background(), 1, "", false)
+	_, _ = s.Deliver(context.Background(), 1, Request{})
 	var failed, withErr int
 	for _, sm := range st.samples {
 		if sm.Status == 200 {
@@ -1773,7 +1812,7 @@ func TestExitOutageDoesNotBackoffSlots(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = fmt.Errorf("要不到粘性出口: %w", types.ErrNoExit)
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("该回 503: %v", err)
 	}
 	for key, sl := range st.slots {
@@ -1783,7 +1822,7 @@ func TestExitOutageDoesNotBackoffSlots(t *testing.T) {
 	}
 	// 出口回来了就该立刻能交付，不用等退避。
 	mn.mintErr = nil
-	if _, err := s.Deliver(context.Background(), 1, "", false); err != nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
 		t.Fatalf("出口恢复后仍然交付不了: %v", err)
 	}
 }
@@ -1835,7 +1874,7 @@ func TestDegradedOnlyReachableWithVerifyOn(t *testing.T) {
 	for gw := range st.gws {
 		mn.full[gw] = false
 	}
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v", err)
 	}
 	degraded := 0
@@ -1891,12 +1930,12 @@ func TestWindowElapsedPutsSlotInCooldown(t *testing.T) {
 
 	mustDeliver(t, s, 1, "")
 	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("窗口过完、唯一的网关进冷却，还发得出来: %v", err)
 	}
 	// 歇满冷却就该恢复（这时候那张 pair 早过期了，走的是现铸）。
 	clk.add(types.SlotCooldown)
-	if _, err := s.Deliver(context.Background(), 1, "", false); err != nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
 		t.Fatalf("歇满 %v 还交付不了: %v", types.SlotCooldown, err)
 	}
 }
@@ -1905,15 +1944,15 @@ func TestWindowElapsedPutsSlotInCooldown(t *testing.T) {
 // 「这个上游账号在这个网关上烧过了」和他有没有上传凭据无关。
 func TestCooldownAppliesToAnonymousToo(t *testing.T) {
 	s, _, clk, _ := anonRig(t, 1, 1)
-	if _, err := s.DeliverAnonymous(context.Background(), "outsider", "", false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.DeliverAnonymous(context.Background(), "outsider", "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("匿名窗口过完还发得出来: %v", err)
 	}
 	// 换一个上游 ID 就是另一条账本，不受连坐。
-	if _, err := s.DeliverAnonymous(context.Background(), "someone-else", "", false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "someone-else", Request{}); err != nil {
 		t.Fatalf("另一个匿名上游被连坐了: %v", err)
 	}
 }
@@ -1938,12 +1977,12 @@ func TestSlotCooldownComesFromConfig(t *testing.T) {
 
 	mustDeliver(t, s, 1, "")
 	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("窗口刚过完就又发了一张: %v", err)
 	}
 	// 配的 10 分钟远短于默认的 4 小时：到点就该恢复，证明读的是配置不是常量。
 	clk.add(10 * time.Minute)
-	if _, err := s.Deliver(context.Background(), 1, "", false); err != nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
 		t.Fatalf("配的是 10 分钟冷却，歇满了还交付不了: %v", err)
 	}
 }
@@ -1966,7 +2005,7 @@ func TestFreshMintDrawsOnlyOnce(t *testing.T) {
 		mn.land[k] = "unified-3"
 	}
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v，抽到的落点在冷却里就该老实 503", err)
 	}
 	if n := len(mn.mintedGateways()); n != 1 {
@@ -1989,7 +2028,7 @@ func TestFreshMintSuccessCostsOneRequest(t *testing.T) {
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	s.opt.MaxTriesPerDeliver = 5
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); err != nil {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	if n := len(mn.mintedGateways()); n != 1 {
@@ -2060,7 +2099,7 @@ func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out[i], errs[i] = s.Deliver(context.Background(), int64(i+1), "", false)
+			out[i], errs[i] = s.Deliver(context.Background(), int64(i+1), Request{})
 		}(i)
 	}
 	wg.Wait()
@@ -2222,7 +2261,7 @@ func TestPoolWideFailureStopsTryingOtherGateways(t *testing.T) {
 	s.opt.MaxTriesPerDeliver = 5
 	mn.mintErr = fmt.Errorf("要不到粘性出口: %w", types.ErrNoExit)
 
-	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("err=%v", err)
 	}
 	if n := len(mn.mintedGateways()); n > 1 {

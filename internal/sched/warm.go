@@ -3,6 +3,7 @@ package sched
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"gwpool/internal/types"
@@ -167,12 +168,22 @@ func (s *Scheduler) renewStalePairs(ctx context.Context, live, target int) {
 		}
 		cur, _ := s.st.Pair(name)
 		// 带着旧 pair 打：pair 自我续期，上游会回一张**同网关**的新 65 分钟 pair。
+		//
+		// 要拿网关锁：不拿的话保温和交付路径的现铸能同时为同一个网关各打一发，
+		// 而一张 pair 本来就能同时服务多个消费者（types.Pair），第二发纯属白烧
+		// 一个槽位加一发请求——正是这一轮要消掉的浪费。
+		// 锁序恒为「先网关、再账号」，和交付那边一致 ⇒ 不存在 ABBA。
+		relGW := s.lockGateway(name)
 		unlock := s.st.LockAccount(sc.ID)
 		_, err = s.mintOnce(ctx, sc, exit, sid, cur, name, name)
 		unlock()
+		relGW()
 		switch {
 		case err == nil:
-			live++
+			// 按实测重数，**不是** live++：上游接受了一张还有效的 pair 时不下发新
+			// cookie（SPEC 第 2 节），那张票的 ExpiresAt 一个字没变 ⇒ 无条件自增会让
+			// 计数器虚高、本轮提前收手，而深度其实没涨。
+			live = s.livePairs()
 			s.clearRenewFails(name)
 		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
 			// 闸门和基础设施故障不是这个网关的错，别给它记失败预算，也别接着打。
@@ -199,16 +210,11 @@ func (s *Scheduler) idle() bool {
 }
 
 // livePairs 数有活 pair 的网关：剩余还够交付的那些。
-func (s *Scheduler) livePairs() int {
-	now := s.now()
-	n := 0
-	for name := range s.st.Gateways() {
-		if p, ok := s.st.Pair(name); ok && p.ExpiresAt.Sub(now) >= types.DeliverFloor {
-			n++
-		}
-	}
-	return n
-}
+//
+// 就是 FreeGateways 本身——保留这个名字是因为保温这边说的是「深度」、HTTP 那边说的是
+// 「空闲」，但读数必须是**同一个**：两份实现会让「硬筛掉没票的网关」和「该不该预铸」
+// 用两把尺子量同一件事。
+func (s *Scheduler) livePairs() int { return s.FreeGateways() }
 
 // PairTarget 是目标活 pair 数：最忙那个号**真的用过**几张 pair，再加 SpareTarget。
 //
@@ -250,6 +256,11 @@ func (s *Scheduler) PairTarget() int {
 // **有外部消费者在取票就不算白烧**：pair 是纯路由，拿一把 key 替自己取票的外部账号
 // 在这些网关上大概率还是首次接触（2026-10-01 实测一张 pair 能同时服务多个账号），
 // 池子答不了它的满血，但不该替它判死。
+//
+// 「是不是外部消费者」按 types.AnonPrefix 判，**不能**按「是不是当前可用账号」：
+// usable() 要求 Enabled 且有凭据，而一个 400/401/403 就会自动停用一个托管号
+// （mintOnce / scan）。按可用性判的话，只要有任一个号在近 cooldown 内交付过之后被停用，
+// 这条成本闸就对整池永久失效。
 func (s *Scheduler) premintWasted() bool {
 	gws, hosted := s.st.Gateways(), s.usable()
 	if len(gws) == 0 || len(hosted) == 0 {
@@ -258,6 +269,12 @@ func (s *Scheduler) premintWasted() bool {
 	ids := make(map[int64]bool, len(hosted))
 	for _, a := range hosted {
 		ids[a.ID] = true
+	}
+	external := map[int64]bool{}
+	for _, a := range s.st.Accounts() {
+		if strings.HasPrefix(a.Creds.AccountID, types.AnonPrefix) {
+			external[a.ID] = true
+		}
 	}
 	now, cooling := s.now(), 0
 	cooldown := s.cfg().SlotCooldown()
@@ -268,8 +285,11 @@ func (s *Scheduler) premintWasted() bool {
 		if _, ok := gws[sl.Gateway]; !ok {
 			continue // 已经被遗忘的网关，不算在冷却里
 		}
-		if !ids[sl.AccountID] {
+		if external[sl.AccountID] {
 			return false
+		}
+		if !ids[sl.AccountID] {
+			continue // 已停用的托管号：它不会再来取票，不该让它的历史解开这条闸
 		}
 		cooling++
 	}

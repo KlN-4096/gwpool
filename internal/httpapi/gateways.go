@@ -46,11 +46,18 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		LastUsedAt string `json:"last_used_at,omitempty"`
 	}
 	out := struct {
-		Account  string `json:"account"`
-		Live     int    `json:"live"`
-		Target   int    `json:"target"`
-		Gateways []row  `json:"gateways"`
-	}{Account: upstream, Target: s.pool.PairTarget()}
+		Account string `json:"account"`
+		Live    int    `json:"live"`
+		Target  int    `json:"target"`
+		// 两个门槛数是**池子侧**的常量，而消费端要自己定 min_remaining ——
+		// 不报出来它只能瞎猜，猜高了就每发都取不到票，而且任何读数里都看不出
+		// 是这个参数的事（和「真的没票」长得一模一样）。
+		DeliverTTLS   int   `json:"deliver_ttl_s"`
+		DeliverFloorS int   `json:"deliver_floor_s"`
+		Gateways      []row `json:"gateways"`
+	}{Account: upstream, Target: s.pool.PairTarget(),
+		DeliverTTLS:   int(types.DeliverTTL / time.Second),
+		DeliverFloorS: int(types.DeliverFloor / time.Second)}
 
 	cooldown := s.slotCooldown()
 	for name := range s.st.Gateways() {
@@ -96,7 +103,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (string, int64, bool) {
 	ref := strings.TrimSpace(r.URL.Query().Get("account"))
 	if len(ref) > 128 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "account 太长"})
+		badRequest(w, http.StatusBadRequest, "account 太长")
 		return "", 0, false
 	}
 
@@ -104,14 +111,13 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (string, int64,
 		if c.admin {
 			// 管理员没有自己的账号：槽位是 (账号 × 网关)，猜一个就等于把 A 的历史报成 B 的。
 			if ref == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "管理员调用必须带 account 参数指明替谁"})
+				badRequest(w, http.StatusBadRequest, "管理员调用必须带 account 参数指明替谁")
 				return "", 0, false
 			}
 			// 和 /cookie 一样按托管行解析：管理员那条路取的是那一行自己的槽位。
 			a, ok := s.findAccount(ref)
 			if !ok {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "没有这个账号"})
+				badRequest(w, http.StatusNotFound, "没有这个账号")
 				return "", 0, false
 			}
 			return ref, a.ID, true
@@ -125,16 +131,19 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (string, int64,
 
 	ps := s.pool.Public()
 	if !ps.Enabled {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "需要本账号的 key"})
+		// 和 /cookie 同一个分类：没带有效 key、池子又不对外开放 = key 不认。
+		// 有码才能让调用方退避——没码的 401 会让它每发请求都照敲一次。
+		unauthorized(w, "需要本账号的 key")
 		return "", 0, false
 	}
 	if !ps.Open {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "池子暂不对外开放"})
+		writeFail(w, http.StatusServiceUnavailable, apiError{Code: codePublicClosed,
+			Message: "池子暂不对外开放", RetryAfterSeconds: retrySeconds(publicClosedRetry)})
 		return "", 0, false
 	}
 	if ref == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "匿名调用必须带 account 参数（你自己的上游 account_id）"})
+		badRequest(w, http.StatusBadRequest,
+			"匿名调用必须带 account 参数（你自己的上游 account_id）")
 		return "", 0, false
 	}
 	return ref, s.rowFor(types.AnonPrefix + ref), true

@@ -76,8 +76,10 @@ type failRow struct {
 	At        string
 	AccountID int64
 	Gateway   string
-	Reason    string
-	Detail    string
+	// Code 是回给客户端的那个闭集错误码；"release" 表示这行是一次归还。
+	Code   string
+	Reason string
+	Detail string
 }
 
 type sampleRow struct {

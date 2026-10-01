@@ -49,16 +49,35 @@ type fakePool struct {
 	anon     []string
 	// 按账号记流水：调度正确性全看池子有没有认出是谁在要。
 	delivered []string
+	// reqs 留住每次收到的请求参数：exclude / min_remaining 这些旋钮必须真的传下去，
+	// 而「传没传到」在响应里看不出来。
+	reqs []sched.Request
+	// calls 数一共取了几次票：wait 那条路最要紧的保证是「等不到就别重跑」，
+	// 重跑一次可能真打一发上游。
+	calls int
+
+	released []string
+	relN     int
+	relErr   error
 }
 
-func (p *fakePool) Deliver(_ context.Context, accountID int64, gw string, force bool) (types.Delivery, error) {
-	p.delivered = append(p.delivered, fmt.Sprintf("%d|%s|force=%v", accountID, gw, force))
+func (p *fakePool) Deliver(_ context.Context, accountID int64, req sched.Request) (types.Delivery, error) {
+	p.calls++
+	p.reqs = append(p.reqs, req)
+	p.delivered = append(p.delivered, fmt.Sprintf("%d|%s|force=%v", accountID, req.Gateway, req.Force))
 	return p.delivery, p.err
 }
 
-func (p *fakePool) DeliverAnonymous(_ context.Context, upstream, gw string, force bool) (types.Delivery, error) {
-	p.anon = append(p.anon, fmt.Sprintf("%s|%s|force=%v", upstream, gw, force))
+func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sched.Request) (types.Delivery, error) {
+	p.calls++
+	p.reqs = append(p.reqs, req)
+	p.anon = append(p.anon, fmt.Sprintf("%s|%s|force=%v", upstream, req.Gateway, req.Force))
 	return p.delivery, p.err
+}
+
+func (p *fakePool) Release(accountID int64, version string) (int, error) {
+	p.released = append(p.released, fmt.Sprintf("%d|%s", accountID, version))
+	return p.relN, p.relErr
 }
 
 func (p *fakePool) Public() sched.PublicState { return p.public }
@@ -1326,21 +1345,28 @@ func TestDeliverFailuresShowOnPages(t *testing.T) {
 	}
 
 	mine := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String()
-	if !strings.Contains(mine, "没有验过满血的槽位可交付") || !strings.Contains(mine, "unified-142") {
+	if !strings.Contains(mine, "没有可交付的活票") || !strings.Contains(mine, "unified-142") {
 		t.Fatal("上传者页没说为什么取不到票")
+	}
+	// 错误码也要落在页面上：同一句人话底下可能是两种完全不同的处置。
+	if !strings.Contains(mine, codeNoLivePair) {
+		t.Fatal("上传者页没显示错误码")
 	}
 	if strings.Contains(mine, "ErrNoFullSlot") || strings.Contains(mine, "上没有验过满血的槽位:") {
 		t.Fatal("上传者页漏了原始错误")
 	}
 	// 另一个账号的页面不该看见这条。
-	if other := do(h, httptest.NewRequest("GET", "/a/vt-2", nil)).Body.String(); strings.Contains(other, "没有验过满血的槽位可交付") {
+	if other := do(h, httptest.NewRequest("GET", "/a/vt-2", nil)).Body.String(); strings.Contains(other, "没有可交付的活票") {
 		t.Fatal("失败记录串到别人页面上了")
 	}
 
 	r := httptest.NewRequest("GET", "/admin/", nil)
 	r.SetBasicAuth("admin", "akey")
 	admin := do(h, r).Body.String()
-	if !strings.Contains(admin, "没有验过满血的槽位可交付") || !strings.Contains(admin, "上没有验过满血的槽位:") {
+	if !strings.Contains(admin, "没有可交付的活票") || !strings.Contains(admin, "上没有验过满血的槽位:") {
 		t.Fatal("管理页该连原始错误一起给")
+	}
+	if !strings.Contains(admin, codeNoLivePair) {
+		t.Fatal("管理页没显示错误码")
 	}
 }

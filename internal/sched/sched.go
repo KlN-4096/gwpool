@@ -98,11 +98,94 @@ type Minter interface {
 	Rate(acct string) (used map[string]int, limit int)
 }
 
-// ErrNoFullSlot：所有候选槽位都没验过满血。宁可 503 也不放降智出去（SPEC 第 8 节）。
-var ErrNoFullSlot = errors.New("没有验过满血的槽位可交付")
+// ErrNoFullSlot：一个可交付的槽位都没挑出来。宁可 503 也不放降智出去（SPEC 第 8 节）。
+//
+// 名字里的「Full」说的是**预期满血**（出了冷却、不在自己的满血窗口里），不是
+// 「验过」：verify_full_at_deliver 默认关，默认路径上一发验证都不打。
+// 具体是哪一种失败由 CoolingError / ErrNoLivePair / ErrMintFailed 这几个一起说，
+// 它们都包在它里面 ⇒ 调用方「是不是该回 503、该不该去找新落点」的分流不用改。
+var ErrNoFullSlot = errors.New("没有可交付的槽位")
 
-// errDegraded 标记「state-echo 判降级」。它和硬失败要分开记退避，见 degradedHold。
-var errDegraded = errors.New("state-echo 判降级")
+// ErrDegraded 标记「state-echo 判降级」。它和硬失败要分开记退避，见 degradedHold。
+//
+// 导出是因为 HTTP 那头要把它翻成对外的错误码（degraded），而这件事只有判据这边知道。
+var ErrDegraded = errors.New("state-echo 判降级")
+
+// ErrUpstreamRejected / ErrMintFailed 把铸票失败分成「上游否决这个账号」和「别的」。
+//
+// 分开不是洁癖：否决（400/401/403）重试多少次都一样、账号已经被当场停用，
+// 而别的（429、5xx、网络错、落点漂移）是「现在不行」。调用方据此告诉客户端
+// 该不该再来（见 types.RejectedByUpstream）。
+var (
+	ErrUpstreamRejected = errors.New("上游否决了这个账号")
+	ErrMintFailed       = errors.New("铸票失败")
+)
+
+// ErrNoLivePair：候选网关里一张活票都没有，而现铸也没成。
+//
+// 和 ErrMintFailed 的分工就是契约里那两句话的分工：no_live_pair 是「没有活票，
+// 且现铸没成」，mint_failed 是「**其他**铸票失败」（例如交付前续期那一发）。
+// 分开是因为**只有前者等得起**：等一会儿别人可能铸出一张票来，而那一次重试
+// 一发上游都不用打；后者等多久都是同一句话。
+var ErrNoLivePair = errors.New("候选网关里没有活票，现铸也没成")
+
+// Request 是一次取票里**调用方说得上话**的那几件事。
+//
+// 收成一个结构体而不是继续加参数：这四个旋钮全是外部输入，长度和范围的校验在 HTTP
+// 边界做完（见 httpapi），进到这里就当可信数据用。
+type Request struct {
+	// Gateway 非空 = 点名一个网关。他点名是因为**他**知道自己没烧过那个落点。
+	Gateway string
+	// Force = 「我手上那张不行了，必须换一个网关」。
+	Force bool
+	// Exclude 是调用方要跳过的网关。它自己那本账（按凭证域身份算的）比池子的准，
+	// 所以这是池子**挑之前**就该排掉的，不是挑完再过滤。
+	Exclude map[string]bool
+	// ExcludeVersions 是调用方要跳过的**具体的票**（types.CookieVersion）。
+	// 和 Exclude 的区别：同一个网关换了张新 pair 之后还能用，排的是票不是落点。
+	ExcludeVersions map[string]bool
+	// MinRemaining 是调用方能接受的 pair 最低剩余寿命。0 = 按服务端的 DeliverFloor。
+	MinRemaining time.Duration
+}
+
+// Floor 是这一次请求的交付门槛。
+//
+// 只影响这一次的候选筛选：/gateways、FreeGateways 那几个读数是**池子的**健康度，
+// 不该被某一个调用方的偏好改写。
+func (r Request) Floor() time.Duration {
+	if r.MinRemaining > 0 {
+		return r.MinRemaining
+	}
+	return types.DeliverFloor
+}
+
+// Skips 报告这个网关 / 这张票是不是被调用方排除了。
+//
+// 两个名单一处判：筛候选和「等票」那条路都要用同一把尺子，分两份迟早对不上。
+func (r Request) Skips(gateway, cookie string) bool {
+	if r.Exclude[gateway] {
+		return true
+	}
+	return len(r.ExcludeVersions) > 0 && r.ExcludeVersions[types.CookieVersion(cookie)]
+}
+
+// CoolingError 是「这个账号在所有候选网关上都还在冷却里」。
+//
+// 带 Wait 是因为 HTTP 那头要把它变成 Retry-After：冷却是**小时**量级，
+// 让客户端按默认节奏重试等于白打几百发。
+// Unwrap 回 ErrNoFullSlot ⇒ 调用方按它回 503、挂发现扫描，分流一个字都不用改。
+type CoolingError struct {
+	Gateways int           // 候选网关数
+	Cooldown time.Duration // 当前生效的冷却时长
+	Wait     time.Duration // 最早一个槽位出冷却还要多久；0 = 算不出来
+}
+
+func (e *CoolingError) Error() string {
+	return fmt.Sprintf("这个账号在 %d 个候选网关上都还在 %v 的冷却里（最早 %v 后出来）",
+		e.Gateways, e.Cooldown, e.Wait.Truncate(time.Second))
+}
+
+func (e *CoolingError) Unwrap() error { return ErrNoFullSlot }
 
 const (
 	// 硬失败（非 200、网络错、落点漂移）指数退避：快重试会让供给更快耗尽
@@ -142,10 +225,9 @@ type Options struct {
 	// 每试一个网关都可能真打一发上游，而且不管成不成那个槽位都烧掉了。
 	MaxTriesPerDeliver int
 
-	// PublicWhenSurplus：票充足时自动对没上传凭据的人开放，供给回落就自动关上。
-	// MinFreeGateways 是开放门槛，见 FreeGateways 和 types.GatewaysForContinuous。
-	PublicWhenSurplus bool
-	MinFreeGateways   int
+	// 「票充足时对匿名开放」的开关和门槛**刻意不在这儿**：它们归 config.PublicWhenSurplus，
+	// Public() 每次现读 ⇒ 管理页改完立即生效。在这里留一份快照的话，
+	// 调紧门槛这个紧急动作会静默失效（日志说改了、页面说生效了，实际没变）。
 
 	// Live 是配置的活引用：交付前验不验满血、保温要不要续期、槽位冷却多久，
 	// 三个旋钮每次**现读**它，于是管理页改完立即生效、不用重启
@@ -217,13 +299,20 @@ func (s *Scheduler) now() time.Time { return s.opt.Now() }
 // cfg 取当前配置快照。一个判断只取一次：两次 Get() 之间配置可能变了。
 func (s *Scheduler) cfg() config.Config { return s.opt.Live.Get() }
 
-// Deliver 为 accountID 这个账号交付一张验过满血的 pair。gatewayHint 非空时只考虑那个网关。
+// Deliver 为 accountID 这个账号交付一张 pair。req.Gateway 非空时只考虑那个网关。
+//
+// **「验过满血」不是这条路的承诺**：verify_full_at_deliver 默认**关**
+// （验证要用消费者自己的凭据打两发，恰好烧掉它马上要用的那个窗口），所以默认
+// 交出去的票 verified_full=false。保证来自调度本身：候选都出了冷却、都不在
+// 自己的满血窗口里。任何「反正交付前会验一次」的兜底推理都不成立。
 //
 // **账号必须是参数，不能由调度器自己挑**：槽位是 (账号 × 网关) 二元组，
 // 拿 A 算出来的槽位发给 B，「取歇得最久的」就整个失效了——B 可能刚在那儿烧过。
 //
-// 流程照 SPEC 第 8 节：选歇得最久的槽位 → 确保有剩余 ≥ DeliverFloor 的 pair →
-// （开了验证的话）state-echo 验一次 → 交付；降级则退避换下一个，全废返回 ErrNoFullSlot。
+// 流程照 SPEC 第 8 节：排掉调用方排除的 → 排掉不能给满血的 → 只在有活 pair 的网关里
+// 挑（剩余 ≥ req.Floor()，一张都没有才现铸）→ 选歇得最久的 →（开了验证的话）
+// state-echo 验一次 → 交付；降级则退避换下一个，挑不出来返回 ErrNoFullSlot
+// （具体哪一种由 CoolingError / ErrNoLivePair 一起说，它们都包在里面）。
 //
 // **不做任何跨消费者的互斥**：同一张 pair 同时发给几个账号是上游允许的，
 // 2026-10-01 实测见 types.Pair 的注释。交付有效期是**槽位的**窗口
@@ -232,11 +321,12 @@ func (s *Scheduler) cfg() config.Config { return s.opt.Live.Get() }
 // force = 「他手上那张不行了，换一个」。换不换由客户端决定：池子猜客户端什么时候
 // 该换本来就是在猜，只有客户端知道自己那一发对不对劲。force 时**必须**换一个网关，
 // 没得换就 ErrNoFullSlot——把原来那张再发一遍等于没换，客户端会死循环。
-func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint string, force bool) (types.Delivery, error) {
+func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (types.Delivery, error) {
 	consumer, ok := s.account(accountID)
 	if !ok {
 		return types.Delivery{}, fmt.Errorf("账号 %d 用不了（不存在、已停用、或没有凭据）", accountID)
 	}
+	gatewayHint, force := req.Gateway, req.Force
 
 	// 先记需求：即使这次 503 了，保温循环也该知道「有人在要」。
 	s.markDemand()
@@ -244,7 +334,7 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	// 窗口还开着的重复请求：原样再发一次，一发上游都不打（见 redeliver）。
 	// force 跳过这条——他就是因为手上那张不行了才来的。
 	if !force {
-		if d, ok := s.redeliver(consumer.ID, gatewayHint); ok {
+		if d, ok := s.redeliver(consumer.ID, req); ok {
 			return d, nil
 		}
 	}
@@ -253,6 +343,15 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	cands := make([]string, 0, len(gws))
 	for name := range gws {
 		if gatewayHint != "" && name != gatewayHint {
+			continue
+		}
+		// 排除名单在**有活 pair 的硬筛之前**生效：调用方那本账比池子的准
+		// （池子只认它自己发过的票），挑完再过滤等于把一次筛选白跑一遍。
+		//
+		// 点名的网关同时又在排除名单里（客户端自相矛盾）时**按排除办**：
+		// exclude 编码的是「我烧过这个」，照它办永远不会发出一张坏票；
+		// 反过来让 gateway 压过 exclude，就可能把客户端自己说烧过的落点发回去。
+		if p, _ := s.st.Pair(name); req.Skips(name, p.Cookie) {
 			continue
 		}
 		cands = append(cands, name)
@@ -264,6 +363,7 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 		return types.Delivery{}, fmt.Errorf("%w（池子里没有可用网关，hint=%q）", ErrNoFullSlot, gatewayHint)
 	}
 
+	cooldown := s.cfg().SlotCooldown()
 	if force {
 		kept := make([]string, 0, len(cands))
 		for _, name := range cands {
@@ -273,7 +373,10 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 			kept = append(kept, name)
 		}
 		if len(kept) == 0 {
-			return types.Delivery{}, ErrNoFullSlot
+			// 他手上那张就是唯一的候选 ⇒ 和「全在冷却里」是同一件事（刚交付过的
+			// 槽位本来就在冷却里），而且**等不起**：冷却是小时量级。
+			return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
+				Wait: s.coolingWait(consumer.ID, cands, cooldown)}
 		}
 		cands = kept
 	}
@@ -281,11 +384,10 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	// 冷却过滤：窗口用完的 (账号 × 网关) 要歇满 SlotCooldown 才重新给满血，
 	// 这期间它不参与挑选。**不给它开后门**——歇不够就发等于发降智的东西，
 	// 而池子宁可 503（SPEC 第 8 节）。全烧完就让发现路径去找新落点。
-	cooldown := s.cfg().SlotCooldown()
 	rested := s.notCooling(consumer.ID, cands, cooldown)
 	if len(rested) == 0 {
-		return types.Delivery{}, fmt.Errorf("%w（这个账号在 %d 个候选网关上都还在 %v 的冷却里）",
-			ErrNoFullSlot, len(cands), cooldown)
+		return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
+			Wait: s.coolingWait(consumer.ID, cands, cooldown)}
 	}
 	cands = rested
 
@@ -301,18 +403,22 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	//
 	// 一张活 pair 都没有时**仍然现铸一发**（见 deliverByFreshMint）：不然冷池子永远 503，
 	// 只能干等预铸。规则是「有票就绝不铸」，不是「永不铸」。
-	withPair, _ := s.splitByPair(cands)
+	withPair, _ := s.splitByPair(cands, req.Floor())
 	if len(withPair) == 0 {
 		// 点名了网关就定向铸（落点漂了算失败）：他点名是因为**他**知道自己没烧过那个
 		// 落点，给他换一个等于没听他说话。没点名才是抽签。
-		d, gateway, err := s.deliverByFreshMint(ctx, consumer, cands, cooldown, gatewayHint != "")
+		d, gateway, err := s.deliverByFreshMint(ctx, consumer, cands, cooldown, req)
 		if err == nil {
 			s.clearBackoff(consumer.ID, gateway)
-			s.noteDeliver(consumer.ID, gateway)
 			return d, nil
 		}
 		s.noteTryFailure(ctx, consumer, gateway, err)
-		return types.Delivery{}, fmt.Errorf("%w（最后一个原因：%w）", ErrNoFullSlot, err)
+		// 三个 %w：候选非空、只是一张活票都没有而现铸又没成 ⇒ 这条**等得起**
+		// （别人铸出一张票来之后的那次重试一发上游都不用打）。
+		// 这正是换票（force + exclude_versions）最常落到的那一格，归成
+		// 「全在冷却里」会让 wait 在每一次轮换上都失效。
+		return types.Delivery{}, fmt.Errorf("%w（%w，最后一个原因：%w）",
+			ErrNoFullSlot, ErrNoLivePair, err)
 	}
 	cands = withPair
 
@@ -329,10 +435,9 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 			break // 剩下的全在退避期
 		}
 		tries--
-		d, err := s.tryGateway(ctx, consumer, gws[sl.Gateway])
+		d, err := s.tryGateway(ctx, consumer, gws[sl.Gateway], req)
 		if err == nil {
 			s.clearBackoff(consumer.ID, sl.Gateway)
-			s.noteDeliver(consumer.ID, sl.Gateway)
 			return d, nil
 		}
 		last = err
@@ -377,7 +482,7 @@ func (s *Scheduler) noteTryFailure(ctx context.Context, consumer types.Account, 
 	if gateway == "" {
 		return true // 连落点都没读出来，没有槽位可记
 	}
-	if errors.Is(err, errDegraded) {
+	if errors.Is(err, ErrDegraded) {
 		s.holdSlot(consumer.ID, gateway, degradedHold)
 	} else {
 		s.bumpBackoff(consumer.ID, gateway)
@@ -392,6 +497,10 @@ func (s *Scheduler) noteTryFailure(ctx context.Context, consumer types.Account, 
 //
 // 每次请求现算、不缓存：供给是秒级变化的，缓存一个「充足」状态就等于拿着过期的
 // 结论放匿名请求进来，而他们正是最该被挡在门外的那一拨。
+//
+// 和保温的「深度目标」是同一个读数（livePairs 就是它的别名）：两份实现会让
+// 「硬筛」和「该不该预铸」用两把尺子量同一件事。
+// 门槛**不跟 min_remaining 走**：这是池子自己的健康度，不是某一个调用方的偏好。
 func (s *Scheduler) FreeGateways() int {
 	now := s.now()
 	n := 0
@@ -412,8 +521,13 @@ type PublicState struct {
 }
 
 // Public 现算一次开放状态。
+//
+// 开关和门槛**现读配置**，不读 New() 时的快照：管理页上那个按钮写着「保存并立即生效」，
+// 而把门槛调紧是运营方最可能的紧急动作——匿名这条路唯一的让路机制就是它
+// （pair 本身不互斥，见 types.Pair）。读快照的话日志说改了、页面说生效了，实际没变。
 func (s *Scheduler) Public() PublicState {
-	st := PublicState{Enabled: s.opt.PublicWhenSurplus, Free: s.FreeGateways(), Threshold: s.opt.MinFreeGateways}
+	c := s.cfg().PublicWhenSurplus
+	st := PublicState{Enabled: c.Enabled, Free: s.FreeGateways(), Threshold: c.MinFreeGateways}
 	st.Open = st.Enabled && st.Free >= st.Threshold
 	return st
 }
@@ -433,7 +547,7 @@ var ErrPublicClosed = errors.New("池子此刻不对外开放")
 //  2. **不现铸**——铸票要烧某个上传者的窗口，不为匿名花这个钱，只发现成的。
 //  3. **严格低优先级**——空闲数跌破门槛就拒，哪怕还剩一张。门槛是给上传者留的余量，
 //     也是匿名这条路唯一的让路机制（pair 本身不互斥，见 types.Pair 的注释）。
-func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHint string, force bool) (types.Delivery, error) {
+func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req Request) (types.Delivery, error) {
 	ps := s.Public()
 	if !ps.Open {
 		return types.Delivery{}, fmt.Errorf("%w（空闲 %d，门槛 %d）", ErrPublicClosed, ps.Free, ps.Threshold)
@@ -442,11 +556,12 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 	if err != nil {
 		return types.Delivery{}, err
 	}
+	gatewayHint, force, floor := req.Gateway, req.Force, req.Floor()
 	s.markDemand()
 
 	// 窗口内重复请求走同一条路：他也是消费者，重连重试不该去烧下一个落点。
 	if !force {
-		if d, ok := s.redeliver(a.ID, gatewayHint); ok {
+		if d, ok := s.redeliver(a.ID, req); ok {
 			return d, nil
 		}
 	}
@@ -459,17 +574,39 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 			continue
 		}
 		p, ok := s.st.Pair(name)
-		if !ok || p.ExpiresAt.Sub(now) < types.DeliverFloor {
+		if !ok || p.ExpiresAt.Sub(now) < floor {
 			continue
 		}
-		// force：他手上那张不行了，排掉他正在用的。
-		if force && s.holding(a.ID, name) {
+		if req.Skips(name, p.Cookie) {
 			continue
 		}
 		cands = append(cands, name)
 	}
+	// force 和冷却分两步筛、各自报错：和上传者那条路同一条规则——
+	// 筛完为空就是「你的槽位全在冷却里」（等几小时，不可等待），
+	// 而「一张活票都没有」是另一码事（上面那个循环就把它筛成空了，等得起）。
+	if force {
+		kept := make([]string, 0, len(cands))
+		for _, name := range cands {
+			if s.holding(a.ID, name) {
+				continue // 他手上那张不行了，排掉他正在用的
+			}
+			kept = append(kept, name)
+		}
+		if len(kept) == 0 && len(cands) > 0 {
+			return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
+				Wait: s.coolingWait(a.ID, cands, cooldown)}
+		}
+		cands = kept
+	}
 	// 冷却对占位行一视同仁：「这个上游账号在这个网关上烧过了」和他有没有上传凭据无关。
-	cands = s.notCooling(a.ID, cands, cooldown)
+	rested := s.notCooling(a.ID, cands, cooldown)
+	if len(rested) == 0 && len(cands) > 0 {
+		// 告诉他最早什么时候回来，别让他按默认节奏重试。
+		return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
+			Wait: s.coolingWait(a.ID, cands, cooldown)}
+	}
+	cands = rested
 	for len(cands) > 0 {
 		sl, ok := s.st.LongestRestedSlot(a.ID, cands)
 		if !ok {
@@ -477,15 +614,15 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 		}
 		p, ok := s.st.Pair(sl.Gateway)
 		// 现算一遍：从选候选到这儿之间，那张 pair 可能已经到点了。
-		if !ok || p.ExpiresAt.Sub(s.now()) < types.DeliverFloor {
+		if !ok || p.ExpiresAt.Sub(s.now()) < floor {
 			cands = drop(cands, sl.Gateway)
 			continue
 		}
 		at := s.now()
-		s.touch(sl.Gateway, a.ID, at)
-		// 外部消费者的用量也要进账本，否则「池子该备多深」这个目标永远看不见他们：
-		// 池子对外服务得越多，目标深度反而不涨。
-		s.noteDeliver(a.ID, sl.Gateway)
+		// 一次读-改-写记下触碰、交付时刻和还原点。外部消费者的用量也要进账本，
+		// 否则「池子该备多深」这个目标永远看不见他们：池子对外服务得越多，
+		// 目标深度反而不涨。
+		s.noteDeliver(a.ID, sl.Gateway, at, true)
 		// 运营方靠这行判断门槛设得对不对。
 		s.opt.Log.Info("匿名交付", "upstream", upstreamID, "account", a.ID,
 			"gateway", sl.Gateway, "free_gateways", ps.Free, "threshold", ps.Threshold)
@@ -493,7 +630,7 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID, gatewayHin
 			Gateway:      sl.Gateway,
 			Cookie:       p.Cookie,
 			ExpiresAt:    at.Add(types.DeliverTTL),
-			ValidForS:    int(types.DeliverTTL / time.Second),
+			ValidForS:    validFor(types.DeliverTTL, p.ExpiresAt.Sub(at)),
 			VerifiedFull: false,
 		}, nil
 	}
@@ -537,13 +674,14 @@ type minted struct {
 // tryGateway 在一个**点名的**网关上交付：确保它有张够新鲜的 pair，然后走 finish。
 //
 // 走到这儿的网关通常已经有票（Deliver 硬筛过），所以这条路一般一发上游都不打。
-func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw types.Gateway) (types.Delivery, error) {
+func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw types.Gateway, req Request) (types.Delivery, error) {
 	exit, ok := pickExit(gw)
 	if !ok {
 		return types.Delivery{}, fmt.Errorf("网关 %s 没有已知可达出口，没法定向铸票", gw.Name)
 	}
+	floor := req.Floor()
 
-	pair, fresh := s.freshPair(gw.Name)
+	pair, fresh := s.freshPair(gw.Name, floor)
 	var m minted
 	if !fresh {
 		// 同一个网关一次只许有一发在铸。**锁顺序恒为「先网关、再账号」**，
@@ -555,7 +693,7 @@ func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw t
 		// 一个槽位加一发请求。
 		release := s.lockGateway(gw.Name)
 		// 拿到锁之后重查一遍：排在前面那个人可能刚把票铸好了。
-		if p, ok := s.freshPair(gw.Name); ok {
+		if p, ok := s.freshPair(gw.Name, floor); ok {
 			pair = p
 			release()
 			s.opt.Log.Debug("等到了别人刚铸的票，省下一发", "gateway", gw.Name, "account", consumer.ID)
@@ -572,7 +710,7 @@ func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw t
 			}
 		}
 	}
-	return s.finish(ctx, consumer, gw.Name, exit, pair, m)
+	return s.finish(ctx, consumer, gw.Name, exit, pair, m, floor)
 }
 
 // deliverByFreshMint 是「一张活 pair 都没有」时的回落：**抽一次签**。
@@ -591,7 +729,7 @@ func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw t
 // 第二个返回值是这一发**实际落在**哪个网关上（失败时尽力给出意图落点），
 // 调用方拿它记退避和交付——善后规则在 Deliver 那边，只有一份。
 func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Account,
-	cands []string, cooldown time.Duration, strict bool) (types.Delivery, string, error) {
+	cands []string, cooldown time.Duration, req Request) (types.Delivery, string, error) {
 	sl, ok := s.st.LongestRestedSlot(consumer.ID, cands)
 	if !ok {
 		return types.Delivery{}, "", fmt.Errorf("%w（候选网关全在退避期）", ErrNoFullSlot)
@@ -602,6 +740,7 @@ func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Accou
 		return types.Delivery{}, sl.Gateway,
 			fmt.Errorf("网关 %s 没有已知可达出口，没法铸票", sl.Gateway)
 	}
+	floor := req.Floor()
 
 	// 冷却状态要在**铸票之前**定格：铸票那一发自己会 touch 消费者的槽位
 	// （单账号模式下铸票者就是他本人），拿铸完之后的账本去判「他出冷却了吗」，
@@ -610,16 +749,18 @@ func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Accou
 
 	release := s.lockGateway(sl.Gateway)
 	// 别人可能刚为这个网关铸好了票——那就直接用，省下这一发。
-	if p, fresh := s.freshPair(sl.Gateway); fresh {
+	if p, fresh := s.freshPair(sl.Gateway, floor); fresh {
 		release()
-		d, err := s.finish(ctx, consumer, sl.Gateway, exit, p, minted{})
+		d, err := s.finish(ctx, consumer, sl.Gateway, exit, p, minted{}, floor)
 		return d, sl.Gateway, err
 	}
 	want := ""
-	if strict {
+	if req.Gateway != "" {
+		// 调用方点名了网关：定向铸、落点漂了算失败。他点名是因为**他**知道自己
+		// 没烧过那个落点，给他换一个等于没听他说话。
 		want = sl.Gateway
 	}
-	got, err := s.mintPair(ctx, consumer, sl.Gateway, exit, s.pairFor(sl.Gateway), want, sl.Gateway)
+	got, err := s.mintPair(ctx, consumer, sl.Gateway, exit, s.pairFor(sl.Gateway, floor), want, sl.Gateway)
 	if err != nil {
 		release()
 		return types.Delivery{}, sl.Gateway, err
@@ -629,7 +770,12 @@ func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Accou
 	if landed == "" {
 		return types.Delivery{}, sl.Gateway, errors.New("现铸没读出落点")
 	}
-	if coolingBefore[landed] {
+	// 闸 1（真的交付过票）要在铸完之后**重查一次**：铸票那几十秒里同一个账号的另一路
+	// 交付可能刚在 landed 上取走过一张票，而那件事快照看不见 ⇒ 这里会 fail-open，
+	// 把一个刚烧掉的槽位当首次接触发出去。
+	// 闸 2（LastTouch 在一个满血窗口内）继续用快照：铸票那一发自己就是一次 touch，
+	// 拿铸后的账本问它等于自己把自己判死。
+	if coolingBefore[landed] || s.coolingByDeliver(consumer.ID, landed, cooldown) {
 		return types.Delivery{}, landed,
 			fmt.Errorf("现铸抽到 %s，而这个账号在它上面还在 %v 的冷却里", landed, cooldown)
 	}
@@ -638,21 +784,24 @@ func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Accou
 		m = got.minted
 	}
 	s.opt.Log.Info("一张活票都没有，现铸一发", "account", consumer.ID, "label", consumer.Label,
-		"asked", sl.Gateway, "landed", landed, "strict", strict)
-	d, err := s.finish(ctx, consumer, landed, exit, got.pair, m)
+		"asked", sl.Gateway, "landed", landed, "strict", want != "")
+	d, err := s.finish(ctx, consumer, landed, exit, got.pair, m, floor)
 	return d, landed, err
 }
 
-// pairFor 取这个网关手上那张票（可能已经过期），没有就是零值。
+// pairFor 取这个网关手上那张**还够交付**的票，不够就是零值（= 裸铸）。
 //
-// 回落那一发要把它带上：手里那张还没硬过期的话，上游会顺手把它续成新的 65 分钟
-// （pair 自我续期，SPEC 第 6 节），比裸打多拿一张票、少一次落点漂移。
-func (s *Scheduler) pairFor(gateway string) types.Pair {
-	p, ok := s.st.Pair(gateway)
-	if !ok || !p.ExpiresAt.After(s.now()) {
-		return types.Pair{}
+// 门槛就是 freshPair 那把尺子，不是「没硬过期」：带进去的那张 pair 还有效时上游会
+// **接受它、不下发新 cookie**（SPEC 第 2 节），于是手里还是那张快到点的，finish 拒发
+// ⇒ 消费者 503，而请求和铸票者的一个槽位已经花掉了。
+// 判据是**送进去的那张还好不好**：烧过/过期的会被上游无视并换掉（SPEC 第 6 节说的
+// 「经某网关铸票回一张新 pair」是这种情形），还有效的被接受且不换（第 2 节）。
+// 而走到回落这条路的前提恰好是「所有票都低于门槛」= 还有效但太短 ⇒ 必然换不回新票。
+func (s *Scheduler) pairFor(gateway string, floor time.Duration) types.Pair {
+	if p, fresh := s.freshPair(gateway, floor); fresh {
+		return p
 	}
-	return p
+	return types.Pair{}
 }
 
 // finish 是两条交付路共用的尾段：验剩余 →（开了验证的话）取消费者自己的活票再 echo
@@ -665,11 +814,11 @@ func (s *Scheduler) pairFor(gateway string) types.Pair {
 // m 是「补 pair 那一发正好是消费者自己打的」时带过来的（单账号模式）：它的 firstAt
 // 才是真正的首次接触时刻，有效期必须按它算。
 func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway string,
-	exit types.Exit, pair types.Pair, m minted) (types.Delivery, error) {
+	exit types.Exit, pair types.Pair, m minted, floor time.Duration) (types.Delivery, error) {
 	// 续完必须**重新判一次剩余**：上游接受了一张还有效的 pair 时不会下发新 cookie
 	// （SPEC 第 2 节「好 pair 不会触发重新下发」），这时「续期」其实没发生，
 	// 手里还是那张快到点的。发出去等于让消费者中途被重新路由到随机网关。
-	if left := pair.ExpiresAt.Sub(s.now()); left < types.DeliverFloor {
+	if left := pair.ExpiresAt.Sub(s.now()); left < floor {
 		return types.Delivery{}, fmt.Errorf("网关 %s 的 pair 只剩 %v，没续上，不发", gateway, left.Truncate(time.Second))
 	}
 
@@ -679,25 +828,28 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	// 要用它自己的凭据打一发（先铸一张属于它的活票、再 echo）——那两发恰好烧掉
 	// 它马上要用的那个窗口，验完交出去的已经是个二手落点。加上 state-echo 有假阴
 	// 无假阳（SPEC 第 3 节），关掉只少一个读数，不会把降智的东西放出去。
-	// 所以判定如实写 unknown（**不是** degraded：我们没验，不是验坏了），
+	// 所以判定如实写 unknown（**不是** degraded：我们没验，不是验坏了，见 markUnverified），
 	// 交付照样记一次触碰——票交出去了，窗口就算烧了，少记一次会让它被当成新鲜的再发一遍。
 	if !s.cfg().VerifyFullAtDeliver {
 		at := s.now()
-		if !m.firstAt.IsZero() {
+		selfMinted := !m.firstAt.IsZero()
+		if selfMinted {
 			// 单账号模式：建 pair 那一发就是消费者自己的首次接触，窗口从那时起算。
 			at = m.firstAt
 		}
-		s.touch(gateway, consumer.ID, at)
-		s.setVerdict(consumer.ID, gateway, types.VerdictUnknown)
 		left := at.Add(types.DeliverTTL).Sub(s.now())
 		if left < minDeliverWindow {
 			return types.Delivery{}, fmt.Errorf("网关 %s 的满血窗口只剩 %v，不发", gateway, left.Truncate(time.Second))
 		}
+		// 触碰、交付时刻、还原点一次写完。selfMinted 时触碰已经由那一发真实请求记过了
+		// （mintOnce 自己 touch 的），别再覆盖一遍——那会把还原点挪到这次交付之后。
+		s.noteDeliver(consumer.ID, gateway, at, !selfMinted)
+		s.markUnverified(consumer.ID, gateway)
 		return types.Delivery{
 			Gateway:      gateway,
 			Cookie:       pair.Cookie,
 			ExpiresAt:    at.Add(types.DeliverTTL),
-			ValidForS:    int(left / time.Second),
+			ValidForS:    validFor(left, pair.ExpiresAt.Sub(s.now())),
 			VerifiedFull: false,
 		}, nil
 	}
@@ -737,7 +889,7 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	}
 	if !v.Full {
 		s.setVerdict(consumer.ID, gateway, types.VerdictDegraded)
-		return types.Delivery{}, fmt.Errorf("%w: %s", errDegraded, v.Note)
+		return types.Delivery{}, fmt.Errorf("%w: %s", ErrDegraded, v.Note)
 	}
 	s.setVerdict(consumer.ID, gateway, types.VerdictFull)
 
@@ -749,13 +901,30 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	if left < minDeliverWindow {
 		return types.Delivery{}, fmt.Errorf("网关 %s 的满血窗口只剩 %v，不发", gateway, left.Truncate(time.Second))
 	}
+	// 触碰不用再记：铸那张活票的那一发（mintOnce）已经记过，而它就是首次接触。
+	s.noteDeliver(consumer.ID, gateway, m.firstAt, false)
 	return types.Delivery{
 		Gateway:      gateway,
 		Cookie:       pair.Cookie,
 		ExpiresAt:    exp,
-		ValidForS:    int(left / time.Second),
+		ValidForS:    validFor(left, pair.ExpiresAt.Sub(s.now())),
 		VerifiedFull: true,
 	}, nil
+}
+
+// validFor 是交付的建议有效期（秒）：满血窗口还剩多少、这张 pair 还能活多久，取小的。
+//
+// 必须取小：min_remaining 能把交付门槛压到 30 s，而窗口是 150 s —— 不取小就会把一张
+// 只剩 40 秒的票标成 valid_for_s=150 发出去，消费端用到一半被重新路由到随机网关。
+// 今天 DeliverFloor(300s) > DeliverTTL(150s) 所以撞不上，是 min_remaining 把它打开的。
+func validFor(windowLeft, pairLeft time.Duration) int {
+	if pairLeft < windowLeft {
+		windowLeft = pairLeft
+	}
+	if windowLeft < 0 {
+		return 0
+	}
+	return int(windowLeft / time.Second)
 }
 
 // pairMint 是「为这个网关补一张 pair」的结果。mintedBySelf 为真时那一发是消费者
@@ -857,7 +1026,9 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	}
 
 	if err != nil {
-		return minted{}, fmt.Errorf("铸票失败: %w", err)
+		// 包一层 ErrMintFailed 但不改这句话：底下可能还裹着速率闸 / 出口熔断，
+		// 调用方按**更靠内**的那几个先分流，剩下的才算「铸票没成」。
+		return minted{}, fmt.Errorf("%w: %w", ErrMintFailed, err)
 	}
 	if res.Status != 200 {
 		msg := fmt.Sprintf("铸票 HTTP %d", res.Status)
@@ -871,11 +1042,12 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 				s.opt.Log.Error("自动停用失败", "account", a.ID, "err", derr)
 			}
 			s.opt.Log.Warn("账号被上游否决，已自动停用", "account", a.ID, "label", a.Label, "reason", msg)
+			return minted{}, fmt.Errorf("%w（%s）", ErrUpstreamRejected, msg)
 		}
-		return minted{}, errors.New(msg)
+		return minted{}, fmt.Errorf("%w（%s）", ErrMintFailed, msg)
 	}
 	if res.Gateway == "" {
-		return minted{}, errors.New("铸票没拿到落点")
+		return minted{}, fmt.Errorf("%w：没拿到落点", ErrMintFailed)
 	}
 
 	// 落点入网关表。裸铸（预铸、发现）**必须**有这一步：Gateways() 是候选清单的
@@ -899,7 +1071,7 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		}
 	}
 	if res.Gateway != want && want != "" {
-		return minted{}, fmt.Errorf("落点漂移：想要 %s，实到 %s", want, res.Gateway)
+		return minted{}, fmt.Errorf("%w：落点漂移，想要 %s，实到 %s", ErrMintFailed, want, res.Gateway)
 	}
 	return minted{pair: p, ticket: res.TurnState, sid: sid, obs: obs, firstAt: start}, nil
 }
@@ -1062,11 +1234,11 @@ func (s *Scheduler) maxTries() int {
 // 注意它给不存在的槽位行合成一个零值 Slot（LastTouch 是零时刻），于是没碰过的
 // 永远排在碰过的前面。硬筛加在它前面之后这个行为没有坏处（组内全是出了冷却的槽位），
 // 但别以为零值会被跳过。
-func (s *Scheduler) splitByPair(cands []string) (withPair, without []string) {
+func (s *Scheduler) splitByPair(cands []string, floor time.Duration) (withPair, without []string) {
 	withPair = make([]string, 0, len(cands))
 	without = make([]string, 0, len(cands))
 	for _, name := range cands {
-		if _, fresh := s.freshPair(name); fresh {
+		if _, fresh := s.freshPair(name, floor); fresh {
 			withPair = append(withPair, name)
 		} else {
 			without = append(without, name)
@@ -1075,14 +1247,17 @@ func (s *Scheduler) splitByPair(cands []string) (withPair, without []string) {
 	return withPair, without
 }
 
-// freshPair 判断池里那张 pair 还够不够交付：剩余不足 DeliverFloor 就别发，
+// freshPair 判断池里那张 pair 还够不够交付：剩余不足 floor 就别发，
 // 否则 65 分钟硬过期会在消费者手里到点（SPEC 第 6 节）。
-func (s *Scheduler) freshPair(gateway string) (types.Pair, bool) {
+//
+// floor 由调用方给（Request.Floor）：默认是 types.DeliverFloor，而调用方可以用
+// min_remaining 把它压低到 30 s —— 「我这一发很短，残票也要」是只有它自己知道的事。
+func (s *Scheduler) freshPair(gateway string, floor time.Duration) (types.Pair, bool) {
 	p, ok := s.st.Pair(gateway)
 	if !ok {
 		return types.Pair{Gateway: gateway}, false
 	}
-	return p, p.ExpiresAt.Sub(s.now()) >= types.DeliverFloor
+	return p, p.ExpiresAt.Sub(s.now()) >= floor
 }
 
 // holding 报告这个账号此刻是不是正拿着这个网关的票。
@@ -1108,14 +1283,19 @@ func (s *Scheduler) holding(accountID int64, gateway string) bool {
 // 会去烧**下一个**落点——供给只有个位数，这么漏一轮就没了。
 //
 // gatewayHint 为空时取他窗口里最近那一次交付：那就是他手上正在用的那张。
-func (s *Scheduler) redeliver(accountID int64, gatewayHint string) (types.Delivery, bool) {
+//
+// 锚点就是槽位上的 LastDeliver，而那个字段存的是**窗口起算时刻**（首次接触那一发发出去
+// 的时间，见 noteDeliver），不是「交付返回的时刻」。两者差一个 20~90 s 的往返：按后者算
+// 的话，客户端在 start+140s 重连会被告知还剩 70 秒，而真实窗口只剩 10 秒，
+// 池子顺带把一张窗口已关的 pair 原样发了出去。
+func (s *Scheduler) redeliver(accountID int64, req Request) (types.Delivery, bool) {
 	now := s.now()
 	var best types.Slot
 	for _, sl := range s.st.Slots() {
 		if sl.AccountID != accountID || sl.LastDeliver.IsZero() {
 			continue
 		}
-		if gatewayHint != "" && sl.Gateway != gatewayHint {
+		if req.Gateway != "" && sl.Gateway != req.Gateway {
 			continue
 		}
 		if now.Sub(sl.LastDeliver) >= types.DeliverTTL {
@@ -1134,9 +1314,15 @@ func (s *Scheduler) redeliver(accountID int64, gatewayHint string) (types.Delive
 	if !ok || !p.ExpiresAt.After(now) {
 		return types.Delivery{}, false
 	}
+	// 排除名单也要在这条路上生效：他带着 exclude 来，就是**不想要**手上那张了。
+	if req.Skips(best.Gateway, p.Cookie) {
+		return types.Delivery{}, false
+	}
 	exp := best.LastDeliver.Add(types.DeliverTTL)
 	left := exp.Sub(now)
-	if left < time.Second {
+	// 两头都要够一秒：窗口剩不到一秒没意义，而那张 pair 剩不到一秒会让
+	// valid_for_s 取小之后变成 0 —— 消费端（sub2api）把非正数当成坏响应直接丢弃。
+	if left < time.Second || p.ExpiresAt.Sub(now) < time.Second {
 		return types.Delivery{}, false
 	}
 	s.opt.Log.Info("窗口内重复请求，原样再发一次", "account", accountID,
@@ -1145,7 +1331,7 @@ func (s *Scheduler) redeliver(accountID int64, gatewayHint string) (types.Delive
 		Gateway:   best.Gateway,
 		Cookie:    p.Cookie,
 		ExpiresAt: exp,
-		ValidForS: int(left / time.Second),
+		ValidForS: validFor(left, p.ExpiresAt.Sub(now)),
 		// 照第一次的判定如实报：这一次什么都没验，不该凭空升级成 true。
 		VerifiedFull: best.LastVerdict == types.VerdictFull,
 	}, true
@@ -1176,13 +1362,17 @@ func (s *Scheduler) notCooling(accountID int64, cands []string, cooldown time.Du
 // 两条闸，各管一件事：
 //
 //  1. LastDeliver 在 cooldown 内——票真发出去过，窗口用完了，要歇满冷却
-//  2. LastTouch 在一个满血窗口内、**且这个槽位没有退避记录**——预铸、扫描、别人的
+//  2. LastTouch 在一个满血窗口内、**且此刻不在退避中**——预铸、扫描、别人的
 //     续期都会 touch，而那一发就在眼前（183 s 内），交出去等于明知故犯
 //
-// 第 2 条为什么要排掉「有退避记录」的：触碰也可能来自一次**失败**的尝试
-// （铸票超时按保守方向记了触碰），而那种情形已经由指数退避管着了
-// （10 s 起、封顶 1 min）。两层闸叠在一起的话退避永远到不了第二级——
-// 满血窗口比退避上限长得多，槽位会被按住三分钟，而那不是任何人要的。
+// 第 2 条的豁免是「**此刻仍在**退避中」，不是「有过退避记录」：触碰也可能来自一次
+// 失败的尝试（铸票超时按保守方向记了触碰），那种情形归指数退避管，两层闸叠起来会让
+// 退避永远到不了第二级。但 BackoffUntil 只被写、只在**该槽位成功交付时**才清零
+// ⇒ 按「字段非零」豁免等于让这条闸对任何失败过一次的槽位永久沉默：
+// 一次铸票超时同时写 LastTouch=T 和 BackoffUntil=T+10s，T+10s 之后退避到点、
+// 闸 1 没有 LastDeliver 不管、闸 2 被豁免 ⇒ 这个槽位在它自己正在烧的满血窗口里
+// （剩下 123 秒）被当成首次接触发出去。backoffMax 只有 1 分钟，管不到窗口尾部。
+// 正在退避的槽位 LongestRestedSlot 本来就跳过，豁免它不损失任何东西。
 //
 // 而且**不拿 LastTouch 当冷却起点**：它连失败的续期都记，那会把好槽位按住几个小时
 // （同一个坑在 premintWasted 那边也写着）。
@@ -1196,11 +1386,46 @@ func (s *Scheduler) coolingSet(accountID int64, cooldown time.Duration) map[stri
 		switch {
 		case !sl.LastDeliver.IsZero() && now.Sub(sl.LastDeliver) < cooldown:
 			out[sl.Gateway] = true
-		case sl.BackoffUntil.IsZero() && !sl.LastTouch.IsZero() && now.Sub(sl.LastTouch) < types.FullWindow:
+		case !now.Before(sl.BackoffUntil) && !sl.LastTouch.IsZero() && now.Sub(sl.LastTouch) < types.FullWindow:
 			out[sl.Gateway] = true
 		}
 	}
 	return out
+}
+
+// coolingByDeliver 是闸 1 单独一问：这个槽位在 cooldown 内真的交付过票吗。
+//
+// 给「铸完之后重查一次」用（见 deliverByFreshMint）：那条路必须用铸票前的快照判闸 2，
+// 但闸 1 在铸票那几十秒里可能被同账号另一路交付写上，而快照看不见。
+func (s *Scheduler) coolingByDeliver(accountID int64, gateway string, cooldown time.Duration) bool {
+	sl, ok := s.st.Slot(accountID, gateway)
+	return ok && !sl.LastDeliver.IsZero() && s.now().Sub(sl.LastDeliver) < cooldown
+}
+
+// coolingWait 是这些候选里最早一个出冷却还要多久。一个都算不出来就回 0。
+//
+// 只看闸 1（LastDeliver）：闸 2 那 183 秒和「等多久能再取票」不是一回事——
+// 它过去之后槽位仍然可能在闸 1 里躺着几个小时，报小了等于骗客户端马上再来一发。
+func (s *Scheduler) coolingWait(accountID int64, cands []string, cooldown time.Duration) time.Duration {
+	want := make(map[string]bool, len(cands))
+	for _, name := range cands {
+		want[name] = true
+	}
+	now := s.now()
+	best := time.Duration(0)
+	for _, sl := range s.st.Slots() {
+		if sl.AccountID != accountID || !want[sl.Gateway] || sl.LastDeliver.IsZero() {
+			continue
+		}
+		left := sl.LastDeliver.Add(cooldown).Sub(now)
+		if left <= 0 {
+			continue
+		}
+		if best == 0 || left < best {
+			best = left
+		}
+	}
+	return best
 }
 
 // ---------- 槽位账本 ----------
@@ -1225,6 +1450,19 @@ func (s *Scheduler) touch(gateway string, accountID int64, at time.Time) {
 
 func (s *Scheduler) setVerdict(accountID int64, gateway, verdict string) {
 	_ = s.updateSlot(accountID, gateway, func(sl *types.Slot) { sl.LastVerdict = verdict })
+}
+
+// markUnverified 把判定写成 unknown —— **除非已经是 degraded**。
+//
+// degraded 是花一发 state-echo 换来的唯一读数，而走到这儿的那一发什么都没验
+// （verify_full_at_deliver 关着）。无条件写 unknown 会把它洗掉，
+// 于是页面上再也看不出哪个槽位真的验坏过。
+func (s *Scheduler) markUnverified(accountID int64, gateway string) {
+	_ = s.updateSlot(accountID, gateway, func(sl *types.Slot) {
+		if sl.LastVerdict != types.VerdictDegraded {
+			sl.LastVerdict = types.VerdictUnknown
+		}
+	})
 }
 
 func (s *Scheduler) sample(sm types.Sample) {
@@ -1376,10 +1614,76 @@ func (s *Scheduler) clearRenewFails(name string) {
 //
 // 两条交付路径都要记：上传者自己取（验过满血）和外部账号取（池子答不了它的满血，
 // 但它确实用掉了一张票）。目标深度靠这个读数算，漏记就等于对外服务不算供给压力。
-func (s *Scheduler) noteDeliver(accountID int64, gateway string) {
-	if err := s.st.UpdateSlot(accountID, gateway, func(sl *types.Slot) {
-		sl.LastDeliver = s.now()
-	}); err != nil {
-		s.opt.Log.Warn("记交付失败", "account", accountID, "gateway", gateway, "err", err)
+//
+// at 是**满血窗口的起算时刻**（首次接触那一发发出去的时间），不是「现在」：
+// 交付要先铸票、也许还要 echo，一个往返 20~90 s。存 now() 的话窗口内的重复请求
+// （redeliver）会按一个往后挪了一个往返的锚点算有效期——真实窗口只剩 10 秒时池子
+// 会承诺 70 秒，还把一张窗口已关的 pair 原样发出去；冷却也会跟着晚算一个往返。
+//
+// touchSelf = 这次交付自己记一次触碰（池子一发上游都没替这个消费者打，票是别人铸的，
+// 纯保守记账）。false = 触碰已经由真实请求记过了，别覆盖它。
+//
+// 三个字段必须在**同一次**读-改-写里落下：Prev* 是「这次交付之前」的两个时刻，
+// 分两次写就会把这次交付自己写进去的值当成旧值存下来，/release 还原完槽位看起来
+// 还是刚烧过的。
+func (s *Scheduler) noteDeliver(accountID int64, gateway string, at time.Time, touchSelf bool) {
+	// 走 updateSlot 这个包装（而不是直接 st.UpdateSlot）：它负责补上 AccountID /
+	// Gateway / 初始判定。这条路现在可能是一条新槽位行的**唯一**写入者
+	// （池子一发上游都没替消费者打的时候），字段补不全的话那行就没有网关名，
+	// 下一次挑选会拿它当候选、而它谁也不是。
+	_ = s.updateSlot(accountID, gateway, func(sl *types.Slot) {
+		sl.PrevDeliver, sl.PrevTouch = sl.LastDeliver, sl.LastTouch
+		if touchSelf {
+			sl.LastTouch = at
+		}
+		sl.LastDeliver = at
+	})
+}
+
+// ErrNoRelease 是「这张票没得还」：过了受理窗口、找不到、或者已经还过了。
+var ErrNoRelease = errors.New("没有可归还的交付")
+
+// Release 还原一次「票取了但一发请求都没发出去」的交付，返回还原了几个槽位。
+//
+// 为什么值得有：交付一张票要烧掉一个 (账号 × 网关)，而那是整个池子最紧的资源
+// （十几个网关、每个烧完歇几小时 ⇒ 每账号每小时只有 3.5 个左右）。消费端临时改主意、
+// 上游先一步 503、请求在它自己那头被取消——这些情形里那个槽位其实一点没动，
+// 不还回来就是白扔一个小时的供给。
+//
+// 只在交付后 DeliverTTL 内受理：过了这个窗口他很可能已经用过了，而「他说没用过」
+// 池子无从验证。**失败即安全**：没人调它时行为和以前完全一样。
+//
+// 乱报只害他自己（拿回一个其实已经烧掉的槽位，下一发就是降智的），
+// 所以和匿名那个 account 参数一样不设防（见 anonAccount）。
+func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) {
+	now := s.now()
+	n := 0
+	for _, sl := range s.st.Slots() {
+		if sl.AccountID != accountID || sl.LastDeliver.IsZero() {
+			continue
+		}
+		if now.Sub(sl.LastDeliver) >= types.DeliverTTL {
+			continue // 过了受理窗口
+		}
+		// 按票本身认，不按网关：同一个网关换过一张新 pair 之后，他手上那张已经不是
+		// 这一次交付的票了，还原就成了凭空多给一个槽位。
+		p, ok := s.st.Pair(sl.Gateway)
+		if !ok || types.CookieVersion(p.Cookie) != cookieVersion {
+			continue
+		}
+		prevDeliver, prevTouch := sl.PrevDeliver, sl.PrevTouch
+		if err := s.st.UpdateSlot(accountID, sl.Gateway, func(x *types.Slot) {
+			x.LastDeliver, x.LastTouch = prevDeliver, prevTouch
+			// 还原点用完就清掉：第二次 release 要回 409，而不是把槽位还到更早。
+			x.PrevDeliver, x.PrevTouch = time.Time{}, time.Time{}
+		}); err != nil {
+			return n, err
+		}
+		s.opt.Log.Info("归还槽位", "account", accountID, "gateway", sl.Gateway)
+		n++
 	}
+	if n == 0 {
+		return 0, ErrNoRelease
+	}
+	return n, nil
 }

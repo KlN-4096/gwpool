@@ -87,6 +87,7 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 	defer unlock()
 
 	var lastErr error
+	tries := 0
 	for try := 0; try < s.maxTries(); try++ {
 		if err := ctx.Err(); err != nil {
 			return Landing{}, err
@@ -96,6 +97,7 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 				return Landing{}, err
 			}
 		}
+		tries++
 		l, err := s.attempt(ctx, acct, r)
 		if err == nil {
 			return l, nil
@@ -113,12 +115,27 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 			}
 			return Landing{}, err
 		}
+		// **只有本地/传输层的失败值得重试**：代理抽风、连接断掉重打一发有意义，
+		// 而上游已经答过话（429、5xx、或者 200 但读不出落点）时重试换不来别的答案——
+		// 每一发都要过速率闸、都可能烧掉一个落点，而上游正在限流时连打三发
+		// 恰好是把配额往最没用的地方花。速率闸和出口熔断同理：重试三轮只是把
+		// 同一句话抄三遍。
+		if errors.Is(err, errAnswered) ||
+			errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit) {
+			break
+		}
 	}
 	if s.Log != nil {
-		s.Log.Warn("区域扫描失败", "account", acct.ID, "region", r.Key, "err", lastErr)
+		s.Log.Warn("区域扫描失败", "account", acct.ID, "region", r.Key, "tries", tries, "err", lastErr)
 	}
-	return Landing{}, fmt.Errorf("区域 %s 重试 %d 次仍失败: %w", r.Key, s.maxTries(), lastErr)
+	return Landing{}, fmt.Errorf("区域 %s 打了 %d 发仍失败: %w", r.Key, tries, lastErr)
 }
+
+// errAnswered 标记「上游已经答过话了」，调用方据此不再重试。
+//
+// 和 ErrAccountRejected 分开：那个是「这个账号不行」（要停用），这个是
+// 「这一发不行，但重试也不行」（限流、5xx、200 但没落点）。
+var errAnswered = errors.New("上游已经答复，重试换不来别的答案")
 
 // attempt 是一发：同一个 sid 先查地理再铸票，于是两者走的是同一个出口 IP。
 func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Region) (Landing, error) {
@@ -167,10 +184,10 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 		if types.RejectedByUpstream(res.Status) {
 			return Landing{}, fmt.Errorf("%w（%s）", ErrAccountRejected, msg)
 		}
-		return Landing{}, fmt.Errorf("%s，不记这个落点", msg)
+		return Landing{}, fmt.Errorf("%s，不记这个落点（%w）", msg, errAnswered)
 	}
 	if res.Gateway == "" {
-		return Landing{}, errors.New("铸票没给出落点")
+		return Landing{}, fmt.Errorf("铸票没给出落点（%w）", errAnswered)
 	}
 
 	// 记**请求过的**出口：ReachableExits 的用途是「下次想回到这个网关该怎么请求」，

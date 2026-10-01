@@ -57,6 +57,24 @@ var ErrNoLanding = errors.New("上游既没下发 __oailb，本次也没发 pair
 // 见 types.ErrNoExit），这里留个别名，免得改一串调用点。
 var ErrNoProxy = types.ErrNoExit
 
+// RateLimited 是速率闸拒绝的结构化形式。
+//
+// 为什么要个类型而不只是一句话：HTTP 那头要把「还要等多久」变成 Retry-After，
+// 而原来这个数只活在错误文案里（"%s 后腾出一发"），取出来只能去 parse 中文。
+// Unwrap 回 types.ErrRateLimited ⇒ 所有 errors.Is 的分流照旧成立。
+type RateLimited struct {
+	Region string
+	Limit  int
+	Wait   time.Duration // 腾出一发还要多久
+}
+
+func (e *RateLimited) Error() string {
+	return fmt.Sprintf("%s（区域 %s 每小时上限 %d，%s 后腾出一发）",
+		types.ErrRateLimited, e.Region, e.Limit, e.Wait)
+}
+
+func (e *RateLimited) Unwrap() error { return types.ErrRateLimited }
+
 // Client 实现 types.Minter。
 type Client struct {
 	// Proxies 是出口供应商清单，下标即 sid 前两位编的那个下标，**顺序不要在运行中变**。
@@ -134,9 +152,8 @@ func (c *Client) spend(acct string, e types.Exit) error {
 	if len(kept) >= lim {
 		c.sent[key] = kept
 		// 说出「还要等多久」：没有它的话调用方只知道被拒，不知道该等 3 秒还是 50 分钟。
-		wait := kept[0].Add(time.Hour).Sub(now).Round(time.Second)
-		return fmt.Errorf("%w（区域 %s 每小时上限 %d，%s 后腾出一发）",
-			types.ErrRateLimited, types.RegionKeyOf(e), lim, wait)
+		return &RateLimited{Region: types.RegionKeyOf(e), Limit: lim,
+			Wait: kept[0].Add(time.Hour).Sub(now).Round(time.Second)}
 	}
 	c.sent[key] = append(kept, now)
 	return nil

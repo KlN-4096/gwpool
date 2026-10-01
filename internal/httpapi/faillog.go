@@ -16,8 +16,12 @@ type deliverFail struct {
 	At        time.Time
 	AccountID int64 // 0 = 匿名调用
 	Gateway   string
-	Reason    string // 给上传者看的短句，和回给客户端的那句一致
-	Detail    string // 原始错误，只进管理页
+	// Code 是回给客户端的那个闭集错误码（cookie.go 里那九个），"release" 表示这行是
+	// 一次归还而不是失败。页面上必须看得见它：同一句人话底下可能是两种完全不同的
+	// 处置（「等几小时」和「等几十秒」长得一样）。
+	Code   string
+	Reason string // 给上传者看的短句，和回给客户端的那句一致
+	Detail string // 原始错误，只进管理页
 }
 
 // failLogKeep 留多少条。够看清「刚才那一阵」就行，不是账本。
@@ -65,7 +69,7 @@ func (l *failLog) failRows(accountID int64, n int, withDetail bool) []failRow {
 	out := make([]failRow, 0, len(fs))
 	for _, f := range fs {
 		r := failRow{At: f.At.UTC().Format("01-02 15:04:05"), AccountID: f.AccountID,
-			Gateway: f.Gateway, Reason: f.Reason}
+			Gateway: f.Gateway, Code: f.Code, Reason: f.Reason}
 		if withDetail {
 			r.Detail = f.Detail
 		}

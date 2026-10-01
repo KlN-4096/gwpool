@@ -183,11 +183,12 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
     <header class="card-head"><div><h2>取票失败记录</h2><p><code>/cookie</code> 没给出票的那几次，按时间倒序。客户端那头只会看到一个 502/503，原因在这里。</p></div></header>
     {{if .Fails}}
     <div class="table-wrap"><table>
-      <thead><tr><th>时间（UTC）</th><th>指定网关</th><th>原因</th></tr></thead>
+      <thead><tr><th>时间（UTC）</th><th>指定网关</th><th>错误码</th><th>原因</th></tr></thead>
       <tbody>
       {{range .Fails}}
         <tr><td class="mono">{{.At}}</td>
           <td class="mono">{{if .Gateway}}{{.Gateway}}{{else}}<span class="muted">未指定</span>{{end}}</td>
+          <td class="mono">{{if .Code}}{{.Code}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td>{{.Reason}}</td></tr>
       {{end}}
       </tbody>

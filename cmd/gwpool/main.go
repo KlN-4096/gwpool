@@ -65,10 +65,9 @@ func run(path string, log *slog.Logger) error {
 		Log:                   log, // 只用来记出口熔断的开合
 	}
 	pool := sched.New(st, minter, sched.Options{
-		Mode:              cfg.Mode,
-		PublicWhenSurplus: cfg.PublicWhenSurplus.Enabled,
-		MinFreeGateways:   cfg.PublicWhenSurplus.MinFreeGateways,
-		// 验满血、续期、槽位冷却三个旋钮由调度现读，改配置不用重启。
+		Mode: cfg.Mode,
+		// 验满血、续期、槽位冷却、对外开放门槛这几个旋钮由调度**现读** live，
+		// 改配置不用重启（管理页上那个按钮写的就是「保存并立即生效」）。
 		Live: live,
 		Log:  log,
 	})

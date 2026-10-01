@@ -3,6 +3,7 @@ package scan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -472,4 +473,51 @@ func TestRejectedAccountIsDisabledOnTheSpot(t *testing.T) {
 	if got.Enabled || got.DisabledReason == "" {
 		t.Fatalf("没停用或没记原因: enabled=%v reason=%q", got.Enabled, got.DisabledReason)
 	}
+}
+
+// S-3：上游已经答过话就不重试，只有本地/传输层的失败才值得再打一发。
+//
+// 429 重试三轮正是把配额往最没用的地方花：每一发都过速率闸、都可能烧掉一个落点，
+// 而上游正在限流时三发换回来的是同一句话。代理抽风则相反，重打一发有意义。
+func TestRetryOnlyForTransportFailures(t *testing.T) {
+	t.Run("上游答了 429 就不重试", func(t *testing.T) {
+		f := newFake()
+		f.statusFor["BR"] = 429
+		s, _ := newScanner(t, f)
+		if _, err := s.ScanRegion(context.Background(), acct, types.Region{
+			Key: "south-america", Exit: types.Exit{Region: "BR"}}); err == nil {
+			t.Fatal("429 该算失败")
+		}
+		if len(f.sids) != 1 {
+			t.Fatalf("429 之后还重试了，共打了 %d 发", len(f.sids))
+		}
+	})
+
+	t.Run("速率闸和出口故障也不重试", func(t *testing.T) {
+		for _, sentinel := range []error{types.ErrRateLimited, types.ErrNoExit} {
+			f := newFake()
+			f.failMint["BR"] = fmt.Errorf("包一层: %w", sentinel)
+			s, _ := newScanner(t, f)
+			if _, err := s.ScanRegion(context.Background(), acct, types.Region{
+				Key: "south-america", Exit: types.Exit{Region: "BR"}}); err == nil {
+				t.Fatal("该算失败")
+			}
+			if len(f.sids) != 1 {
+				t.Fatalf("%v 之后还重试了，共打了 %d 发", sentinel, len(f.sids))
+			}
+		}
+	})
+
+	t.Run("传输层失败照旧重试", func(t *testing.T) {
+		f := newFake()
+		f.failMint["BR"] = errors.New("socks5: connection reset by peer")
+		s, _ := newScanner(t, f)
+		if _, err := s.ScanRegion(context.Background(), acct, types.Region{
+			Key: "south-america", Exit: types.Exit{Region: "BR"}}); err == nil {
+			t.Fatal("该算失败")
+		}
+		if len(f.sids) != 2 {
+			t.Fatalf("代理抽风该重试到 MaxTries=2，只打了 %d 发", len(f.sids))
+		}
+	})
 }

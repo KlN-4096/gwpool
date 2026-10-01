@@ -1,6 +1,7 @@
 package types
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,6 +68,35 @@ func TestGatewaysForContinuousFollowsCooldown(t *testing.T) {
 	// 不能整除时要向上取整：差半张票也是不够连续供。
 	if got, want := GatewaysForContinuous(200*time.Second), 2; got != want {
 		t.Fatalf("200s ÷ 150s 算出 %d，应向上取整到 %d", got, want)
+	}
+}
+
+// cookie_version 是调用方拿来回头指名一张票的身份（exclude_versions、/release）：
+// 必须确定、定长、不泄露 cookie 本体，而且**不存状态** ⇒ 重启后仍是同一个值。
+func TestCookieVersion(t *testing.T) {
+	const cookie = "__cflb=cf-secret; __oailb=oailb-secret"
+	v := CookieVersion(cookie)
+	if len(v) != CookieVersionLen {
+		t.Fatalf("长度 %d，约定是 %d", len(v), CookieVersionLen)
+	}
+	if v != CookieVersion(cookie) {
+		t.Fatal("同一张票算出两个值，调用方的引用就对不上了")
+	}
+	if v == CookieVersion(cookie+"x") {
+		t.Fatal("两张不同的票撞上了同一个版本号")
+	}
+	for _, c := range v {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			t.Fatalf("不是小写十六进制: %q", v)
+		}
+	}
+	// 哈希，不是摘要式的「前几个字」：cookie 本体一个字都不许漏（SPEC 红线 1）。
+	if strings.Contains(v, "cf") || strings.Contains(v, "secret") {
+		t.Fatalf("版本号里带了 cookie 本体: %q", v)
+	}
+	// 没有票就没有身份：别给调用方一个「空串的哈希」让它当成真实引用。
+	if CookieVersion("") != "" {
+		t.Fatal("空 cookie 该回空串")
 	}
 }
 
