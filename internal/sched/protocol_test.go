@@ -367,6 +367,119 @@ func TestDeliveredToAnswersOwnershipNotMerePossession(t *testing.T) {
 	}
 }
 
+// 归属的判据必须是**交付出去那一张**，不是「池子现持那张」。
+//
+// 2026-10-02 复审抓到的 blocker：现持那张的号谁都查得到（自己取一张同网关的票就
+// 知道），拿它当判据 ⇒ 一次交付能换到那张 pair 在整个窗口里被无限次改写（实测 5/5）。
+// 这个用例把两者**错开**，所以两种实现的答案正好相反。
+func TestDeliveredToFollowsTheTicketHandedOutNotThePoolsCurrent(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	delete(st.gws, "unified-2")
+	delete(st.gws, "unified-3")
+	seedPairs(st, clk)
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	handedOut := types.CookieVersion(d.Cookie)
+
+	// 池子换了一张（续期、重铸都会走到这儿），交付记录不动。
+	cur, _ := st.Pair(d.Gateway)
+	cur.Cookie = cookiePrefix + d.Gateway + "-renewed"
+	if err := st.PutPair(cur); err != nil {
+		t.Fatal(err)
+	}
+	nowHeld := types.CookieVersion(cur.Cookie)
+	if nowHeld == handedOut {
+		t.Fatal("夹具没把两个号错开")
+	}
+
+	// 这一格是整条攻击链的闸，所以先查它：现持那张的号**任何人都查得到**。
+	if s.DeliveredTo(1, nowHeld) {
+		t.Fatal("认了「池子现持那张」的号 ⇒ 一次交付能换到无限次改写")
+	}
+	if !s.DeliveredTo(1, handedOut) {
+		t.Fatal("不认交付出去那一张——那消费端换了票之后就续不了了")
+	}
+}
+
+// 窗口内重复请求（redeliver）**不动**交付记录，票号也不许跟着变。
+//
+// 它刻意不记一次新交付（锚点要留在首次接触那一刻），所以票号也该原样留着。
+// 跟着变的话每一次重连都等于发一张新的续期许可，一次交付的改写次数又回到无限。
+func TestRedeliverDoesNotReissueTheRenewPermit(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	delete(st.gws, "unified-2")
+	delete(st.gws, "unified-3")
+	seedPairs(st, clk)
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	before, _ := st.Slot(1, d.Gateway)
+	// 池子换了一张，然后窗口内重连：答回来的是**新**那张（路由一样），
+	// 但交付记录里的票号得还是老那张。
+	cur, _ := st.Pair(d.Gateway)
+	cur.Cookie = cookiePrefix + d.Gateway + "-renewed"
+	if err := st.PutPair(cur); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("窗口内重连取不到票: %v", err)
+	}
+	if again.Cookie != cur.Cookie {
+		t.Fatalf("重连答回的不是池子现持那张: %q", again.Cookie)
+	}
+	after, _ := st.Slot(1, d.Gateway)
+	if after.LastDeliverVersion != before.LastDeliverVersion {
+		t.Fatalf("重连把许可换了一张: %q → %q", before.LastDeliverVersion, after.LastDeliverVersion)
+	}
+	if !after.LastDeliver.Equal(before.LastDeliver) {
+		t.Fatalf("重连挪了锚点: %v → %v", before.LastDeliver, after.LastDeliver)
+	}
+}
+
+// 归还要把票号**一起**还原。
+//
+// 留着这次交付的号，还原完它就指向一张已经不属于任何人的票，而 /pair/renew 的
+// 归属闸正按它算 ⇒ 一个已经还掉的槽位还留着一张续期许可。
+func TestReleaseRestoresTheRenewPermitToo(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	delete(st.gws, "unified-2")
+	delete(st.gws, "unified-3")
+	seedPairs(st, clk)
+	// 这个槽位有真实历史：五小时前交付过另一张票。
+	old := clk.now().Add(-5 * time.Hour)
+	st.mu.Lock()
+	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1",
+		LastTouch: old, LastDeliver: old, LastDeliverVersion: "aaaaaaaaaaaa"}
+	st.mu.Unlock()
+
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	version := types.CookieVersion(d.Cookie)
+	if !s.DeliveredTo(1, version) {
+		t.Fatal("刚交付出去的票不认")
+	}
+	if _, err := s.Release(1, version); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	// 还掉的槽位不该再留着这张票的续期许可。
+	if s.DeliveredTo(1, version) {
+		t.Fatal("槽位还掉了，续期许可还留着")
+	}
+	sl, _ := st.Slot(1, "unified-1")
+	if sl.LastDeliverVersion != "aaaaaaaaaaaa" {
+		t.Fatalf("票号没还原成交付之前那张: %q", sl.LastDeliverVersion)
+	}
+	if sl.PrevDeliverVersion != "" {
+		t.Fatalf("还原点没清掉（第二次 release 会把槽位还到更早）: %q", sl.PrevDeliverVersion)
+	}
+}
+
 // N-5：不验证的那条交付路不许把 degraded 洗成 unknown。
 // 那是花一发 state-echo 换来的唯一读数，而这一发什么都没验。
 func TestUnverifiedDeliveryKeepsDegradedVerdict(t *testing.T) {

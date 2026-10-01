@@ -692,7 +692,7 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 		// 一次读-改-写记下触碰、交付时刻和还原点。外部消费者的用量也要进账本，
 		// 否则「池子该备多深」这个目标永远看不见他们：池子对外服务得越多，
 		// 目标深度反而不涨。
-		s.noteDeliver(a.ID, sl.Gateway, at, true)
+		s.noteDeliver(a.ID, sl.Gateway, at, true, p.Cookie)
 		// 运营方靠这行判断门槛设得对不对，以及这些票到底是匿名拿走的还是
 		// 鉴权过的跨账号调用方拿走的（后者不受门槛约束）。
 		s.opt.Log.Info("无凭据交付", "upstream", upstreamID, "account", a.ID,
@@ -935,7 +935,7 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 		}
 		// 触碰、交付时刻、还原点一次写完。selfMinted 时触碰已经由那一发真实请求记过了
 		// （mintOnce 自己 touch 的），别再覆盖一遍——那会把还原点挪到这次交付之后。
-		s.noteDeliver(consumer.ID, gateway, at, !selfMinted)
+		s.noteDeliver(consumer.ID, gateway, at, !selfMinted, pair.Cookie)
 		s.markUnverified(consumer.ID, gateway)
 		exp, validFor := s.deliverWindow(at.Add(types.DeliverTTL), pair.ExpiresAt)
 		return types.Delivery{
@@ -994,7 +994,7 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 		return types.Delivery{}, fmt.Errorf("网关 %s 的满血窗口只剩 %v，不发", gateway, left.Truncate(time.Second))
 	}
 	// 触碰不用再记：铸那张活票的那一发（mintOnce）已经记过，而它就是首次接触。
-	s.noteDeliver(consumer.ID, gateway, m.firstAt, false)
+	s.noteDeliver(consumer.ID, gateway, m.firstAt, false, pair.Cookie)
 	exp, validFor := s.deliverWindow(windowEnd, pair.ExpiresAt)
 	return types.Delivery{
 		Gateway:      gateway,
@@ -1745,20 +1745,27 @@ func (s *Scheduler) clearRenewFails(name string) {
 // touchSelf = 这次交付自己记一次触碰（池子一发上游都没替这个消费者打，票是别人铸的，
 // 纯保守记账）。false = 触碰已经由真实请求记过了，别覆盖它。
 //
-// 三个字段必须在**同一次**读-改-写里落下：Prev* 是「这次交付之前」的两个时刻，
+// cookie 是这一次**真正发出去的那张票**的内容，它的 cookie_version 要一起记下来：
+// /pair/renew 的归属闸拿它当判据（见 gotThisTicket——拿「池子现持那张」当判据是
+// 假判据，谁都查得到）。
+//
+// Prev* 三个字段必须在**同一次**读-改-写里落下：它们是「这次交付之前」的那一组值，
 // 分两次写就会把这次交付自己写进去的值当成旧值存下来，/release 还原完槽位看起来
-// 还是刚烧过的。
-func (s *Scheduler) noteDeliver(accountID int64, gateway string, at time.Time, touchSelf bool) {
+// 还是刚烧过的。票号也在这一组里——漏掉它，还原完票号仍指向一张已经不在的票。
+func (s *Scheduler) noteDeliver(accountID int64, gateway string, at time.Time, touchSelf bool, cookie string) {
+	version := types.CookieVersion(cookie)
 	// 走 updateSlot 这个包装（而不是直接 st.UpdateSlot）：它负责补上 AccountID /
 	// Gateway / 初始判定。这条路现在可能是一条新槽位行的**唯一**写入者
 	// （池子一发上游都没替消费者打的时候），字段补不全的话那行就没有网关名，
 	// 下一次挑选会拿它当候选、而它谁也不是。
 	_ = s.updateSlot(accountID, gateway, func(sl *types.Slot) {
 		sl.PrevDeliver, sl.PrevTouch = sl.LastDeliver, sl.LastTouch
+		sl.PrevDeliverVersion = sl.LastDeliverVersion
 		if touchSelf {
 			sl.LastTouch = at
 		}
 		sl.LastDeliver = at
+		sl.LastDeliverVersion = version
 	})
 }
 
@@ -1796,11 +1803,15 @@ func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) 
 		if !s.gotThisTicket(sl, cookieVersion, now, types.DeliverTTL) {
 			continue
 		}
-		prevDeliver, prevTouch := sl.PrevDeliver, sl.PrevTouch
+		prevDeliver, prevTouch, prevVersion := sl.PrevDeliver, sl.PrevTouch, sl.PrevDeliverVersion
 		if err := s.st.UpdateSlot(accountID, sl.Gateway, func(x *types.Slot) {
 			x.LastDeliver, x.LastTouch = prevDeliver, prevTouch
+			// 票号跟着一起还原：留着这次交付的号，还原完它就指向一张已经不属于
+			// 任何人的票，而 /pair/renew 的归属闸正是按它算。
+			x.LastDeliverVersion = prevVersion
 			// 还原点用完就清掉：第二次 release 要回 409，而不是把槽位还到更早。
 			x.PrevDeliver, x.PrevTouch = time.Time{}, time.Time{}
+			x.PrevDeliverVersion = ""
 		}); err != nil {
 			return n, err
 		}
@@ -1815,18 +1826,24 @@ func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) 
 
 // gotThisTicket 报告这个槽位最近那次交付发出去的**就是** cookieVersion 这张票。
 //
-// 按票本身认，不按网关：同一个网关换过一张新 pair 之后，他手上那张已经不是这一次
-// 交付的票了。
+// 判据是槽位上记着的 LastDeliverVersion，**不是**「池子现持那张的号」。后者是
+// 2026-10-02 复审抓到的假判据：现持那张的号谁都查得到（自己取一张同网关的票就知道），
+// 于是一次交付能换到那张 pair 在整个窗口里被无限次改写（实测 5/5）。按交付记录算，
+// 一次交付就只换到一次改写：改写之后池子现持的已经不是它了，/pair/renew 的票号闸
+// 就把第二次挡住。
 //
 // 两个调用方共用这一份，窗口各自给：/release 用 DeliverTTL（见上），
 // /pair/renew 用 PairLifetime（见 DeliveredTo）。判据写成两份迟早走散，而走散的
 // 后果是静默的——一边认一张票是你的、另一边不认。
+//
+// 对 /release 这是**收紧**：原先比现持那张，所以「你被交付的是 V、池子换成了 W」
+// 时它既会把报 W 的人放进来（W 的号是公开可得的），也会把报 V 的真主人拒掉。
 func (s *Scheduler) gotThisTicket(sl types.Slot, cookieVersion string, now time.Time, window time.Duration) bool {
 	if sl.LastDeliver.IsZero() || now.Sub(sl.LastDeliver) >= window {
 		return false
 	}
-	p, ok := s.st.Pair(sl.Gateway)
-	return ok && types.CookieVersion(p.Cookie) == cookieVersion
+	// 零值 = 老 state.json 的记录（那时候不记票号）⇒ 一律不认，等下一次交付写上。
+	return sl.LastDeliverVersion != "" && sl.LastDeliverVersion == cookieVersion
 }
 
 // DeliveredTo 报告这张票（cookieVersion）**确实被交付给过**这一行。

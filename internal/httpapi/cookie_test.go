@@ -1207,34 +1207,6 @@ func TestRenewRefusesTicketsNotDeliveredToYou(t *testing.T) {
 	}
 }
 
-// B1 续：`public_when_surplus` 开着时**一个 header 都不带**也走得到这个端点，
-// 所以匿名那条路上归属闸同样是唯一的边界。
-func TestRenewAnonymousStillNeedsOwnership(t *testing.T) {
-	_, h, p, st, _ := rig(t, types.ModePool)
-	old := agePair(st, 10*time.Minute)
-	ver := types.CookieVersion(old.Cookie)
-	p.public = sched.PublicState{Enabled: true, Open: true}
-	req := func() *http.Request {
-		r := renewReq(ver, routeCookie("GARBAGE", "unified-142", time.Now().Add(types.OailbLifetime)))
-		r.URL.RawQuery = "account=acct-stranger"
-		return r
-	}
-	if w := do(h, req()); w.Code != http.StatusConflict {
-		t.Fatalf("匿名换别人的票却 %d，应为 409: %s", w.Code, w.Body.String())
-	}
-	if len(st.puts) != 0 {
-		t.Fatalf("匿名也落盘了: %+v", st.puts)
-	}
-	if got := st.pairs["unified-142"].Cookie; got != old.Cookie {
-		t.Fatalf("现役 cookie 被匿名请求换成了 %q", got)
-	}
-	// 另一侧：匿名解出来的占位行（夹具里没有这一行 ⇒ 0）确实拿到过这张票就受理。
-	grantTicket(p, 0)
-	if w := do(h, req()); w.Code != 200 {
-		t.Fatalf("匿名续自己的票却 %d: %s", w.Code, w.Body.String())
-	}
-}
-
 // B2 之一：`__oailb` 的 exp 必须落在上游定死的那个跨度上。
 //
 // exp−iat 恒为 OailbLifetime ⇒ 刚下发那张的 exp 必然在 now+OailbLifetime 附近。
@@ -1362,39 +1334,120 @@ func TestRenewWriteFailureIsNotSilent(t *testing.T) {
 	}
 }
 
-// 和 /release 刻意相反的两处之一：**占位行照收**。
+// **占位行一律拒**，和 /release 同一个判据。
 //
-// 归还的方向是「少记一次接触」，错了会把别人烧过的槽位还原成没碰过（见
-// types.AnonPrefix）；续期一个槽位都不碰，它改的只是「池子手上这张票的寿命」，
-// 而**归属闸**把占位行锁在它自己的票上（占位行只能续交付给那个占位行的票）。
-// 不是因为 cookie 伪造不出来——那个验不了签，见 handleRenew 头上那段。
+// 这条是 2026-10-02 复审抓到的 blocker。占位行的「归属」是**自助办下来的**：
+// acctID 来自 ?account= 这个查询参数（零证据），而 GET /cookie 会用同一个 ref
+// 现场建行、把槽位记上去 ⇒ 归属闸对它形同虚设。换个 ref 连冷却都不吃（全新占位行
+// = 零槽位历史），实测一把合法 key 能把 5/5 个网关的共享 pair 全换成垃圾。
 //
-// 同一个请求在两个端点上走出两种结果，这才是「刻意不同」的判据。
-func TestRenewAcceptsPlaceholderRowsUnlikeRelease(t *testing.T) {
+// 代价是跨账号和匿名消费端拿不到这个端点 —— 刻意的取舍，见 handleRenew 的注释。
+func TestRenewRefusesPlaceholderRows(t *testing.T) {
 	srv, h, p, st, _ := rig(t, types.ModePool)
 	old := agePair(st, 10*time.Minute)
 	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
-	p.relN = 1
-	// 占位行**真的存在**（和 TestReleaseRefusesPlaceholderRows 同一个夹具），
-	// 而且这张票确实交付给过它 —— 占位行能续的前提就是归属闸认它。
-	st.accounts = append(st.accounts, types.Account{ID: 7, Enabled: true,
-		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-friend"}})
-	grantTicket(p, 7)
+	fresh := routeCookie("ATTACKER-CONTROLLED-GARBAGE", "unified-142",
+		time.Now().Add(types.OailbLifetime))
+	// 归属闸**全放开**：这个用例要证的是占位行连归属闸都走不到。
+	// 只靠归属闸是不够的 —— 它恰好是占位行能自助办下来的那个东西。
+	p.deliveredTo = func(int64, string) bool { return true }
 
-	// 同一把 key 替**别人的**上游账号办事 ⇒ 解出来的是 anon: 占位行。
-	rel := releaseReq(ver)
-	rel.URL.RawQuery = "account=acct-friend"
-	if w := do(h, authed(rel, key)); w.Code != http.StatusConflict {
-		t.Fatalf("/release 的占位行该 409，得到 %d", w.Code)
+	// 复现实测的两步攻击链：同一个随口编的 ref 先取票、再续。
+	// 第一步**本来就该成**（匿名/跨账号取票是产品功能），拦的是第二步。
+	for _, c := range []struct {
+		name string
+		key  string
+		ref  string
+	}{
+		{"鉴权过的 key 替别人的 ref 续", key, "acct-made-up"},
+		{"换一个全新的 ref（不吃冷却）", key, "acct-another-one"},
+		{"真匿名、零 header", "", "acct-stranger"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p.public = sched.PublicState{Enabled: true, Open: true}
+			get := httptest.NewRequest("GET", "/cookie?gateway=unified-142&account="+c.ref, nil)
+			ren := renewReq(ver, fresh)
+			ren.URL.RawQuery = "account=" + c.ref
+			if c.key != "" {
+				get, ren = authed(get, c.key), authed(ren, c.key)
+			}
+			if w := do(h, get); w.Code != 200 {
+				t.Fatalf("第一步取票该成（那是产品功能），得到 %d: %s", w.Code, w.Body.String())
+			}
+			w := do(h, ren)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("占位行的续期该 409，得到 %d: %s", w.Code, w.Body.String())
+			}
+			if code := decodeFail(t, w).Error.Code; code != codeBadRequest {
+				t.Fatalf("码 %q，应为 %q", code, codeBadRequest)
+			}
+			if len(st.puts) != 0 {
+				t.Fatalf("占位行也落盘了: %+v", st.puts)
+			}
+			if got := st.pairs["unified-142"].Cookie; got != old.Cookie {
+				t.Fatalf("共享 pair 被换成了 %q", got)
+			}
+		})
 	}
-	ren := renewReq(ver, routeCookie("NEW", "unified-142", time.Now().Add(types.OailbLifetime)))
-	ren.URL.RawQuery = "account=acct-friend"
-	if w := do(h, authed(ren, key)); w.Code != 200 {
-		t.Fatalf("/pair/renew 的占位行该受理，得到 %d: %s", w.Code, w.Body.String())
+	// 另一侧：**真上传者照旧能续**（别把功能一起锁死）。
+	// 重铺一次：闸拆掉时上面那三格会真写盘，不重铺这一侧就会红在票号闸上、
+	// 让人以为是功能被锁死了。
+	st.puts = nil
+	ver = types.CookieVersion(agePair(st, 10*time.Minute).Cookie)
+	if w := do(h, authed(renewReq(ver, fresh), key)); w.Code != 200 {
+		t.Fatalf("真上传者续不了了: %d %s", w.Code, w.Body.String())
 	}
 	if len(st.puts) != 1 {
-		t.Fatalf("占位行的续期没落盘: %+v", st.puts)
+		t.Fatalf("真上传者的续期没落盘: %+v", st.puts)
+	}
+}
+
+// 一次交付只换到**一次**改写。
+//
+// 复审实测的放大系数就在这儿：原先归属闸比的是「池子现持那张的号」，而那个号谁都
+// 查得到 ⇒ 一次交付换到 5/5 次连续改写（LastDeliver 不被刷新，窗口又放宽到了
+// PairLifetime）。改成比「交付出去那一张」之后，第二发无论报哪个号都过不去：
+// 报旧号 → 票号闸（池子现持的已经不是它）；报新号 → 归属闸（交付的不是它）。
+//
+// 这里的 deliveredTo 照真实 sched 的语义建模：只认**最初交付出去**那一张。
+func TestRenewGivesOneRewritePerDelivery(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	old := agePair(st, 10*time.Minute)
+	delivered := types.CookieVersion(old.Cookie)
+	key := srv.ConsumerKeyFor(st.accounts[0])
+	p.deliveredTo = func(row int64, v string) bool { return row == 1 && v == delivered }
+
+	first := routeCookie("FIRST", "unified-142", time.Now().Add(types.OailbLifetime))
+	if w := do(h, authed(renewReq(delivered, first), key)); w.Code != 200 {
+		t.Fatalf("第一次续该成，得到 %d: %s", w.Code, w.Body.String())
+	}
+	if len(st.puts) != 1 {
+		t.Fatalf("第一次续落盘 %d 次，应为 1 次", len(st.puts))
+	}
+
+	// 第二发无论报哪个号都该被拒，而且要钉住**是哪一道闸**在说话：
+	// 两道闸互为对方的兜底，只断言「被拒了」的话删掉任一道用例都照样绿。
+	second := routeCookie("SECOND", "unified-142", time.Now().Add(types.OailbLifetime))
+	for _, c := range []struct{ name, version, want string }{
+		{"报旧号 ⇒ 票号闸", delivered, "不是池子此刻持有的那张"},
+		{"报新号 ⇒ 归属闸", types.CookieVersion(first), "不是交付给你的"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := do(h, authed(renewReq(c.version, second), key))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("状态 %d，应为 409: %s", w.Code, w.Body.String())
+			}
+			if msg := decodeFail(t, w).Error.Message; !strings.Contains(msg, c.want) {
+				t.Fatalf("拒的理由是 %q，没提到 %q —— 挡它的是别的闸", msg, c.want)
+			}
+		})
+	}
+	if len(st.puts) != 1 {
+		t.Fatalf("一次交付换到了 %d 次改写，应为 1 次: %+v", len(st.puts), st.puts)
+	}
+	if got := st.pairs["unified-142"].Cookie; got != first {
+		t.Fatalf("第二次改写还是落了盘: %q", got)
 	}
 }
 

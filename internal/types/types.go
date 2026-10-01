@@ -313,6 +313,22 @@ type Slot struct {
 	// 还原完槽位看起来还是刚烧过的。
 	PrevDeliver time.Time
 	PrevTouch   time.Time
+
+	// LastDeliverVersion 是上一次交付**真正发出去的那张票**的 cookie_version。
+	//
+	// 单有 LastDeliver（时刻）不够：/pair/renew 要回答「这张票是不是交付给你的」，
+	// 而拿「你报的号 == 池子现持那张的号」当判据是**假判据**——现持那张的号谁都查得到
+	// （自己取一张同网关的票就知道），于是一次交付能换到那张 pair 在整个窗口里被
+	// 无限次改写（2026-10-02 复审实测 5/5）。记下交付出去的那一张，一次交付就只换到
+	// 一次改写：改写之后池子现持的已经不是它了，再报同一个号就过不了票号闸。
+	//
+	// PrevDeliverVersion 和 PrevDeliver / PrevTouch 同理，归还时一起还原——
+	// 漏掉它的话 /release 还原完，票号仍指向一张已经不在的票。
+	//
+	// 老 state.json 里没有这两个键 ⇒ 零值 ⇒ 续期一律拒，直到下一次交付把它写上。
+	// 方向是安全的那边，不需要迁移。
+	LastDeliverVersion string
+	PrevDeliverVersion string
 }
 
 // Pair 是池子里一张活的路由 cookie。
