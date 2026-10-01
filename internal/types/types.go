@@ -407,6 +407,13 @@ const (
 	// 它和 OailbLifetime−PairLifetime 都是 300 s 纯属巧合，别把两件事绑在一起：
 	// 前者是「留给消费者的余量」，后者是两个 cookie 的寿命差。
 	DeliverFloor = 300 * time.Second
+	// RenewAccept 是 /pair/renew 的写放大**兜底**闸：池子手上那张还有
+	// 多于 PairLifetime−RenewAccept 的寿命（= 刚换过不到这么久）时受理但不落盘。
+	//
+	// 刻意只是兜底，不是机制：正常节奏由消费端定——它只在「取票后的第一发业务
+	// 请求」里续一次（2026-10-02 口径）。这条防的是异常：重试风暴，或者两个消费者
+	// 拿着同一张票各续一次。state.json 是整份原子重写，每次落盘都带着全部账号和槽位。
+	RenewAccept = 60 * time.Second
 )
 
 // FallbackCflbExpiry 在读不出 __cflb 死期时按实测差值从 __oailb 的 exp 倒推。

@@ -111,6 +111,10 @@ type fakeStore struct {
 	samples  []types.Sample
 	added    []types.Account
 	deleted  []int64
+	// puts 留住每一次 PairPut：「受理但不落盘」那条路唯一的判据就是这里**没有**
+	// 多出一行，光看响应（两边都是 200）区分不出来。
+	puts   []types.Pair
+	putErr error
 }
 
 func (f *fakeStore) Gateways() map[string]types.Gateway { return f.gws }
@@ -166,6 +170,16 @@ func (f *fakeStore) DeleteAccount(id int64) error {
 
 func (f *fakeStore) Samples() ([]types.Sample, error) { return f.samples, nil }
 
+// PutPair 照真实 store：按网关覆盖。putErr 是「落盘失败」那条路的旋钮。
+func (f *fakeStore) PutPair(p types.Pair) error {
+	if f.putErr != nil {
+		return f.putErr
+	}
+	f.puts = append(f.puts, p)
+	f.pairs[p.Gateway] = p
+	return nil
+}
+
 type fakeScanner struct {
 	discovery []int64
 }
@@ -194,8 +208,12 @@ func rig(t *testing.T, mode types.Mode) (*Server, http.Handler, *fakePool, *fake
 			Name: "unified-142", FirstSeenBy: 1, FirstSeenAt: now.Add(-time.Hour),
 			ReachableExits: []types.Exit{{Region: "IT"}},
 		}},
+		// CflbExpiresAt 和 ExpiresAt 一起铺：线上这两个字段永远同时有值
+		// （ExpiresAt 就是两个组件取小，几乎总是 __cflb 那个），而 pair_remaining_s
+		// 量的是 CflbExpiresAt——只铺一个就等于铺一个生产不存在的状态。
 		pairs: map[string]types.Pair{"unified-142": {
-			Gateway: "unified-142", Cookie: liveCookie, ExpiresAt: now.Add(time.Hour), MintedBy: 1,
+			Gateway: "unified-142", Cookie: liveCookie, MintedBy: 1,
+			ExpiresAt: now.Add(time.Hour), CflbExpiresAt: now.Add(time.Hour),
 		}},
 		slots: map[string]types.Slot{"1|unified-142": {
 			AccountID: 1, Gateway: "unified-142", LastTouch: now.Add(-3 * time.Hour), LastVerdict: "full",

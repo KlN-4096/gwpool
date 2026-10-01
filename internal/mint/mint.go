@@ -818,11 +818,27 @@ func parsePair(pair string) map[string]string {
 
 // pairGateway 从一张完整 cookie 头里读网关名。
 func pairGateway(pair string) string {
-	gw, _, err := parseOailb(parsePair(pair)[cookieOailb])
+	gw, _, err := PairInfo(pair)
 	if err != nil {
 		return ""
 	}
 	return gw
+}
+
+// PairInfo 读一张**外面交进来的** cookie 头里的两件事实：落点（__oailb 的 host
+// 第三段）和 __oailb 自己的硬过期。
+//
+// 导出是给 /pair/renew 用的：消费端自己续出来的那张要在收下之前验完整性
+// （落点必须就是那张票所在的网关）并算寿命，而 JWT 解析只该有这一份。
+//
+// **缺 __cflb 也报错**：钉路由的是它（见 cookieCflb），没有它那张 cookie
+// 一个网关都钉不住，收下来只会在账本上记一张假票。
+func PairInfo(pair string) (gateway string, oailbExp time.Time, err error) {
+	kv := parsePair(pair)
+	if kv[cookieCflb] == "" {
+		return "", time.Time{}, errors.New("缺 " + cookieCflb + "，这张 cookie 钉不住任何网关")
+	}
+	return parseOailb(kv[cookieOailb])
 }
 
 // parseOailb 解 __oailb 这个 ES256 JWT：网关名 = payload.host 按 "." 分割的第三段。

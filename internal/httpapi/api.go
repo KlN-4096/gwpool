@@ -73,6 +73,9 @@ type Store interface {
 	AddAccount(a types.Account) (types.Account, error)
 	// SetAccountEnabled 只翻一个 bool。给上传者自己停用/启用用。
 	SetAccountEnabled(id int64, enabled bool) error
+	// PutPair 覆盖一个网关的 pair。只有 /pair/renew 用它（消费端自己续出来的那张
+	// 交回来），所以这一层写盘只会改 Cookie 和两个死期，不碰 MintedBy。
+	PutPair(p types.Pair) error
 
 	// DeleteAccount 删掉账号连同它的槽位，不动已经铸出来的 pair。
 	DeleteAccount(id int64) error
@@ -202,6 +205,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /cookie", s.handleCookie)
 	// /release 和 /cookie 同一把钥匙、同一套 account 语义（见 handleRelease）。
 	mux.HandleFunc("POST /release", s.handleRelease)
+	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
+	mux.HandleFunc("POST /pair/renew", s.handleRenew)
 	mux.HandleFunc("GET /gateways", s.handleGateways)
 	mux.HandleFunc("POST /admin/rescan", s.handleAdminRescan)
 	mux.HandleFunc("POST /admin/accounts/{id}/delete", s.handleAdminDeleteAccount)
@@ -806,11 +811,37 @@ type deliveryResponse struct {
 	// exclude_versions=<它> 表示「别再给我这张」，/release 用它说「这张我没用」。
 	// 算法见 types.CookieVersion（确定性、不存状态、重启后仍一致）。
 	CookieVersion string `json:"cookie_version"`
+	// PairRemainingS 是**这张 pair 自己**还能活多久（秒）。
+	//
+	// 和 ValidForS 是**两件事**，一个字都不许混：ValidForS 是满血窗口的剩余
+	// （150 秒量级，过了就该换票），PairRemainingS 是路由的剩余（小时量级，
+	// 过了这张 cookie 谁都用不了）。消费端拿它决定要不要在业务请求里顺手续一发
+	// （剩不到 12 分钟才续，见 /pair/renew）。混成一个的后果是每发都续、或者永不续。
+	PairRemainingS int `json:"pair_remaining_s"`
 }
 
-func delivered(d types.Delivery) deliveryResponse {
+func (s *Server) delivered(d types.Delivery) deliveryResponse {
 	return deliveryResponse{Delivery: d, TTLIsAdvisory: true,
-		CookieVersion: types.CookieVersion(d.Cookie)}
+		CookieVersion:  types.CookieVersion(d.Cookie),
+		PairRemainingS: s.pairRemainingS(d)}
+}
+
+// pairRemainingS 算交付出去这张 pair 的剩余寿命：向下取整到秒，负数钳 0。
+//
+// 按 CflbExpiresAt 算，因为钉路由的是 __cflb（见 types.PairLifetime），续期换到的
+// 也正是它。读不出来就报 0：
+//   - 零值 = 老记录（store.Open 的兜底会填上，这里只是不去赌它填过了）；
+//   - cookie 对不上 = 池子手上那张已经不是交付出去的这张，那它的死期和消费端
+//     手里这张无关。
+//
+// 两种都报 0，而消费端把 0 和字段缺失都当成「不续」——方向是安全的那边
+// （少续一次只是少一张票，照着一个不属于这张 cookie 的死期去续才会写坏账本）。
+func (s *Server) pairRemainingS(d types.Delivery) int {
+	p, ok := s.st.Pairs()[d.Gateway]
+	if !ok || p.Cookie != d.Cookie {
+		return 0
+	}
+	return int(max(time.Until(p.CflbExpiresAt), 0) / time.Second)
 }
 
 // truthy 认几种常见的「真」写法：客户端是别人写的，别为了一个开关卡他。

@@ -365,7 +365,7 @@ func (s *Server) serveCookie(w http.ResponseWriter, r *http.Request, acctID, con
 		s.deliverFailed(w, err, acctID, consumerID, req.Gateway)
 		return
 	}
-	writeJSON(w, http.StatusOK, delivered(d))
+	writeJSON(w, http.StatusOK, s.delivered(d))
 }
 
 // noteMinRemainingTooHigh 在「只有这个参数把候选筛空了」时单说一句。
@@ -470,6 +470,174 @@ func validCookieVersion(v string) bool {
 		}
 	}
 	return true
+}
+
+// ---------- POST /pair/renew ----------
+
+// renewBodyMax 封住请求体：一个 12 字符的票号 + 一张完整 cookie 头（几百字节量级）。
+const renewBodyMax = 4 << 10
+
+// renewResponse 是续期的成功响应。
+//
+// **形状和消费端冻结**（2026-10-02，sub2api 侧先落地）：它只在 HTTP 200 **且**
+// ok 为真时认成功，并拿 cookie_version 当新票号；非 200 走统一错误体 + 闭集十一码。
+// valid_for_s 它**刻意不读**（本地那个 until 不跟着延长），这边照样给——
+// 运维对着它能一眼看出续到了多久，而且少一个字段比多一个难加回来。
+type renewResponse struct {
+	OK bool `json:"ok"`
+	// CookieVersion 是**池子此刻持有的那张**的票号。写了盘就是新那张，
+	// 跳过落盘（RenewAccept 兜底）就还是旧那张——两种情形下这个字段说的都是
+	// 池子的实际状态，而不是「你交上来的那张」。
+	CookieVersion string `json:"cookie_version"`
+	ValidForS     int    `json:"valid_for_s"`
+}
+
+// handleRenew 收下消费端**自己续出来的**那张新 cookie。
+//
+// 为什么续期由消费端做、而不是池子自己打一发：续 __cflb 要往上游发一发有效请求，
+// 池子自己发就要烧掉一个 (铸票者 × 这个网关)——那是整个池子最紧的资源。消费端反正
+// 要发业务请求，顺手在第一发里把 __oailb 摘掉，上游就补一张新 __cflb 回来
+// （实测见 SPEC 第 2 节）⇒ 这条路**零上游成本**换到一条新的路由寿命。
+//
+// 所以这个端点只做一件事：**把它交回来的那张记进账本**。不打上游、不验满血、
+// 不动槽位、不动交付记录、不动 MintedBy。
+//
+// 和 /release 刻意有两处不同：
+//   - 占位行（跨账号 / 匿名）**照收**。归还的方向是「少记一次接触」，错了会把别人
+//     烧过的槽位还原成没碰过（见 types.AnonPrefix）；续期一个槽位都不碰，它改的是
+//     「池子手上这张票的寿命」，而伪造一张 cookie 骗不到别人——下面三道闸要求它
+//     交回来的东西和池子现持的那张同票号、同网关。
+//   - verify_full_at_deliver 开着时**不拒**。/release 拒是因为那条路上的槽位是实烧的、
+//     还了就是对池子说谎；续期和槽位无关，和那个开关也就无关。
+//
+// 副作用说在明处：换掉池子手上那张之后，消费端原来那张票的 /release 会开始 409
+// （Release 按池子现持的票号认）。这是**对的**——触发续期的那一发业务请求已经把
+// 槽位烧掉了，还回去就是说谎。
+func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
+	// 鉴权在读请求体之前，和 /release 同一个顺序、同一个 whoAsks：
+	// 三个机器端点同一把钥匙，身份解析也只该有一份（对不齐的后果是静默的）。
+	_, acctID, _, ok := s.whoAsks(w, r)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, renewBodyMax))
+	if err != nil {
+		s.badRequestFor(w, http.StatusBadRequest, acctID, "请求体太大")
+		return
+	}
+	var in struct {
+		CookieVersion string `json:"cookie_version"`
+		Cookie        string `json:"cookie"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		s.badRequestFor(w, http.StatusBadRequest, acctID, "请求体不是合法 JSON")
+		return
+	}
+	version := strings.ToLower(strings.TrimSpace(in.CookieVersion))
+	if !validCookieVersion(version) {
+		s.badRequestFor(w, http.StatusBadRequest, acctID,
+			fmt.Sprintf("cookie_version 必须是 %d 位十六进制", types.CookieVersionLen))
+		return
+	}
+	// 形状：必须是完整两件，而且 __oailb 解得开（落点和它自己的硬过期都要从里面读）。
+	// 解析只借 mint.PairInfo 这一份——JWT 那段逻辑在这儿抄一遍就是第二把尺子。
+	cookie := strings.TrimSpace(in.Cookie)
+	landed, oailbExp, perr := mint.PairInfo(cookie)
+	if perr != nil {
+		// 形状描述只进日志，不抄进响应：那串里可能带着 cookie 的片段（红线 1）。
+		s.opt.Log.Info("续期交回的 cookie 形状不对", "account", acctID, "err", perr)
+		s.badRequestFor(w, http.StatusBadRequest, acctID,
+			"cookie 不是一张完整的路由 cookie（要 __cflb 和能解开的 __oailb 两件）")
+		return
+	}
+	// 票号必须对上池子**此刻持有的**那张。对不上说明这张票早被换掉了（或者从来不是
+	// 池子发的）⇒ 照它写盘就是用一个来历不明的 cookie 盖掉现役那张。
+	// 带码的 409：闭集不许留洞，而唯一不带码的那个 409 是 /release 的（见 apiError）。
+	cur, found := s.pairByVersion(version)
+	if !found {
+		s.badRequestFor(w, http.StatusConflict, acctID,
+			"这张票不是池子此刻持有的那张（已经被换过了，或者从来不是池子发的）")
+		return
+	}
+	// 完整性：交回来那张读出的落点必须就是这张票所在的网关。对不上说明消费端把两张
+	// 票搞混了——而账本一错，后面所有「这个网关还能不能交付」都跟着错。
+	// Warn 不是 Info：这是消费端的 bug，不是一次正常的拒绝。
+	if landed != cur.Gateway {
+		s.opt.Log.Warn("续期交回的 cookie 落点和票所在的网关不一致，拒收",
+			"account", acctID, "ticket_gateway", cur.Gateway, "cookie_gateway", landed)
+		s.badRequestFor(w, http.StatusBadRequest, acctID, "交回的 cookie 落在另一个网关上")
+		return
+	}
+	// 必须真的换了一张。一字不差交回来说明它那头根本没续到（上游没补发），
+	// 收下只是把同一份内容再落一次盘，而「续期成功」这个读数会变成假的。
+	if cookie == cur.Cookie {
+		s.badRequestFor(w, http.StatusBadRequest, acctID,
+			"交回的 cookie 和池子手上这张一模一样（没有续到新的）")
+		return
+	}
+	// 写放大兜底：池子手上这张本来就还有近乎整条命 ⇒ 这一发换不到寿命，只是一次
+	// 整份 state.json 的原子重写。受理但不落盘（见 types.RenewAccept——它防的是
+	// 异常而不是常态）。
+	if time.Until(cur.ExpiresAt) > types.PairLifetime-types.RenewAccept {
+		s.opt.Log.Info("续期跳过落盘：池子手上这张还几乎是满寿命",
+			"account", acctID, "gateway", cur.Gateway,
+			"left_s", int(time.Until(cur.ExpiresAt)/time.Second))
+		writeJSON(w, http.StatusOK, renewResponse{OK: true, CookieVersion: version,
+			ValidForS: int(max(time.Until(cur.ExpiresAt), 0) / time.Second)})
+		return
+	}
+	// 寿命按**新的那张**算，所以第二个参数刻意传零值而不是 cur.CflbExpiresAt：
+	// 旧 __cflb 已经被换掉了，拿它的死期当上限等于把新票钉死在旧票的死期上。
+	// 真正的 Max-Age 读不出来（它在消费端那一跳的 Set-Cookie 里，池子没见过），
+	// 所以走 RouteDeadline 的第三级兜底——两件是同一个响应下发的，差值是实测的。
+	route, cflb := types.MintResult{PairExpires: oailbExp}.RouteDeadline(time.Time{})
+	// 续不出寿命就不收：交回来一张比现持那张死得更早的 cookie（过期的、或者消费端
+	// 拿错了一张旧的），收下就是自己把池子最紧的供给换短。信任边界就在这一层。
+	if !route.After(cur.ExpiresAt) {
+		s.opt.Log.Warn("续期交回的 cookie 活不过池子手上那张，拒收",
+			"account", acctID, "gateway", cur.Gateway,
+			"new_left_s", int(time.Until(route)/time.Second),
+			"cur_left_s", int(time.Until(cur.ExpiresAt)/time.Second))
+		s.badRequestFor(w, http.StatusBadRequest, acctID,
+			"交回的 cookie 比池子手上这张死得更早（没有续到寿命）")
+		return
+	}
+	// 只改 Cookie 和两个死期。从 cur 拷过来是刻意的：Gateway 和 MintedBy 原样留着
+	// （铸它的还是那个号，续期没换铸票者），将来 Pair 加字段也不会在这儿被抹掉。
+	next := cur
+	next.Cookie, next.ExpiresAt, next.CflbExpiresAt = cookie, route, cflb
+	if err := s.st.PutPair(next); err != nil {
+		s.opt.Log.Error("续期落盘失败", "account", acctID, "gateway", cur.Gateway, "err", err)
+		writeFail(w, http.StatusInternalServerError,
+			apiError{Code: codeMintFailed, Message: "续期写盘失败"})
+		return
+	}
+	left := int(max(time.Until(route), 0) / time.Second)
+	s.noteRenew(acctID, cur.Gateway, left)
+	writeJSON(w, http.StatusOK, renewResponse{OK: true,
+		CookieVersion: types.CookieVersion(cookie), ValidForS: left})
+}
+
+// pairByVersion 找池子此刻持有的、票号等于 version 的那张。
+//
+// 网关名不在请求里（消费端手上只有票号和 cookie 本体），所以只能扫一遍。
+// 网关数是十几个量级，为它建一份索引是白开销，而且那是第二份要和账本同步的状态。
+func (s *Server) pairByVersion(version string) (types.Pair, bool) {
+	for _, p := range s.st.Pairs() {
+		if types.CookieVersion(p.Cookie) == version {
+			return p, true
+		}
+	}
+	return types.Pair{}, false
+}
+
+// noteRenew 把续期记进那张卡片，和归还同一个理由（见 noteRelease）：
+// 「续期在不在生效」和取票失败是同一个问题的两面，分两张表只会让人少看一张。
+// **票号和 cookie 本体一个字都不进去**——那张卡片是给页面看的。
+func (s *Server) noteRenew(accountID int64, gateway string, leftS int) {
+	s.opt.Log.Info("续期收下新 cookie", "account", accountID, "gateway", gateway, "left_s", leftS)
+	s.fails.add(deliverFail{At: time.Now(), AccountID: accountID, Gateway: gateway,
+		Code: "renew", Reason: fmt.Sprintf("续到还剩 %d 秒", leftS)})
 }
 
 // noteRelease 把归还也记进那张卡片。
