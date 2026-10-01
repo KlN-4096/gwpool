@@ -1,18 +1,15 @@
 {{define "content"}}
-<h1>需要访问码</h1>
-<p class="lead">这个池子不对外公开。有访问码就填进来，没有就请回。</p>
-
-<section class="card">
-  {{if .Wrong}}<p class="err">访问码不对。</p>{{end}}
-  <form method="get" action="/">
-    <label><span>访问码</span>
-      <input name="k" type="password" autocomplete="off" autofocus required>
-    </label>
-    <div class="actions">
+<div class="gate">
+  <div class="card"><div class="card-body">
+    <div class="lock"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+    <h1>需要访问码</h1>
+    <p class="muted">本站点需要访问码才能浏览，请输入管理员提供的访问码。</p>
+    {{if .Wrong}}<p class="err">访问码不正确或已更换，请重新输入。</p>{{end}}
+    <form method="get" action="/">
+      <label>访问码<input name="k" type="password" autocomplete="off" autofocus required></label>
       <button type="submit" class="primary">进入</button>
-    </div>
-  </form>
-  <p class="foot">填对以后会在这台浏览器上记住，不用每次都填；
-  链接后面直接带 <code>?k=…</code> 也能进，认完会立刻把它从地址栏里去掉。</p>
-</section>
+    </form>
+    <p class="foot">验证通过后，浏览器会记住访问码 30 天。也可以直接打开带有 <code>?k=…</code> 参数的链接进入。</p>
+  </div></div>
+</div>
 {{end}}

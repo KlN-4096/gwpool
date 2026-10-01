@@ -1,149 +1,252 @@
 {{define "content"}}
-<h1>全量记录</h1>
-<p class="lead">点数字卡片跳到对应表格。</p>
+<div class="page-head">
+  <h1>管理后台</h1>
+  <p>代理、账号、网关与采样数据的实时快照，刷新页面即可更新。</p>
+</div>
 
-<nav class="stats">
-  <a class="stat" href="#proxies"><b>{{len .Proxies}}</b><span>出口</span></a>
-  <a class="stat" href="#accounts"><b>{{len .Accounts}}</b><span>账号</span></a>
-  <a class="stat" href="#gateways"><b>{{len .Gateways}}</b><span>网关</span></a>
-  <a class="stat" href="#pairs"><b>{{len .Pairs}}</b><span>活 pair</span></a>
-  <a class="stat" href="#slots"><b>{{len .Slots}}</b><span>槽位</span></a>
-  <a class="stat" href="#samples"><b>{{.TotalSamples}}</b><span>样本</span></a>
+<nav class="tabs" data-tabs hidden data-js>
+  <a href="#overview">概览</a>
+  <a href="#proxies">出口代理 <span class="n">{{len .Proxies}}</span></a>
+  <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
+  <a href="#gateways">网关 <span class="n">{{len .Gateways}}</span></a>
+  <a href="#pairs">路由 Cookie <span class="n">{{len .Pairs}}</span></a>
+  <a href="#slots">账号×网关 <span class="n">{{len .Slots}}</span></a>
+  <a href="#samples">采样记录 <span class="n">{{.TotalSamples}}</span></a>
+  <a href="#fails">取票失败 <span class="n">{{len .Fails}}</span></a>
+  <a href="#config">配置</a>
 </nav>
 
-<section class="card" id="proxies">
-  <h2>出口代理</h2>
-  {{if .Proxies}}
-  <div class="scroll"><table>
-    <thead><tr><th>名字</th><th>类型</th><th>地址</th><th>用户名</th><th>状态</th>
-      <th>粘性</th><th class="num">连续失败</th><th>熔断剩余</th><th class="num">在用 sid</th></tr></thead>
-    <tbody>
-    {{range .Proxies}}
-      <tr>
-        <td>{{.Name}}</td>
-        <td class="mono">{{.Kind}}</td>
-        <td class="mono text">{{.Host}}</td>
-        <td class="mono muted">{{.UserMask}}</td>
-        <td>{{if .Enabled}}<span class="badge ok">启用</span>{{else}}<span class="badge">停用</span>{{end}}</td>
-        <td>{{if .Sticky}}<span class="badge ok">粘性</span>{{else}}<span class="badge" title="每连接换 IP，铸票与 state-echo 配不成同一个出口，扫描用不上它">无</span>{{end}}</td>
-        <td class="num {{if .Fails}}bad{{end}}">{{.Fails}}</td>
-        <td class="mono">{{if .SkipLeft}}<span class="badge bad">{{.SkipLeft}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
-        <td class="num">{{.BoundSIDs}}</td>
-      </tr>
+<section id="tab-overview">
+  <div class="kpis wide">
+    <a class="kpi" href="#proxies"><b>{{len .Proxies}}</b><span>出口代理</span><small>系统访问上游时使用的代理出口</small><small class="facets" data-facets-of="t-proxies"></small></a>
+    <a class="kpi" href="#accounts"><b>{{len .Accounts}}</b><span>账号</span><small>已登记的账号，有凭据的账号参与探测</small><small class="facets" data-facets-of="t-accounts"></small></a>
+    <a class="kpi" href="#gateways"><b>{{len .Gateways}}</b><span>网关</span><small>探测过程中发现的上游网关</small></a>
+    <a class="kpi" href="#pairs"><b>{{len .Pairs}}</b><span>路由 Cookie</span><small>各网关当前持有的路由 Cookie</small><small class="facets" data-facets-of="t-pairs"></small></a>
+    <a class="kpi" href="#slots"><b>{{len .Slots}}</b><span>账号×网关</span><small>每个账号在各网关上的使用与校验状态</small><small class="facets" data-facets-of="t-slots"></small></a>
+    <a class="kpi" href="#samples"><b>{{.TotalSamples}}</b><span>采样记录</span><small>探测请求明细（统计范围为最近 {{len .Samples}} 条）</small><small class="facets" data-facets-of="t-samples"></small></a>
+  </div>
+</section>
+
+<section id="tab-proxies">
+  <div class="card">
+    <header class="card-head"><div><h2>出口代理</h2><p>在 <code>config.json</code> 的 <code>proxies</code> 中配置，修改后需要重启服务才能生效。</p></div></header>
+    {{if .Proxies}}
+    <div class="table-wrap"><table id="t-proxies" data-grid data-facets="ok:正常:ok|skip:暂停中:warn|off:已停用" data-placeholder="搜索名称或地址">
+      <thead><tr><th>名称</th><th>类型</th><th>地址</th><th>用户名</th><th>状态</th><th>粘性会话</th>
+        <th class="num">连续失败</th><th>暂停剩余</th><th class="num">绑定会话</th></tr></thead>
+      <tbody>
+      {{range .Proxies}}
+        <tr data-facet="{{if not .Enabled}}off{{else if .SkipLeft}}skip{{else}}ok{{end}}">
+          <td>{{.Name}}</td>
+          <td class="mono">{{.Kind}}</td>
+          <td class="mono text">{{.Host}}</td>
+          <td class="mono muted">{{.UserMask}}</td>
+          <td>{{if .Enabled}}<span class="badge ok">启用</span>{{else}}<span class="badge">已停用</span>{{end}}</td>
+          <td>{{if .Sticky}}<span class="badge ok" title="同一会话固定使用同一个出口 IP">支持</span>{{else}}<span class="badge" title="不能固定出口 IP，每次请求都可能更换">不支持</span>{{end}}</td>
+          <td class="num {{if .Fails}}bad{{end}}">{{.Fails}}</td>
+          <td>{{if .SkipLeft}}<span class="badge warn">{{.SkipLeft}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="num">{{.BoundSIDs}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">没有配出口代理，或者服务端没把状态接进来。</p>
     {{end}}
-    </tbody>
-  </table></div>
-  <p class="foot"><strong>密码一个字节都不在这一页上</strong>，用户名也只给前 4 个字符
-  （novproxy 的用户名里嵌着账号标识）。要改配置只能编辑服务器上的
-  <code>config.json</code> 的 <code>proxies</code> 段，然后重启服务——
-  清单在启动时读一次，运行中不重载。<br>
-  「连续失败」到 3 就熔断那条供应商，按 30s 起指数退避、上限 10 分钟。
-  <strong>只有连不上代理本身或认证被拒才算失败</strong>；隧道建起来又被出口节点掐断的
-  不记在供应商头上（住宅池约一成的会话会摸到死节点，记进去会一次把整条供应商熔断掉）。<br>
-  「在用 sid」= 此刻钉在这条出口上的会话数。粘性窗口过了自动清掉。</p>
-  {{else}}
-  <p class="muted">没有配出口代理，或者服务端没把状态接进来。</p>
+    <p class="foot">请求失败的代理会被暂时跳过，到期后自动恢复。粘性会话指同一会话固定使用同一个出口 IP，目前只有 novproxy 类型支持；绑定会话是当前固定在该代理上的会话数。</p>
+  </div>
+</section>
+
+<section id="tab-accounts">
+  <div class="card">
+    <header class="card-head"><div><h2>账号</h2><p>没有凭据的账号（例如不带 key 调用时自动登记的调用方）只接收分发，不参与探测。</p></div></header>
+    {{if .Accounts}}
+    <div class="table-wrap"><table id="t-accounts" data-grid data-facets="on:启用:ok|off:已停用:bad|ext:无凭据" data-placeholder="搜索名称、套餐或上游账号 ID">
+      <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>凭据</th><th>上游账号 ID</th>
+        <th class="num">请求数</th><th class="num">发现网关</th><th>添加时间（UTC）</th><th data-nosort>账号页</th><th data-nosort></th></tr></thead>
+      <tbody>
+      {{range .Accounts}}
+        <tr data-facet="{{if not .Enabled}}off{{else if not .HasCreds}}ext{{else}}on{{end}}">
+          <td class="num">{{.ID}}</td>
+          <td class="text">{{.Label}}{{if not .Enabled}} <span class="badge bad">已停用</span>{{if .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}{{end}}</td>
+          <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else}}{{.Plan}}{{end}}</td>
+          <td>{{if .HasCreds}}<span class="badge ok">有</span>{{else}}<span class="badge">无</span>{{end}}</td>
+          <td class="mono text">{{.Upstream}}</td>
+          <td class="num">{{.Requests}}</td>
+          <td class="num">{{.Found}}</td>
+          <td class="mono">{{.Since}}</td>
+          <td>{{if .ViewToken}}<a href="/a/{{.ViewToken}}">打开</a>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td><form method="post" action="/admin/accounts/{{.ID}}/delete"
+                onsubmit="return confirm('确定删除账号 {{.ID}}（{{.Label}}）？此操作无法撤销。')">
+            <button class="danger sm" type="submit">删除</button></form></td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">还没有账号。</p>
+    {{end}}
+  </div>
+</section>
+
+<section id="tab-gateways">
+  <div class="card">
+    <header class="card-head"><div><h2>网关</h2><p>探测过程中发现的全部网关，以及能连通各网关的出口地区。</p></div></header>
+    {{if .Gateways}}
+    <div class="table-wrap"><table id="t-gateways" class="tiles gw" data-grid data-natsort data-size="240"
+        data-placeholder="搜索网关或出口地区">
+      <thead><tr><th>网关</th><th class="num">首次发现账号</th><th>首次发现时间（UTC）</th><th>可达出口</th></tr></thead>
+      <tbody>
+      {{range .Gateways}}
+        <tr title="{{.Name}}　首次发现 账号 {{.FirstSeenBy}}　{{.FirstSeen}} UTC　可达出口 {{.Exits}}">
+          <td class="mono">{{.Name}}</td><td>{{.FirstSeenBy}}</td>
+          <td class="mono">{{.FirstSeen}}</td><td class="mono">{{.Exits}}</td></tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">尚未发现网关。</p>
+    {{end}}
+  </div>
+</section>
+
+<section id="tab-pairs">
+  <div class="card">
+    <header class="card-head"><div><h2>路由 Cookie</h2><p>各网关当前持有的路由 Cookie。Cookie 内容不在页面显示，只能通过 <code>/cookie</code> 接口获取。</p></div></header>
+    {{if .Pairs}}
+    <div class="table-wrap"><table id="t-pairs" data-grid data-natsort data-facets="live:有效:ok|expired:已过期" data-placeholder="搜索网关">
+      <thead><tr><th>网关</th><th>剩余有效期</th><th class="num">获取账号</th></tr></thead>
+      <tbody>
+      {{range .Pairs}}
+        <tr data-facet="{{if eq .Left "已过期"}}expired{{else}}live{{end}}">
+          <td class="mono">{{.Gateway}}</td>
+          <td>{{if eq .Left "已过期"}}<span class="muted">已过期</span>{{else}}{{.Left}}{{end}}</td>
+          <td class="num">{{.MintedBy}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">暂无路由 Cookie。</p>
+    {{end}}
+  </div>
+</section>
+
+<section id="tab-slots">
+  <div class="card">
+    <header class="card-head"><div><h2>账号×网关</h2><p>每个账号在每个网关上的最近使用时间、校验结果和退避状态。</p></div></header>
+    {{if .Slots}}
+    <div class="table-wrap"><table id="t-slots" data-grid data-natsort data-facets="full:正常:ok|degraded:降级:bad|unknown:未知" data-placeholder="搜索账号或网关">
+      <thead><tr><th class="num">账号</th><th>网关</th><th>距上次使用</th><th>最近校验</th><th>退避剩余</th></tr></thead>
+      <tbody>
+      {{range .Slots}}
+        <tr data-facet="{{.Verdict}}">
+          <td class="num">{{.AccountID}}</td>
+          <td class="mono">{{.Gateway}}</td>
+          <td>{{.Rested}}</td>
+          <td>{{if eq .Verdict "full"}}<span class="badge ok" title="full">正常</span>
+            {{- else if eq .Verdict "degraded"}}<span class="badge bad" title="degraded">降级</span>
+            {{- else if eq .Verdict "unknown"}}<span class="badge" title="unknown">未知</span>
+            {{- else if .Verdict}}<span class="badge">{{.Verdict}}</span>
+            {{- else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .Backoff}}<span class="badge warn">{{.Backoff}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">暂无数据。</p>
+    {{end}}
+    <p class="foot">退避剩余：校验未通过或请求失败后，该账号在这个网关上暂停使用的剩余时间。</p>
+  </div>
+</section>
+
+<section id="tab-samples">
+  <div class="card">
+    <header class="card-head"><div><h2>采样记录</h2><p>探测请求明细，按时间倒序排列。显示最近 {{len .Samples}} 条，共 {{.TotalSamples}} 条。</p></div></header>
+    {{if .Samples}}
+    <div class="table-wrap"><table id="t-samples" data-grid data-facets="ok:成功:ok|err:失败:bad" data-placeholder="搜索地区、ASN 或网关">
+      <thead><tr><th>时间（UTC）</th><th class="num">账号</th><th>区域</th><th>出口位置</th><th>ASN</th><th>网关</th><th class="num">HTTP</th></tr></thead>
+      <tbody>
+      {{range .Samples}}
+        <tr data-facet="{{if eq .Status 200}}ok{{else}}err{{end}}">
+          <td class="mono">{{.At}}</td>
+          <td class="num">{{.AccountID}}</td>
+          <td class="mono">{{.Region}}</td>
+          <td>{{.Where}}</td>
+          <td class="mono">{{.ASN}}</td>
+          <td class="mono">{{.Gateway}}</td>
+          <td class="num {{if ne .Status 200}}bad{{end}}">{{if .Status}}{{.Status}}{{else}}<span title="未收到响应（网络错误或超时）">—</span>{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">暂无采样记录。</p>
+    {{end}}
+  </div>
+</section>
+
+<section id="tab-fails">
+  <div class="card">
+    <header class="card-head"><div><h2>取票失败</h2><p><code>/cookie</code> 没给出票的那几次，按时间倒序。客户端那头只会看到一个 502/503，原因在这里。</p></div></header>
+    {{if .Fails}}
+    <div class="table-wrap"><table id="t-fails" data-grid data-placeholder="搜索原因或网关">
+      <thead><tr><th>时间（UTC）</th><th class="num">账号</th><th>指定网关</th><th>原因</th><th>原始错误</th></tr></thead>
+      <tbody>
+      {{range .Fails}}
+        <tr><td class="mono">{{.At}}</td>
+          <td class="num">{{if .AccountID}}{{.AccountID}}{{else}}<span class="muted" title="没带 key 的匿名取用">匿名</span>{{end}}</td>
+          <td class="mono">{{if .Gateway}}{{.Gateway}}{{else}}<span class="muted">未指定</span>{{end}}</td>
+          <td>{{.Reason}}</td>
+          <td class="mono text muted">{{.Detail}}</td></tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">最近没有失败记录。</p>
+    {{end}}
+    <p class="foot">进程内存态，只留最近 200 条，重启清零。上传者自己那一页只给「原因」，不给原始错误。</p>
+  </div>
+</section>
+
+<section id="tab-config">
+  {{with .Config}}
+  <div class="card">
+    <header class="card-head"><div><h2>配置</h2>
+      {{if .ReadOnly}}<p>这个实例没接配置文件，这一节只能看不能改。</p>
+      {{else}}<p>改完<strong>立即生效，不用重启</strong>。配置文件：<code>{{.Path}}</code></p>{{end}}
+    </div></header>
+    <div class="card-body">
+      {{if .Note}}<div class="note info"><p>{{.Note}}</p></div>{{end}}
+      {{if .Err}}<p class="err" role="alert">{{.Err}}</p>{{end}}
+      {{if not .ReadOnly}}
+      <form method="post" action="/admin/config">
+        <fieldset>
+          <legend>模型 <span class="hint">勾中的就是候选，<strong>第一个是默认</strong>；顺序按当前配置里的来</span></legend>
+          <div class="choices">
+          {{range .AllModels}}
+            <label class="choice"><input type="checkbox" name="models" value="{{.Name}}"{{if .Selected}} checked{{end}}>
+              <span class="mono">{{.Name}}</span></label>
+          {{end}}
+          </div>
+        </fieldset>
+        <div class="fields">
+          <label>别的模型名 <span class="hint">上面没列的手打，逗号或换行分隔</span>
+            <input name="models_extra" autocomplete="off" spellcheck="false"></label>
+          <label>每账号每小时上游请求上限 <span class="hint">0 = 用默认值 54。安全阀，不是吞吐量目标</span>
+            <input name="upstream_per_hour" inputmode="numeric" value="{{.UpstreamPerHour}}"></label>
+          <label>对外开放门槛 <span class="hint">空闲网关少于这个数就只服务上传者</span>
+            <input name="min_free_gateways" inputmode="numeric" value="{{.MinFreeGateways}}"></label>
+        </div>
+        <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
+          <span>票富裕时允许没上传凭据的人取</span></label>
+        <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>
+      </form>
+      {{end}}
+    </div>
+    <p class="foot"><strong>出口代理、密钥、监听地址不在这儿改。</strong>代理里是 socks 口令，放进网页表单等于把凭据搬进浏览器和 HTTP 日志；而且 <code>proxies</code> 的下标编进了 sid，运行中换顺序会让已经发出去的 sid 指向另一条出口。那几项改配置文件 + 重启。</p>
+  </div>
   {{end}}
-</section>
-
-<section class="card" id="accounts">
-  <h2>账号</h2>
-  <div class="scroll"><table>
-    <thead><tr><th>ID</th><th>备注</th><th>套餐</th><th>凭据</th><th>上游标识</th>
-      <th class="num">请求</th><th class="num">首发现</th><th>托管于（UTC）</th><th>查看链接</th>
-      <th>操作</th></tr></thead>
-    <tbody>
-    {{range .Accounts}}
-      <tr>
-        <td>{{.ID}}</td>
-        <td class="text">{{.Label}}{{if not .Enabled}} <span class="badge bad">已停用</span>{{if .DisabledReason}}<div class="muted mono">{{.DisabledReason}}</div>{{end}}{{end}}</td>
-        <td>{{if eq .Plan "free"}}<span class="badge bad">free</span>{{else}}{{.Plan}}{{end}}</td>
-        <td>{{if .HasCreds}}<span class="badge ok">有</span>{{else}}<span class="badge">无（只回报）</span>{{end}}</td>
-        <td class="mono text">{{.Upstream}}</td>
-        <td class="num">{{.Requests}}</td><td class="num">{{.Found}}</td>
-        <td class="mono">{{.Since}}</td>
-        <td class="mono">{{if .ViewToken}}<a href="/a/{{.ViewToken}}">/a/…</a>{{else}}<span class="muted">—</span>{{end}}</td>
-        <td>
-          <form method="post" action="/admin/accounts/{{.ID}}/delete"
-                onsubmit="return confirm('删掉账号 {{.ID}}（{{.Label}}）？凭据和它的槽位都会没，已经铸出来的 pair 留着。')">
-            <button class="danger" type="submit">删除</button>
-          </form>
-        </td>
-      </tr>
-    {{else}}
-      <tr><td colspan="10" class="muted">还没有账号。</td></tr>
-    {{end}}
-    </tbody>
-  </table></div>
-</section>
-
-<section class="card" id="gateways">
-  <h2>网关</h2>
-  <div class="scroll"><table>
-    <thead><tr><th>网关</th><th>首次发现者</th><th>首次发现（UTC）</th><th>可达出口</th></tr></thead>
-    <tbody data-natsort>
-    {{range .Gateways}}
-      <tr><td class="mono">{{.Name}}</td><td>{{.FirstSeenBy}}</td>
-        <td class="mono">{{.FirstSeen}}</td><td class="mono text">{{.Exits}}</td></tr>
-    {{else}}
-      <tr><td colspan="4" class="muted">还没有网关。</td></tr>
-    {{end}}
-    </tbody>
-  </table></div>
-</section>
-
-<section class="card" id="pairs">
-  <h2>活 pair</h2>
-  <div class="scroll"><table>
-    <thead><tr><th>网关</th><th>剩余</th><th>铸它的账号</th></tr></thead>
-    <tbody data-natsort>
-    {{range .Pairs}}
-      <tr><td class="mono">{{.Gateway}}</td>
-        <td>{{if eq .Left "已过期"}}<span class="muted">已过期</span>{{else}}{{.Left}}{{end}}</td>
-        <td>{{.MintedBy}}</td></tr>
-    {{else}}
-      <tr><td colspan="3" class="muted">池里没有 pair。</td></tr>
-    {{end}}
-    </tbody>
-  </table></div>
-  <p class="foot">cookie 本体不在任何页面上出现，只能经 <code>/cookie</code> 下发。</p>
-</section>
-
-<section class="card" id="slots">
-  <h2>槽位（账号 × 网关）</h2>
-  <div class="scroll"><table>
-    <thead><tr><th>账号</th><th>网关</th><th>歇了</th><th>上次判定</th><th>退避剩余</th></tr></thead>
-    <tbody data-natsort>
-    {{range .Slots}}
-      <tr><td>{{.AccountID}}</td><td class="mono">{{.Gateway}}</td>
-        <td>{{.Rested}}</td>
-        <td>{{if eq .Verdict "full"}}<span class="badge ok">full</span>
-          {{- else if eq .Verdict "degraded"}}<span class="badge bad">degraded</span>
-          {{- else if .Verdict}}<span class="badge">{{.Verdict}}</span>
-          {{- else}}<span class="muted">—</span>{{end}}</td>
-        <td>{{if .Backoff}}<span class="badge warn">{{.Backoff}}</span>{{else}}<span class="muted">—</span>{{end}}</td></tr>
-    {{else}}
-      <tr><td colspan="5" class="muted">还没有槽位记录。</td></tr>
-    {{end}}
-    </tbody>
-  </table></div>
-</section>
-
-<section class="card" id="samples">
-  <div class="card-head"><h2>样本</h2><span>最近 {{len .Samples}} / {{.TotalSamples}} 条，新的在上面</span></div>
-  <div class="scroll"><table>
-    <thead><tr><th>时间（UTC）</th><th>账号</th><th>请求出口</th>
-      <th>实际观测</th><th>ASN</th><th>落点</th><th class="num">HTTP</th></tr></thead>
-    <tbody>
-    {{range .Samples}}
-      <tr><td class="mono">{{.At}}</td><td>{{.AccountID}}</td>
-        <td class="mono">{{.Region}}</td><td>{{.Where}}</td><td class="mono">{{.ASN}}</td>
-        <td class="mono">{{.Gateway}}</td>
-        <td class="num {{if ne .Status 200}}bad{{end}}">{{if .Status}}{{.Status}}{{else}}<span title="没拿到 HTTP 响应（网络或代理失败）">—</span>{{end}}</td></tr>
-    {{else}}
-      <tr><td colspan="7" class="muted">还没有样本。</td></tr>
-    {{end}}
-    </tbody>
-  </table></div>
 </section>
 {{end}}
