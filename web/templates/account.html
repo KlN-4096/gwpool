@@ -1,0 +1,157 @@
+{{define "content"}}
+<h1>{{.Label}}{{if .Enabled}}<span class="badge ok">启用中</span>{{else}}<span class="badge bad">已停用</span>{{end}}</h1>
+<p class="lead">{{if .Plan}}套餐 {{.Plan}} · {{end}}托管于 {{.Since}} UTC</p>
+
+<div class="stats">
+  <div class="stat"><b>{{.Requests}}</b><span>用你的凭据发过的请求</span></div>
+  <div class="stat ok"><b>0</b><span>累计输出 token</span></div>
+  <div class="stat"><b>{{.NewGateways}}</b><span>为池子发现的新网关</span></div>
+  <div class="stat"><b class="mono">{{.Model}}</b><span>只用过的模型</span></div>
+</div>
+
+<section class="card">
+  <p>本服务用你的凭据发起了 <strong>{{.Requests}} 次请求</strong>，全部是 <code>ping</code>
+  （<code>reasoning.effort={{.Effort}}</code>），累计输出 <strong>0 token</strong>，
+  只用过 <code>{{.Model}}</code>，为池子发现了 <strong>{{.NewGateways}} 个新网关</strong>。</p>
+  <p class="muted">每一次请求都只发一个字 <code>ping</code>、只读响应头就断开，
+  从不读正文、不保存会话（<code>store=false</code>）。下面是逐条流水，自己核对。</p>
+</section>
+
+<section class="card">
+  <h2>你的 key</h2>
+  {{if .ConsumerKey}}
+  {{if not .Enabled}}<p class="err">这个账号已停用，下面这把 key 已经失效。</p>{{end}}
+  <p>拿它换 pair。<strong>这是机器凭证，别贴进聊天框、别进 URL。</strong></p>
+  <div class="copyrow"><pre class="mono" id="key">{{.ConsumerKey}}</pre><button type="button" data-copy="#key" hidden data-js>复制</button></div>
+  {{else}}
+  <p class="muted">服务端还没配派生密钥，暂时发不出 key。找运营方。</p>
+  {{end}}
+
+  <h3>本页地址</h3>
+  <p>本页地址本身也要保密：有本页地址的人就能看到本页全部内容{{if .ConsumerKey}}，包括这把 key{{end}}。
+  同时也要<strong>存好</strong>（书签或密码管理器），丢了只能找运营方。</p>
+  <div class="copyrow" hidden data-js><pre class="mono" id="page-url"></pre><button type="button" data-copy="#page-url">复制</button></div>
+</section>
+
+{{if .ConsumerKey}}
+<section class="card">
+  <h2>怎么用</h2>
+  <p>池子只做一件事：给你一张<strong>路由 cookie</strong>。你拿它去打你自己的
+  Codex 请求，上游就会把你落到那张票对应的网关上。和你用什么客户端无关。</p>
+
+  <div class="note">
+    <p><strong>端点是站点根地址的 <code>/cookie</code>，不是本页地址。</strong></p>
+    <p>本页地址（<code>/a/&lt;一长串&gt;</code>）是你的凭证页，不是 API。把它当 base URL
+    拼出来的是 <code>/a/&lt;一长串&gt;/cookie</code>，只会回 404。</p>
+    <p class="mono">base URL = <span class="origin">https://&lt;本站&gt;</span>　←　到域名为止，后面什么都不带</p>
+  </div>
+
+  <h3>一、取票</h3>
+  <pre class="mono cmd">curl -H 'Authorization: Bearer &lt;你的 key&gt;' <span class="origin">https://&lt;本站&gt;</span>/cookie</pre>
+  <p class="muted">回的是 JSON：</p>
+  <pre class="mono cmd">{
+  "gateway":       "unified-142",   // 落到哪个网关，自己记日志用
+  "cookie":        "__cflb=…; __oailb=…",  // ← 整段原样放进请求头
+  "expires_at":    "2026-10-01T12:44:40Z", // 这张票的硬过期，上游定死 65 分钟
+  "valid_for_s":   150,             // 建议用多久，**不是承诺**
+  "verified_full": true,            // 池子刚验过它是满血的
+  "ttl_is_advisory": true
+}</pre>
+
+  <h3>二、用票</h3>
+  <p>把 <code>cookie</code> 整段塞进你发给上游的 <code>Cookie</code> 请求头，别的什么都不用改：</p>
+  <pre class="mono cmd">POST https://chatgpt.com/backend-api/codex/responses
+Authorization: Bearer &lt;你自己的 Codex token&gt;
+chatgpt-account-id: &lt;你自己的账号 id&gt;
+Cookie: &lt;上面那段 cookie 原样&gt;</pre>
+  <p class="foot"><strong>同一轮对话里一直用同一张</strong>：换票等于换网关，上下文缓存和
+  路由都会跟着变。票不是你的凭据，它只决定你落到哪台机器上——你的 token 还是你自己的。</p>
+
+  <h3>三、什么时候换</h3>
+  <p>满血是 <strong>(账号 × 网关) 第一次接触</strong>的那一小段窗口，之后静默失效——
+  上游不会告诉你它失效了，响应里一个字都不会变。所以：</p>
+  <ul>
+    <li>拿到就用，别缓存、别预取。<code>valid_for_s</code> 过了就当它废了。</li>
+    <li>觉得这一发不对劲了，要一个<strong>不同</strong>的网关：
+      <pre class="mono cmd">curl -H 'Authorization: Bearer &lt;你的 key&gt;' '<span class="origin">https://&lt;本站&gt;</span>/cookie?force=1'</pre>
+      它不会把刚给过你的那张再发一遍；实在换不出别的就回 503。</li>
+    <li>想回到某个特定网关：<code>/cookie?gateway=unified-142</code>。</li>
+  </ul>
+  <p class="foot">什么时候该换由你判断，池子不替你猜。也<strong>不用回报</strong>用完了——
+  票是池子发的、满血也是池子验的，你知道的它都知道。</p>
+
+  <h3>四、回什么错就是什么意思</h3>
+  <table>
+    <thead><tr><th>状态</th><th>意思</th><th>该怎么办</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">200</td><td>给你一张票</td><td>立刻用</td></tr>
+      <tr><td class="mono">401</td><td>key 不对，或者这个账号被停用了</td>
+        <td>对一下上面那把 key；本页顶上显示「已停用」就是被停了</td></tr>
+      <tr><td class="mono">503</td><td>此刻没有<strong>验过满血</strong>的票</td>
+        <td><strong>等一两分钟再来，别重试打</strong>。池子宁可 503，也不把降级的票发给你。
+          回了 503 说明你的号在已知网关上都烧过了，池子会同时派别的托管账号去找新网关
+          （一次约一分钟），新落点上你才是首次接触</td></tr>
+      <tr><td class="mono">400</td><td>参数不对（比如 <code>gateway=</code> 填了个不存在的）</td>
+        <td>看回的那句话</td></tr>
+      <tr><td class="mono">404</td><td>你把本页地址当成了 base URL</td><td>见上面那个框</td></tr>
+    </tbody>
+  </table>
+  <p class="foot"><strong>503 不要快重试。</strong>每一次取票请求都会让池子真打一发上游去验满血，
+  空转就是在烧大家共用的供给——包括你自己的号。</p>
+</section>
+{{end}}
+
+<section class="card">
+  <h2>停用</h2>
+  {{if .Enabled}}
+  <div class="note">
+    <p>停用之后，上面那把 key <strong>当场失效</strong>，池子也不再用你的凭据发任何请求。
+    已经发出去的 pair 不会收回，但它们本来也只活几分钟。</p>
+    <p class="muted">这不等于注销：凭据还在我们这儿。要让它彻底失效，
+    去 ChatGPT 的设备列表里取消登录。</p>
+  </div>
+  <form method="post" action="/a/{{.ViewToken}}/enabled">
+    <input type="hidden" name="enabled" value="0">
+    <div class="actions"><button type="submit" class="danger">停用这个账号</button></div>
+  </form>
+  {{else}}
+  <div class="note">
+    <p>这个账号<strong>已停用</strong>：key 不好使，池子也不碰你的凭据。随时可以开回来。</p>
+    {{if .DisabledReason}}
+    <p>不是你关的——池子用你的凭据打上游时被拒了，所以自动停了，原话是：</p>
+    <pre class="mono cmd">{{.DisabledReason}}</pre>
+    <p class="foot">常见就两种：票过期了（重新上传一份新的），或者这个账号没有池子所用模型的权限。
+      原因没解决就直接点下面重新启用，下一轮还是会被停。</p>
+    {{end}}
+  </div>
+  <form method="post" action="/a/{{.ViewToken}}/enabled">
+    <input type="hidden" name="enabled" value="1">
+    <div class="actions"><button type="submit" class="primary">重新启用</button></div>
+  </form>
+  {{end}}
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>请求流水</h2>{{if .Rows}}<span>{{len .Rows}} 条，新的在上面</span>{{end}}</div>
+  {{if .Rows}}
+  <div class="scroll"><table>
+    <thead><tr><th>时间（UTC）</th><th>出口（实际观测）</th><th>落点网关</th><th class="num">HTTP</th></tr></thead>
+    <tbody>
+    {{range .Rows}}
+      <tr>
+        <td class="mono">{{.At}}</td>
+        <td>{{.Where}}</td>
+        <td class="mono">{{.Gateway}}</td>
+        <td class="num {{if ne .Status 200}}bad{{end}}">{{if .Status}}{{.Status}}{{else}}<span title="没拿到 HTTP 响应（网络或代理失败）">—</span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table></div>
+  {{if .Truncated}}<p class="foot">另有 {{.Truncated}} 条更早的记录没列出来。</p>{{end}}
+  {{else}}
+  <p class="muted">还没发过任何请求（首扫在排队）。</p>
+  {{end}}
+  <p class="foot">出口按<strong>实际观测到的</strong> IP 地理标注，不是我们请求的国家——
+  代理商库存不足时会把我们扔到别的国家，按请求记就是假账。</p>
+</section>
+{{end}}

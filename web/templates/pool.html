@@ -1,0 +1,126 @@
+{{define "content"}}
+<h1>池子现状</h1>
+<p class="lead">这一页只报聚合读数，<strong>不下发任何 cookie</strong>。</p>
+
+<div class="stats">
+  <div class="stat"><b>{{len .Gateways}}</b><span>已知网关</span></div>
+  <div class="stat"><b>{{.ReadyCount}}</b><span>可交付的网关</span></div>
+  <div class="stat"><b>{{.Accounts}}</b><span>托管账号</span></div>
+</div>
+
+<section class="card">
+  <h2>这是什么</h2>
+  <p>上游不是一台机器，而是一堆网关。同一个账号落到不同网关上，表现可以差很远，
+  而<strong>一个账号在一个网关上的好状态只有第一次接触的那一小段窗口</strong>，之后静默失效。
+  落到哪个网关由两个 cookie（<code>__cflb</code> / <code>__oailb</code>）决定，这里管它叫一张「票」。</p>
+  <p>池子做的事：用大家托管的账号去各个地区出口试探，把发现的网关攒起来、把票续着，
+  然后<strong>只把刚验过是好状态的票发出去</strong>。宁可回 503，也不发一张已经废掉的。</p>
+  <p class="foot">和你用什么客户端无关 —— 你拿到的是一段 <code>Cookie</code> 头，
+  塞进你自己打上游的那个请求里就行。你的凭据始终是你自己的，池子不碰。</p>
+
+  <h3>怎么取</h3>
+  <pre class="mono cmd">curl -H 'Authorization: Bearer &lt;你的 key&gt;' <span class="origin">https://&lt;本站&gt;</span>/cookie</pre>
+  <p class="muted">key 从哪来：<strong>在下面托管一个账号</strong>，提交后会给你一个私密页，
+  key 和完整用法（怎么用票、什么时候换、每个错误码什么意思）都在那一页上。
+  {{if .PublicEnabled}}票富裕时也允许不上传就取，见下一节。{{end}}</p>
+  <p class="foot"><strong>端点是上面这个根地址的 <code>/cookie</code>，不是你那个私密页的地址。</strong>
+  把私密页地址当 base URL 拼出来的是 <code>/a/&lt;一长串&gt;/cookie</code>，只会回 404 ——
+  这是目前为止最常踩的一脚。</p>
+</section>
+
+{{if .PublicEnabled}}
+<section class="card">
+  <h2>对外开放 {{if .PublicOpen}}<span class="badge ok">开放中</span>{{else}}<span class="badge">已关闭</span>{{end}}</h2>
+  <div class="note">
+    {{if .PublicOpen}}
+    <p>空闲 <strong>{{.FreeGateways}}</strong> 个网关，达到了 {{.Threshold}} 个的门槛，
+    所以<strong>没上传凭据也能取</strong>：</p>
+    <p><code>curl '<span class="origin">https://&lt;本站&gt;</span>/cookie?account=&lt;你自己的上游 account_id&gt;'</code></p>
+    <p class="muted">要报自己的 account_id，池子才知道该避开你已经烧过的哪些网关——报错了只会害你自己。
+    匿名取到的 pair <strong>没有经过满血校验</strong>（校验要用你的凭据打一发，池子没有），
+    而且上传者优先：他们正在用的网关不会发给你，空闲数跌回 {{.Threshold}} 以下就自动关上。</p>
+    {{else}}
+    <p>空闲 <strong>{{.FreeGateways}}</strong> 个网关，不到 {{.Threshold}} 个的门槛，此刻只服务上传者。
+    票富裕时会自动开放；上传一个账号就能一直取，不受门槛限制。</p>
+    {{end}}
+  </div>
+</section>
+{{end}}
+
+<section class="card">
+  <h2>网关</h2>
+  {{if .Gateways}}
+  <div class="scroll"><table>
+    <thead><tr>
+      <th>网关</th><th>状态</th><th>pair 剩余</th>
+      <th class="num" title="这个网关上，有多少个托管账号最近没碰过它">没碰过它的账号</th>
+      <th class="num">已知出口</th>
+    </tr></thead>
+    <tbody data-natsort>
+    {{range .Gateways}}
+      <tr class="{{if .PairReady}}ready{{end}}">
+        <td class="mono">{{.Name}}</td>
+        <td>{{if .PairReady}}<span class="badge ok">可交付</span>{{else}}<span class="badge">暂不可交付</span>{{end}}</td>
+        <td class="muted">{{.PairLeft}}</td>
+        <td class="num">{{.RestedSlots}}</td>
+        <td class="num">{{.Exits}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table></div>
+  <div class="note">
+    <p><strong>票和「好状态」是两层，别混。</strong></p>
+    <p><strong>一个网关一张票</strong>（<code>pair</code> 那一列）。票只是路由，它决定你落到哪台机器上，
+    和账号无关——任何账号拿同一张票都会落到同一个网关。所以池子每个网关只存一张，
+    谁来取就借给谁用一会儿（同一时刻只借给一个人：两个账号同时带着同一张票去同一个网关，
+    这个形状本身就是跨账号共享的特征）。</p>
+    <p><strong>「好状态」是每个账号自己的</strong>。(账号 × 网关) 这个组合叫一个槽位，
+    每个账号在每个网关上各有一个，各自独立地烧、独立地冷却。所以同一张票，
+    A 用是满血、B 用可能就是降级的——票一样，槽位不一样。</p>
+    <p>「没碰过它的账号」= 这个网关上，超过 {{.RestedLabel}} 没碰过它、且不在退避期的
+    托管账号数，也就是<strong>大概还有几个人能从这个网关拿到满血</strong>。
+    它只是人眼读数：真实冷却时长至今没测准，所以这个数不参与任何调度决策。</p>
+  </div>
+  {{else}}
+  <p class="muted">池子还是空的：上传一个账号，首扫会把它能到达的网关收进来。</p>
+  {{end}}
+</section>
+
+<section class="card">
+  <h2>托管一个账号</h2>
+  <div class="note">
+    <p>贴进来的凭据只会用来发 <code>ping</code>：模型固定 <code>{{.Model}}</code>、
+    <code>reasoning.effort={{.Effort}}</code>、只读响应头就断开，<strong>累计输出 0 token</strong>。
+    目的只有一个——看你的账号经各个区域出口会落到哪些网关。</p>
+    <p>提交后你会拿到一个<strong>私密查看链接</strong>，上面逐条列出我们用你的凭据发过的每一次请求，
+    另外还有一把 <strong>key</strong>——<strong>上传了凭据就能用这把 key 取池子里的 pair</strong>，
+    这就是池子存在的意义：大家凑出来的网关互相共享。</p>
+    <p>凭据不加密保存、也不做撤销：不放心的话，在 ChatGPT 的设备列表里取消登录即可失效。</p>
+  </div>
+  <form id="upload" method="post" action="/upload">
+    <div class="fields">
+      <label><span>备注名<small>可选，只是给你自己认的</small></span>
+        <input name="label" maxlength="64" autocomplete="off"></label>
+    </div>
+    <fieldset>
+      <legend>贴什么<small>三种都行，不想交整份 auth.json 就只贴一个 token</small></legend>
+      <label class="inline"><input type="radio" name="kind" value="auto" checked>
+        <span>自动认<small>整份 auth.json，或者单个 token——是 JWT 就当 access_token，不是就当 refresh_token</small></span></label>
+      <label class="inline"><input type="radio" name="kind" value="access">
+        <span>只有 access_token<small>约九天到期，到期后这个号会自动停用，要再贴一次</small></span></label>
+      <label class="inline"><input type="radio" name="kind" value="refresh">
+        <span>只有 refresh_token<small>池子自己换票，不用你再管</small></span></label>
+    </fieldset>
+    <label><span>凭据<small>account_id 不用贴，票里就写着</small></span>
+      <textarea name="creds" required spellcheck="false"
+        placeholder="整份 auth.json 的内容，或者单独一个 token"></textarea>
+    </label>
+    <p class="err" id="upload-err" role="alert" hidden></p>
+    <div class="actions">
+      <button type="submit" class="primary">上传并排队首扫</button>
+      <button type="button" id="pick" hidden data-js>从文件读取…</button>
+      <input type="file" id="creds-file" accept=".json,application/json" hidden>
+    </div>
+  </form>
+</section>
+{{end}}

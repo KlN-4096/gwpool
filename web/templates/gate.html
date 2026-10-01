@@ -1,0 +1,18 @@
+{{define "content"}}
+<h1>需要访问码</h1>
+<p class="lead">这个池子不对外公开。有访问码就填进来，没有就请回。</p>
+
+<section class="card">
+  {{if .Wrong}}<p class="err">访问码不对。</p>{{end}}
+  <form method="get" action="/">
+    <label><span>访问码</span>
+      <input name="k" type="password" autocomplete="off" autofocus required>
+    </label>
+    <div class="actions">
+      <button type="submit" class="primary">进入</button>
+    </div>
+  </form>
+  <p class="foot">填对以后会在这台浏览器上记住，不用每次都填；
+  链接后面直接带 <code>?k=…</code> 也能进，认完会立刻把它从地址栏里去掉。</p>
+</section>
+{{end}}

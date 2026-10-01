@@ -1,0 +1,16 @@
+accept: text/event-stream
+authorization: Bearer tok-SECRET
+chatgpt-account-id: acc-123
+content-type: application/json
+cookie: __cflb=c1; __oailb=o1
+originator: codex-tui
+session-id: 00000000-0000-7000-8000-000000000001
+thread-id: 00000000-0000-7000-8000-000000000001
+user-agent: codex-tui/0.156.1 (Ubuntu 22.4.0; x86_64) xterm-256color (codex-tui; 0.156.1)
+version: 0.156.1
+x-client-request-id: 00000000-0000-7000-8000-000000000001
+x-codex-turn-metadata: {"context_window_id":"00000000-0000-7000-8000-000000000003","installation_id":"da71f67d-8168-4e08-9524-90ae541f754f","model":"gpt-6-luna","reasoning_effort":"low","root_turn_id":"00000000-0000-7000-8000-000000000002","session_id":"00000000-0000-7000-8000-000000000001","thread_id":"00000000-0000-7000-8000-000000000001","turn_id":"00000000-0000-7000-8000-000000000002","window_id":"00000000-0000-7000-8000-000000000001:1","window_number":1}
+x-codex-turn-state: live-ticket
+x-codex-window-id: 00000000-0000-7000-8000-000000000001:1
+
+{"model":"gpt-6-luna","input":[{"content":[{"text":"ping","type":"input_text"}],"role":"user","type":"message"}],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":"low","summary":"auto"},"store":false,"stream":true,"include":["reasoning.encrypted_content"],"prompt_cache_key":"00000000-0000-7000-8000-000000000001","text":{"verbosity":"low"},"client_metadata":{"guardian_credits_requested":"true","root_turn_id":"00000000-0000-7000-8000-000000000002","session_id":"00000000-0000-7000-8000-000000000001","thread_id":"00000000-0000-7000-8000-000000000001","turn_id":"00000000-0000-7000-8000-000000000002","x-codex-installation-id":"da71f67d-8168-4e08-9524-90ae541f754f","x-codex-turn-metadata":"{\"context_window_id\":\"00000000-0000-7000-8000-000000000003\",\"installation_id\":\"da71f67d-8168-4e08-9524-90ae541f754f\",\"model\":\"gpt-6-luna\",\"reasoning_effort\":\"low\",\"root_turn_id\":\"00000000-0000-7000-8000-000000000002\",\"session_id\":\"00000000-0000-7000-8000-000000000001\",\"thread_id\":\"00000000-0000-7000-8000-000000000001\",\"turn_id\":\"00000000-0000-7000-8000-000000000002\",\"window_id\":\"00000000-0000-7000-8000-000000000001:1\",\"window_number\":1}","x-codex-window-id":"00000000-0000-7000-8000-000000000001:1"}}

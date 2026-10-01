@@ -1,0 +1,12 @@
+accept: text/event-stream
+accept-encoding: identity
+authorization: Bearer tok-SECRET
+chatgpt-account-id: acc-123
+content-type: application/json
+cookie: __cflb=c1; __oailb=o1
+originator: codex-tui
+session-id: 00000000-0000-4000-8000-000000000000
+user-agent: codex-tui/0.154.0 (Ubuntu 24.04; x86_64) OVH (codex-tui; 0.154.0)
+x-codex-turn-state: live-ticket
+
+{"model":"gpt-6-luna","instructions":"","stream":true,"store":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"reasoning":{"effort":"low"},"tool_choice":"auto","parallel_tool_calls":false}
