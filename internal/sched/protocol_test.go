@@ -45,10 +45,13 @@ func spreadTouches(st *fakeStore, clk *clock) {
 	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3", LastTouch: now.Add(-2 * time.Hour)}
 }
 
+// putPair 铺一张票。CflbExpiresAt 跟 ExpiresAt 一致——生产里 ExpiresAt 就是
+// 两个组件取小的那个，而取小的几乎总是 __cflb（见 types.Pair）。
 func putPair(st *fakeStore, gateway, cookie string, expires time.Time) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.pairs[gateway] = types.Pair{Gateway: gateway, Cookie: cookie, ExpiresAt: expires, MintedBy: 2}
+	st.pairs[gateway] = types.Pair{Gateway: gateway, Cookie: cookie,
+		ExpiresAt: expires, CflbExpiresAt: expires, MintedBy: 2}
 }
 
 // exclude 在「有活 pair」的硬筛**之前**生效：调用方那本账比池子的准
@@ -414,8 +417,9 @@ func warmRig(t *testing.T, gateways ...string) (*Scheduler, *fakeStore, *fakeMin
 		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
 		mn.land[region] = gw
 		mn.full[gw] = true
+		exp := clk.now().Add(100 * time.Second)
 		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
-			ExpiresAt: clk.now().Add(100 * time.Second), MintedBy: 2}
+			ExpiresAt: exp, CflbExpiresAt: exp, MintedBy: 2}
 	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.RenewPairs = true })})
@@ -546,7 +550,13 @@ func TestHasCandidateUsesTheSameJudgeAsDeliver(t *testing.T) {
 	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
-	// 另一侧：票还活着，但他刚在这个网关上取过 ⇒ 对他而言没有候选。
+	// 窗口里他还能原样拿回手上那张（redeliver，一发上游都不打）⇒ 这算有候选。
+	if !s.HasCandidate(1, Request{}) {
+		t.Fatal("窗口内重连拿得回手上那张，判据却说没候选")
+	}
+	// 另一侧：窗口过了、冷却还在（4 小时 ≫ 150 秒，这是池子最常见的稳态）⇒
+	// 票还活着，但对他而言没有候选。
+	clk.add(types.DeliverTTL + time.Second)
 	if s.HasCandidate(1, Request{}) {
 		t.Fatal("槽位在冷却里、这张票他拿不到，判据却说有（每次等待都会白铸一发）")
 	}
@@ -633,6 +643,190 @@ func TestTryGatewayNeverMints(t *testing.T) {
 	}
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("有现成票还铸了 %d 发", n)
+	}
+}
+
+// 洞 1：一张票能用多久按 **__cflb** 算，不按 __oailb 算。
+//
+// 两个 cookie 同一个响应下发，__cflb 早死 300 秒，而 DeliverFloor 恰好就是 300 秒
+// ⇒ 按 __oailb 算的话，「刚好够交付」那张票的路由其实已经死了：亲和失效、上游按
+// 出口地理重新分配，现场看到的就是「落点漂移：想要 unified-194，实到 unified-150」。
+func TestPairLifeFollowsCflbNotOailb(t *testing.T) {
+	s, st, mn, clk := noVerifyRig(t)
+	delete(st.gws, "unified-2")
+	delete(st.gws, "unified-3")
+	// __oailb 还剩 301 秒（刚好够 DeliverFloor），而 __cflb 1 秒后就死。
+	mn.pairLife = types.DeliverFloor + time.Second
+	mn.cflbLife = time.Second
+
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err == nil {
+		t.Fatal("路由已经死了的票被当成「刚好够交付」发了出去")
+	}
+	p, ok := st.Pair("unified-1")
+	if !ok {
+		t.Fatal("票没落盘")
+	}
+	if want := clk.now().Add(time.Second); !p.ExpiresAt.Equal(want) {
+		t.Fatalf("ExpiresAt=%v，应按 __cflb 算成 %v", p.ExpiresAt, want)
+	}
+}
+
+// 洞 2：续期只补发 __oailb 时，寿命必须还按**旧 __cflb** 算。
+//
+// 新 __oailb 的 65 分钟盖不住旧 __cflb——后者是 AEAD 密文、读不出时间，
+// 只有账本上那个字段知道它什么时候死。盖掉的话虚报量无上限。
+func TestRenewKeepsOldCflbDeadline(t *testing.T) {
+	s, st, mn, clk := warmRig(t, "unified-1")
+	dead := clk.now().Add(400 * time.Second) // 低于 RenewLead ⇒ 该续了
+	putPair(st, "unified-1", cookiePrefix+"unified-1", dead)
+	mn.onlyOailb = true // 上游只补发 __oailb，钉路由那张原样留着
+
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n != 1 {
+		t.Fatalf("续了 %d 发，这个用例要的就是一发", n)
+	}
+	p, _ := st.Pair("unified-1")
+	if !p.ExpiresAt.Equal(dead) {
+		t.Fatalf("ExpiresAt=%v，只补发 __oailb 时该还是旧 __cflb 的 %v", p.ExpiresAt, dead)
+	}
+	if !p.CflbExpiresAt.Equal(dead) {
+		t.Fatalf("CflbExpiresAt=%v，应为 %v", p.CflbExpiresAt, dead)
+	}
+}
+
+// B-1：一把合法 key 替**别的**上游账号取票，那是鉴权过的调用方，
+// 不该吃 public_when_surplus 这道闸。
+//
+// 门槛是给上传者留的余量（缺省 = 冷却 ÷ 单张可用时长 ≈ 96 个网关），而上传者本人
+// 反而被挡了 ⇒ 默认配置下每一发都是 503；而那个码按契约说的是「**匿名**此刻不开放」，
+// 对一个鉴权过的调用方是错的。
+func TestCrossAccountIsNotGatedByPublicSwitch(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	seedPairs(st, clk)
+	if ps := s.Public(); ps.Open {
+		t.Fatal("这个用例的前提是公开池关着（默认就是关的）")
+	}
+
+	// 鉴权过的那条路：照发。
+	d, err := s.DeliverAnonymous(context.Background(), "acct-别人的号", Request{}, true)
+	if err != nil {
+		t.Fatalf("鉴权过的跨账号取票被公开池开关挡了: %v", err)
+	}
+	if d.Cookie == "" || d.VerifiedFull {
+		t.Fatalf("交付内容不对（跨账号验不了满血）: %+v", d)
+	}
+	// 另一侧：真匿名照旧被挡（门槛是给上传者留的余量）。
+	if _, err := s.DeliverAnonymous(context.Background(), "acct-路人", Request{}, false); !errors.Is(err, ErrPublicClosed) {
+		t.Fatalf("匿名那条路该被挡: %v", err)
+	}
+}
+
+// B-3：等别人代铸的那几十秒里，(消费者 × 落点) 可能被**并发的发现扫描**烧掉
+// （scan 直接写 LastTouch，而且裸铸不受网关锁约束）。
+//
+// 这一发不是消费者自己打的 ⇒ 闸 2 必须现读账本，用铸票前的快照会漏掉它。
+// 「自己铸票时要用快照」那条理由只在单账号模式成立。
+func TestConcurrentTouchDuringAnothersMintBlocksDelivery(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{{Region: "US"}}}
+	mn.land["US"] = "unified-1"
+	mn.full["unified-1"] = true
+	// 铸票那一发拿到账号锁之后，模拟一次并发的发现扫描烧掉 (消费者 1 × unified-1)。
+	// 用这个回调而不是真起 goroutine：时序得是确定的。
+	st.afterLock = func(id int64) {
+		if id == 2 { // 代铸的那个号
+			_ = st.UpdateSlot(1, "unified-1", func(sl *types.Slot) { sl.LastTouch = clk.now() })
+		}
+	}
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(nil)})
+
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err == nil {
+		t.Fatal("铸票那几十秒里这个槽位已经被烧掉了，还是发了出去")
+	}
+	// 另一侧：没有那次并发触碰时照常交付（别把这条闸关成永久拦路）。
+	st.afterLock = nil
+	st.mu.Lock()
+	delete(st.slots, slotKey(1, "unified-1"))
+	delete(st.pairs, "unified-1")
+	st.mu.Unlock()
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
+		t.Fatalf("没有并发触碰时该照常交付: %v", err)
+	}
+}
+
+// S-1：退避中的槽位不是候选，而「有票的网关全在退避里」要能回落到现铸。
+//
+// LongestRestedSlot 跳过正在退避的槽位，而 coolingSet 的闸 2 恰好对正在退避的槽位
+// 豁免 ⇒ 只问 notCooling 的话，刚失败过的槽位会被当成候选（HasCandidate 说有、
+// 重跑还是 503），而 Deliver 那半边会 503 且一发不打——可现铸本来能成。
+func TestBackoffSlotIsNotACandidateAndFallsBackToMint(t *testing.T) {
+	s, st, mn, clk := noVerifyRig(t)
+	delete(st.gws, "unified-3")
+	// unified-1 有票但槽位正在退避；unified-2 没票、可现铸。
+	putPair(st, "unified-1", cookiePrefix+"unified-1", clk.now().Add(types.PairLifetime))
+	st.mu.Lock()
+	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1",
+		BackoffUntil: clk.now().Add(30 * time.Second)}
+	st.mu.Unlock()
+
+	// 判据一侧：那张票他此刻拿不到（槽位在退避里）。
+	if s.HasCandidate(1, Request{Gateway: "unified-1"}) {
+		t.Fatal("退避中的槽位被当成候选了：等到的那一下重跑还是 503")
+	}
+	// 交付一侧：有票的那个在退避里 ⇒ 回落现铸，而不是 503 且一发不打。
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("有票的网关全在退避里时该回落现铸: %v", err)
+	}
+	if d.Gateway != "unified-2" {
+		t.Fatalf("交付了 %s，该是现铸出来的 unified-2", d.Gateway)
+	}
+	if n := len(mn.mintedGateways()); n != 1 {
+		t.Fatalf("铸了 %d 发", n)
+	}
+}
+
+// S-6：漂移之后 state-echo 要用**落到的那个**网关的出口。
+//
+// 拿「想去 A」的出口去验 B 大概率再漂一次，把一张好票判成失败。默认关着所以今天
+// 不咬人，但它是定时炸弹。
+func TestVerifyUsesLandedGatewayExit(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	// 想去 unified-1，实到 unified-77，两个网关各有自己的出口。
+	//
+	// 目标那个出口**刻意不带区域**：UpsertGateway 只合并带区域的出口（见它的实现），
+	// 否则这一发用过的出口会被并进 unified-77 的可达清单里，于是「用旧的」和
+	// 「按落点重取」都成了合法选择，两种行为再也分不开（pickExit 是随机挑的）。
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{{}}}
+	st.gws["unified-77"] = types.Gateway{Name: "unified-77", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{{Region: "R77"}}}
+	mn.land[""], mn.land["R77"] = "unified-1", "unified-77"
+	mn.drift = map[string]string{"unified-1": "unified-77"}
+	mn.full["unified-77"] = true
+	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(verifyOn)})
+
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if d.Gateway != "unified-77" || !d.VerifiedFull {
+		t.Fatalf("交付不对: %+v", d)
+	}
+	mn.mu.Lock()
+	defer mn.mu.Unlock()
+	if len(mn.echoExits) != 1 || mn.echoExits[0] != "R77" {
+		t.Fatalf("state-echo 用的出口是 %v，漂到 unified-77 之后该用它自己的 R77", mn.echoExits)
 	}
 }
 

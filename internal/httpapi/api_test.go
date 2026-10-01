@@ -72,10 +72,16 @@ func (p *fakePool) Deliver(_ context.Context, accountID int64, req sched.Request
 	return p.delivery, p.err
 }
 
-func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sched.Request) (types.Delivery, error) {
+func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sched.Request, authed bool) (types.Delivery, error) {
 	p.calls++
 	p.reqs = append(p.reqs, req)
-	p.anon = append(p.anon, fmt.Sprintf("%s|%s|force=%v", upstream, req.Gateway, req.Force))
+	p.anon = append(p.anon, fmt.Sprintf("%s|%s|force=%v|authed=%v", upstream, req.Gateway, req.Force, authed))
+	// **这道闸真实实现里有，fake 少了它两轮审查都没抓到跨账号那条**：
+	// HTTP 层所有跨账号用例都绿在「真实实现必然 503」的地方。
+	// 鉴权过的调用方不吃这个门槛（门槛是给上传者留的余量，别把上传者本人挡在门外）。
+	if !authed && !p.public.Open {
+		return types.Delivery{}, sched.ErrPublicClosed
+	}
 	return p.delivery, p.err
 }
 
@@ -592,7 +598,7 @@ func TestAnonymousCookie(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
 	}
-	if len(p.anon) != 1 || p.anon[0] != "acct-x|unified-142|force=false" {
+	if len(p.anon) != 1 || p.anon[0] != "acct-x|unified-142|force=false|authed=false" {
 		t.Fatalf("没把匿名标识传下去: %v", p.anon)
 	}
 	// 有 key 的人永远走上传者那条路，不会被当成匿名。
@@ -665,7 +671,7 @@ func TestForceAndAdvisoryTTL(t *testing.T) {
 	// 匿名那条路也要带上。
 	p.public = sched.PublicState{Enabled: true, Open: true, Free: 9, Threshold: 6}
 	do(h, httptest.NewRequest("GET", "/cookie?account=acct-x&force=1", nil))
-	if len(p.anon) != 1 || !strings.HasSuffix(p.anon[0], "force=true") {
+	if len(p.anon) != 1 || !strings.Contains(p.anon[0], "force=true") {
 		t.Fatalf("匿名 force 没传下去: %v", p.anon)
 	}
 }
@@ -1276,7 +1282,7 @@ func TestCookieForAnotherUpstreamAccount(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
 	}
-	if len(p.anon) != 1 || p.anon[0] != "acct-别人的号||force=false" {
+	if len(p.anon) != 1 || p.anon[0] != "acct-别人的号||force=false|authed=true" {
 		t.Fatalf("没按报上来的账号记槽位: anon=%v delivered=%v", p.anon, p.delivered)
 	}
 	if len(p.delivered) != 0 {

@@ -120,6 +120,21 @@ func Open(dir string) (*Store, error) {
 		if s.st.Mints == nil {
 			s.st.Mints = map[string]types.RegionMint{}
 		}
+		// 老记录里 ExpiresAt 存的是 __oailb 的 exp，而真正钉路由的 __cflb 比它早死
+		// 300 秒（见 types.PairLifetime）⇒ 那些值整篇偏乐观 300 秒，照着发就会把
+		// 一张路由已经死了的 cookie 当成「刚好够交付」发出去。
+		// CflbExpiresAt 的零值就是「这是老记录」的标志，在这儿一次收口——
+		// 零值**绝不能**当成「不过期」，所以这一步不能省。
+		for gw, p := range s.st.Pairs {
+			if !p.CflbExpiresAt.IsZero() {
+				continue
+			}
+			p.CflbExpiresAt = types.FallbackCflbExpiry(p.ExpiresAt)
+			if !p.CflbExpiresAt.IsZero() {
+				p.ExpiresAt = p.CflbExpiresAt
+			}
+			s.st.Pairs[gw] = p
+		}
 	}
 
 	samplesPath := filepath.Join(dir, samplesFile)
@@ -374,11 +389,14 @@ func (s *Store) SetAccountEnabled(id int64, enabled bool) error {
 		}
 		old := s.st.Accounts[i].Enabled
 		oldReason := s.st.Accounts[i].DisabledReason
-		if old == enabled && oldReason == "" {
+		// 开关没变就什么都不做。**特别是不许在这里清理由**：对一个已经被自动停用的号
+		// 再 POST 一次 enabled=false，清掉理由就让它在管理页上和「手动暂停」长得一样，
+		// 于是运营方会反复打开一个凭据已经死了的号（线上刚发生过 token_revoked 那次）。
+		if old == enabled {
 			return nil
 		}
 		s.st.Accounts[i].Enabled = enabled
-		// 人手动开关就清掉自动停用的理由：那条话说的是上一次的事。
+		// 真的翻了开关才清自动停用的理由：那条话说的是上一次的事。
 		s.st.Accounts[i].DisabledReason = ""
 		if err := s.save(); err != nil {
 			s.st.Accounts[i].Enabled = old // 没落盘就别留在内存里

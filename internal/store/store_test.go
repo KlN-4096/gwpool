@@ -509,6 +509,77 @@ func TestDisableAccountRecordsReasonAndManualTogglesClearIt(t *testing.T) {
 	}
 }
 
+// 对一个**已经自动停用**的号再 POST 一次 enabled=false 不许把理由抹掉。
+//
+// 抹掉之后它在管理页上和「手动暂停」一模一样，于是运营方会反复打开一个凭据已经
+// 死了的号（线上刚发生过 token_revoked 那次）。
+func TestRepeatedDisableKeepsTheReason(t *testing.T) {
+	s := open(t, t.TempDir())
+	a, err := s.AddAccount(types.Account{
+		Label: "x", Enabled: true,
+		Creds: types.Creds{AccessToken: "t", AccountID: "acct-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const reason = "铸票 HTTP 401：token_revoked"
+	if err := s.DisableAccount(a.ID, reason); err != nil {
+		t.Fatal(err)
+	}
+	// 开关没变（已经是停用）⇒ 什么都不该动。
+	if err := s.SetAccountEnabled(a.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := accountByID(t, s, a.ID); got.Enabled || got.DisabledReason != reason {
+		t.Fatalf("重复停用把理由抹了: enabled=%v reason=%q", got.Enabled, got.DisabledReason)
+	}
+	// 另一侧：真的翻了开关（启用）才清理由——那条话说的是上一次的事。
+	if err := s.SetAccountEnabled(a.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := accountByID(t, s, a.ID); !got.Enabled || got.DisabledReason != "" {
+		t.Fatalf("启用没清掉理由: enabled=%v reason=%q", got.Enabled, got.DisabledReason)
+	}
+}
+
+// 老 state.json 里的 pairs 行没有 cflb_expires_at：那时候 ExpiresAt 存的是 __oailb
+// 的 exp，整篇**虚报 300 秒**。加载时必须收口到钉路由那个 cookie 上——
+// 零值绝不能退化成「不过期」，也不能退化成零值（那会让一池子票全被当成死票）。
+func TestOpenNormalizesOldPairExpiry(t *testing.T) {
+	dir := t.TempDir()
+	oailbExp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	// 手写一份老格式：没有 cflb_expires_at 这个键。
+	old := `{"pairs":{"unified-7":{"Gateway":"unified-7","Cookie":"__cflb=a; __oailb=b",` +
+		`"ExpiresAt":"` + oailbExp.Format(time.RFC3339) + `","MintedBy":1}}}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, ok := open(t, dir).Pair("unified-7")
+	if !ok {
+		t.Fatal("老记录没加载进来")
+	}
+	want := oailbExp.Add(-(types.OailbLifetime - types.PairLifetime))
+	if !p.CflbExpiresAt.Equal(want) {
+		t.Fatalf("cflb 死期 %v，应按兜底算成 %v", p.CflbExpiresAt, want)
+	}
+	if !p.ExpiresAt.Equal(want) {
+		t.Fatalf("ExpiresAt 没收口：%v，应为 %v（虚报 300 秒就会发出路由已死的票）", p.ExpiresAt, want)
+	}
+
+	// 另一侧：带了新字段的记录一个字都不许动。
+	dir2 := t.TempDir()
+	cflb := oailbExp.Add(-time.Minute)
+	now := `{"pairs":{"unified-8":{"Gateway":"unified-8","Cookie":"c","ExpiresAt":"` +
+		cflb.Format(time.RFC3339) + `","CflbExpiresAt":"` + cflb.Format(time.RFC3339) + `"}}}`
+	if err := os.WriteFile(filepath.Join(dir2, "state.json"), []byte(now), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p2, _ := open(t, dir2).Pair("unified-8")
+	if !p2.ExpiresAt.Equal(cflb) || !p2.CflbExpiresAt.Equal(cflb) {
+		t.Fatalf("新格式的记录被改了: %+v", p2)
+	}
+}
+
 func accountByID(t *testing.T, s *Store, id int64) types.Account {
 	t.Helper()
 	for _, a := range s.Accounts() {

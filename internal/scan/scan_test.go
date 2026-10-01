@@ -75,7 +75,8 @@ func (f *fakeMinter) Geo(_ context.Context, e types.Exit, sid string) (types.Obs
 	return types.Observed{IP: "10.0.0." + e.Region, Country: e.Region, City: e.City}, nil
 }
 
-func (f *fakeMinter) Mint(_ context.Context, _ types.Creds, e types.Exit, sid, sentPair string) (types.MintResult, error) {
+func (f *fakeMinter) Mint(_ context.Context, _ types.Creds, e types.Exit, sid, sentPair string,
+	_ time.Time) (types.MintResult, error) {
 	n := atomic.AddInt32(&f.inflight, 1)
 	defer atomic.AddInt32(&f.inflight, -1)
 	for {
@@ -108,7 +109,7 @@ func (f *fakeMinter) Mint(_ context.Context, _ types.Creds, e types.Exit, sid, s
 		Gateway:     gw,
 		NewPair:     "__cflb=c-" + gw + "; __oailb=o-" + gw,
 		TurnState:   "ticket-" + gw,
-		PairExpires: time.Now().Add(types.PairLifetime).UTC(),
+		PairExpires: time.Now().Add(types.OailbLifetime).UTC(),
 	}, nil
 }
 

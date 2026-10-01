@@ -152,7 +152,8 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 	}
 
 	// 裸打：扫描要的就是让上游按出口地理重新分一个网关，带 pair 会把落点钉住。
-	res, mintErr := s.Mint.Mint(ctx, acct.Creds, r.Exit, sid, "")
+	// 扫描恒为裸铸：没有送进去的 pair，也就没有「旧 __cflb 还活着吗」这个问题。
+	res, mintErr := s.Mint.Mint(ctx, acct.Creds, r.Exit, sid, "", time.Time{})
 
 	// 样本先落盘再说：失败的那一发（HTTP 429、读不出落点）也是数据，
 	// samples.jsonl 只追加、永不重写。Requested 和 Observed 两列都留着，事后能查回退。
@@ -212,11 +213,16 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 		return Landing{}, fmt.Errorf("记槽位: %w", err)
 	}
 	if res.NewPair != "" {
+		// 寿命按**路由**算（钉路由的是 __cflb，它比 __oailb 早死 300 秒，
+		// 见 types.MintResult.RouteDeadline）。扫描恒为裸铸 ⇒ 没有「上一张的 __cflb」
+		// 可继承，传零值让它走响应头 / 兜底那两级。
+		route, cflb := res.RouteDeadline(time.Time{})
 		if err := s.Store.PutPair(types.Pair{
-			Gateway:   res.Gateway,
-			Cookie:    res.NewPair,
-			ExpiresAt: res.PairExpires,
-			MintedBy:  acct.ID,
+			Gateway:       res.Gateway,
+			Cookie:        res.NewPair,
+			ExpiresAt:     route,
+			CflbExpiresAt: cflb,
+			MintedBy:      acct.ID,
 		}); err != nil {
 			return Landing{}, fmt.Errorf("记 pair: %w", err)
 		}

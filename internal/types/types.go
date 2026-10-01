@@ -122,9 +122,13 @@ type RegionMint struct {
 // MintResult 是一次铸票的结果。
 //
 // Gateway 的语义是本项目最容易写错的地方，照 SPEC.md 第 2 节：
-//   - 响应里有新的 set-cookie __oailb  → Gateway = 该 JWT 的 host 第三段
-//   - 没有新 __oailb 且本次发送了 pair  → Gateway = 发送的那个 pair 的网关（上游接受了）
-//   - 没有新 __oailb 且本次没发 pair    → 视为失败，Gateway 为空
+//   - 响应里有新的 set-cookie __oailb → Gateway = 该 JWT 的 host 第三段
+//   - 没有新 __oailb、本次发了 pair、且那张的 __cflb **可证还活着** → Gateway = 那张
+//     pair 的网关（上游接受了它，路由没变）
+//   - 没有新 __oailb、本次发了 pair，但那张的 __cflb 已经不保证活着 → **视为失败**，
+//     Gateway 为空。钉路由的是 __cflb：它死了这一发就是按出口地理随机路由走的，
+//     而 __oailb 还能读出那个过期的名字 ⇒ 认它就是把触碰记在没打到的网关上
+//   - 没有新 __oailb 且本次没发 pair → 视为失败，Gateway 为空
 //
 // NewPair 为空表示上游没下发新 cookie；此时若 Gateway 非空，说明沿用了送进去的 pair。
 type MintResult struct {
@@ -132,10 +136,39 @@ type MintResult struct {
 	Gateway     string    // "unified-167"
 	NewPair     string    // 新下发的完整 cookie 头；没下发则为空
 	TurnState   string    // x-codex-turn-state
-	PairExpires time.Time // 新 pair 的 __oailb exp；没下发则零值
+	PairExpires time.Time // 新下发的 __oailb 的 exp；没下发则零值
+	// CflbExpires 是这一发下发的 __cflb 的死期（Set-Cookie 的 Max-Age / Expires）。
+	//
+	// **零值 = 这一发没补发 __cflb**（上游常只补发变动的那一项）：送进去那张的
+	// __cflb 被原样留在 pair 里，而它是 AEAD 密文、读不出时间 ⇒ 它的死期只有账本
+	// 上的旧值知道。所以寿命一律走 RouteDeadline，别直接用这两个字段。
+	CflbExpires time.Time
 	// ErrBody 是非 2xx 时上游回的那段 JSON（截断）。只在失败路径填。
 	// 没有它的话一个 400 什么都不告诉人——2026-10-01 首扫全军覆没就查了半天。
 	ErrBody string
+}
+
+// RouteDeadline 算这一发之后那张 pair 的两个死期：钉路由那个 cookie 自己的（cflb），
+// 和路由**真正**失效的时刻（route = 两个组件取小，就是 Pair.ExpiresAt）。
+//
+// prevCflb 是送进去那张 pair 的 Pair.CflbExpiresAt（裸铸传零值）。三级取值：
+//  1. 这一发补发了 __cflb ⇒ 用它自己的 Max-Age
+//  2. 没补发 ⇒ 旧的那张原样留在 cookie 里 ⇒ 用账本上它的死期。**这一条不能漏**：
+//     漏了就会让新 __oailb 的 65 分钟盖掉旧 __cflb 的死期，虚报量无上限
+//  3. 两样都没有（Max-Age 读不出的裸铸）⇒ FallbackCflbExpiry
+func (r MintResult) RouteDeadline(prevCflb time.Time) (route, cflb time.Time) {
+	cflb = r.CflbExpires
+	if cflb.IsZero() {
+		cflb = prevCflb
+	}
+	if cflb.IsZero() {
+		cflb = FallbackCflbExpiry(r.PairExpires)
+	}
+	route = r.PairExpires
+	if !cflb.IsZero() && cflb.Before(route) {
+		route = cflb
+	}
+	return route, cflb
 }
 
 // Verdict 是满血判定。nil 表示不下结论（HTTP 非 200 等）。
@@ -151,8 +184,11 @@ type Verdict struct {
 // 实现要点：
 //   - 铸票与随后的 state-echo 必须复用**同一个 sid**，否则可能换出口 IP、换网关
 //   - 单账号并发硬性为 1，由调用方用 per-account mutex 保证
+//   - sentCflbExp = 送进去那张 pair 的 Pair.CflbExpiresAt（裸打传零值）。
+//     「上游没下发新 cookie」只有在它**可证还活着**时才意味着「路由没变」，
+//     否则这一发其实是随机路由走的、落点读不出来（见 MintResult.Gateway）
 type Minter interface {
-	Mint(ctx context.Context, c Creds, e Exit, sid, sentPair string) (MintResult, error)
+	Mint(ctx context.Context, c Creds, e Exit, sid, sentPair string, sentCflbExp time.Time) (MintResult, error)
 
 	// VerifyFull 带一张活票再打一发，只读响应头。必须复用铸票时的 sid 和 pair。
 	VerifyFull(ctx context.Context, c Creds, e Exit, sid, pair, ticket string) (*Verdict, error)
@@ -281,8 +317,9 @@ type Slot struct {
 
 // Pair 是池子里一张活的路由 cookie。
 //
-// __oailb 的 exp-iat 恒为 3900s（65 分钟），硬过期。
-// 剩余不足 RenewLead 就续；剩余不足 DeliverFloor 不交付。
+// 寿命看 PairLifetime（= 钉路由那个 __cflb 的 Max-Age），不是 __oailb 的 3900 s。
+// 下面所有门槛量的都是 ExpiresAt（两个组件取小）：剩余不足 RenewLead 就续；
+// 剩余不足 DeliverFloor 不交付。
 //
 // **刻意没有租约字段。** 曾经有过 LeasedBy/LeaseUntil，理由是「两个不同账号同时带着
 // 同一张路由 cookie 到同一个网关」这个形状本身就是跨账号共享的特征，所以同一张 pair
@@ -299,10 +336,19 @@ type Slot struct {
 // 也就是说上游不介意一张 pair 被几个号同时用，互斥只是白白把池子深度砍半。
 // 要加回来先拿出比这个更强的实测。
 type Pair struct {
-	Gateway   string
-	Cookie    string
+	Gateway string
+	Cookie  string
+	// ExpiresAt 是**路由失效的时刻**，不是某一个 cookie 的 exp：两个组件里先死的那个
+	// （几乎总是 __cflb，它比 __oailb 早死 300 秒，见 PairLifetime / OailbLifetime）。
+	// 全池判「这张票还能不能发」只读这一个字段。
 	ExpiresAt time.Time
-	MintedBy  int64
+	// CflbExpiresAt 是钉路由那个 cookie 自己的死期。单独留着有两个用处：
+	// 续期**只补发 __oailb** 时寿命得按它算（新 __oailb 的 65 分钟盖不住旧 __cflb，
+	// 而 __cflb 是 AEAD 密文、读不出时间，只有这个字段知道它什么时候死）；
+	// 以及零值能认出「老 state.json 写的记录」——那时候 ExpiresAt 存的是 __oailb 的 exp。
+	// 零值**绝不能**当成「不过期」，见 store.Open 里的兜底。
+	CflbExpiresAt time.Time
+	MintedBy      int64
 }
 
 // CookieVersionLen 是 cookie_version 的长度（十六进制字符数）。
@@ -329,17 +375,52 @@ func CookieVersion(cookie string) string {
 
 // 时间常量，依据 2026-10-01 实测。改之前先看 SPEC.md。
 const (
-	PairLifetime = 3900 * time.Second // __oailb exp-iat，上游定死
-	FullWindow   = 183 * time.Second  // 首次接触后的满血窗口，静默失效
-	DeliverTTL   = 150 * time.Second  // 交付给消费者的有效期，FullWindow 留 18% 余量
-	RenewLead    = 600 * time.Second  // pair 剩余不足这么多就续
-	// DeliverFloor 是交付的最低 pair 剩余量。
+	// PairLifetime 是**一张票能用多久** = 路由寿命 = __cflb 的 Set-Cookie Max-Age。
+	// 铺一张新鲜 pair 的地方一律用它。
+	//
+	// **钉路由的是 __cflb，不是 __oailb。** 2026-10-01 的干净隔离复验：只带一个 ES 的
+	// __cflb 就能把一发 US 直连请求从 unified-126 拽到 183；只带 __oailb 则连落点都
+	// 读不出来（上游不认，重新分配）。更早那个「__oailb 签名强制校验」的结论是被
+	// 真实 __cflb 污染出来的假结论。__oailb 的作用只是让我们**读出**落到了哪儿。
+	//
+	// __oailb 还能多活 300 秒（见 OailbLifetime），但那 300 秒**钉不住路由**：
+	// 按它算寿命的话，「刚好够交付」那张票（DeliverFloor = 300 s）的路由恰好已经
+	// 死了——亲和失效 ⇒ 上游按出口地理重新分配 ⇒ 现场看到的就是
+	// 「落点漂移：想要 unified-194，实到 unified-150」。
+	PairLifetime = 3600 * time.Second
+	// OailbLifetime 是 __oailb 的 exp−iat，上游定死。
+	//
+	// **它不是「一张票能用多久」**，只有两处真的需要这个跨度：算 __cflb 的兜底死期
+	// （FallbackCflbExpiry，差值就是它减 PairLifetime），和构造 / 伪造 __oailb 的时候。
+	// 拿它铺场景就会铺出一个生产永远不会出现的状态，而那 300 秒的带子正是出过 bug 的地方。
+	OailbLifetime = 3900 * time.Second
+	FullWindow    = 183 * time.Second // 首次接触后的满血窗口，静默失效
+	DeliverTTL    = 150 * time.Second // 交付给消费者的有效期，FullWindow 留 18% 余量
+	RenewLead     = 600 * time.Second // pair 剩余不足这么多就续
+	// DeliverFloor 是交付的最低 pair 剩余量，量的是 Pair.ExpiresAt（= 路由死期，
+	// 也就是 __cflb 那个）。
 	//
 	// 比 RenewLead 低一截是刻意的：两个数相等时，一张低于门槛的票同时意味着
 	// 「不能发」和「该续了」，于是供给紧的时候交付路径只能原地等保温。
 	// 300 s 的含义是「消费者手上这张至少还能活过两个交付窗口」。
+	//
+	// 它和 OailbLifetime−PairLifetime 都是 300 s 纯属巧合，别把两件事绑在一起：
+	// 前者是「留给消费者的余量」，后者是两个 cookie 的寿命差。
 	DeliverFloor = 300 * time.Second
 )
+
+// FallbackCflbExpiry 在读不出 __cflb 死期时按实测差值从 __oailb 的 exp 倒推。
+//
+// 依据：两个 cookie 是**同一个响应**下发的，Max-Age=3600 对 exp−iat=3900 ⇒ 差 300 秒。
+// 用在两处：Set-Cookie 里没给 Max-Age/Expires 的裸铸，以及老 state.json 的记录
+// （那时候只记了 __oailb 的 exp）。零值进零值出——零值得由调用方当成「不知道」处理，
+// 绝不能当成「不过期」。
+func FallbackCflbExpiry(oailbExp time.Time) time.Time {
+	if oailbExp.IsZero() {
+		return time.Time{}
+	}
+	return oailbExp.Add(-(OailbLifetime - PairLifetime))
+}
 
 // AnonPrefix 是外部消费者占位行的 account_id 前缀。
 //

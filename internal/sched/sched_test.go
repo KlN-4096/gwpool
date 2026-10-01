@@ -288,7 +288,15 @@ type fakeMinter struct {
 	full  map[string]bool   // 网关 → state-echo 判满血
 	delay time.Duration
 
-	noNewPair  bool // 模拟「上游接受了送进去的 pair，不下发新 cookie」
+	noNewPair bool // 模拟「上游接受了送进去的 pair，不下发新 cookie」
+	// drift 是「预期落点 → 实际落点」：出口只能把落点倾向到某个网关，定不住。
+	drift map[string]string
+	// pairLife / cflbLife 是两个组件各自的寿命，零值 = 生产常量。
+	// 钉路由的是 __cflb（早死 300 秒），那条带子要能单独铺出来。
+	pairLife time.Duration
+	cflbLife time.Duration
+	// onlyOailb = 这一发只补发 __oailb，钉路由那张原样留着。
+	onlyOailb  bool
 	mintErr    error
 	mintStatus int           // 非 0 时顶替 200，用来模拟上游否决
 	mintBody   string        // 上游那段 JSON
@@ -298,6 +306,7 @@ type fakeMinter struct {
 	sidSeq    int
 	mints     []types.Sample // 只借这个结构记 (account, gateway) 调用流水
 	echoes    int
+	echoExits []string // 每发 state-echo 用的出口区域键
 	inflight  map[int64]int
 	maxPerAcc int
 
@@ -349,7 +358,8 @@ func (m *fakeMinter) leave(id int64) {
 	m.mu.Unlock()
 }
 
-func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid, sentPair string) (types.MintResult, error) {
+func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid, sentPair string,
+	sentCflbExp time.Time) (types.MintResult, error) {
 	id := acctID(c)
 	m.enter(id)
 	defer m.leave(id)
@@ -364,6 +374,12 @@ func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid,
 	if sentPair != "" {
 		gw = gwOf(sentPair) // 带 pair 就留在那个网关上
 	}
+	// 漂移：出口只能把落点「倾向」到某个网关，定不住。没有这个旋钮的话这个 fake
+	// 结构性地永不漂移（两条路都写死「落点 = 预期落点」），于是整类漂移 bug
+	// 在套子里不可达。
+	if to := m.drift[gw]; to != "" {
+		gw = to
+	}
 	m.mints = append(m.mints, types.Sample{AccountID: id, Gateway: gw, RegionKey: exitKey(e)})
 	// 借 Err 这一列记「这一发带没带 pair 进去」：裸铸和续期的区别只在这个参数上，
 	// 而「交付路径不许带着一张快到点的 pair 去续」正是要钉住的那条（S-2）。
@@ -377,12 +393,35 @@ func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid,
 	if st := m.status(); st != 0 && st != 200 {
 		return types.MintResult{Status: st, Gateway: gw, ErrBody: m.body()}, nil
 	}
-	res := types.MintResult{Status: 200, Gateway: gw, TurnState: "ticket-" + gw + "-" + sid}
-	if !(noNew && sentPair != "") {
-		res.NewPair = cookiePrefix + gw
-		res.PairExpires = m.clk.now().Add(types.PairLifetime)
+	if noNew && sentPair != "" {
+		// 上游接受了送进去的 pair、不换 cookie。**只有那张的 __cflb 可证还活着**
+		// 才能把旧名字当落点（和真实实现同一条规矩，见 mint.Mint）：死了的话这一发
+		// 其实是随机路由走的，落点读不出来 ⇒ Gateway 留空，调用方按失败走。
+		if !sentCflbExp.After(m.clk.now()) {
+			return types.MintResult{Status: 200}, nil
+		}
+		return types.MintResult{Status: 200, Gateway: gw, TurnState: "ticket-" + gw + "-" + sid}, nil
+	}
+	res := types.MintResult{Status: 200, Gateway: gw, TurnState: "ticket-" + gw + "-" + sid,
+		NewPair: cookiePrefix + gw,
+		// 这一格是 __oailb 的 exp，所以默认值用 OailbLifetime：比路由寿命长 300 秒，
+		// 和线上一样。拿 PairLifetime 铺就把那条带子抹平了，而它正是出过 bug 的地方。
+		PairExpires: m.clk.now().Add(m.lifetime(m.pairLife, types.OailbLifetime)),
+	}
+	// onlyOailb 模拟「上游只补发了 __oailb」：钉路由那张原样留在 cookie 里，
+	// 响应里没有它的 Max-Age ⇒ CflbExpires 留零值，寿命得按账本上的旧值算。
+	if !m.onlyOailb {
+		res.CflbExpires = m.clk.now().Add(m.lifetime(m.cflbLife, types.PairLifetime))
 	}
 	return res, nil
+}
+
+// lifetime 取旋钮，没设就用生产常量。
+func (m *fakeMinter) lifetime(set, def time.Duration) time.Duration {
+	if set != 0 {
+		return set
+	}
+	return def
 }
 
 func (m *fakeMinter) status() int {
@@ -404,6 +443,9 @@ func (m *fakeMinter) VerifyFull(ctx context.Context, c types.Creds, e types.Exit
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.echoes++
+	// 记下这一发用的出口：漂移之后必须按**落到的那个**网关重取出口，
+	// 拿「想去 A」的出口去验 B 大概率再漂一次、把一张好票判成失败。
+	m.echoExits = append(m.echoExits, exitKey(e))
 	gw := gwOf(pair)
 	if !strings.Contains(ticket, gw) {
 		return nil, errors.New("票和 pair 对不上：sid/pair 没有复用")
@@ -505,8 +547,11 @@ func seedPairs(st *fakeStore, clk *clock) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	for name := range st.gws {
+		// 寿命按 __cflb 算（它才钉路由、而且早死 300 秒）：按 __oailb 的 3900 铺场景
+		// 等于铺一个生产永远不会出现的状态。
+		exp := clk.now().Add(types.PairLifetime)
 		st.pairs[name] = types.Pair{Gateway: name, Cookie: cookiePrefix + name,
-			ExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
+			ExpiresAt: exp, CflbExpiresAt: exp, MintedBy: 1}
 	}
 }
 
@@ -819,22 +864,85 @@ func TestOneInFlightPerAccount(t *testing.T) {
 	}
 }
 
-// 落点漂移（指定出口没把我们送到想去的网关）算这次失败，但新 pair 要留下，
-// 触碰也要记在实际落点上。
-func TestLandingDriftIsFailureButPairKept(t *testing.T) {
-	s, st, mn, _ := rig(t, types.ModeSingle)
-	delete(st.gws, "unified-2")
-	delete(st.gws, "unified-3")
-	mn.land["1"] = "unified-77" // 想去 unified-1，实际落到 77
+// driftRig 搭一个「只有一个网关、出口会把我们漂到别处」的池子，验证默认关着
+// （生产就是这样），所以漂移的后果是调度自己的决定，不是被验证挡下来的。
+//
+// 为什么要专门搭：原先那个用例发 Request{} ⇒ want 为空 ⇒ 漂移判据根本不执行，
+// 三条断言全靠**验证把漂到的网关判成 degraded** 才绿，被测分支其实不可达。
+func driftRig(t *testing.T, from, to string) (*Scheduler, *fakeStore, *fakeMinter, *clock) {
+	t.Helper()
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	region := strings.ToUpper(strings.TrimPrefix(from, "unified-"))
+	st.gws[from] = types.Gateway{Name: from, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
+	mn.land[region] = from
+	mn.drift = map[string]string{from: to} // 想去 from，实到 to
+	mn.full[from], mn.full[to] = true, true
+	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(nil)}) // 两个开关都按默认关着
+	return s, st, mn, clk
+}
 
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err = %v，漂移该算失败", err)
+// **点名了网关**时漂移算失败：他点名是因为他知道自己没烧过那个落点。
+// 这一条才真正钉住 mintOnce 里的漂移判据（want 非空那一支）。
+func TestNamedGatewayDriftIsFailure(t *testing.T) {
+	s, st, _, _ := driftRig(t, "unified-1", "unified-77")
+
+	_, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"})
+	if !errors.Is(err, ErrMintFailed) || !strings.Contains(err.Error(), "落点漂移") {
+		t.Fatalf("err = %v，点名网关时漂移该是 ErrMintFailed 且说清是漂移", err)
 	}
+	// 白来的供给别扔：pair 留在池里，触碰记在**实际**落点上。
 	if _, ok := st.Pair("unified-77"); !ok {
-		t.Fatal("漂移拿到的新 pair 应该留在池子里，白来的供给别扔")
+		t.Fatal("漂移拿到的新 pair 该留在池子里")
 	}
 	if sl, ok := st.Slot(1, "unified-77"); !ok || sl.LastTouch.IsZero() {
 		t.Fatalf("触碰该记在实际落点上: %+v", sl)
+	}
+}
+
+// **没点名**时漂移是抽签的正常结果，照发漂到的那个（代码的约定就是这样：
+// 出口只能把落点倾向到某个网关，定不住，所以 want 留空时不判漂移）。
+func TestUnnamedDriftDeliversWhereItLanded(t *testing.T) {
+	s, st, _, clk := driftRig(t, "unified-1", "unified-77")
+
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("没点名网关时漂移不该算失败: %v", err)
+	}
+	if d.Gateway != "unified-77" {
+		t.Fatalf("交付了 %s，抽签抽到的是 unified-77", d.Gateway)
+	}
+	// 账本两条：pair 落在实际落点上，交付时刻也记在那一行。
+	if p, ok := st.Pair("unified-77"); !ok || p.Cookie != d.Cookie {
+		t.Fatalf("pair 没落在实际落点上: %+v", p)
+	}
+	if sl, ok := st.Slot(1, "unified-77"); !ok || sl.LastDeliver.IsZero() {
+		t.Fatalf("交付没记在实际落点的槽位上: %+v", sl)
+	}
+	if sl, ok := st.Slot(1, "unified-1"); ok && !sl.LastDeliver.IsZero() {
+		t.Fatalf("交付记到了想去的那个网关上: %+v", sl)
+	}
+	_ = clk
+}
+
+// B-2：漂到调用方**明确排除**的网关上时不许交付。
+//
+// exclude 编码的是「我自己烧过这个」——池子账本上没有记录，两条冷却闸都看不见。
+// 换票（force + exclude_versions 把有票的网关全排掉）正好最常落到这一格，
+// 于是客户端拿回一张自己刚烧过的落点，而验证默认关 ⇒ 无从察觉。
+func TestUnnamedDriftRespectsExclude(t *testing.T) {
+	s, st, _, _ := driftRig(t, "unified-1", "unified-77")
+
+	_, err := s.Deliver(context.Background(), 1, Request{Exclude: map[string]bool{"unified-77": true}})
+	if !errors.Is(err, ErrNoLivePair) {
+		t.Fatalf("err = %v，漂到被排除的网关上该拒发（而且归成等得起的那一格）", err)
+	}
+	// 票照旧留在池里：白来的供给别扔，只是不发给**他**。
+	if _, ok := st.Pair("unified-77"); !ok {
+		t.Fatal("拒发不等于扔掉这张票")
 	}
 }
 
@@ -911,10 +1019,22 @@ func TestDeliverRejectsUnusableAccount(t *testing.T) {
 			Creds: types.Creds{AccessToken: "x", AccountID: "acct-2"}},
 		types.Account{ID: 3, Label: "只回报", Enabled: true,
 			Creds: types.Creds{AccountID: "acct-3"}})
+	// 必须是**有 sentinel 的**那个错：没有它的话这件事掉进 no_live_pair，
+	// 于是运营方逐个启号来验时拿到「稍后再试」+ 挂满 wait + 白排一次发现扫描，
+	// 而真实原因是那个号本身（见 httpapi 的 classify）。
 	for _, id := range []int64{0, 2, 3, 99} {
-		if _, err := s.Deliver(context.Background(), id, Request{}); err == nil {
-			t.Fatalf("账号 %d 不该能交付", id)
+		_, err := s.Deliver(context.Background(), id, Request{})
+		if !errors.Is(err, ErrAccountUnusable) {
+			t.Fatalf("账号 %d: err=%v，应为 ErrAccountUnusable", id, err)
 		}
+	}
+	// 停用理由要带出来：「手动暂停」和「凭据已死」要做的事完全不同。
+	if err := s.st.DisableAccount(2, "铸票 HTTP 401：token_revoked"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Deliver(context.Background(), 2, Request{})
+	if err == nil || !strings.Contains(err.Error(), "token_revoked") {
+		t.Fatalf("停用理由没带出来: %v", err)
 	}
 }
 
@@ -1177,7 +1297,7 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 	if ps := s.Public(); !ps.Open || ps.Free != 6 {
 		t.Fatalf("应开放: %+v", ps)
 	}
-	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{})
+	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{}, false)
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -1188,9 +1308,9 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 	if d.VerifiedFull {
 		t.Fatal("匿名交付不该写 verified_full=true")
 	}
-	for _, want := range []string{"匿名交付", "gateway=" + d.Gateway, "free_gateways=6", "threshold=6"} {
+	for _, want := range []string{"无凭据交付", "authed=false", "gateway=" + d.Gateway, "free_gateways=6"} {
 		if !strings.Contains(buf.String(), want) {
-			t.Fatalf("匿名交付日志缺了 %q: %s", want, buf.String())
+			t.Fatalf("无凭据交付日志缺了 %q: %s", want, buf.String())
 		}
 	}
 	// 槽位按 (占位账号 × 网关) 记下了，而且占位账号没有凭据。
@@ -1208,7 +1328,7 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 	}
 	// 他再要一次，应该换一个没烧过的网关。
 	clk.add(types.DeliverTTL + time.Second)
-	d2, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{})
+	d2, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{}, false)
 	if err != nil || d2.Gateway == d.Gateway {
 		t.Fatalf("第二次又给了同一个网关 %s (err=%v)", d2.Gateway, err)
 	}
@@ -1220,7 +1340,7 @@ func TestAnonymousRefusedBelowThreshold(t *testing.T) {
 	if ps := s.Public(); ps.Open {
 		t.Fatalf("不该开放: %+v", ps)
 	}
-	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}); !errors.Is(err, ErrPublicClosed) {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false); !errors.Is(err, ErrPublicClosed) {
 		t.Fatalf("err=%v，应为 ErrPublicClosed", err)
 	}
 	// 开关没开时，再富裕也不开放。改的是**活配置**：Public() 现读它。
@@ -1231,7 +1351,7 @@ func TestAnonymousRefusedBelowThreshold(t *testing.T) {
 	if ps := off.Public(); ps.Open || ps.Enabled {
 		t.Fatalf("开关关着却开放了: %+v", ps)
 	}
-	if _, err := off.DeliverAnonymous(context.Background(), "x", Request{}); !errors.Is(err, ErrPublicClosed) {
+	if _, err := off.DeliverAnonymous(context.Background(), "x", Request{}, false); !errors.Is(err, ErrPublicClosed) {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -1250,7 +1370,7 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 	if free := s.FreeGateways(); free != 1 {
 		t.Fatalf("空闲数算成了 %d，应为 1", free)
 	}
-	d, err := s.DeliverAnonymous(context.Background(), "x", Request{})
+	d, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false)
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -1261,7 +1381,7 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 	p := st.pairs["unified-6"]
 	p.ExpiresAt = clk.now().Add(types.DeliverFloor - time.Minute)
 	st.pairs["unified-6"] = p
-	if _, err := s.DeliverAnonymous(context.Background(), "y", Request{}); !errors.Is(err, ErrPublicClosed) {
+	if _, err := s.DeliverAnonymous(context.Background(), "y", Request{}, false); !errors.Is(err, ErrPublicClosed) {
 		t.Fatalf("err=%v，空闲跌破门槛时应 ErrPublicClosed", err)
 	}
 }
@@ -1273,7 +1393,7 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1)
 	addAccount(st, 2, "acct-2")
-	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	up, err := s.Deliver(context.Background(), 2, Request{})
@@ -1288,7 +1408,7 @@ func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 // 匿名报一个上传者的上游 ID，不能污染那个上传者的账本。
 func TestAnonymousCannotPolluteUploaderLedger(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1)
-	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", Request{}); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", Request{}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	for _, sl := range st.slots {
@@ -1371,11 +1491,11 @@ func TestForceWithNothingElseFails(t *testing.T) {
 // 匿名那条路也认 force。
 func TestForceForAnonymous(t *testing.T) {
 	s, _, _, _ := anonRig(t, 6, 1)
-	first, err := s.DeliverAnonymous(context.Background(), "x", Request{})
+	first, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false)
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
-	forced, err := s.DeliverAnonymous(context.Background(), "x", Request{Force: true})
+	forced, err := s.DeliverAnonymous(context.Background(), "x", Request{Force: true}, false)
 	if err != nil {
 		t.Fatalf("force: %v", err)
 	}
@@ -1383,7 +1503,7 @@ func TestForceForAnonymous(t *testing.T) {
 		t.Fatalf("匿名 force 还是给了同一个网关 %s", forced.Gateway)
 	}
 	// 指名要自己正租着的那张 + force ⇒ 没得换，老实失败。
-	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{Gateway: forced.Gateway, Force: true}); err == nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{Gateway: forced.Gateway, Force: true}, false); err == nil {
 		t.Fatal("指名自己租着的那张还 force，居然成功了")
 	}
 }
@@ -1849,7 +1969,7 @@ func TestDeliverWithoutVerifyNeverEchoes(t *testing.T) {
 	mn.land["US"] = "unified-1"
 	mn.full["unified-1"] = false // 就算验也会判降智，但压根不该去验
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
+		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
 	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1})
 
 	d := mustDeliver(t, s, 1, "")
@@ -1949,15 +2069,15 @@ func TestWindowElapsedPutsSlotInCooldown(t *testing.T) {
 // 「这个上游账号在这个网关上烧过了」和他有没有上传凭据无关。
 func TestCooldownAppliesToAnonymousToo(t *testing.T) {
 	s, _, clk, _ := anonRig(t, 1, 1)
-	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}, false); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("匿名窗口过完还发得出来: %v", err)
 	}
 	// 换一个上游 ID 就是另一条账本，不受连坐。
-	if _, err := s.DeliverAnonymous(context.Background(), "someone-else", Request{}); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "someone-else", Request{}, false); err != nil {
 		t.Fatalf("另一个匿名上游被连坐了: %v", err)
 	}
 }
@@ -1976,7 +2096,7 @@ func TestSlotCooldownComesFromConfig(t *testing.T) {
 	mn.land["US"] = "unified-1"
 	mn.full["unified-1"] = true
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
+		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
 	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.SlotCooldownMinutes = 10 })})
 
@@ -2049,7 +2169,7 @@ func TestDeliverPrefersGatewayWithLivePair(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
 	st.pairs["unified-2"] = types.Pair{Gateway: "unified-2", Cookie: cookiePrefix + "unified-2",
-		ExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
 
 	d := mustDeliver(t, s, 1, "")
 	if d.Gateway != "unified-2" {
@@ -2225,7 +2345,7 @@ func TestPremintStopsAfterTwoWastedShots(t *testing.T) {
 	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
 		ReachableExits: []types.Exit{{Region: "US"}}}
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
 	// 富余目标拉到 9，缺口远大于 2 ⇒「只打两发」只可能来自浪费预算。
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 9 })})

@@ -44,9 +44,12 @@ type Pool interface {
 	// req 带着调用方说得上话的那几件事（点名网关、force、两个排除名单、最低剩余寿命）。
 	// 它们全是外部输入，校验在 parseCookieRequest 做完（信任边界只有一道）。
 	Deliver(ctx context.Context, accountID int64, req sched.Request) (types.Delivery, error)
-	// DeliverAnonymous 给没上传凭据的人交付。upstreamAccountID 是他自己的上游账号标识，
-	// 槽位照常按它记——调度单位永远是 (账号 × 网关)。
-	DeliverAnonymous(ctx context.Context, upstreamAccountID string, req sched.Request) (types.Delivery, error)
+	// DeliverAnonymous 给池子**手上没有凭据**的那个上游账号交付。upstreamAccountID 是
+	// 他自己的上游账号标识，槽位照常按它记——调度单位永远是 (账号 × 网关)。
+	//
+	// authed 为真 = 调用方自己是鉴权过的，只是替别的上游账号取票。那种调用方不受
+	// public_when_surplus 门槛约束（门槛是给上传者留的余量，不该挡住上传者本人）。
+	DeliverAnonymous(ctx context.Context, upstreamAccountID string, req sched.Request, authed bool) (types.Delivery, error)
 	// Release 还原一次「票取了但一发没打」的交付，返回还原了几个槽位。
 	Release(accountID int64, cookieVersion string) (int, error)
 	// HasCandidate 是 wait 轮询的判据：此刻有没有一张**这个账号**拿得到、而且不用铸
@@ -715,7 +718,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	req, wait, perr := parseCookieRequest(r)
 	if perr != nil {
-		badRequest(w, http.StatusBadRequest, perr.Error())
+		s.badRequest(w, http.StatusBadRequest, perr.Error())
 		return
 	}
 	c, ok := s.resolveCaller(r)
@@ -747,9 +750,12 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	if ref != "" && !accountRefMatches(acct, ref) {
 		// 记账归上传者（他的页面该看见这一行），**调度归占位行**：轮询要按那个号的
 		// 冷却判，发现扫描要排除的也是那个号——而池内行里只有上传者。
+		//
+		// authed=true：这条路的调用方**鉴权过了**，走 DeliverAnonymous 只是因为池子
+		// 手上没有那个号的凭据（验不了、也不替它铸），不该连带吃匿名的开放门槛。
 		s.serveCookie(w, r, acct.ID, s.rowFor(types.AnonPrefix+ref), req, wait,
 			func(rq sched.Request) (types.Delivery, error) {
-				return s.pool.DeliverAnonymous(r.Context(), ref, rq)
+				return s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
 			})
 		return
 	}
@@ -778,12 +784,13 @@ func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sche
 	// 避开他已经烧过的网关。报错的只会害他自己，所以不防乱填。
 	ref := strings.TrimSpace(r.URL.Query().Get("account"))
 	if ref == "" || len(ref) > 128 {
-		badRequest(w, http.StatusBadRequest, "匿名取用必须带 account 参数（你自己的上游 account_id）")
+		s.badRequest(w, http.StatusBadRequest, "匿名取用必须带 account 参数（你自己的上游 account_id）")
 		return
 	}
 	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait,
 		func(rq sched.Request) (types.Delivery, error) {
-			return s.pool.DeliverAnonymous(r.Context(), ref, rq)
+			// authed=false：真匿名，门槛照常卡他（那是给上传者留的余量）。
+			return s.pool.DeliverAnonymous(r.Context(), ref, rq, false)
 		})
 }
 
@@ -838,8 +845,16 @@ func (s *Server) deliverFailed(w http.ResponseWriter, err error, acctID, consume
 	}
 	// 页面上要看得见：客户端那头只有一个 502/503，上传者对着它猜不出是哪种。
 	// 码也要落下来——同一句人话底下可能是两种完全不同的处置。
+	detail := err.Error()
+	if code == codeNoGateway {
+		// 冷启动得人踢一脚，而这件事只在日志里说过。只有一个启用账号时它自己就是
+		// 消费者 ⇒ 派谁去找落点都会被排掉（派他自己等于当场烧掉那个落点），
+		// 而网关表空着时现铸也无从下手（pickExit 要一个已在表上的网关）。
+		detail += "｜池子一个网关都没有：要么再上传一个账号（让它去找落点），" +
+			"要么手动 POST /admin/rescan 踢一次"
+	}
 	s.fails.add(deliverFail{At: time.Now(), AccountID: acctID, Gateway: gateway,
-		Code: code, Reason: msg, Detail: err.Error()})
+		Code: code, Reason: msg, Detail: detail})
 	writeFail(w, http.StatusServiceUnavailable,
 		apiError{Code: code, Message: msg, RetryAfterSeconds: retrySeconds(retry)})
 }

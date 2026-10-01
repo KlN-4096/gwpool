@@ -81,10 +81,12 @@ func writeFail(w http.ResponseWriter, status int, e apiError) {
 
 // badRequest 是「你的请求错了」：400 和 404 共用一个码，一律不给 retry_after。
 //
-// **只回话、不记卡片**：参数校验排在鉴权前面（信任边界就该在最前），所以这条路
-// 未鉴权的请求也走得到，往那个 200 条的环里灌几下就能把真实诊断全挤出去。
-// 鉴权通过之后的 400/404 走 badRequestFor。
-func badRequest(w http.ResponseWriter, status int, msg string) {
+// **不记卡片，但要记日志。** 不进环是因为参数校验排在鉴权前面（信任边界就该在最前），
+// 未鉴权的请求往那个 200 条的环里灌几下就能把真实诊断全挤出去；而三处都没有记录的话
+// 「消费端每一发都带着畸形参数」和「池子没货」在运营眼里长得一模一样——偏偏这两种
+// 是最可能的开局故障。鉴权通过之后的 400/404 走 badRequestFor（那条进环）。
+func (s *Server) badRequest(w http.ResponseWriter, status int, msg string) {
+	s.opt.Log.Info("请求参数不合法", "code", codeBadRequest, "status", status, "reason", msg)
 	writeFail(w, status, apiError{Code: codeBadRequest, Message: msg})
 }
 
@@ -92,7 +94,7 @@ func badRequest(w http.ResponseWriter, status int, msg string) {
 // 管理员少带 account、点名的账号不存在这类错只有在页面上看得见才查得动。
 func (s *Server) badRequestFor(w http.ResponseWriter, status int, accountID int64, msg string) {
 	s.fails.add(deliverFail{At: time.Now(), AccountID: accountID, Code: codeBadRequest, Reason: msg})
-	badRequest(w, status, msg)
+	s.badRequest(w, status, msg)
 }
 
 // unauthorized 是「你的 key 不认」。三个机器端点（/cookie、/release、/gateways）
@@ -136,7 +138,8 @@ const (
 	// min_remaining 的钳位区间。
 	//
 	// 下限 30 s 就是 sched 的 minDeliverWindow：比这还短的票发出去没有意义。
-	// 上限 3600 s 是 __oailb 的整个寿命（3900 s）量级，再大就永远筛不出候选。
+	// 上限 3600 s 就是一张票的整个寿命（types.PairLifetime），再大必然永远筛不出候选。
+	// 数值本身是冻结的契约（SPEC 第 10 节写着钳到 [30, 3600]），别跟着常量改名动它。
 	minRemainingFloor = 30 * time.Second
 	minRemainingCap   = 3600 * time.Second
 
@@ -254,6 +257,11 @@ func (s *Server) classify(err error) (code, msg string, retry time.Duration) {
 		return codeDegraded, "交付前的满血验证判了降级，不发降智的票", types.FullWindow
 	case errors.Is(err, sched.ErrUpstreamRejected):
 		return codeUpstreamRejected, "上游否决了池子的这个账号", 0
+	case errors.Is(err, sched.ErrAccountUnusable):
+		// 「你点的这个号用不了」正好是 bad_request 的语义（请求错了，改了再来），
+		// 而**不是**「池子暂时没货」：后者会让调用方挂满 wait、还去排一次发现扫描。
+		// 不给 retry_after：等多久那个号都还是停用的。
+		return codeBadRequest, "点名的这个账号用不了（不存在、已停用、或凭据已死）", 0
 	case errors.Is(err, sched.ErrNoLivePair):
 		// 必须排在 mint_failed **前面**：这一格是「候选非空、只是没有活票，
 		// 而现铸也没成」，而契约里 no_live_pair 的定义就是这句话。它等得起
@@ -421,19 +429,19 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, releaseBodyMax))
 	if err != nil {
-		badRequest(w, http.StatusBadRequest, "请求体太大")
+		s.badRequestFor(w, http.StatusBadRequest, acctID, "请求体太大")
 		return
 	}
 	var in struct {
 		CookieVersion string `json:"cookie_version"`
 	}
 	if err := json.Unmarshal(body, &in); err != nil {
-		badRequest(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		s.badRequestFor(w, http.StatusBadRequest, acctID, "请求体不是合法 JSON")
 		return
 	}
 	version := strings.ToLower(strings.TrimSpace(in.CookieVersion))
 	if !validCookieVersion(version) {
-		badRequest(w, http.StatusBadRequest,
+		s.badRequestFor(w, http.StatusBadRequest, acctID,
 			fmt.Sprintf("cookie_version 必须是 %d 位十六进制", types.CookieVersionLen))
 		return
 	}

@@ -46,16 +46,22 @@ func newClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server) {
 		Proxies: []config.Proxy{novProxy}}, srv
 }
 
+// liveCflb 是「送进去那张 pair 的 __cflb 还活得好好的」。
+//
+// 这个参数不是装饰：「上游没下发新 cookie」只有在它可证还活着时才等于「路由没变」，
+// 死了的话那一发是随机路由走的（见 Mint 里那段注释）。
+func liveCflb() time.Time { return time.Now().Add(types.PairLifetime) }
+
 // SPEC 第 2 节第一条：下发了新 __oailb ⇒ 落点 = JWT host 第三段。
 func TestMintNewCookieGivesGateway(t *testing.T) {
-	exp := time.Now().Add(types.PairLifetime).Truncate(time.Second).UTC()
+	exp := time.Now().Add(types.OailbLifetime).Truncate(time.Second).UTC()
 	c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("set-cookie", "__cflb=NEWCFLB; Path=/; Max-Age=3600")
 		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-167", exp)+"; Path=/")
 		w.Header().Set("x-codex-turn-state", "ticket-abc")
 		w.WriteHeader(200)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "")
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +79,51 @@ func TestMintNewCookieGivesGateway(t *testing.T) {
 	}
 }
 
+// 钉路由的是 __cflb，而它的死期只能从 Set-Cookie 的 Max-Age 读出来。
+// 读不出来就只能按实测差值兜底，而兜底值必须比 __oailb 的 exp 早 300 秒。
+func TestMintReadsCflbDeadline(t *testing.T) {
+	exp := time.Now().Add(types.OailbLifetime).Truncate(time.Second).UTC()
+	withHeaders := func(cflb string) types.MintResult {
+		t.Helper()
+		c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+			if cflb != "" {
+				w.Header().Add("set-cookie", cflb)
+			}
+			w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-167", exp))
+			w.WriteHeader(200)
+		})
+		res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "", time.Time{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	// 一侧：给了 Max-Age ⇒ 死期按它算，路由寿命跟着它（比 __oailb 早）。
+	res := withHeaders("__cflb=NEW; Max-Age=3600")
+	left := time.Until(res.CflbExpires)
+	if left < types.PairLifetime-time.Minute || left > types.PairLifetime {
+		t.Fatalf("__cflb 死期按 Max-Age 该是 %v 之后，实际还剩 %v", types.PairLifetime, left)
+	}
+	route, _ := res.RouteDeadline(time.Time{})
+	if !route.Equal(res.CflbExpires) {
+		t.Fatalf("路由寿命没跟着 __cflb：route=%v cflb=%v", route, res.CflbExpires)
+	}
+	if !res.PairExpires.After(route) {
+		t.Fatalf("__oailb 的 exp 该比路由死期晚：%v vs %v", res.PairExpires, route)
+	}
+
+	// 另一侧：一个 __cflb 都没下发 ⇒ 死期读不出（零值），寿命走兜底、比 exp 早 300 秒。
+	res = withHeaders("")
+	if !res.CflbExpires.IsZero() {
+		t.Fatalf("没下发 __cflb 却算出了死期 %v（那会让继承来的旧票被盖掉）", res.CflbExpires)
+	}
+	route, _ = res.RouteDeadline(time.Time{})
+	if want := res.PairExpires.Add(-(types.OailbLifetime - types.PairLifetime)); !route.Equal(want) {
+		t.Fatalf("兜底寿命 %v，应为 %v", route, want)
+	}
+}
+
 // 上游常只补发变动的那一项。只拿新的那半会丢掉真正钉路由的 __cflb。
 func TestMintMergesOntoSentPair(t *testing.T) {
 	sent := "__cflb=KEEPME; __oailb=" + fakeOailb("unified-84", time.Now().Add(time.Hour))
@@ -80,7 +131,7 @@ func TestMintMergesOntoSentPair(t *testing.T) {
 		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-202", time.Now().Add(time.Hour)))
 		w.WriteHeader(200)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent)
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent, liveCflb())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +155,7 @@ func TestMintNoNewCookieWithSentPairIsSuccess(t *testing.T) {
 		w.Header().Set("x-codex-turn-state", "ticket-xyz")
 		w.WriteHeader(200) // 一个 set-cookie 都不给
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent)
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent, liveCflb())
 	if err != nil {
 		t.Fatalf("不下发新 cookie 不是失败: %v", err)
 	}
@@ -119,13 +170,48 @@ func TestMintNoNewCookieWithSentPairIsSuccess(t *testing.T) {
 	}
 }
 
+// 「没下发新 cookie」的另一半：送进去那张的 __cflb 已经不保证活着时，
+// 旧名字**不能**当落点。
+//
+// 钉路由的是 __cflb：它死了这一发就是按出口地理随机路由走的，而 __oailb 还能读出
+// 那个过期的名字。认它的话三处账本一起写坏——触碰记在没打到的网关上（真正打到的
+// 那个仍是「从没碰过」，下次当首次接触发给别人）、定向铸票的漂移永远检测不出来、
+// 续期的失败预算永远攒不满。
+func TestMintRefusesStaleCflbAsLanding(t *testing.T) {
+	sent := "__cflb=abc; __oailb=" + fakeOailb("unified-142", time.Now().Add(time.Hour))
+	srv := func() *Client {
+		c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("x-codex-turn-state", "ticket-xyz")
+			w.WriteHeader(200) // 一个 set-cookie 都不给
+		})
+		return c
+	}
+	for _, c := range []struct {
+		name string
+		exp  time.Time
+	}{
+		{"已经过期", time.Now().Add(-time.Second)},
+		{"死期读不出（零值）", time.Time{}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := srv().Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent, c.exp)
+			if !errors.Is(err, ErrNoLanding) {
+				t.Fatalf("err=%v，应为 ErrNoLanding（读不出落点）", err)
+			}
+			if res.Gateway != "" {
+				t.Fatalf("把过期 __cflb 里的旧名字当落点了: %q", res.Gateway)
+			}
+		})
+	}
+}
+
 // SPEC 第 2 节第三条：没回新 cookie 又没发 pair ⇒ 读不出落点，算失败。
 func TestMintNoNewCookieNoSentPairFails(t *testing.T) {
 	c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-codex-turn-state", "ticket-xyz")
 		w.WriteHeader(200)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "")
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{})
 	if !errors.Is(err, ErrNoLanding) {
 		t.Fatalf("该是 ErrNoLanding，得到 %v", err)
 	}
@@ -143,7 +229,7 @@ func TestMintUnauthorizedHasNoLanding(t *testing.T) {
 		w.Header().Add("set-cookie", "__cflb=onlythis")
 		w.WriteHeader(401)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "")
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{})
 	if !errors.Is(err, ErrNoLanding) || res.Status != 401 {
 		t.Fatalf("401 该报读不出落点并带回状态码: res=%+v err=%v", res, err)
 	}
@@ -155,7 +241,7 @@ func TestMintRateLimitedStillReportsStatus(t *testing.T) {
 		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-9", time.Now().Add(time.Hour)))
 		w.WriteHeader(429)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "")
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,7 +664,7 @@ func TestMintSendsSelectedFingerprint(t *testing.T) {
 			w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-1", time.Now().Add(time.Hour)))
 		})
 		c.Fingerprint = fp
-		if _, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", ""); err != nil {
+		if _, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{}); err != nil {
 			t.Fatal(err)
 		}
 		if got.Get("authorization") != "Bearer tok-SECRET" || got.Get("originator") != "codex-tui" {
@@ -645,7 +731,7 @@ func TestSocks5ConnectThroughFakeProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "AU"}, sid, "")
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "AU"}, sid, "", time.Time{})
 	if err != nil {
 		t.Fatalf("经 SOCKS5 铸票失败: %v", err)
 	}
@@ -691,7 +777,7 @@ func TestDeadExitDoesNotTripSupplierBreaker(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, ""); err == nil {
+		if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, "", time.Time{}); err == nil {
 			t.Fatalf("第 %d 发居然成功了，这个假代理应该每次都断", i)
 		}
 	}
@@ -722,7 +808,7 @@ func TestUnreachableProxyTripsBreaker(t *testing.T) {
 		if err != nil {
 			t.Fatalf("第 %d 发还没到阈值就挑不出供应商: %v", i, err)
 		}
-		if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, ""); err == nil {
+		if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, "", time.Time{}); err == nil {
 			t.Fatalf("第 %d 发居然成功了", i)
 		}
 	}
@@ -764,7 +850,7 @@ func TestDeadExitDoesNotRefundRateWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, ""); err == nil {
+	if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, "", time.Time{}); err == nil {
 		t.Fatal("这个假代理该在握手之后断开")
 	}
 	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
@@ -813,7 +899,7 @@ func TestCallerCancelDoesNotRefundRateWindow(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		cancel()
 	}()
-	if _, err := c.Mint(ctx, testCreds, types.Exit{Region: "US"}, sid, ""); err == nil {
+	if _, err := c.Mint(ctx, testCreds, types.Exit{Region: "US"}, sid, "", time.Time{}); err == nil {
 		t.Fatal("调用方取消了还成功？")
 	}
 	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
@@ -927,11 +1013,11 @@ func TestUpstreamRateGate(t *testing.T) {
 
 	cr := types.Creds{AccessToken: "tok", AccountID: "acc"}
 	for i := 0; i < 3; i++ {
-		if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "US"}, "sid-x", ""); err != nil {
+		if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "US"}, "sid-x", "", time.Time{}); err != nil {
 			t.Fatalf("第 %d 发就被拦了: %v", i+1, err)
 		}
 	}
-	_, err := c.Mint(context.Background(), cr, types.Exit{Region: "US"}, "sid-x", "")
+	_, err := c.Mint(context.Background(), cr, types.Exit{Region: "US"}, "sid-x", "", time.Time{})
 	if !errors.Is(err, types.ErrRateLimited) {
 		t.Fatalf("第 4 发应该被速率闸拦下，实为 %v", err)
 	}
@@ -944,7 +1030,7 @@ func TestUpstreamRateGate(t *testing.T) {
 	}
 	// 闸是**按区域**分桶的：us-east 打满了，另外八个区域各有自己的一整份预算——
 	// 而那八个区域才是能发现新落点的地方。
-	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "JP"}, "sid-x", ""); err != nil {
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "JP"}, "sid-x", "", time.Time{}); err != nil {
 		t.Fatalf("east-asia 被 us-east 的配额拖累了: %v", err)
 	}
 	if used, limit := c.Rate("acc"); used["us-east"] != 3 || used["east-asia"] != 1 || limit != 3 {
@@ -954,7 +1040,7 @@ func TestUpstreamRateGate(t *testing.T) {
 	// 要真的往那个桶里花钱才测得到：只用表上的出口时 used[""] 恒为 0，断言恒真。
 	wild := []types.Exit{{Region: "NG"}, {Region: "US", City: "Dallas"}}
 	for i, e := range wild {
-		if _, err := c.Mint(context.Background(), cr, e, "sid-w", ""); err != nil {
+		if _, err := c.Mint(context.Background(), cr, e, "sid-w", "", time.Time{}); err != nil {
 			t.Fatalf("野出口第 %d 发被拦了: %v", i+1, err)
 		}
 	}
@@ -962,15 +1048,15 @@ func TestUpstreamRateGate(t *testing.T) {
 		t.Fatalf("两个野出口没挤进同一个空桶（各自多出一份配额）: %v", used)
 	}
 	// 挤满了就一起被拦：limit=3，上面已经花了 2 发。
-	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "ZZ"}, "sid-w", ""); err != nil {
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "ZZ"}, "sid-w", "", time.Time{}); err != nil {
 		t.Fatalf("空桶第 3 发就被拦了: %v", err)
 	}
-	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "QQ"}, "sid-w", ""); !errors.Is(err, types.ErrRateLimited) {
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "QQ"}, "sid-w", "", time.Time{}); !errors.Is(err, types.ErrRateLimited) {
 		t.Fatalf("空桶打满了还放行，实为 %v", err)
 	}
 	// 闸是按上游账号算的：另一个号自己有一整份预算，不该被这个号打满而挨饿。
 	other := types.Creds{AccessToken: "tok", AccountID: "acc-2"}
-	if _, err := c.Mint(context.Background(), other, types.Exit{Region: "US"}, "sid-y", ""); err != nil {
+	if _, err := c.Mint(context.Background(), other, types.Exit{Region: "US"}, "sid-y", "", time.Time{}); err != nil {
 		t.Fatalf("另一个账号被别人的配额拖累了: %v", err)
 	}
 }

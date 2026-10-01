@@ -47,10 +47,12 @@ const (
 	proxySkipMax       = time.Minute
 )
 
-// ErrNoLanding 是「没下发新 __oailb，本次又没发 pair」——读不出落点，按失败处理。
+// ErrNoLanding 是「读不出这一发落到哪儿了」——按失败处理。两种情形：
+//   - 没下发新 __oailb，本次又没发 pair
+//   - 没下发新 __oailb，发了 pair，但那张的 __cflb 已经不保证还活着 ⇒ 旧名字不作数
 //
-// 注意反过来不成立：没下发新 cookie 但**发了** pair 是**成功**，
-// 说明上游接受了那张 pair、没换网关（SPEC 第 2 节、红线 3）。
+// 注意第二条的反面才是成功：没下发新 cookie 而送进去那张**确定还活着**，
+// 说明上游接受了它、没换网关（SPEC 第 2 节、红线 3）。
 var ErrNoLanding = errors.New("上游既没下发 __oailb，本次也没发 pair，读不出落点")
 
 // ErrNoProxy 是「能用的出口一个都没有」。定义搬到了 types（调度要按它分流，
@@ -286,7 +288,12 @@ func (c *Client) bindLocked(sid string, idx int, now time.Time) {
 }
 
 // Mint 经 e 指定的出口打一发最小 ping。sentPair 为空表示裸打。
-func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, sentPair string) (types.MintResult, error) {
+//
+// sentCflbExp 是送进去那张 pair 的 __cflb 死期（types.Pair.CflbExpiresAt；裸打传零值）。
+// 它决定「上游没下发新 cookie」这件事怎么判，见下面那段注释——没有它就只能瞎猜，
+// 而猜错是**静默写坏账本**。
+func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, sentPair string,
+	sentCflbExp time.Time) (types.MintResult, error) {
 	if err := c.spend(cr.AccountID, e); err != nil {
 		return types.MintResult{}, err
 	}
@@ -302,6 +309,8 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 	// 只读响应头就断：body 是 SSE 流，读完它要等上游把整轮推完，白等几十秒。
 	defer resp.Body.Close()
 
+	// Max-Age 是**相对收到响应的时刻**算的，所以时刻要在这儿取，别拖到后面。
+	at := time.Now().UTC()
 	res := types.MintResult{
 		Status:    resp.StatusCode,
 		TurnState: resp.Header.Get(stateHeader),
@@ -312,25 +321,43 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		res.ErrBody = strings.TrimSpace(string(b))
 	}
 	fresh := newCookies(resp)
-	if oailb := fresh[cookieOailb]; oailb != "" {
-		gw, exp, err := parseOailb(oailb)
+	if oailb := fresh[cookieOailb]; oailb != nil {
+		gw, exp, err := parseOailb(oailb.Value)
 		if err != nil {
 			return res, fmt.Errorf("解 __oailb: %w", err)
 		}
 		res.Gateway = gw
 		res.PairExpires = exp
+		// 钉路由的是 __cflb（见 cookieCflb 和 types.PairLifetime），而它比 __oailb
+		// 早死 300 秒 ⇒ 它的死期必须单独带出去。只按 __oailb 算寿命的话，
+		// 「刚好够交付」那张票的路由其实已经死了，亲和失效、落点重新分配。
+		res.CflbExpires = cookieDeadline(fresh[cookieCflb], at)
 		// 上游常只补发变动的那一项。只拿新的那半会丢掉钉路由的 __cflb，
 		// 所以在送进去的 pair 上**覆盖**，而不是替换。
 		res.NewPair = mergePair(sentPair, fresh)
 		return res, nil
 	}
 	if sentPair != "" {
-		// 没下发新 cookie = 网关没变（relay index.js 的判读同款）。这是成功。
-		res.Gateway = pairGateway(sentPair)
-		if res.Gateway == "" {
-			return res, fmt.Errorf("送进去的 pair 里读不出网关")
+		// 「没下发新 cookie」对应两件**相反**的事，判据是送进去那张的 __cflb 还活着没：
+		//
+		//   活着 ⇒ 上游接受了它、路由没变 ⇒ 落点就是旧名字（SPEC 第 2 节）
+		//   死了 ⇒ 亲和已经失效，这一发按出口地理随机路由走了，而 __oailb 还能读出
+		//          那个**过期的**名字（实验 D：只带 __oailb ⇒ 无新 cookie、读不出落点）
+		//
+		// 无条件认旧名字会静默写坏三处账本：触碰标在没打到的网关上（真正打到的那个
+		// 仍是「从没碰过」，下次当首次接触发给别人）、定向铸票的漂移永远检测不出来、
+		// 续期的失败预算永远攒不满（死票不会被丢，每轮还重发）。
+		//
+		// **判据必须「可证」**：要求死期晚于**响应时刻**。响应时刻之后才死 ⇒ 整个
+		// 往返期间它都活着。读不出死期（零值）一律按死了算——猜错的代价不对称。
+		if sentCflbExp.After(at) {
+			res.Gateway = pairGateway(sentPair)
+			if res.Gateway == "" {
+				return res, fmt.Errorf("送进去的 pair 里读不出网关")
+			}
+			return res, nil
 		}
-		return res, nil
+		return res, fmt.Errorf("%w（送进去那张的 __cflb 已经不保证还活着，旧名字不能当落点）", ErrNoLanding)
 	}
 	return res, ErrNoLanding
 }
@@ -728,24 +755,45 @@ func isProxyToken(s string) bool {
 // ---------- cookie / JWT ----------
 
 // newCookies 收本次响应下发的 __cflb / __oailb。
-func newCookies(resp *http.Response) map[string]string {
-	out := map[string]string{}
+// newCookies 留着整个 *http.Cookie 而不只是值：__cflb 的死期要从它的 Max-Age 读
+// （见 cookieDeadline），而那是钉路由那个 cookie 唯一能读出时间的地方。
+func newCookies(resp *http.Response) map[string]*http.Cookie {
+	out := map[string]*http.Cookie{}
 	for _, ck := range resp.Cookies() {
 		switch ck.Name {
 		case cookieCflb, cookieOailb:
 			if ck.Value != "" {
-				out[ck.Name] = ck.Value
+				out[ck.Name] = ck
 			}
 		}
 	}
 	return out
 }
 
+// cookieDeadline 把一个 Set-Cookie 的生存期换成绝对时刻。
+//
+// Max-Age 优先（上游给的就是它），其次 Expires；都没给就回零值 = 「这一发没说」，
+// 由调用方兜底（types.MintResult.RouteDeadline）。负的 Max-Age 按 RFC 6265 是
+// 「立刻删掉」⇒ 当场就算死。
+func cookieDeadline(ck *http.Cookie, now time.Time) time.Time {
+	switch {
+	case ck == nil:
+		return time.Time{}
+	case ck.MaxAge > 0:
+		return now.Add(time.Duration(ck.MaxAge) * time.Second)
+	case ck.MaxAge < 0:
+		return now
+	case !ck.Expires.IsZero():
+		return ck.Expires.UTC()
+	}
+	return time.Time{}
+}
+
 // mergePair 把本次新下发的项盖在送进去的 pair 上，输出完整的 cookie 头。
-func mergePair(sentPair string, fresh map[string]string) string {
+func mergePair(sentPair string, fresh map[string]*http.Cookie) string {
 	cur := parsePair(sentPair)
-	for k, v := range fresh {
-		cur[k] = v
+	for k, ck := range fresh {
+		cur[k] = ck.Value
 	}
 	// 固定 __cflb 在前，便于比对和落盘去重。
 	parts := make([]string, 0, 2)

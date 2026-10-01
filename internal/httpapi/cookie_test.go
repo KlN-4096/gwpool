@@ -7,8 +7,10 @@ package httpapi
 // 它们一变就是改协议，必须让这几个用例红。
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -691,6 +693,113 @@ func TestCodesReachTheFailLog(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Fatalf("管理页上没有 %s", want)
 		}
+	}
+}
+
+// B-1：跨账号取票（一把合法 key 替别的上游账号取）走的是「池子没有那个号的凭据」
+// 这条路，但调用方**鉴权过了** ⇒ 不该吃 public_when_surplus 这道闸。
+//
+// 默认公开池是关的、门槛缺省又是 96 个网关（冷却 ÷ 单张可用时长），不区分的话这条
+// 文档明写支持的路径每一发都是 503 public_closed——而那个码说的是「**匿名**此刻不开放」。
+func TestCrossAccountIsNotGatedByPublicSwitch(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	key := srv.ConsumerKeyFor(st.accounts[0])
+	if p.public.Open {
+		t.Fatal("前提是公开池关着（默认就是关的）")
+	}
+
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-friend", nil), key))
+	if w.Code != 200 {
+		t.Fatalf("状态 %d（公开池开关把鉴权过的跨账号调用挡了）: %s", w.Code, w.Body.String())
+	}
+	if len(p.anon) != 1 || !strings.HasSuffix(p.anon[0], "authed=true") {
+		t.Fatalf("没报成「鉴权过的」: %v", p.anon)
+	}
+	// 另一侧：真匿名照旧被门槛挡住，而且码不变。
+	w = do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
+	if w.Code != 401 { // 开关没开 ⇒ 没带 key 就是 key 不认
+		t.Fatalf("匿名状态 %d", w.Code)
+	}
+	p.public = sched.PublicState{Enabled: true, Open: false, Free: 1, Threshold: 6}
+	w = do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
+	if w.Code != 503 || decodeFail(t, w).Error.Code != codePublicClosed {
+		t.Fatalf("匿名该被门槛挡住: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// S-2：「你点的这个号用不了」要有自己的分流，不能掉进 no_live_pair。
+//
+// 运营方逐个启用账号来验、或者管理员拿 ?account=<已停用的号> 取票时，回「没有可交付
+// 的活票，稍后再试」会让他挂满 wait、还白排一次发现扫描，而真实原因是那个号本身。
+func TestAccountUnusableIsBadRequest(t *testing.T) {
+	srv, h, p, st, sc := rig(t, types.ModePool)
+	p.err = fmt.Errorf("%w：账号 1（停用理由：铸票 HTTP 401：token_revoked）", sched.ErrAccountUnusable)
+	key := srv.ConsumerKeyFor(st.accounts[0])
+
+	start := time.Now()
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?wait=5", nil), key))
+	if w.Code != 503 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	got := decodeFail(t, w)
+	if got.Error.Code != codeBadRequest {
+		t.Fatalf("code=%q，应为 %q", got.Error.Code, codeBadRequest)
+	}
+	if got.Error.RetryAfterSeconds != 0 {
+		t.Fatalf("等多久那个号都还是停用的，不该给退避建议: %+v", got.Error)
+	}
+	// 不可等待：挂满 wait 只是把连接耗在一件不会变的事上。
+	if took := time.Since(start); took > waitPoll {
+		t.Fatalf("在「账号用不了」上等了 %v", took)
+	}
+	if p.calls != 1 {
+		t.Fatalf("取票次数 %d", p.calls)
+	}
+	// 也不该排发现扫描：找新落点救不了一个已停用的号。
+	if len(sc.discovery) != 0 {
+		t.Fatalf("白排了发现扫描: %v", sc.discovery)
+	}
+	// 停用理由要落在卡片的原始错误里（「手动暂停」和「凭据已死」要做的事不同）。
+	admin := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	if !strings.Contains(admin, "token_revoked") {
+		t.Fatal("管理页上看不到停用理由")
+	}
+}
+
+// S-3 / S-4：开局最可能的两种故障要留下痕迹。
+//
+// 鉴权前的 bad_request 刻意不进那个 200 条的环（谁都能灌），但**必须进日志**——
+// 三处都没有记录的话，「消费端每一发都带着畸形参数」和「池子没货」长得一模一样。
+// 而冷启动（网关表空着）池子自己走不出来，那句「要人踢一脚」得写在卡片上。
+func TestColdStartAndBadParamsLeaveATrace(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	var buf bytes.Buffer
+	srv.opt.Log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	// S-3：畸形参数（鉴权之前就拒了）⇒ 日志里要有，环里不许有。
+	if w := do(h, httptest.NewRequest("GET", "/cookie?wait=abc", nil)); w.Code != 400 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	if !strings.Contains(buf.String(), codeBadRequest) {
+		t.Fatalf("参数不合法没进日志: %s", buf.String())
+	}
+	admin := func() string {
+		return do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	}
+	if strings.Contains(admin(), codeBadRequest) {
+		t.Fatal("鉴权前的 400 进了环（未鉴权的请求能把真实诊断挤出去）")
+	}
+
+	// S-4：冷启动 ⇒ no_gateway，卡片上要写清「池子自己走不出来」。
+	st.gws = map[string]types.Gateway{}
+	p.err = sched.ErrNoFullSlot
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil),
+		srv.ConsumerKeyFor(st.accounts[0]))); w.Code != 503 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	page := admin()
+	if !strings.Contains(page, codeNoGateway) || !strings.Contains(page, "/admin/rescan") {
+		t.Fatal("冷启动的卡片上没写该怎么踢")
 	}
 }
 

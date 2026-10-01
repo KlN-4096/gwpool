@@ -111,7 +111,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (upstream string, row int64, placeholder, ok bool) {
 	ref := strings.TrimSpace(r.URL.Query().Get("account"))
 	if len(ref) > 128 {
-		badRequest(w, http.StatusBadRequest, "account 太长")
+		s.badRequest(w, http.StatusBadRequest, "account 太长")
 		return "", 0, false, false
 	}
 
@@ -149,7 +149,7 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (upstream strin
 		return "", 0, false, false
 	}
 	if ref == "" {
-		badRequest(w, http.StatusBadRequest,
+		s.badRequest(w, http.StatusBadRequest,
 			"匿名调用必须带 account 参数（你自己的上游 account_id）")
 		return "", 0, false, false
 	}

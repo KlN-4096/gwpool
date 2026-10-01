@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
@@ -15,7 +16,7 @@ import (
 // （真打那一发在 scan.ScanRegion 里，这些用例只看入队决策）。
 type stubMinter struct{}
 
-func (stubMinter) Mint(context.Context, types.Creds, types.Exit, string, string) (types.MintResult, error) {
+func (stubMinter) Mint(context.Context, types.Creds, types.Exit, string, string, time.Time) (types.MintResult, error) {
 	return types.MintResult{}, nil
 }
 

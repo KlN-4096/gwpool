@@ -113,3 +113,70 @@ func TestDeliverFloorOutlastsWindow(t *testing.T) {
 			"同时「不能发」和「该续了」，供给紧时交付只能原地等保温", DeliverFloor, RenewLead)
 	}
 }
+
+// 一张票能用多久由 __cflb 定（它才钉路由），而它比 __oailb 早死。
+// 按 __oailb 算寿命的话，「刚好够交付」那张票的路由其实已经死了。
+func TestCflbDiesBeforeOailb(t *testing.T) {
+	if PairLifetime >= OailbLifetime {
+		t.Fatalf("PairLifetime=%v 不短于 OailbLifetime=%v，那 300 秒的带子没了",
+			PairLifetime, OailbLifetime)
+	}
+}
+
+// RouteDeadline 三级取值都要对，而且**一律取小**。
+func TestRouteDeadlineTakesTheShorterCookie(t *testing.T) {
+	now := time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC)
+	oailb := now.Add(OailbLifetime)
+	for _, c := range []struct {
+		name      string
+		res       MintResult
+		prevCflb  time.Time
+		wantRoute time.Time
+		wantCflb  time.Time
+	}{{
+		// 一级：这一发补发了 __cflb ⇒ 用它自己的 Max-Age，而它更早 ⇒ 取它。
+		name:      "补发了 cflb",
+		res:       MintResult{PairExpires: oailb, CflbExpires: now.Add(PairLifetime)},
+		wantRoute: now.Add(PairLifetime), wantCflb: now.Add(PairLifetime),
+	}, {
+		// 二级：只补发了 __oailb ⇒ 旧 __cflb 原样留着 ⇒ 按账本上它的死期。
+		// 这一格漏了就等于让新 __oailb 的 65 分钟盖掉旧 __cflb，虚报量无上限。
+		name:     "只补发 oailb，继承旧 cflb",
+		res:      MintResult{PairExpires: oailb},
+		prevCflb: now.Add(400 * time.Second),
+		// 旧 __cflb 只剩 400 秒 ⇒ 路由 400 秒后就死，和新 __oailb 的 3900 无关。
+		wantRoute: now.Add(400 * time.Second), wantCflb: now.Add(400 * time.Second),
+	}, {
+		// 三级：Max-Age 读不出又没有上一张 ⇒ 按实测差值倒推 300 秒。
+		name:      "两样都没有，按差值兜底",
+		res:       MintResult{PairExpires: oailb},
+		wantRoute: oailb.Add(-(OailbLifetime - PairLifetime)),
+		wantCflb:  oailb.Add(-(OailbLifetime - PairLifetime)),
+	}, {
+		// __oailb 反而更早（继承来的 __cflb 还很长）⇒ 取 __oailb。
+		name:      "oailb 更早就取它",
+		res:       MintResult{PairExpires: now.Add(time.Minute)},
+		prevCflb:  now.Add(time.Hour),
+		wantRoute: now.Add(time.Minute), wantCflb: now.Add(time.Hour),
+	}} {
+		t.Run(c.name, func(t *testing.T) {
+			route, cflb := c.res.RouteDeadline(c.prevCflb)
+			if !route.Equal(c.wantRoute) {
+				t.Fatalf("route=%v，应为 %v", route, c.wantRoute)
+			}
+			if !cflb.Equal(c.wantCflb) {
+				t.Fatalf("cflb=%v，应为 %v", cflb, c.wantCflb)
+			}
+			if route.After(cflb) {
+				t.Fatal("route 比 cflb 还晚：路由死了票就不能发了")
+			}
+		})
+	}
+}
+
+// 兜底算法零值进零值出：零值得由调用方当「不知道」处理，绝不能变成「不过期」。
+func TestFallbackCflbExpiryZeroStaysZero(t *testing.T) {
+	if got := FallbackCflbExpiry(time.Time{}); !got.IsZero() {
+		t.Fatalf("零值进去出来成了 %v", got)
+	}
+}
