@@ -403,7 +403,7 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (
 	//
 	// 一张活 pair 都没有时**仍然现铸一发**（见 deliverByFreshMint）：不然冷池子永远 503，
 	// 只能干等预铸。规则是「有票就绝不铸」，不是「永不铸」。
-	withPair, _ := s.splitByPair(cands, req.Floor())
+	withPair := s.gatewaysWithPair(cands, req.Floor())
 	if len(withPair) == 0 {
 		// 点名了网关就定向铸（落点漂了算失败）：他点名是因为**他**知道自己没烧过那个
 		// 落点，给他换一个等于没听他说话。没点名才是抽签。
@@ -456,6 +456,38 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (
 		return types.Delivery{}, fmt.Errorf("%w（最后一个原因：%w）", ErrNoFullSlot, last)
 	}
 	return types.Delivery{}, ErrNoFullSlot
+}
+
+// HasCandidate 报告「此刻有没有一张这个账号拿得到、而且不用铸的票」。
+//
+// 这是 HTTP 那边 wait 轮询的判据，**必须和 Deliver 的前半段是同一把尺子**，所以
+// 它就住在这儿、照抄那个顺序（排除 → force 排掉手上那张 → 冷却 → 只看有活票的）。
+// 判据分成两份的后果是实打实的浪费：少了 accountID 就应用不了那两条冷却闸，而
+// 「刚交付过的网关在冷却里、它那张 pair 还活着」是这个池子最常见的稳态
+// （冷却 4 小时 ≫ pair 寿命 65 分钟）⇒ 每一次等待都会看见一张自己拿不到的票、
+// 立刻重跑、白铸一发（1 发请求 + 2 个槽位）。
+//
+// 门槛就是「有现成票」：候选为空时 Deliver 会去现铸，而那正是等待想省掉的那一发——
+// 所以这里只在**不用铸**的时候才说有。
+func (s *Scheduler) HasCandidate(accountID int64, req Request) bool {
+	cands := make([]string, 0, 8)
+	for name := range s.st.Gateways() {
+		if req.Gateway != "" && name != req.Gateway {
+			continue
+		}
+		if p, _ := s.st.Pair(name); req.Skips(name, p.Cookie) {
+			continue
+		}
+		if req.Force && s.holding(accountID, name) {
+			continue
+		}
+		cands = append(cands, name)
+	}
+	if len(cands) == 0 {
+		return false
+	}
+	rested := s.notCooling(accountID, cands, s.cfg().SlotCooldown())
+	return len(s.gatewaysWithPair(rested, req.Floor())) > 0
 }
 
 // noteTryFailure 给一次失败的尝试善后，返回「还值得试下一个吗」。
@@ -672,46 +704,28 @@ type minted struct {
 	firstAt time.Time
 }
 
-// tryGateway 在一个**点名的**网关上交付：确保它有张够新鲜的 pair，然后走 finish。
+// tryGateway 在一个选中的网关上交付那张现成的票。
 //
-// 走到这儿的网关通常已经有票（Deliver 硬筛过），所以这条路一般一发上游都不打。
+// **这条路一发上游都不打**（开了交付前验证的话由 finish 自己去打）：走到这儿的网关
+// 是 Deliver 从「有活票」那一拨里挑出来的，铸票只归 deliverByFreshMint。
+// exit 只是传给 finish 备用（验证那一发要用它）。
 func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw types.Gateway, req Request) (types.Delivery, error) {
 	exit, ok := pickExit(gw)
 	if !ok {
-		return types.Delivery{}, fmt.Errorf("网关 %s 没有已知可达出口，没法定向铸票", gw.Name)
+		return types.Delivery{}, fmt.Errorf("网关 %s 没有已知可达出口", gw.Name)
 	}
 	floor := req.Floor()
 
 	pair, fresh := s.freshPair(gw.Name, floor)
-	var m minted
 	if !fresh {
-		// 同一个网关一次只许有一发在铸。**锁顺序恒为「先网关、再账号」**，
-		// 而 finish 只拿账号锁、绝不回头要网关锁 ⇒ 不存在 ABBA。
-		//
-		// 为什么账号锁拦不住这件事：两个消费者在同一个网关上都没票时，minterFor
-		// 大概率给他们挑**不同**的铸票者，于是两发都放出去了——而一张 pair 本来就能
-		// 同时服务多个消费者（types.Pair 的 2026-10-01 实测），第二发纯属白烧
-		// 一个槽位加一发请求。
-		release := s.lockGateway(gw.Name)
-		// 拿到锁之后重查一遍：排在前面那个人可能刚把票铸好了。
-		if p, ok := s.freshPair(gw.Name, floor); ok {
-			pair = p
-			release()
-			s.opt.Log.Debug("等到了别人刚铸的票，省下一发", "gateway", gw.Name, "account", consumer.ID)
-		} else {
-			got, err := s.mintPair(ctx, consumer, gw.Name, exit, pair, gw.Name, gw.Name)
-			release()
-			if err != nil {
-				return types.Delivery{}, err
-			}
-			pair = got.pair
-			if got.mintedBySelf {
-				// 单账号模式：建 pair 那一发就是消费者的首次接触，票直接拿来用。
-				m = got.minted
-			}
-		}
+		// 走到这儿的网关是从「有活票」那一拨里挑出来的，唯一的到法是选中到这儿之间
+		// 那张票正好跨过门槛。**不在这条路上铸**：要带进去的就是这张「还有效、只是太短」
+		// 的 pair，而上游会接受它、不下发新 cookie（SPEC 第 2 节）⇒ finish 照样拒发，
+		// 请求和铸票者的槽位白花（见 pairFor 的注释）。回落铸票归 deliverByFreshMint。
+		return types.Delivery{}, fmt.Errorf("网关 %s 的 pair 刚跌破门槛（剩 %v），这一轮不发",
+			gw.Name, pair.ExpiresAt.Sub(s.now()).Truncate(time.Second))
 	}
-	return s.finish(ctx, consumer, gw.Name, exit, pair, m, floor)
+	return s.finish(ctx, consumer, gw.Name, exit, pair, minted{}, floor)
 }
 
 // deliverByFreshMint 是「一张活 pair 都没有」时的回落：**抽一次签**。
@@ -752,6 +766,15 @@ func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Accou
 	// 别人可能刚为这个网关铸好了票——那就直接用，省下这一发。
 	if p, fresh := s.freshPair(sl.Gateway, floor); fresh {
 		release()
+		// 闸 2 在这一支要**现读**，不能用 coolingBefore：等这把锁花掉的 20~90 秒里
+		// 并没有「消费者自己铸票」这回事（那一发是别人打的），所以现读不会自己把自己
+		// 判死；而池子模式下 minterFor 常常就挑中另一个消费者，于是等到的那张票恰好
+		// 是**他自己**刚铸的 ⇒ 他对这个网关的满血窗口已经烧了几十秒，再按 now() 起算
+		// 窗口会多报最多 57 秒（和 B-2 同类错，从另一条路进来）。
+		if s.coolingSet(consumer.ID, cooldown)[sl.Gateway] {
+			return types.Delivery{}, sl.Gateway, fmt.Errorf(
+				"等锁期间这个账号刚碰过 %s，窗口已经在烧", sl.Gateway)
+		}
 		d, err := s.finish(ctx, consumer, sl.Gateway, exit, p, minted{}, floor)
 		return d, sl.Gateway, err
 	}
@@ -1237,23 +1260,20 @@ func (s *Scheduler) maxTries() int {
 	return s.cfg().MaxTriesPerDeliver
 }
 
-// splitByPair 把候选网关分成「此刻有活 pair 的」和「要现铸的」两拨。
+// gatewaysWithPair 留下此刻有活 pair 的候选网关。一张都没有（返回空）就该去现铸。
 //
 // 组内的排序仍然交给 LongestRestedSlot，所以「从没碰过的网关优先」照旧成立——
 // 注意它给不存在的槽位行合成一个零值 Slot（LastTouch 是零时刻），于是没碰过的
 // 永远排在碰过的前面。硬筛加在它前面之后这个行为没有坏处（组内全是出了冷却的槽位），
 // 但别以为零值会被跳过。
-func (s *Scheduler) splitByPair(cands []string, floor time.Duration) (withPair, without []string) {
-	withPair = make([]string, 0, len(cands))
-	without = make([]string, 0, len(cands))
+func (s *Scheduler) gatewaysWithPair(cands []string, floor time.Duration) []string {
+	out := make([]string, 0, len(cands))
 	for _, name := range cands {
 		if _, fresh := s.freshPair(name, floor); fresh {
-			withPair = append(withPair, name)
-		} else {
-			without = append(without, name)
+			out = append(out, name)
 		}
 	}
-	return withPair, without
+	return out
 }
 
 // freshPair 判断池里那张 pair 还够不够交付：剩余不足 floor 就别发，
@@ -1325,6 +1345,13 @@ func (s *Scheduler) redeliver(accountID int64, req Request) (types.Delivery, boo
 	}
 	// 排除名单也要在这条路上生效：他带着 exclude 来，就是**不想要**手上那张了。
 	if req.Skips(best.Gateway, p.Cookie) {
+		return types.Delivery{}, false
+	}
+	// 只在调用方**显式**给了门槛时才按它筛：他说「至少 600 秒」，窗口内重连却拿回
+	// 一张只剩 40 秒的票就是骗他。
+	// 默认门槛**不能**加在这儿：那会让窗口内的重连掉进正常流程去烧下一个落点，
+	// 而省掉那个槽位正是 redeliver 存在的理由。
+	if req.MinRemaining > 0 && p.ExpiresAt.Sub(now) < req.MinRemaining {
 		return types.Delivery{}, false
 	}
 	exp, validFor := s.deliverWindow(best.LastDeliver.Add(types.DeliverTTL), p.ExpiresAt)

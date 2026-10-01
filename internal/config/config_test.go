@@ -276,6 +276,35 @@ func TestSlotCooldownFromMinutes(t *testing.T) {
 	}
 }
 
+// min_free_gateways 的默认值要跟着**配置里的**冷却算，而不是那个 4 小时的常量：
+// 冷却调成 30 分钟时「一个账号不停转」只要 12 个网关，留着 96 会让公开池难开一个量级。
+func TestMinFreeGatewaysDefaultFollowsCooldown(t *testing.T) {
+	cfg, err := Load(writeCfg(t, `{"slot_cooldown_minutes":30,`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := types.GatewaysForContinuous(30 * time.Minute); cfg.PublicWhenSurplus.MinFreeGateways != want {
+		t.Fatalf("门槛 %d，按 30 分钟冷却该是 %d", cfg.PublicWhenSurplus.MinFreeGateways, want)
+	}
+	// 没动冷却时还是那个常量算出来的数：这条改动不许顺手改掉默认部署的门槛。
+	cfg, err = Load(writeCfg(t, `{`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := types.GatewaysForContinuous(types.SlotCooldown); cfg.PublicWhenSurplus.MinFreeGateways != want {
+		t.Fatalf("默认门槛变成了 %d，应为 %d", cfg.PublicWhenSurplus.MinFreeGateways, want)
+	}
+	// 显式写了就照显式的办——那是运营决策，不许被派生值盖掉。
+	cfg, err = Load(writeCfg(t, `{"slot_cooldown_minutes":30,
+		"public_when_surplus":{"enabled":true,"min_free_gateways":3},`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PublicWhenSurplus.MinFreeGateways != 3 {
+		t.Fatalf("显式门槛被盖成了 %d", cfg.PublicWhenSurplus.MinFreeGateways)
+	}
+}
+
 // spare_target 的 0 是真的 0（全按需、不预铸），不许被「0 = 用默认值」吃掉。
 func TestSpareTargetZeroIsMeaningful(t *testing.T) {
 	cfg, err := Load(writeCfg(t, `{"spare_target":0,`+okProxies+`}`))

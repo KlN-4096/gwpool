@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -524,5 +525,136 @@ func TestPublicReadsLiveConfig(t *testing.T) {
 	s.opt.Live = config.NewLive("", c)
 	if ps := s.Public(); ps.Open || ps.Threshold != 99 {
 		t.Fatalf("门槛调紧没生效: %+v", ps)
+	}
+}
+
+// F1：wait 的轮询判据和交付必须是同一把尺子——它看见的票得是**这个账号**真拿得到的。
+//
+// 「刚交付过的网关在冷却里、它那张 pair 还活着」是这个池子最常见的稳态
+// （冷却 4 小时 ≫ pair 寿命 65 分钟），判据少看一条闸就会每次等待都重跑、
+// 白铸一发（1 发请求 + 2 个槽位）。
+func TestHasCandidateUsesTheSameJudgeAsDeliver(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	delete(st.gws, "unified-2")
+	delete(st.gws, "unified-3")
+	putPair(st, "unified-1", cookiePrefix+"unified-1", clk.now().Add(types.PairLifetime))
+
+	// 一侧：没碰过这个网关 ⇒ 这张现成票他拿得到。
+	if !s.HasCandidate(1, Request{}) {
+		t.Fatal("有现成票却说没有")
+	}
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	// 另一侧：票还活着，但他刚在这个网关上取过 ⇒ 对他而言没有候选。
+	if s.HasCandidate(1, Request{}) {
+		t.Fatal("槽位在冷却里、这张票他拿不到，判据却说有（每次等待都会白铸一发）")
+	}
+	// 冷却是 (账号 × 网关) 的事：同一张票对别的账号仍然算候选。
+	if !s.HasCandidate(2, Request{}) {
+		t.Fatal("另一个账号没碰过这个网关，该算有候选")
+	}
+	// 调用方自己说不要的也不算候选，否则等到的那一下重跑仍然是 503。
+	p, _ := st.Pair("unified-1")
+	for name, req := range map[string]Request{
+		"exclude":          {Exclude: map[string]bool{"unified-1": true}},
+		"exclude_versions": {ExcludeVersions: map[string]bool{types.CookieVersion(p.Cookie): true}},
+		"min_remaining":    {MinRemaining: types.PairLifetime + time.Hour},
+	} {
+		if s.HasCandidate(2, req) {
+			t.Fatalf("%s 在轮询判据里失效了", name)
+		}
+	}
+}
+
+// F3：等锁期间别人铸好的那张票，用之前必须**现读**一遍自己的闸。
+//
+// 池子模式下 minterFor 常常挑中另一个消费者，于是等到的票恰好是他自己刚铸的——
+// 他对这个网关的满血窗口已经烧了几十秒，而铸票前的快照看不见这件事。
+func TestWaitingForAnothersMintRechecksOwnWindow(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	mn.delay = 20 * time.Millisecond // 两路都在飞
+	mn.mintCost = 60 * time.Second   // 一发 60 秒往返：窗口真的在烧
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	// 只有一个网关、一张票都没有 ⇒ 两个人必然挑到同一个，而铸票者只能是对方。
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{{Region: "US"}}}
+	mn.land["US"] = "unified-1"
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(nil)})
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = s.Deliver(context.Background(), int64(i+1), Request{})
+		}(i)
+	}
+	wg.Wait()
+	got := 0
+	for _, err := range errs {
+		if err == nil {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Fatalf("成功了 %d 路：铸票那一发烧的正是另一个消费者的窗口，他不该拿到这张票（errs=%v）", got, errs)
+	}
+	if n := len(mn.mintedGateways()); n != 1 {
+		t.Fatalf("铸了 %d 发，网关锁没拦住", n)
+	}
+}
+
+// F5：挑中的网关在选中之后才跌破门槛时**不许顺手补一发**。
+//
+// 带进去的是一张「还有效、只是太短」的 pair ⇒ 上游接受它、不下发新 cookie
+// （SPEC 第 2 节）⇒ finish 照样拒发，而请求和铸票者的槽位已经花掉了，
+// 消费者还白得一次退避。铸票只归「一张活票都没有」那条回落路。
+func TestTryGatewayNeverMints(t *testing.T) {
+	s, st, mn, clk := noVerifyRig(t)
+	gw := st.Gateways()["unified-1"]
+
+	putPair(st, "unified-1", cookiePrefix+"unified-1", clk.now().Add(types.DeliverFloor-time.Second))
+	if _, err := s.tryGateway(context.Background(), st.accounts[0], gw, Request{}); err == nil {
+		t.Fatal("残票直接发出去了")
+	}
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("为一张残票铸了 %d 发（上游根本不会换它）", n)
+	}
+	// 另一侧：票够新鲜就照常交付，而且一发都不打。
+	putPair(st, "unified-1", cookiePrefix+"unified-1", clk.now().Add(types.PairLifetime))
+	if _, err := s.tryGateway(context.Background(), st.accounts[0], gw, Request{}); err != nil {
+		t.Fatalf("够新鲜的票没发出去: %v", err)
+	}
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("有现成票还铸了 %d 发", n)
+	}
+}
+
+// F8：窗口内重连那条路也得认 min_remaining——但只认**显式**给的那个。
+//
+// 默认门槛不能加在那儿：那会让重连掉进正常流程去烧下一个落点，而省掉那个槽位
+// 正是 redeliver 存在的理由。
+func TestRedeliverHonorsExplicitMinRemaining(t *testing.T) {
+	s, st, _, clk := noVerifyRig(t)
+	putPair(st, "unified-1", cookiePrefix+"unified-1", clk.now().Add(40*time.Second))
+	st.mu.Lock()
+	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1",
+		LastDeliver: clk.now()}
+	st.mu.Unlock()
+
+	// 一侧：没说门槛 ⇒ 照样拿回手上那张残票（默认门槛 300 秒在这条路上**不生效**）。
+	d, ok := s.redeliver(1, Request{})
+	if !ok || d.ValidForS != 40 {
+		t.Fatalf("窗口内重连没原样答回去: ok=%v %+v", ok, d)
+	}
+	// 另一侧：显式说「至少 600 秒」⇒ 那张 40 秒的票不许发回去。
+	if d, ok := s.redeliver(1, Request{MinRemaining: 10 * time.Minute}); ok {
+		t.Fatalf("说了至少 600 秒，却拿回一张只剩 %d 秒的票", d.ValidForS)
 	}
 }

@@ -212,6 +212,7 @@ func Defaults() Config {
 		// 默认不对外开放：开放是运营决策，不该由默认值替人做主。
 		// 门槛取「一个账号能不停转」所需的网关数（冷却 ÷ 单张可用时长），
 		// 不是随手填一个小数字让它看起来开着。
+		// 冷却改过的话这个默认值会在 Load 里按**配置里那个冷却**重算。
 		PublicWhenSurplus: PublicWhenSurplus{
 			MinFreeGateways: types.GatewaysForContinuous(types.SlotCooldown)},
 		// 九个区域各 6 发 = 原先按账号算的 54 发/小时，拆开之后一个区域的重试
@@ -224,6 +225,17 @@ func Defaults() Config {
 		VerifyFullAtDeliver: false,
 		RenewPairs:          false,
 	}
+}
+
+// hasNestedKey 报告文件里显式写了 obj.key 没有。Load 为别的键做过同一件事
+// （那份 raw），嵌套对象只是多解一层。
+func hasNestedKey(raw map[string]json.RawMessage, obj, key string) bool {
+	var inner map[string]json.RawMessage
+	if json.Unmarshal(raw[obj], &inner) != nil {
+		return false
+	}
+	_, ok := inner[key]
+	return ok
 }
 
 // StickyProxies 返回启用着的粘性供应商。
@@ -337,6 +349,12 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.Model = cfg.Models[0] // 派生镜像，见字段注释
+	// min_free_gateways 没显式写时按**配置里的**冷却算，不按那个常量：冷却调成 30 分钟
+	// 时「一个账号不停转」只要 12 个网关，留着按 4 小时算出来的 96 会让公开池难开
+	// 一个量级（而那个函数自己的注释就说冷却是参数不是常量）。
+	if !hasNestedKey(raw, "public_when_surplus", "min_free_gateways") {
+		cfg.PublicWhenSurplus.MinFreeGateways = types.GatewaysForContinuous(cfg.SlotCooldown())
+	}
 	if cfg.PublicWhenSurplus.Enabled && cfg.PublicWhenSurplus.MinFreeGateways <= 0 {
 		return Config{}, fmt.Errorf("public_when_surplus.min_free_gateways 必须为正，" +
 			"否则一张空闲票都没有也会放匿名进来")

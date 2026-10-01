@@ -16,7 +16,7 @@ type deliverFail struct {
 	At        time.Time
 	AccountID int64 // 0 = 匿名调用
 	Gateway   string
-	// Code 是回给客户端的那个闭集错误码（cookie.go 里那九个），"release" 表示这行是
+	// Code 是回给客户端的那个闭集错误码（cookie.go 里那十一个），"release" 表示这行是
 	// 一次归还而不是失败。页面上必须看得见它：同一句人话底下可能是两种完全不同的
 	// 处置（「等几小时」和「等几十秒」长得一样）。
 	Code   string
@@ -27,7 +27,7 @@ type deliverFail struct {
 // failLogKeep 留多少条。够看清「刚才那一阵」就行，不是账本。
 const failLogKeep = 200
 
-// failDetailMax 截断原始错误：它进的是 HTML 页面，不是日志。
+// failDetailMax 截断原始错误：它进的是 HTML 页面，不是日志。单位是**字符**。
 const failDetailMax = 300
 
 // failLog 是最近若干次交付失败的环形缓冲。
@@ -37,8 +37,10 @@ type failLog struct {
 }
 
 func (l *failLog) add(f deliverFail) {
-	if n := len(f.Detail); n > failDetailMax {
-		f.Detail = f.Detail[:failDetailMax] + "…"
+	// 按字符截，不按字节：Detail 基本全是中文，按字节切会把半个汉字落进 HTML 页面
+	// （同仓库的 sanitizeLabel 和 types.SampleErr 也都是按字符）。
+	if r := []rune(f.Detail); len(r) > failDetailMax {
+		f.Detail = string(r[:failDetailMax]) + "…"
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

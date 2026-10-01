@@ -49,6 +49,10 @@ type Pool interface {
 	DeliverAnonymous(ctx context.Context, upstreamAccountID string, req sched.Request) (types.Delivery, error)
 	// Release 还原一次「票取了但一发没打」的交付，返回还原了几个槽位。
 	Release(accountID int64, cookieVersion string) (int, error)
+	// HasCandidate 是 wait 轮询的判据：此刻有没有一张**这个账号**拿得到、而且不用铸
+	// 的票。判据必须和交付是同一把尺子，所以归调度（它才看得见冷却），HTTP 这层
+	// 绝不自己算一份。
+	HasCandidate(accountID int64, req sched.Request) bool
 	// Public 是此刻的对外开放状态，现算不缓存。
 	Public() sched.PublicState
 	// PairTarget 是目标活 pair 数，只给 /gateways 的读数用。
@@ -725,11 +729,11 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 		// 管理员兜底必须显式说替谁取：槽位是 (账号 × 网关)，替谁取决定了取哪个槽位，
 		// 猜一个账号就等于把 A 的槽位发给 B。
 		if ref == "" {
-			badRequest(w, http.StatusBadRequest, "管理员调用必须带 account 参数指明替谁取")
+			s.badRequestFor(w, http.StatusBadRequest, 0, "管理员调用必须带 account 参数指明替谁取")
 			return
 		}
 		if acct, ok = s.findAccount(ref); !ok {
-			badRequest(w, http.StatusNotFound, "没有这个账号")
+			s.badRequestFor(w, http.StatusNotFound, 0, "没有这个账号")
 			return
 		}
 		ref = ""
@@ -741,13 +745,16 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	// 代价说在明处：池子**验不了**那张票——state-echo 要用那个账号的凭据打一发，池子
 	// 手上只有上传者的。所以走和匿名同一条路，回去的 verified_full 是 false。
 	if ref != "" && !accountRefMatches(acct, ref) {
-		s.serveCookie(w, r, acct.ID, req, wait, func(rq sched.Request) (types.Delivery, error) {
-			return s.pool.DeliverAnonymous(r.Context(), ref, rq)
-		})
+		// 记账归上传者（他的页面该看见这一行），**调度归占位行**：轮询要按那个号的
+		// 冷却判，发现扫描要排除的也是那个号——而池内行里只有上传者。
+		s.serveCookie(w, r, acct.ID, s.rowFor(types.AnonPrefix+ref), req, wait,
+			func(rq sched.Request) (types.Delivery, error) {
+				return s.pool.DeliverAnonymous(r.Context(), ref, rq)
+			})
 		return
 	}
 	// 挑不出可交付的槽位就 503。宁可 503，也不把降智的东西发出去。
-	s.serveCookie(w, r, acct.ID, req, wait, func(rq sched.Request) (types.Delivery, error) {
+	s.serveCookie(w, r, acct.ID, acct.ID, req, wait, func(rq sched.Request) (types.Delivery, error) {
 		return s.pool.Deliver(r.Context(), acct.ID, rq)
 	})
 }
@@ -760,13 +767,11 @@ func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sche
 	ps := s.pool.Public()
 	if !ps.Enabled {
 		// 没带有效 key，而池子又不对外开放 ⇒ 这就是「你的 key 不认」。
-		unauthorized(w, "需要本账号的 key")
+		s.unauthorized(w, "需要本账号的 key")
 		return
 	}
 	if !ps.Open {
-		writeFail(w, http.StatusServiceUnavailable, apiError{Code: codePublicClosed,
-			Message:           fmt.Sprintf("池子暂不对外开放：空闲 %d 个网关，门槛 %d", ps.Free, ps.Threshold),
-			RetryAfterSeconds: retrySeconds(publicClosedRetry)})
+		s.publicClosed(w, fmt.Sprintf("池子暂不对外开放：空闲 %d 个网关，门槛 %d", ps.Free, ps.Threshold))
 		return
 	}
 	// 必须报上他**自己的**上游账号标识：槽位是 (账号 × 网关)，不知道是谁就没法
@@ -776,9 +781,10 @@ func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sche
 		badRequest(w, http.StatusBadRequest, "匿名取用必须带 account 参数（你自己的上游 account_id）")
 		return
 	}
-	s.serveCookie(w, r, 0, req, wait, func(rq sched.Request) (types.Delivery, error) {
-		return s.pool.DeliverAnonymous(r.Context(), ref, rq)
-	})
+	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait,
+		func(rq sched.Request) (types.Delivery, error) {
+			return s.pool.DeliverAnonymous(r.Context(), ref, rq)
+		})
 }
 
 // deliveryResponse 在 types.Delivery 之外多说两句话。
@@ -814,20 +820,25 @@ func truthy(v string) bool {
 //
 // 状态码一律 503：对客户端来说这九种都是「这一发拿不到票」，该不该再来、等多久
 // 由码和 Retry-After 说，不由状态码说（而 sub2api 的客户端只认 503 → ErrNoSlot）。
-func (s *Server) deliverFailed(w http.ResponseWriter, err error, accountID int64, gateway string) {
-	s.opt.Log.Info("交付失败", "account", accountID, "gateway", gateway, "err", err)
+func (s *Server) deliverFailed(w http.ResponseWriter, err error, acctID, consumerID int64, gateway string) {
+	s.opt.Log.Info("交付失败", "account", acctID, "consumer", consumerID, "gateway", gateway, "err", err)
 	code, msg, retry := s.classify(err)
 	if errors.Is(err, sched.ErrNoFullSlot) {
 		// 这个账号在所有已知网关上都烧完了。光回 503 的话池子就卡在这儿了——
 		// 同一个网关上重铸一张新 pair 对它没用（烧掉的是「这个号接触过这个网关」，
 		// 换票不解封），只有**没碰过的新网关**才有窗口。所以去找新落点。
-		if s.scan != nil && accountID != 0 {
-			s.scan.EnqueueDiscovery(accountID)
+		//
+		// 派去的人要排除的是**消费者**，不是记账那一行：跨账号时消费者是占位行，
+		// 而上传者在这里恰恰是最合适的铸票者（烧它的窗口不影响消费者对新落点的首次
+		// 接触）。把上传者当成消费者排掉的话，单上传者的池子永远挑不出铸票者 ⇒
+		// 这种失败唯一的出路被堵死。消费者是占位行时传 0（它没凭据，本来也选不上它）。
+		if s.scan != nil {
+			s.scan.EnqueueDiscovery(consumerID)
 		}
 	}
 	// 页面上要看得见：客户端那头只有一个 502/503，上传者对着它猜不出是哪种。
 	// 码也要落下来——同一句人话底下可能是两种完全不同的处置。
-	s.fails.add(deliverFail{At: time.Now(), AccountID: accountID, Gateway: gateway,
+	s.fails.add(deliverFail{At: time.Now(), AccountID: acctID, Gateway: gateway,
 		Code: code, Reason: msg, Detail: err.Error()})
 	writeFail(w, http.StatusServiceUnavailable,
 		apiError{Code: code, Message: msg, RetryAfterSeconds: retrySeconds(retry)})

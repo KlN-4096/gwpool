@@ -17,7 +17,8 @@ import (
 // 鉴权和 /cookie 完全一致，连 account 参数的含义也一致：返回的 used_by_you 是**那个
 // 上游账号的**槽位历史，不带 account 就按这把 key 的上传者算。
 func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
-	upstream, acctID, ok := s.whoAsks(w, r)
+	// 占位行在这条路上照常用：used_by_you 问的就是「那个上游账号」的槽位历史。
+	upstream, acctID, _, ok := s.whoAsks(w, r)
 	if !ok {
 		return
 	}
@@ -104,53 +105,55 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 // 行的选法必须和 /cookie **逐条对齐**（见 handleCookie）：同一个请求参数在那边写哪一行，
 // 这边就得读哪一行。对不齐的后果是静默的——used_by_you 恒为 false，客户端照着一张全是
 // 「没用过」的清单挑，等于没挑。
-func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (string, int64, bool) {
+// 第三个返回值说「解出来的是占位行吗」（`anon:` 命名空间，没有任何归属证据）。
+// 两个端点对它的态度刻意相反：取票照占位行算（方向保守，见 types.AnonPrefix），
+// 归还一律拒（方向危险）。调用方自己按前缀判就是第二把尺子，所以由这儿一次说清。
+func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (upstream string, row int64, placeholder, ok bool) {
 	ref := strings.TrimSpace(r.URL.Query().Get("account"))
 	if len(ref) > 128 {
 		badRequest(w, http.StatusBadRequest, "account 太长")
-		return "", 0, false
+		return "", 0, false, false
 	}
 
 	if c, ok := s.resolveCaller(r); ok {
 		if c.admin {
 			// 管理员没有自己的账号：槽位是 (账号 × 网关)，猜一个就等于把 A 的历史报成 B 的。
 			if ref == "" {
-				badRequest(w, http.StatusBadRequest, "管理员调用必须带 account 参数指明替谁")
-				return "", 0, false
+				s.badRequestFor(w, http.StatusBadRequest, 0, "管理员调用必须带 account 参数指明替谁")
+				return "", 0, false, false
 			}
 			// 和 /cookie 一样按托管行解析：管理员那条路取的是那一行自己的槽位。
-			a, ok := s.findAccount(ref)
-			if !ok {
-				badRequest(w, http.StatusNotFound, "没有这个账号")
-				return "", 0, false
+			a, found := s.findAccount(ref)
+			if !found {
+				s.badRequestFor(w, http.StatusNotFound, 0, "没有这个账号")
+				return "", 0, false, false
 			}
-			return ref, a.ID, true
+			return ref, a.ID, false, true
 		}
 		if ref != "" && !accountRefMatches(c.acct, ref) {
 			// 跨账号：/cookie 把这种票算在占位行上，这边也只能读那一行。
-			return ref, s.rowFor(types.AnonPrefix + ref), true
+			return ref, s.rowFor(types.AnonPrefix + ref), true, true
 		}
-		return c.acct.Creds.AccountID, c.acct.ID, true
+		return c.acct.Creds.AccountID, c.acct.ID, false, true
 	}
 
 	ps := s.pool.Public()
 	if !ps.Enabled {
 		// 和 /cookie 同一个分类：没带有效 key、池子又不对外开放 = key 不认。
 		// 有码才能让调用方退避——没码的 401 会让它每发请求都照敲一次。
-		unauthorized(w, "需要本账号的 key")
-		return "", 0, false
+		s.unauthorized(w, "需要本账号的 key")
+		return "", 0, false, false
 	}
 	if !ps.Open {
-		writeFail(w, http.StatusServiceUnavailable, apiError{Code: codePublicClosed,
-			Message: "池子暂不对外开放", RetryAfterSeconds: retrySeconds(publicClosedRetry)})
-		return "", 0, false
+		s.publicClosed(w, "池子暂不对外开放")
+		return "", 0, false, false
 	}
 	if ref == "" {
 		badRequest(w, http.StatusBadRequest,
 			"匿名调用必须带 account 参数（你自己的上游 account_id）")
-		return "", 0, false
+		return "", 0, false, false
 	}
-	return ref, s.rowFor(types.AnonPrefix + ref), true
+	return ref, s.rowFor(types.AnonPrefix + ref), true, true
 }
 
 // slotCooldown 是当前生效的槽位冷却时长。没接配置文件（测试）就用默认值。

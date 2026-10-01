@@ -328,6 +328,8 @@ func acctID(c types.Creds) int64 {
 		return 1
 	case "acct-2":
 		return 2
+	case "acct-3":
+		return 3
 	}
 	return 0
 }
@@ -875,8 +877,11 @@ func TestDeliverIsPerAccount(t *testing.T) {
 	}
 }
 
-// 剩余不足 DeliverFloor 的 pair 不能直接交付，要先续。
-func TestStalePairIsRenewedBeforeDelivery(t *testing.T) {
+// 剩余不足 DeliverFloor 的 pair 不能直接交付，要**裸铸**一张顶上。
+//
+// 不是「续期」：带一张还有效的 pair 进去上游会接受它、不下发新 cookie（SPEC 第 2 节），
+// 而走到这条路的前提恰好是「还有效但太短」⇒ 必然换不回新票（见 pairFor）。
+func TestStalePairIsRemintedNotRenewed(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModeSingle)
 	delete(st.gws, "unified-2")
 	delete(st.gws, "unified-3")
@@ -2079,13 +2084,20 @@ func TestStalePairDoesNotCountAsLive(t *testing.T) {
 //
 // 账号锁拦不住这件事：minterFor 会给两个消费者挑**不同**的铸票者，于是两发都放出去了
 // ——而一张 pair 本来就能同时服务多个消费者，第二发纯属白烧一个槽位加一发请求。
+//
+// 三个号、消费者是 2 和 3：铸票者必然是账号 1（minterFor 只排掉消费者自己，剩下按 ID）。
+// 铸票者不能是其中一个消费者，否则等到票的那个人该被拒——那是另一条规则，由
+// TestWaitingForAnothersMintRechecksOwnWindow 盯着。mintCost 非零，不然「等到的票
+// 还剩多久」这件事恒为真，用例就什么都没证。
 func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)
 	mn := newMinter(clk)
 	mn.delay = 30 * time.Millisecond
+	mn.mintCost = 60 * time.Second
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
+	addAccount(st, 3, "acct-3")
 	// 只有一个网关、一张票都没有 ⇒ 两个人必然挑到同一个。
 	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
 		ReachableExits: []types.Exit{{Region: "US"}}}
@@ -2099,7 +2111,7 @@ func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out[i], errs[i] = s.Deliver(context.Background(), int64(i+1), Request{})
+			out[i], errs[i] = s.Deliver(context.Background(), int64(i+2), Request{})
 		}(i)
 	}
 	wg.Wait()

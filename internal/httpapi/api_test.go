@@ -55,6 +55,10 @@ type fakePool struct {
 	// calls 数一共取了几次票：wait 那条路最要紧的保证是「等不到就别重跑」，
 	// 重跑一次可能真打一发上游。
 	calls int
+	// hasCand 顶替 sched.HasCandidate。nil = 一张候选都没有。
+	// 判据归调度（只有它看得见冷却），HTTP 那层照它的答案办——而「池子里有票」
+	// 和「这个账号拿得到票」是两件事，这个 fake 必须能把它们分开。
+	hasCand func(accountID int64, req sched.Request) bool
 
 	released []string
 	relN     int
@@ -78,6 +82,13 @@ func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sche
 func (p *fakePool) Release(accountID int64, version string) (int, error) {
 	p.released = append(p.released, fmt.Sprintf("%d|%s", accountID, version))
 	return p.relN, p.relErr
+}
+
+func (p *fakePool) HasCandidate(accountID int64, req sched.Request) bool {
+	if p.hasCand == nil {
+		return false
+	}
+	return p.hasCand(accountID, req)
 }
 
 func (p *fakePool) Public() sched.PublicState { return p.public }

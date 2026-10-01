@@ -1,7 +1,7 @@
 package httpapi
 
 // 这一份盯的是 2026-10-02 那轮协议改动：四个新请求参数、cookie_version、
-// 九个错误码的闭集、以及 POST /release。
+// 十一个错误码的闭集、以及 POST /release。
 //
 // **参数名 / JSON 字段名 / 错误码是和消费端冻结的**，所以这里的字面量是故意写死的：
 // 它们一变就是改协议，必须让这几个用例红。
@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gwpool/internal/mint"
 	"gwpool/internal/sched"
@@ -66,7 +67,9 @@ func TestCookieResponseCarriesVersion(t *testing.T) {
 		t.Fatalf("cookie_version 长度 %d，约定是 %d", len(got.CookieVersion), types.CookieVersionLen)
 	}
 	// 版本号是**哈希**，不许把 cookie 本体漏进去（SPEC 红线 1）。
-	if strings.Contains(got.CookieVersion, "OAILB") || strings.Contains(got.CookieVersion, "cf") {
+	// 只查真·标记：`cf` 本身就是合法的十六进制双字符，查它对任何给定常量要么恒绿
+	// 要么恒红，和想证明的事无关。
+	if strings.Contains(got.CookieVersion, "OAILB") {
 		t.Fatalf("cookie_version 里带了 cookie 本体: %q", got.CookieVersion)
 	}
 	// 老字段照旧。
@@ -75,7 +78,7 @@ func TestCookieResponseCarriesVersion(t *testing.T) {
 	}
 }
 
-// 九个码是闭集，每个都要能从真实的失败路径上走出来，而且带 retry 的要同时发
+// 错误码是闭集，每个都要能从真实的失败路径上走出来，而且带 retry 的要同时发
 // Retry-After 头（不认识这份协议的中间件也能照着退避）。
 func TestCookieFailureCodes(t *testing.T) {
 	cases := []struct {
@@ -186,6 +189,14 @@ func TestForceRotationIsWaitable(t *testing.T) {
 	p.err = fmt.Errorf("%w（%w，最后一个原因：%w）",
 		sched.ErrNoFullSlot, sched.ErrNoLivePair, sched.ErrMintFailed)
 	ver := types.CookieVersion(liveCookie)
+	polled := false
+	p.hasCand = func(_ int64, req sched.Request) bool {
+		polled = true
+		if !req.ExcludeVersions[ver] || !req.Force {
+			t.Errorf("轮询丢了请求参数: %+v", req)
+		}
+		return false
+	}
 	w := do(h, authed(httptest.NewRequest("GET",
 		"/cookie?force=1&exclude_versions="+ver+"&wait=1", nil), srv.ConsumerKeyFor(st.accounts[0])))
 	if w.Code != 503 {
@@ -196,9 +207,13 @@ func TestForceRotationIsWaitable(t *testing.T) {
 		t.Fatalf("code=%q，应为 %q（归成别的码 wait 就在每次轮换上失效了）",
 			got.Error.Code, codeNoLivePair)
 	}
-	// 池子里那张票正是被排除的那一张 ⇒ 等不到候选 ⇒ 不重跑，但确实等过。
+	// 等不到候选 ⇒ 不重跑，但确实等过；而且轮询用的是**同一份**请求参数
+	// （池子里那张票正是被排除的那一张，判据必须看得见这件事）。
 	if p.calls != 1 {
 		t.Fatalf("取票次数 %d", p.calls)
+	}
+	if !polled {
+		t.Fatal("可等待的码上根本没去轮询")
 	}
 }
 
@@ -289,6 +304,12 @@ func TestBadRequestCode(t *testing.T) {
 			}
 		})
 	}
+	// 上限的另一侧：正好 64 项要收下。先数逗号再切（省掉一次几十万元素的分配）
+	// 很容易把边界挪一位。
+	ok := strings.Join(tooMany[:maxExcludeItems], ",")
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?exclude="+ok, nil), key)); w.Code != 200 {
+		t.Fatalf("正好 %d 项被拒了: %d %s", maxExcludeItems, w.Code, w.Body.String())
+	}
 }
 
 // 四个旋钮必须**原样传到调度**：钳位在边界做完，调度那边直接信。
@@ -339,18 +360,45 @@ func TestCookieRequestParamsReachThePool(t *testing.T) {
 
 // wait 只在**等得起**的失败上等，而且等到票了才重跑：重跑一次可能真打一发上游，
 // 而槽位是这个池子最紧的资源。
+//
+// 判据只有一份，在调度那边（sched.HasCandidate）：它才看得见「这个账号在这个网关上
+// 还在冷却」。这一层照它的答案办，自己绝不照着 pairs 表再算一份。
 func TestWaitOnlyRetriesWhenATicketShowsUp(t *testing.T) {
 	t.Run("等到票就重跑一次", func(t *testing.T) {
 		srv, h, p, st, _ := rig(t, types.ModePool)
 		p.err = sched.ErrNoFullSlot // 分类成 no_live_pair：可等待
+		var asked []int64
+		p.hasCand = func(id int64, _ sched.Request) bool { asked = append(asked, id); return true }
 		w := do(h, authed(httptest.NewRequest("GET", "/cookie?wait=5", nil),
 			srv.ConsumerKeyFor(st.accounts[0])))
 		if w.Code != 503 {
 			t.Fatalf("状态 %d", w.Code)
 		}
-		// rig 的池子里本来就有一张活票 ⇒ 第一次轮询就命中 ⇒ 正好重跑一次。
 		if p.calls != 2 {
 			t.Fatalf("取票次数 %d，应为 2（原始一次 + 等到票之后重跑一次）", p.calls)
+		}
+		// 问的必须是**真正在要票的那一行**，否则判据又按别人的冷却算了。
+		if len(asked) == 0 || asked[0] != st.accounts[0].ID {
+			t.Fatalf("轮询问的是 %v，应为账号 %d", asked, st.accounts[0].ID)
+		}
+	})
+
+	t.Run("池子里有票但这个账号拿不到就不重跑", func(t *testing.T) {
+		srv, h, p, st, _ := rig(t, types.ModePool)
+		p.err = sched.ErrNoFullSlot
+		// 池子里那张票还活着（rig 自带），但调度说这个账号拿不到它——
+		// 「刚交付过的网关在冷却里、pair 还活着」是这个池子最常见的稳态。
+		p.hasCand = func(int64, sched.Request) bool { return false }
+		if len(st.pairs) == 0 {
+			t.Fatal("这个用例的前提就是池子里有票")
+		}
+		w := do(h, authed(httptest.NewRequest("GET", "/cookie?wait=1", nil),
+			srv.ConsumerKeyFor(st.accounts[0])))
+		if w.Code != 503 {
+			t.Fatalf("状态 %d", w.Code)
+		}
+		if p.calls != 1 {
+			t.Fatalf("取票次数 %d：照着 pairs 表判就会每次等待都白铸一发", p.calls)
 		}
 	})
 
@@ -452,18 +500,62 @@ func TestReleaseConflicts(t *testing.T) {
 	if got := decodeFail(t, w); got.Error.Message == "" {
 		t.Fatal("409 也要说句人话")
 	}
+}
 
-	// 跨账号：/cookie 把那种票算在占位行上，这边也只能读那一行——
-	// 池子里还没有那一行，就等于没有可还的交付，而且**不许**退回上传者那一行
-	// （那会把上传者的槽位还掉）。
-	p.released = nil
-	r := releaseReq(types.CookieVersion(liveCookie))
-	r.URL.RawQuery = "account=acct-friend"
-	if w := do(h, authed(r, srv.ConsumerKeyFor(st.accounts[0]))); w.Code != http.StatusConflict {
-		t.Fatalf("状态 %d，应为 409", w.Code)
+// F4：**占位行（`anon:` 命名空间）的交付一律不许还**，真实行照常。
+//
+// 归还的方向是**少记**一次接触：被还原成「从没碰过」的那一行会排到挑选队列最前，
+// 于是它立刻拿回自己刚烧过的落点——降智的票，而且无从察觉。而占位行的命名空间谁都能
+// 填、没有任何归属证据（pair 不互斥，自己取一张同网关的票就知道 cookie_version）。
+// 前缀隔离只对取票够用：那边是**多**记一次，方向保守。
+//
+// 判据是**解出来的那一行**而不是「带没带 account 参数」：消费端每次取票都带自己的
+// 上游 account_id，按参数判会把它的正常归还全拒掉。四条调用方各一侧。
+func TestReleaseRefusesPlaceholderRows(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	// 占位行**真的存在**：这正是「池子里没那一行」挡不住的那一格。
+	st.accounts = append(st.accounts, types.Account{ID: 7, Enabled: true,
+		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-friend"}})
+	key := srv.ConsumerKeyFor(st.accounts[0])
+	ver := types.CookieVersion(liveCookie)
+	p.relN = 1
+
+	withAccount := func(ref string) *http.Request {
+		r := releaseReq(ver)
+		r.URL.RawQuery = "account=" + ref
+		return r
 	}
-	if len(p.released) != 0 {
-		t.Fatalf("把别人的槽位还了: %+v", p.released)
+	for _, c := range []struct {
+		name     string
+		req      *http.Request
+		key      string
+		status   int
+		wantRows []string // 期望 Release 收到的 (行|版本)
+	}{
+		// 消费端的常态：带着**自己的**上游 account_id 来，解到的是它自己那一行。
+		{"自己的 account_id", withAccount("acct-upstream"), key, 204, []string{"1|" + ver}},
+		{"不带 account", releaseReq(ver), key, 204, []string{"1|" + ver}},
+		// 别人的 ref ⇒ 占位行 ⇒ 拒，而且一个字段都不许动（Release 根本不该被调）。
+		{"别人的 ref", withAccount("acct-friend"), key, 409, nil},
+		// 管理员带 ref 是管理动作，解到的是那个托管行本身。
+		{"管理员带 ref", withAccount("acct-b"), "akey", 204, []string{"2|" + ver}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p.released = nil
+			w := do(h, authed(c.req, c.key))
+			// 先查账本再查状态码：闸漏了的时候要一眼看见是**哪一行**被改了。
+			if len(p.released) != len(c.wantRows) {
+				t.Fatalf("Release 收到 %+v，应为 %+v", p.released, c.wantRows)
+			}
+			if w.Code != c.status {
+				t.Fatalf("状态 %d，应为 %d: %s", w.Code, c.status, w.Body.String())
+			}
+			for i, want := range c.wantRows {
+				if p.released[i] != want {
+					t.Fatalf("归还记到了 %q，应为 %q", p.released[i], want)
+				}
+			}
+		})
 	}
 }
 
@@ -498,5 +590,121 @@ func TestReleaseNeedsSameAuthAsCookie(t *testing.T) {
 	// 管理员必须显式说替谁还（槽位是 (账号 × 网关)，猜一个就等于还别人的）。
 	if w := do(h, authed(releaseReq(types.CookieVersion(liveCookie)), "akey")); w.Code != http.StatusBadRequest {
 		t.Fatalf("管理员没带 account 却受理了: %d", w.Code)
+	}
+	// F7：鉴权排在**读请求体之前**。顺序反过来的话畸形体的未鉴权请求拿到的是 400，
+	// 等于白送扫描器一个「版本号格式对不对」的区分信号，还让它免费使唤一次 JSON 解析。
+	if w := do(h, httptest.NewRequest("POST", "/release", strings.NewReader("not json"))); w.Code != http.StatusUnauthorized {
+		t.Fatalf("畸形体 + 没鉴权 → %d，应为 401", w.Code)
+	}
+	if len(p.released) != 0 {
+		t.Fatalf("没鉴权就还了: %+v", p.released)
+	}
+}
+
+// F9：no_gateway 上**不等**。
+//
+// 那是结构性空等：这个码的定义就是「网关表是空的」，而候选判据要求命中的票属于表里
+// 的某个网关 ⇒ 恒为假、必然等满 30 秒；而能把表填上的发现扫描恰好要等这次失败完
+// 才入队（单账号模式连保温都不跑）。立刻把码交回调用方更有用。
+func TestNoGatewayIsNotWaitable(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	st.gws = map[string]types.Gateway{}
+	p.err = sched.ErrNoFullSlot
+	p.hasCand = func(int64, sched.Request) bool {
+		t.Error("在 no_gateway 上还去轮询了：网关表空着，判据不可能变真")
+		return false
+	}
+	start := time.Now()
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?wait=30", nil),
+		srv.ConsumerKeyFor(st.accounts[0])))
+	if w.Code != 503 || decodeFail(t, w).Error.Code != codeNoGateway {
+		t.Fatalf("状态 %d body=%s", w.Code, w.Body.String())
+	}
+	if p.calls != 1 {
+		t.Fatalf("取票次数 %d", p.calls)
+	}
+	if took := time.Since(start); took > waitPoll {
+		t.Fatalf("空等了 %v", took)
+	}
+}
+
+// F2：「失败记在谁头上」和「谁是消费者」是两件事。
+//
+// 跨账号取票时消费者是占位行，而上传者在这里恰恰是最合适的铸票者（烧它的窗口不影响
+// 消费者对新落点的首次接触）。把上传者当成消费者排掉的话，单上传者的池子里这种失败
+// 永远挑不出铸票者 ⇒ 发现扫描一次也不会跑，而那是这种失败唯一的出路。
+func TestCrossAccountFailureDoesNotExcludeUploader(t *testing.T) {
+	srv, h, p, st, sc := rig(t, types.ModePool)
+	p.err = sched.ErrNoFullSlot
+	key := srv.ConsumerKeyFor(st.accounts[0])
+	uploader := st.accounts[0].ID
+
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-friend", nil), key)); w.Code != 503 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	if len(sc.discovery) != 1 || sc.discovery[0] == uploader {
+		t.Fatalf("排除的是 %v，上传者（%d）在这里是铸票者，不是消费者", sc.discovery, uploader)
+	}
+	// 记账照旧归上传者：那是他自己页面上该看见的那一行。
+	if mine := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(); !strings.Contains(mine, codeNoLivePair) {
+		t.Fatal("上传者页面上看不见这次失败")
+	}
+	// 另一侧：自己取自己的票时，要排除的就是他本人（派他去找落点等于白跑）。
+	sc.discovery = nil
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), key)); w.Code != 503 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	if len(sc.discovery) != 1 || sc.discovery[0] != uploader {
+		t.Fatalf("自己取票时该排除自己，实际 %v", sc.discovery)
+	}
+}
+
+// F6：这几个码也要落进「取票失败记录」——那张卡片是运营唯一不用 SSH 的读数，
+// 而 consumer_rejected 正是「谁的 key 配错了在狂敲」唯一的线索。
+//
+// 但灌环面要堵住：**未鉴权**的请求不许往那 200 条里写，否则谁都能把真实诊断挤出去。
+func TestCodesReachTheFailLog(t *testing.T) {
+	_, h, p, _, _ := rig(t, types.ModePool)
+	adminPage := func() string {
+		return do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	}
+
+	// consumer_rejected：只进日志。公开池默认关着 ⇒ 认不出的 key = 401。
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), "谁的 key 都不是")); w.Code != 401 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	if strings.Contains(adminPage(), codeConsumerRejected) {
+		t.Fatal("401 进了环：未鉴权的请求能把真实诊断挤出去")
+	}
+
+	// bad_request：鉴权通过之后的那些才进环（管理员没说替谁取）。
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), "akey")); w.Code != 400 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	// public_closed：匿名撞上关着的公开池。
+	p.public = sched.PublicState{Enabled: true, Open: false, Free: 1, Threshold: 6}
+	if w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil)); w.Code != 503 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	page := adminPage()
+	for _, want := range []string{codeBadRequest, codePublicClosed} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("管理页上没有 %s", want)
+		}
+	}
+}
+
+// N3：Detail 按**字符**截，不按字节——它基本全是中文，而它进的是 HTML 页面，
+// 按字节切会把半个汉字落进去。
+func TestFailDetailTruncatesByRune(t *testing.T) {
+	l := &failLog{}
+	// 开头故意放一个 ASCII：这样第 300 个**字节**正好落在一个汉字中间。
+	l.add(deliverFail{Detail: "x" + strings.Repeat("网关", failDetailMax)})
+	got := l.recent(0, 1)[0].Detail
+	if !utf8.ValidString(got) {
+		t.Fatalf("截出了半个汉字: %q", got)
+	}
+	if n := utf8.RuneCountInString(strings.TrimSuffix(got, "…")); n != failDetailMax {
+		t.Fatalf("截了 %d 个字符，应为 %d", n, failDetailMax)
 	}
 }

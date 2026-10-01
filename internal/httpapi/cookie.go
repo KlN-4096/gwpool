@@ -21,7 +21,7 @@ import (
 // **参数名、JSON 字段名、错误码三样是和消费端冻结的**（2026-10-02 契约，sub2api 侧
 // 照同一份实现）。改一个字就是改协议，不是重构。
 
-// 错误码闭集。九个，不多不少。
+// 错误码闭集。十一个，不多不少。
 //
 // 为什么要码而不只是一句人话：客户端那头只看到一个 503，而「你的槽位全在冷却里」
 // （等几小时）和「出口全熔断了」（等几十秒）要做的事完全相反。
@@ -80,15 +80,39 @@ func writeFail(w http.ResponseWriter, status int, e apiError) {
 }
 
 // badRequest 是「你的请求错了」：400 和 404 共用一个码，一律不给 retry_after。
+//
+// **只回话、不记卡片**：参数校验排在鉴权前面（信任边界就该在最前），所以这条路
+// 未鉴权的请求也走得到，往那个 200 条的环里灌几下就能把真实诊断全挤出去。
+// 鉴权通过之后的 400/404 走 badRequestFor。
 func badRequest(w http.ResponseWriter, status int, msg string) {
 	writeFail(w, status, apiError{Code: codeBadRequest, Message: msg})
 }
 
+// badRequestFor 是**鉴权通过之后**的 400/404：同一个码，另外记一行卡片。
+// 管理员少带 account、点名的账号不存在这类错只有在页面上看得见才查得动。
+func (s *Server) badRequestFor(w http.ResponseWriter, status int, accountID int64, msg string) {
+	s.fails.add(deliverFail{At: time.Now(), AccountID: accountID, Code: codeBadRequest, Reason: msg})
+	badRequest(w, status, msg)
+}
+
 // unauthorized 是「你的 key 不认」。三个机器端点（/cookie、/release、/gateways）
 // 共用它：三条路同一把钥匙，分类当然也该是同一个。
-func unauthorized(w http.ResponseWriter, msg string) {
+//
+// **只进日志不进环**：这条路按定义是未鉴权的，进环就是给任何人一个挤掉诊断的开关。
+// 而「谁的 key 配错了在狂敲」这个读数日志里有（它本来就要 SSH 才查得到的那类事）。
+func (s *Server) unauthorized(w http.ResponseWriter, msg string) {
+	s.opt.Log.Info("消费端鉴权失败", "code", codeConsumerRejected, "reason", msg)
 	writeFail(w, http.StatusUnauthorized, apiError{Code: codeConsumerRejected,
 		Message: msg, RetryAfterSeconds: retrySeconds(consumerRejectedRetry)})
+}
+
+// publicClosed 是「此刻不对外开放」。两个直接拒掉匿名的入口（/cookie 的匿名支、
+// /gateways）和 DeliverAnonymous 回来那条共用一个码，也共用这一行卡片——
+// 运营判断门槛设得对不对，看的就是这个码出现的密度。
+func (s *Server) publicClosed(w http.ResponseWriter, msg string) {
+	s.fails.add(deliverFail{At: time.Now(), Code: codePublicClosed, Reason: msg})
+	writeFail(w, http.StatusServiceUnavailable, apiError{Code: codePublicClosed,
+		Message: msg, RetryAfterSeconds: retrySeconds(publicClosedRetry)})
 }
 
 // retrySeconds 把时长换成「至少 1 秒」的整数秒。向上取整：报小了客户端会提前回来，
@@ -174,10 +198,12 @@ func parseList(raw, name string) (map[string]bool, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	parts := strings.Split(raw, ",")
-	if len(parts) > maxExcludeItems {
+	// 先数逗号再切：Split 一个几兆的 URL 参数会先分配出几十万个 string，
+	// 而它注定要被下一行拒掉。
+	if strings.Count(raw, ",") >= maxExcludeItems {
 		return nil, fmt.Errorf("%s 最多 %d 项", name, maxExcludeItems)
 	}
+	parts := strings.Split(raw, ",")
 	out := make(map[string]bool, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
@@ -246,10 +272,14 @@ func (s *Server) classify(err error) (code, msg string, retry time.Duration) {
 
 // waitableCode 报告这个码等一会儿有没有可能变好。
 //
-// **只有这两个**：all_cooling 是几小时量级，让一次 HTTP 请求挂在那儿等它纯属把
+// **只有这一个**：all_cooling 是几小时量级，让一次 HTTP 请求挂在那儿等它纯属把
 // 连接耗光；rate_limited 同理（滑窗最长一小时）；upstream_rejected 等多久都一样。
+//
+// no_gateway 也不等，而且是**结构性**的空等：它的定义就是「网关表是空的」，而判据
+// 要求命中的票属于表里的某个网关 ⇒ 恒为假、必然等满；能让表非空的发现扫描恰好要等
+// 这个请求失败完才入队（单账号模式连保温都不跑）。立刻把这个码交回调用方更有用。
 func waitableCode(code string) bool {
-	return code == codeNoLivePair || code == codeNoGateway
+	return code == codeNoLivePair
 }
 
 // proxySkipLeft 是最早一条出口出熔断还要多久。没有熔断中的出口（或没接出口状态）回 0。
@@ -283,7 +313,10 @@ const waitPoll = 500 * time.Millisecond
 // 返回「等到了吗」。**等不到就不重跑**：重跑一次选择可能真打一发上游，而
 // 「轮询期间什么都没变」的情况下那一发必然重复刚才那次失败，纯浪费一个槽位。
 // 等到了才重跑，那一次大概率一发不打（硬筛直接命中新出现的票）。
-func (s *Server) waitForCandidate(ctx context.Context, d time.Duration, req sched.Request) bool {
+// 判据**不在这一层**：它要用 accountID 应用那两条冷却闸，而冷却是调度的事
+// （见 sched.HasCandidate）。这边重写一份的后果不是「略有偏差」，而是每一次等待
+// 都看见一张自己拿不到的票、立刻重跑、白铸一发。
+func (s *Server) waitForCandidate(ctx context.Context, d time.Duration, accountID int64, req sched.Request) bool {
 	deadline := time.Now().Add(d)
 	t := time.NewTicker(waitPoll)
 	defer t.Stop()
@@ -292,7 +325,7 @@ func (s *Server) waitForCandidate(ctx context.Context, d time.Duration, req sche
 		case <-ctx.Done():
 			return false
 		case <-t.C:
-			if s.hasCandidate(req) {
+			if s.pool.HasCandidate(accountID, req) {
 				return true
 			}
 			if !time.Now().Before(deadline) {
@@ -302,46 +335,26 @@ func (s *Server) waitForCandidate(ctx context.Context, d time.Duration, req sche
 	}
 }
 
-// hasCandidate 现算一遍「此刻有没有这次请求收得下的票」。
-//
-// 判据必须和调度的硬筛同口径（网关在表上 + pair 剩余够 + 没被排除），
-// 否则等到的那一下重跑仍然是 503，而调用方以为池子骗了它。
-func (s *Server) hasCandidate(req sched.Request) bool {
-	now := time.Now().UTC()
-	gws := s.st.Gateways()
-	for name, p := range s.st.Pairs() {
-		if _, ok := gws[name]; !ok {
-			continue
-		}
-		if req.Gateway != "" && name != req.Gateway {
-			continue
-		}
-		if p.ExpiresAt.Sub(now) < req.Floor() {
-			continue
-		}
-		if req.Skips(name, p.Cookie) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
 // serveCookie 是 /cookie 三条身份路径共用的尾段：取票 → 成了就回，没成按码回话。
+//
+// 两个账号参数是**两件事**，刻意分开：acctID 是记账用的（卡片、日志，上传者该在
+// 自己页面上看见的那一行），consumerID 是**真正在要票的那一行**（跨账号/匿名是占位行）。
+// 合成一个的后果是静默的：轮询会按上传者的冷却去判，而发现扫描会把上传者排除掉。
 //
 // get 收 Request 而不是闭包捕获它：重跑那一次必须用**同一份**请求参数，
 // 否则等到的票和筛选条件可能对不上。
-func (s *Server) serveCookie(w http.ResponseWriter, r *http.Request, accountID int64,
+func (s *Server) serveCookie(w http.ResponseWriter, r *http.Request, acctID, consumerID int64,
 	req sched.Request, wait time.Duration, get func(sched.Request) (types.Delivery, error)) {
 	d, err := get(req)
 	if err != nil && wait > 0 {
-		if code, _, _ := s.classify(err); waitableCode(code) && s.waitForCandidate(r.Context(), wait, req) {
+		if code, _, _ := s.classify(err); waitableCode(code) &&
+			s.waitForCandidate(r.Context(), wait, consumerID, req) {
 			d, err = get(req)
 		}
 	}
 	if err != nil {
-		s.noteMinRemainingTooHigh(accountID, req)
-		s.deliverFailed(w, err, accountID, req.Gateway)
+		s.noteMinRemainingTooHigh(consumerID, req)
+		s.deliverFailed(w, err, acctID, consumerID, req.Gateway)
 		return
 	}
 	writeJSON(w, http.StatusOK, delivered(d))
@@ -353,13 +366,13 @@ func (s *Server) serveCookie(w http.ResponseWriter, r *http.Request, accountID i
 // 每一发都取不到票，而失败读数和「真的没票」一模一样 —— 没有这行，
 // 运维翻遍页面也看不出是客户端的一个参数在作怪。
 func (s *Server) noteMinRemainingTooHigh(accountID int64, req sched.Request) {
-	if req.MinRemaining == 0 || s.hasCandidate(req) {
+	if req.MinRemaining == 0 || s.pool.HasCandidate(accountID, req) {
 		return
 	}
 	// 同一份筛选，只把门槛换回服务端默认：换回去就有候选 ⇒ 就是这个参数。
 	relaxed := req
 	relaxed.MinRemaining = 0
-	if !s.hasCandidate(relaxed) {
+	if !s.pool.HasCandidate(accountID, relaxed) {
 		return
 	}
 	s.opt.Log.Info("min_remaining 把候选筛空了（不是真的没票）", "account", accountID,
@@ -385,6 +398,27 @@ const releaseBodyMax = 1 << 10
 // **失败即安全**：没人调它时行为和以前完全一样；受理窗口过了、票对不上、已经还过了
 // 都是 409，一个字段都不改。
 func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
+	// 鉴权排在读请求体**前面**：顺序反过来的话畸形体的未鉴权请求拿到的是 400 而不是
+	// 401（和「鉴权与 /cookie 完全一致」不符，给扫描器一个区分信号），而且没鉴权就能
+	// 让服务端读一遍体、解一次 JSON。
+	_, acctID, placeholder, ok := s.whoAsks(w, r)
+	if !ok {
+		return
+	}
+	// **占位行（`anon:` 命名空间）一律拒。** 那条路上没有任何归属证据——pair 不互斥，
+	// 谁都能自己取一张同网关的票拿到 cookie_version——而归还的方向是**少记**一次接触：
+	// 受害者的槽位被还原成「从没碰过」，LongestRestedSlot 把它排到最前，于是他立刻
+	// 拿回自己刚烧过的落点，是降智的票而且无从察觉。AnonPrefix 那层前缀隔离只对取票
+	// 够用（在别人账本上多记一次是保守方向，见 types.AnonPrefix）。
+	//
+	// 判据是**解出来的那一行**，不是「带没带 account 参数」：消费端每次取票都带自己的
+	// 上游 account_id（解到的就是它自己那一行），按参数判会把它的正常归还全拒掉。
+	if placeholder {
+		// 不进卡片：这条路匿名也走得到（见 badRequest 的注释）。
+		s.opt.Log.Info("拒绝归还占位行的交付", "row", acctID)
+		writeFail(w, http.StatusConflict, apiError{Message: "只能归还自己账号的交付"})
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, releaseBodyMax))
 	if err != nil {
 		badRequest(w, http.StatusBadRequest, "请求体太大")
@@ -403,16 +437,8 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("cookie_version 必须是 %d 位十六进制", types.CookieVersionLen))
 		return
 	}
-	_, acctID, ok := s.whoAsks(w, r)
-	if !ok {
-		return
-	}
-	// 没有池内行 = 这个上游账号在池子里一条槽位历史都没有，自然没有能还的交付。
-	if acctID == 0 {
-		s.noteRelease(acctID, 0, "没有这个账号的交付记录")
-		writeFail(w, http.StatusConflict, apiError{Message: "没有可归还的交付"})
-		return
-	}
+	// 不单独拦「没有池内行」（acctID == 0）：拒掉占位行之后走到这儿的都是真实行，
+	// 真要是 0，Release 也只会找不到交付、照样 409。
 	n, err := s.pool.Release(acctID, version)
 	if err != nil {
 		s.noteRelease(acctID, 0, "归还被拒："+err.Error())

@@ -91,7 +91,9 @@ func TestCookieVersion(t *testing.T) {
 		}
 	}
 	// 哈希，不是摘要式的「前几个字」：cookie 本体一个字都不许漏（SPEC 红线 1）。
-	if strings.Contains(v, "cf") || strings.Contains(v, "secret") {
+	// 只查真·标记：`cf` 本身就是合法的十六进制双字符，查它对任何给定常量要么恒绿
+	// 要么恒红（约 4% 的常量恒红），和想证明的事无关。
+	if strings.Contains(v, "secret") {
 		t.Fatalf("版本号里带了 cookie 本体: %q", v)
 	}
 	// 没有票就没有身份：别给调用方一个「空串的哈希」让它当成真实引用。
