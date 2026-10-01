@@ -626,11 +626,12 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 		// 运营方靠这行判断门槛设得对不对。
 		s.opt.Log.Info("匿名交付", "upstream", upstreamID, "account", a.ID,
 			"gateway", sl.Gateway, "free_gateways", ps.Free, "threshold", ps.Threshold)
+		exp, validFor := s.deliverWindow(at.Add(types.DeliverTTL), p.ExpiresAt)
 		return types.Delivery{
 			Gateway:      sl.Gateway,
 			Cookie:       p.Cookie,
-			ExpiresAt:    at.Add(types.DeliverTTL),
-			ValidForS:    validFor(types.DeliverTTL, p.ExpiresAt.Sub(at)),
+			ExpiresAt:    exp,
+			ValidForS:    validFor,
 			VerifiedFull: false,
 		}, nil
 	}
@@ -845,11 +846,12 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 		// （mintOnce 自己 touch 的），别再覆盖一遍——那会把还原点挪到这次交付之后。
 		s.noteDeliver(consumer.ID, gateway, at, !selfMinted)
 		s.markUnverified(consumer.ID, gateway)
+		exp, validFor := s.deliverWindow(at.Add(types.DeliverTTL), pair.ExpiresAt)
 		return types.Delivery{
 			Gateway:      gateway,
 			Cookie:       pair.Cookie,
-			ExpiresAt:    at.Add(types.DeliverTTL),
-			ValidForS:    validFor(left, pair.ExpiresAt.Sub(s.now())),
+			ExpiresAt:    exp,
+			ValidForS:    validFor,
 			VerifiedFull: false,
 		}, nil
 	}
@@ -896,35 +898,42 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	// 有效期从**首次接触**起算，不是从 echo 回来起算（窗口在第一发就开始烧了）。
 	// valid_for_s 是**满血窗口**的剩余量，不是 cookie 的有效期（那是 65 分钟）。
 	// 消费端在这段时间内可以反复复用同一个 pair。
-	exp := m.firstAt.Add(types.DeliverTTL)
-	left := exp.Sub(s.now())
-	if left < minDeliverWindow {
+	windowEnd := m.firstAt.Add(types.DeliverTTL)
+	if left := windowEnd.Sub(s.now()); left < minDeliverWindow {
 		return types.Delivery{}, fmt.Errorf("网关 %s 的满血窗口只剩 %v，不发", gateway, left.Truncate(time.Second))
 	}
 	// 触碰不用再记：铸那张活票的那一发（mintOnce）已经记过，而它就是首次接触。
 	s.noteDeliver(consumer.ID, gateway, m.firstAt, false)
+	exp, validFor := s.deliverWindow(windowEnd, pair.ExpiresAt)
 	return types.Delivery{
 		Gateway:      gateway,
 		Cookie:       pair.Cookie,
 		ExpiresAt:    exp,
-		ValidForS:    validFor(left, pair.ExpiresAt.Sub(s.now())),
+		ValidForS:    validFor,
 		VerifiedFull: true,
 	}, nil
 }
 
-// validFor 是交付的建议有效期（秒）：满血窗口还剩多少、这张 pair 还能活多久，取小的。
+// deliverWindow 算这一次交付的可用期末尾和建议有效期（秒）：满血窗口什么时候关、
+// 这张 pair 什么时候硬过期，**取早的那个**。
 //
 // 必须取小：min_remaining 能把交付门槛压到 30 s，而窗口是 150 s —— 不取小就会把一张
 // 只剩 40 秒的票标成 valid_for_s=150 发出去，消费端用到一半被重新路由到随机网关。
 // 今天 DeliverFloor(300s) > DeliverTTL(150s) 所以撞不上，是 min_remaining 把它打开的。
-func validFor(windowLeft, pairLeft time.Duration) int {
-	if pairLeft < windowLeft {
-		windowLeft = pairLeft
+//
+// 两个返回值必须出自**同一次**计算：expires_at 说时刻、valid_for_s 说时长，
+// 而它们讲的是同一件事。各算一次就会出现「两个字段描述同一件事却给不同的数」，
+// 那是个陷阱——按哪个算都可能超出真实可用期。
+func (s *Scheduler) deliverWindow(windowEnd, pairEnd time.Time) (time.Time, int) {
+	end := windowEnd
+	if pairEnd.Before(end) {
+		end = pairEnd
 	}
-	if windowLeft < 0 {
-		return 0
+	left := end.Sub(s.now())
+	if left < 0 {
+		left = 0
 	}
-	return int(windowLeft / time.Second)
+	return end, int(left / time.Second)
 }
 
 // pairMint 是「为这个网关补一张 pair」的结果。mintedBySelf 为真时那一发是消费者
@@ -1318,20 +1327,19 @@ func (s *Scheduler) redeliver(accountID int64, req Request) (types.Delivery, boo
 	if req.Skips(best.Gateway, p.Cookie) {
 		return types.Delivery{}, false
 	}
-	exp := best.LastDeliver.Add(types.DeliverTTL)
-	left := exp.Sub(now)
-	// 两头都要够一秒：窗口剩不到一秒没意义，而那张 pair 剩不到一秒会让
-	// valid_for_s 取小之后变成 0 —— 消费端（sub2api）把非正数当成坏响应直接丢弃。
-	if left < time.Second || p.ExpiresAt.Sub(now) < time.Second {
+	exp, validFor := s.deliverWindow(best.LastDeliver.Add(types.DeliverTTL), p.ExpiresAt)
+	// 够不够一秒按**取小之后**的那个数判：pair 剩不到一秒时 valid_for_s 会是 0，
+	// 而消费端（sub2api）把非正数当成坏响应直接丢弃。
+	if validFor < 1 {
 		return types.Delivery{}, false
 	}
 	s.opt.Log.Info("窗口内重复请求，原样再发一次", "account", accountID,
-		"gateway", best.Gateway, "left", left.Truncate(time.Second))
+		"gateway", best.Gateway, "left", exp.Sub(now).Truncate(time.Second))
 	return types.Delivery{
 		Gateway:   best.Gateway,
 		Cookie:    p.Cookie,
 		ExpiresAt: exp,
-		ValidForS: validFor(left, p.ExpiresAt.Sub(now)),
+		ValidForS: validFor,
 		// 照第一次的判定如实报：这一次什么都没验，不该凭空升级成 true。
 		VerifiedFull: best.LastVerdict == types.VerdictFull,
 	}, true
@@ -1656,6 +1664,14 @@ var ErrNoRelease = errors.New("没有可归还的交付")
 // 乱报只害他自己（拿回一个其实已经烧掉的槽位，下一发就是降智的），
 // 所以和匿名那个 account 参数一样不设防（见 anonAccount）。
 func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) {
+	// 开着交付前验证时一律不受理：那条路池子**真用消费者的凭据打了两发**
+	// （先铸一张属于它的活票，再 echo），槽位是实烧的——还了就是对池子说谎，
+	// 下一个人会拿到一个已经烧掉的落点，而冷却会从 4 小时缩成一个满血窗口。
+	// 失败闭合、不加状态：开关在交付和归还之间被改掉这种情形不管，
+	// 窗口只有 150 秒，而且方向偏保守。
+	if s.cfg().VerifyFullAtDeliver {
+		return 0, fmt.Errorf("%w（交付前验证开着：这条路上的槽位是实烧的）", ErrNoRelease)
+	}
 	now := s.now()
 	n := 0
 	for _, sl := range s.st.Slots() {

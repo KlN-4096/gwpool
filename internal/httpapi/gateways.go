@@ -52,6 +52,10 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		// 两个门槛数是**池子侧**的常量，而消费端要自己定 min_remaining ——
 		// 不报出来它只能瞎猜，猜高了就每发都取不到票，而且任何读数里都看不出
 		// 是这个参数的事（和「真的没票」长得一模一样）。
+		//
+		// 哪天 DeliverFloor 变成配置项（像 slot_cooldown_minutes 那样），
+		// 这两个字段**必须跟着现读 Live**：报一个过期的门槛出去，消费端会照它
+		// 算 min_remaining，于是每发都取不到票，而两边的读数都「自洽」。
 		DeliverTTLS   int   `json:"deliver_ttl_s"`
 		DeliverFloorS int   `json:"deliver_floor_s"`
 		Gateways      []row `json:"gateways"`

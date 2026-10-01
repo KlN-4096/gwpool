@@ -118,13 +118,23 @@ func TestMinRemainingLowersFloorAndCapsValidFor(t *testing.T) {
 	}
 
 	// 调用方说它只要 30 秒：收下，但有效期只能报 40 秒。
-	s, _, mn, _ := staleRig()
+	s, st, mn, clk := staleRig()
 	d, err := s.Deliver(context.Background(), 1, Request{MinRemaining: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("min_remaining=30s 还是发不出来: %v", err)
 	}
 	if d.ValidForS != 40 {
 		t.Fatalf("valid_for_s=%d，应取 pair 剩余 40（窗口 150 更长，不能拿它报）", d.ValidForS)
+	}
+	// expires_at 和 valid_for_s 讲的是同一件事，必须给同一个数：
+	// 两个字段各算一次就会出现「按哪个算都可能超出真实可用期」的陷阱。
+	p, _ := st.Pair("unified-1")
+	if !d.ExpiresAt.Equal(p.ExpiresAt) {
+		t.Fatalf("expires_at=%v，应是那张 pair 的硬过期时刻 %v（窗口末尾更晚）",
+			d.ExpiresAt, p.ExpiresAt)
+	}
+	if got := int(d.ExpiresAt.Sub(clk.now()) / time.Second); got != d.ValidForS {
+		t.Fatalf("两个字段对不上: expires_at 还有 %d 秒，valid_for_s=%d", got, d.ValidForS)
 	}
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("有票可用却铸了 %d 发", n)
@@ -266,6 +276,29 @@ func TestReleaseRestoresPreviousTimes(t *testing.T) {
 	}
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("这一轮不该打上游，却打了 %d 发", n)
+	}
+}
+
+// 开着交付前验证时一律不受理归还：那条路池子真用消费者的凭据打了两发，
+// 槽位是**实烧**的，还了就是对池子说谎（冷却会从几小时缩成一个满血窗口）。
+func TestReleaseRefusedWhenVerifyIsOn(t *testing.T) {
+	// rig 把 verify_full_at_deliver 开着。
+	s, st, _, clk := rig(t, types.ModeSingle)
+	seedPairs(st, clk)
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if !d.VerifiedFull {
+		t.Fatal("这个用例的前提是走了验证那条路")
+	}
+	if _, err := s.Release(1, types.CookieVersion(d.Cookie)); !errors.Is(err, ErrNoRelease) {
+		t.Fatalf("实烧的槽位被还了: %v", err)
+	}
+	// 账本一个字都不许动。
+	sl, _ := st.Slot(1, d.Gateway)
+	if sl.LastDeliver.IsZero() || sl.LastTouch.IsZero() {
+		t.Fatalf("槽位被动过了: %+v", sl)
 	}
 }
 

@@ -248,29 +248,46 @@ func TestPublicClosedCode(t *testing.T) {
 	}
 }
 
-// 参数不合法是**请求的**错，不是一次交付失败 ⇒ 状态码照旧、信封照旧，但**没有码**：
-// 闭集里没有「你参数写错了」这一项，编一个假的会让按码分流的调用方读到一个假结论。
-func TestCookieBadParamsHaveNoCode(t *testing.T) {
+// 「你的请求错了」有自己的码：400 和 404 合成一个 bad_request，**不给 retry_after**
+// （重试不会变好）。闭集留着洞就意味着调用方的 default 分支要同时兜「我配错了」
+// 和「池子暂时没货」两件语义相反的事。
+func TestBadRequestCode(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModePool)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 	tooMany := make([]string, maxExcludeItems+1)
 	for i := range tooMany {
 		tooMany[i] = fmt.Sprintf("unified-%d", i)
 	}
-	for _, q := range []string{
-		"gateway=../etc/passwd",
-		"exclude=" + strings.Join(tooMany, ","),
-		"exclude_versions=" + strings.Join(tooMany, ","),
-		"min_remaining=abc",
-		"wait=abc",
-	} {
-		w := do(h, authed(httptest.NewRequest("GET", "/cookie?"+q, nil), key))
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("%s → 状态 %d，应为 400", q, w.Code)
-		}
-		if got := decodeFail(t, w); got.Error.Code != "" || got.Error.Message == "" {
-			t.Fatalf("%s → %+v（参数错不该带闭集里的码）", q, got.Error)
-		}
+	cases := []struct {
+		name   string
+		req    *http.Request
+		key    string
+		status int
+	}{
+		{"网关名不合法", httptest.NewRequest("GET", "/cookie?gateway=../etc/passwd", nil), key, 400},
+		{"exclude 超项", httptest.NewRequest("GET", "/cookie?exclude="+strings.Join(tooMany, ","), nil), key, 400},
+		{"版本名单超项", httptest.NewRequest("GET", "/cookie?exclude_versions="+strings.Join(tooMany, ","), nil), key, 400},
+		{"min_remaining 不是数", httptest.NewRequest("GET", "/cookie?min_remaining=abc", nil), key, 400},
+		{"wait 不是数", httptest.NewRequest("GET", "/cookie?wait=abc", nil), key, 400},
+		// 管理员那条路：不说替谁取就等于让池子猜一个账号。
+		{"管理员没带 account", httptest.NewRequest("GET", "/cookie", nil), "akey", 400},
+		{"没有这个账号", httptest.NewRequest("GET", "/cookie?account=不存在的号", nil), "akey", 404},
+		{"release 版本号畸形", releaseReq("zz"), key, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := do(h, authed(c.req, c.key))
+			if w.Code != c.status {
+				t.Fatalf("状态 %d，应为 %d: %s", w.Code, c.status, w.Body.String())
+			}
+			got := decodeFail(t, w)
+			if got.Error.Code != codeBadRequest || got.Error.Message == "" {
+				t.Fatalf("%+v", got.Error)
+			}
+			if got.Error.RetryAfterSeconds != 0 || w.Header().Get("Retry-After") != "" {
+				t.Fatalf("请求错了还给退避建议: %+v / %q", got.Error, w.Header().Get("Retry-After"))
+			}
+		})
 	}
 }
 

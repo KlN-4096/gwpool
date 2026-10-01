@@ -42,6 +42,12 @@ const (
 	// 必须有自己的码：没有码的 401 会让调用方掉进通用路径、不退避，于是
 	// 「每发推理请求敲一次池子」无限敲下去——而这种错要人去改配置，敲得再勤也不会好。
 	codeConsumerRejected = "consumer_rejected"
+	// codeBadRequest 是「你的请求错了」：参数不合法、管理员没带 account、
+	// 点名的账号不存在（400 和 404 合成一个码——对调用方是同一件事）。
+	//
+	// 闭集不许留洞：没有它的话调用方的 default 分支要同时兜「我配错了」和
+	// 「池子暂时没货」两件语义**相反**的事。**不给 retry_after**：重试不会变好。
+	codeBadRequest = "bad_request"
 )
 
 // consumerRejectedRetry 是 consumer_rejected 的重试建议：要人去改配置，敲勤了也没用。
@@ -55,9 +61,9 @@ const publicClosedRetry = time.Minute
 
 // apiError 是失败响应的 error 字段。
 //
-// code 为空的只有一种情形：请求本身不合法（参数越界、没带 key、点名的账号不存在）。
-// 那不是一次交付失败，闭集里也没有对应的码——**刻意不编一个**，
-// 让按码分流的调用方掉进它自己的 default 分支，而不是读到一个假的交付结论。
+// code 留空的只剩 /release 的 409（太晚 / 票对不上 / 已经还过了）：那不是「请求错了」
+// 也不是一次交付失败，而调用方对它要做的事只有「记一行日志走人」——
+// sub2api 侧连响应体都不读（只看状态码不是 204）。别为它编一个码。
 type apiError struct {
 	Code              string `json:"code,omitempty"`
 	Message           string `json:"message"`
@@ -73,9 +79,9 @@ func writeFail(w http.ResponseWriter, status int, e apiError) {
 	writeJSON(w, status, map[string]apiError{"error": e})
 }
 
-// badRequest 是参数类失败：没有码（见 apiError）。
+// badRequest 是「你的请求错了」：400 和 404 共用一个码，一律不给 retry_after。
 func badRequest(w http.ResponseWriter, status int, msg string) {
-	writeFail(w, status, apiError{Message: msg})
+	writeFail(w, status, apiError{Code: codeBadRequest, Message: msg})
 }
 
 // unauthorized 是「你的 key 不认」。三个机器端点（/cookie、/release、/gateways）
