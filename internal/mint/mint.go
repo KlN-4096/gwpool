@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -81,6 +82,12 @@ type Client struct {
 	// 代理清单刻意**不**走它：Proxies 的下标编进了 sid，运行中换顺序会让已经发出去的
 	// sid 指向另一条出口，铸票和 state-echo 就配不成同一个 IP 了。改代理要重启。
 	Live *config.Live
+
+	// Log 非 nil 时记熔断的开合。**只记这一件事**：别的失败都原路返回给调用方，
+	// 由它决定记不记；而熔断是进程内部的状态变化，不记的话事后只能看到
+	// 「没有可用的出口代理」，查不出是哪条、为什么、什么时候恢复
+	// （2026-10-01 的一次全池 503 就是这么丢掉现场的）。
+	Log *slog.Logger
 
 	mu        sync.Mutex
 	cursor    int                    // 轮询游标
@@ -463,34 +470,46 @@ func (c *Client) do(req *http.Request, e types.Exit, sid string) (*http.Response
 	case err != nil:
 		// 连不上代理本身、认证被拒：这才是供应商的账。
 		// err 里会带 URL，代理用户名在 Transport 里，不会被 net/http 带进来。
-		c.noteFailure(p.Name)
+		c.noteFailure(p.Name, err)
 		return nil, fmt.Errorf("经 %s 请求失败: %w", p.Name, err)
 	}
 	c.noteSuccess(p.Name)
 	return resp, nil
 }
 
-func (c *Client) noteFailure(name string) {
+func (c *Client) noteFailure(name string, cause error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.fails == nil {
 		c.fails, c.skipUntil = map[string]int{}, map[string]time.Time{}
 	}
 	c.fails[name]++
-	if n := c.fails[name]; n >= proxyFailThreshold {
-		d := proxySkipBase << (n - proxyFailThreshold)
-		if d > proxySkipMax || d <= 0 {
-			d = proxySkipMax
+	n := c.fails[name]
+	var skip time.Duration
+	if n >= proxyFailThreshold {
+		skip = proxySkipBase << (n - proxyFailThreshold)
+		if skip > proxySkipMax || skip <= 0 {
+			skip = proxySkipMax
 		}
-		c.skipUntil[name] = time.Now().Add(d)
+		c.skipUntil[name] = time.Now().Add(skip)
+	}
+	c.mu.Unlock()
+
+	if c.Log != nil && skip > 0 {
+		// 一条粘性供应商熔断就等于整池停摆（非粘性的那条顶不上 sticky 请求），
+		// 所以这行是 WARN 不是 INFO。
+		c.Log.Warn("出口熔断", "proxy", name, "fails", n, "skip", skip, "cause", cause)
 	}
 }
 
 func (c *Client) noteSuccess(name string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	was := !c.skipUntil[name].IsZero()
 	delete(c.fails, name)
 	delete(c.skipUntil, name)
+	c.mu.Unlock()
+	if c.Log != nil && was {
+		c.Log.Info("出口恢复", "proxy", name)
+	}
 }
 
 func (c *Client) stickyMin() int {

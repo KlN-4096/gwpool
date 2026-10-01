@@ -367,7 +367,7 @@ func TestProxyBreaker(t *testing.T) {
 	c := &Client{Proxies: []config.Proxy{novProxy,
 		{Name: "nov2", Kind: config.KindNovproxy, Host: "h", User: "u2", Pass: "p", Enabled: true}}}
 	for i := 0; i < proxyFailThreshold; i++ {
-		c.noteFailure("nov")
+		c.noteFailure("nov", errors.New("认证被拒"))
 	}
 	for i := 0; i < 5; i++ {
 		sid, err := c.NewSID(true)

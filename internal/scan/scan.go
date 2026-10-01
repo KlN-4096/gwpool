@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"gwpool/internal/store"
@@ -48,7 +47,6 @@ const (
 	defaultStopAfter = 3
 
 	// 样本里的错误原因截到这么多字符：上游那段 JSON 一两百字就说完了。
-	sampleErrMaxRunes = 512
 )
 
 // Minter 是 scan 需要的铸票能力：types.Minter 再加上挑出口的两个方法
@@ -223,7 +221,7 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r Region) (la
 		Gateway:   res.Gateway,
 		Status:    res.Status,
 		At:        now,
-		Err:       sampleErr(res.ErrBody, mintErr),
+		Err:       types.SampleErr(res.ErrBody, mintErr),
 	}
 	if err := s.Store.AppendSample(sm); err != nil {
 		return landing{}, fmt.Errorf("落样本: %w", err)
@@ -317,20 +315,4 @@ func sleep(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
-}
-
-// sampleErr 挑一行写进样本的失败原因。
-//
-// 上游那段 JSON 优先——它说的是「为什么」（"The 'gpt-6-astra' model is not supported…"）。
-// 传输层失败时上游什么都没回，这时候退回本地错误文本，否则这一行只剩 status=0。
-// 按**字符**截，别把一个汉字劈成半个落进 samples.jsonl。
-func sampleErr(errBody string, err error) string {
-	s := strings.TrimSpace(errBody)
-	if s == "" && err != nil {
-		s = err.Error()
-	}
-	if r := []rune(s); len(r) > sampleErrMaxRunes {
-		s = string(r[:sampleErrMaxRunes])
-	}
-	return s
 }

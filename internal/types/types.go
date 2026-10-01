@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -147,6 +148,29 @@ type Sample struct {
 	// 没有它的话 samples.jsonl 里一行 status=400 什么都不告诉人：2026-10-01 首扫
 	// 二十发全 400，真正的原因（账号清单里没有 gpt-6-astra）要单独打一发才看得见。
 	Err string
+}
+
+// SampleErrMaxRunes 截断样本里的原因：它进的是账本和网页，不是日志系统。
+const SampleErrMaxRunes = 512
+
+// SampleErr 按「上游原话优先、本地错误兜底」拼 Sample.Err。
+//
+// 上游那段 JSON 优先——它说的是「为什么」（"The 'gpt-6-astra' model is not supported…"）。
+// 传输层失败时上游什么都没回，这时候退回本地错误文本，否则这一行只剩 status=0。
+// 按**字符**截，别把一个汉字劈成半个落进 samples.jsonl。
+//
+// 三条路都要用它（首扫、铸票、state-echo）：2026-10-01 的教训是铸票那条路忘了填，
+// 于是出口熔断那几分钟 samples.jsonl 里只剩一串 status=0 的空行，
+// 「是连不上代理、认证被拒、还是出口中途断开」在事后完全查不出来。
+func SampleErr(errBody string, err error) string {
+	s := strings.TrimSpace(errBody)
+	if s == "" && err != nil {
+		s = err.Error()
+	}
+	if r := []rune(s); len(r) > SampleErrMaxRunes {
+		s = string(r[:SampleErrMaxRunes])
+	}
+	return s
 }
 
 // Gateway 是池子里的一个网关。

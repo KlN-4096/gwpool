@@ -1517,3 +1517,50 @@ func TestPremintKeepsServingExternalConsumers(t *testing.T) {
 		t.Fatal("有外部消费者在取票却停了预铸")
 	}
 }
+
+// 503 要把**真实原因**带出去：「没有验过满血的槽位可交付」会把「你的槽位都烧完了」
+// 和「出口全熔断了、谁都铸不出票」说成同一件事，而这两者要做的事完全相反。
+// 2026-10-01 现网就吃过这个：页面上只看到前者，真实原因（没有可用的出口代理）只在日志里。
+func TestDeliverCarriesTheRealCause(t *testing.T) {
+	s, _, mn, _ := rig(t, types.ModeSingle)
+	mn.mintErr = errors.New("要不到粘性出口: 没有可用的出口代理（sticky=true，共 2 条）")
+
+	_, err := s.Deliver(context.Background(), 1, "", false)
+	if !errors.Is(err, ErrNoFullSlot) {
+		t.Fatalf("调用方认不出该回 503: %v", err)
+	}
+	if !strings.Contains(err.Error(), "没有可用的出口代理") {
+		t.Fatalf("真实原因丢了: %v", err)
+	}
+	if !errors.Is(err, mn.mintErr) {
+		t.Fatalf("底层错误没串起来，上层没法按类型分流: %v", err)
+	}
+}
+
+// 铸票和 state-echo 那两条路也要把原因落进样本：出口熔断那几分钟
+// samples.jsonl 里只剩一串 status=0 的空行，事后什么都查不出来。
+func TestFailedMintRecordsCauseInSample(t *testing.T) {
+	s, st, mn, _ := rig(t, types.ModeSingle)
+	mn.mintErr = errors.New("经 novproxy 请求失败: socks connect refused")
+
+	_, _ = s.Deliver(context.Background(), 1, "", false)
+	var failed, withErr int
+	for _, sm := range st.samples {
+		if sm.Status == 200 {
+			if sm.Err != "" {
+				t.Fatalf("成功的样本也填了原因，账本分不清哪行真出过问题: %+v", sm)
+			}
+			continue
+		}
+		failed++
+		if strings.Contains(sm.Err, "connect refused") {
+			withErr++
+		}
+	}
+	if failed == 0 {
+		t.Fatal("一条失败样本都没落，交付路径没在记账")
+	}
+	if withErr == 0 {
+		t.Fatalf("%d 条失败样本全是空原因", failed)
+	}
+}

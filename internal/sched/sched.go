@@ -240,6 +240,9 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	// 一轮摸干净，后面的人就无票可用了（2026-10-01 实测：一次请求连试 5 个、耗 90 秒，
 	// 然后告诉调用方 503）。按需取票：试不出来就早点认 503，让供给留给下一个人。
 	tries := s.opt.MaxTriesPerDeliver
+	// 留住最后一个真实原因：ErrNoFullSlot 这一句话把「你的槽位都烧完了」和
+	// 「出口全熔断了、谁都铸不出票」说成同一件事，而这两者要做的事完全相反。
+	var last error
 	for len(cands) > 0 && tries > 0 {
 		sl, ok := s.st.LongestRestedSlot(consumer.ID, cands)
 		if !ok {
@@ -259,6 +262,7 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 			break
 		}
 		s.opt.Log.Info("槽位不可交付", "account", consumer.ID, "gateway", sl.Gateway, "reason", err)
+		last = err
 		// 速率闸不是槽位的错也不是账号的错：给它记退避等于拿速率纪律惩罚供给。
 		// 直接认 503，下一个人来的时候配额可能已经腾出来了。
 		if errors.Is(err, types.ErrRateLimited) {
@@ -274,6 +278,11 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 	if tries == 0 && len(cands) > 0 {
 		s.opt.Log.Info("试满上限仍没拿到满血票，剩下的留给别人",
 			"account", consumer.ID, "tried", s.opt.MaxTriesPerDeliver, "left", len(cands))
+	}
+	if last != nil {
+		// 两个 %w：调用方既能 errors.Is 出 ErrNoFullSlot（该回 503），也能认出底下
+		// 那个真正的故障（出口没了、速率闸、上游拒收）。页面上的「原始错误」就是这一句。
+		return types.Delivery{}, fmt.Errorf("%w（最后一个原因：%w）", ErrNoFullSlot, last)
 	}
 	return types.Delivery{}, ErrNoFullSlot
 }
@@ -491,7 +500,7 @@ func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw t
 	// 只在交付前验一次。state-echo 有假阴（满血号偶尔也下发新 state），
 	// 当持续闸门会误杀好槽位（SPEC 红线 4）。
 	v, verr := s.mint.VerifyFull(ctx, consumer.Creds, exit, m.sid, pair.Cookie, m.ticket)
-	s.recordEcho(consumer.ID, exit, gw.Name, m.obs, v, s.now())
+	s.recordEcho(consumer.ID, exit, gw.Name, m.obs, v, verr, s.now())
 	if verr != nil {
 		return types.Delivery{}, fmt.Errorf("state-echo 失败: %w", verr)
 	}
@@ -543,6 +552,7 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	s.sample(types.Sample{
 		AccountID: a.ID, RegionKey: exitKey(e), Requested: e, Observed: obs,
 		Gateway: res.Gateway, Status: res.Status, At: at,
+		Err: types.SampleErr(res.ErrBody, err),
 	})
 
 	// 触碰按**保守方向**记：超时和网络错在这里分不清「请求出去了但响应丢了」
@@ -738,15 +748,22 @@ func (s *Scheduler) sample(sm types.Sample) {
 
 // recordEcho 把 state-echo 那一发也记进样本：它同样是一次用上传者凭据发出的真实请求，
 // 账本漏了它上传者视图就不诚实了。
-func (s *Scheduler) recordEcho(accountID int64, e types.Exit, gateway string, obs types.Observed, v *types.Verdict, at time.Time) {
+func (s *Scheduler) recordEcho(accountID int64, e types.Exit, gateway string, obs types.Observed, v *types.Verdict, err error, at time.Time) {
 	status := 0
+	note := ""
 	if v != nil {
-		status = v.Status
+		status, note = v.Status, v.Note
 	}
-	s.sample(types.Sample{
+	sm := types.Sample{
 		AccountID: accountID, RegionKey: exitKey(e), Requested: e, Observed: obs,
 		Gateway: gateway, Status: status, At: at,
-	})
+	}
+	// 只在失败那几行填原因：Note 在满血那一发也有值，填上去就把「成功时为空」这个
+	// 约定破了，账本里再也分不清哪行是真出过问题。
+	if err != nil || status != 200 {
+		sm.Err = types.SampleErr(note, err)
+	}
+	s.sample(sm)
 }
 
 // ---------- 退避 ----------

@@ -62,6 +62,7 @@ func run(path string, log *slog.Logger) error {
 
 		UpstreamPerHour: cfg.UpstreamPerHour,
 		Live:            live,
+		Log:             log, // 只用来记出口熔断的开合
 	}
 	pool := sched.New(st, minter, sched.Options{
 		Mode:              cfg.Mode,
