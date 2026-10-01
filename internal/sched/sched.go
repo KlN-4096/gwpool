@@ -86,8 +86,13 @@ var errDegraded = errors.New("state-echo 判降级")
 const (
 	// 硬失败（非 200、网络错、落点漂移）指数退避：快重试会让供给更快耗尽
 	// （2026-10-01 实测：两小时上千次铸票把能碰到的组合全烧空），SPEC 红线 7。
-	backoffBase = time.Minute
-	backoffMax  = 20 * time.Minute
+	//
+	// 10s 起、封顶 1 分钟（2026-10-01 从 1min/20min 压下来）：原来那套的问题是
+	// 一次**外部**故障（出口熔断、调用方取消）会把一个账号的所有槽位挨个打进
+	// 20 分钟退避，故障恢复了它还要再瞎等十几分钟——当天两次全池 502 就是这样
+	// 被拖长的。退避是「别对着刚坏的东西连打」，不是罚站。
+	backoffBase = 10 * time.Second
+	backoffMax  = time.Minute
 
 	// 判降级只歇一个满血窗口，**不进指数**：state-echo 有假阴（满血号偶尔也下发新
 	// state），翻倍会让一次误判把好槽位停到 20 分钟，而供给本来就只有几个槽位。
@@ -263,9 +268,11 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, gatewayHint st
 		}
 		s.opt.Log.Info("槽位不可交付", "account", consumer.ID, "gateway", sl.Gateway, "reason", err)
 		last = err
-		// 速率闸不是槽位的错也不是账号的错：给它记退避等于拿速率纪律惩罚供给。
-		// 直接认 503，下一个人来的时候配额可能已经腾出来了。
-		if errors.Is(err, types.ErrRateLimited) {
+		// 速率闸和「出口全没了」都不是这个槽位的错，也不是这个账号的错：给它们记退避
+		// 等于拿池子自己的故障惩罚供给——而且退避是按槽位记的，一次外部故障会把这个
+		// 账号的槽位挨个打进退避，故障恢复后它还要再瞎等一轮（2026-10-01 现网实测）。
+		// 直接认 503，下一个人来的时候配额/出口可能已经回来了。
+		if errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit) {
 			break
 		}
 		if errors.Is(err, errDegraded) {

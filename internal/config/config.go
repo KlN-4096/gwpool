@@ -67,7 +67,15 @@ type Proxy struct {
 // 所以**只有粘性供应商能做需要配对的事**（扫描时的 Geo+Mint 配对、交付前的铸票+echo）。
 // 非粘性的只能做粗粒度国家扫描：拿落点，不做质量判定。
 // 续期不挑供应商——续期带着 pair 打，路由由 cookie 决定，出口无所谓。
-func (p Proxy) Sticky() bool { return p.Kind == KindNovproxy }
+// Sticky 报告这个供应商能不能把同一个 sid 钉在同一个出口 IP 上。
+//
+// webshare 也能：用户名尾段给个**纯数字**会话号就固定 IP（2026-10-01 实测
+// 同号两发同 IP、换号换 IP；字母数字的会话号认证直接被拒，见 mint.webshareSession）。
+// 它粘住多久在 webshare 面板里设，不在用户名里。
+//
+// 这件事不是锦上添花：只有一家粘性供应商时，它一熔断整池立刻停摆
+// （2026-10-01 现网两次全池 502 都是这么来的）。
+func (p Proxy) Sticky() bool { return p.Kind == KindNovproxy || p.Kind == KindWebshare }
 
 // Fingerprint 选出站报文形状。见 internal/mint。
 type Fingerprint string
@@ -261,8 +269,8 @@ func Load(path string) (Config, error) {
 	// 一个粘性供应商都没有时，铸票和 state-echo 配不成对，整个交付路径是坏的。
 	// 启动即拒，别等到第一次交付才发现（SPEC 第 5 节）。
 	if len(cfg.StickyProxies()) == 0 {
-		return Config{}, fmt.Errorf("至少要有一个启用着的粘性代理（kind=%q），"+
-			"否则铸票与 state-echo 配不成同一个出口 IP", KindNovproxy)
+		return Config{}, fmt.Errorf("至少要有一个启用着的粘性代理（kind=%q 或 %q），"+
+			"否则铸票与 state-echo 配不成同一个出口 IP", KindNovproxy, KindWebshare)
 	}
 	return cfg, nil
 }

@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,9 +39,12 @@ const (
 
 	// 连续这么多次连接层失败就临时跳过这个供应商。novproxy 实测约 10% 抖动，
 	// 一两次失败是常态，不该让它下线。
+	// 退避刻意压得很短（10s 起、封顶 1 分钟）：熔断是为了别对着一条死供应商反复撞墙，
+	// 不是惩罚。而只要还有别的粘性供应商顶着，退避长一点的收益也不大；
+	// 退避太长的代价倒是实打实的——2026-10-01 一次误判就让整池停了 70 秒。
 	proxyFailThreshold = 3
-	proxySkipBase      = 30 * time.Second
-	proxySkipMax       = 10 * time.Minute
+	proxySkipBase      = 10 * time.Second
+	proxySkipMax       = time.Minute
 
 	// **单个上游账号**每小时的上游请求上限（Mint + VerifyFull 共用这一个预算）。
 	// 一次九区域扫描是 9 发、一次取票最多 6 发，54 发留得下一次扫描加几次取票。
@@ -54,8 +59,9 @@ const (
 // 说明上游接受了那张 pair、没换网关（SPEC 第 2 节、红线 3）。
 var ErrNoLanding = errors.New("上游既没下发 __oailb，本次也没发 pair，读不出落点")
 
-// ErrNoProxy 是「能用的出口一个都没有」：全被熔断跳过了，或者配置里没有符合要求的。
-var ErrNoProxy = errors.New("没有可用的出口代理")
+// ErrNoProxy 是「能用的出口一个都没有」。定义搬到了 types（调度要按它分流，
+// 见 types.ErrNoExit），这里留个别名，免得改一串调用点。
+var ErrNoProxy = types.ErrNoExit
 
 // Client 实现 types.Minter。
 type Client struct {
@@ -459,6 +465,12 @@ func (c *Client) do(req *http.Request, e types.Exit, sid string) (*http.Response
 	cl := proxyClient(p, user, c.timeout(), c.fingerprint(), func() { tunneled.Store(true) })
 	resp, err := cl.Do(req)
 	switch {
+	case err != nil && req.Context().Err() != nil:
+		// **调用方自己撤了**（sub2api 放弃重试、客户端断开、上层超时），不是供应商的账。
+		// 2026-10-01 现网两次全池 502 就毁在这一条上：重试风暴里每发都被很快掐断，
+		// 三发 "context canceled" 就把 novproxy 熔断，而它一直是好的——
+		// 池子被客户端的重试把自己打停了。也不记成功：这一发什么都没证明。
+		return nil, fmt.Errorf("经 %s 的请求被调用方取消: %w", p.Name, err)
 	case err != nil && tunneled.Load():
 		// 隧道建起来了又断 ⇒ **出口节点**死了，不是供应商的账。住宅池里约一成的
 		// 粘性会话会摸到这种死节点（2026-10-01 实测 2/20），记在供应商头上就会
@@ -558,7 +570,7 @@ func proxyClient(p config.Proxy, user string, timeout time.Duration, fp config.F
 // proxyUser 按供应商拼用户名。加新供应商 = 加一个 case。
 //
 //	novproxy: <user>-region-<CC>[-city-<City>]-sid-<SID>-t-<N>   同 sid 在 N 分钟内固定出口 IP
-//	webshare: <user>-<CC>-rotate                                 每连接换 IP，没有粘性
+//	webshare: <user>-<CC>-<数字会话号>                            同号固定出口 IP，粘多久在面板里设
 func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, error) {
 	if err := validateExit(e); err != nil {
 		return "", err
@@ -583,10 +595,22 @@ func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, erro
 		if e.Region == "" {
 			return "", errors.New("webshare 必须指定国家")
 		}
-		// 没有城市段可用，只能按国家定向——这正是它只配做粗粒度扫描的原因。
-		return p.User + "-" + e.Region + "-rotate", nil
+		// 没有城市段可用，只能按国家定向（ASN 也能挑，但那要在面板里配，不走用户名）。
+		return p.User + "-" + e.Region + "-" + webshareSession(sid), nil
 	}
 	return "", fmt.Errorf("不认识的代理 kind %q", p.Kind)
+}
+
+// webshareSession 把 sid 映成 webshare 要的会话号。
+//
+// **必须是纯数字**：2026-10-01 实测字母数字和带连字符的会话号在 SOCKS5 认证这一步
+// 就被拒（而认证被拒会直接记进熔断计数，把整条供应商打停），纯数字两发同 IP。
+// 用 FNV-32 而不是截取 sid：sid 的字符集本来就不是十进制，截出来会撞一堆。
+// 同一个 sid 必须永远映到同一个号——铸票和随后那一发 state-echo 靠它共用出口。
+func webshareSession(sid string) string {
+	h := fnv.New32a()
+	_, _ = io.WriteString(h, sid)
+	return strconv.FormatUint(uint64(h.Sum32()), 10)
 }
 
 // validateExit 卡住能进代理用户名的内容。

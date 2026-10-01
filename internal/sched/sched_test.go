@@ -514,12 +514,14 @@ func TestMintFailureBacksOff(t *testing.T) {
 	}
 }
 
-// 硬失败的退避必须翻倍且封顶 20 分钟。
+// 硬失败的退避必须翻倍且封顶在 backoffMax。
 func TestBackoffDoublesAndCaps(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("socks5 连不上")
-	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute,
-		16 * time.Minute, 20 * time.Minute, 20 * time.Minute}
+	// 按常量算，别把数字写死：封顶值 2026-10-01 从 20 分钟压到 1 分钟，
+	// 写死的话这个测试只会在改常量时红一次，证明不了「翻倍 + 封顶」这件事本身。
+	want := []time.Duration{backoffBase, 2 * backoffBase, 4 * backoffBase,
+		backoffMax, backoffMax}
 	for i, w := range want {
 		at := clk.now()
 		if _, err := s.Deliver(context.Background(), 1, "unified-1", false); !errors.Is(err, ErrNoFullSlot) {
@@ -1562,5 +1564,26 @@ func TestFailedMintRecordsCauseInSample(t *testing.T) {
 	}
 	if withErr == 0 {
 		t.Fatalf("%d 条失败样本全是空原因", failed)
+	}
+}
+
+// 出口没了是池子自己的基础设施故障，不该把槽位挨个打进退避：出口一恢复就该能用，
+// 而不是让这个账号的每个槽位再瞎等一轮（2026-10-01 现网实测出的毛病）。
+func TestExitOutageDoesNotBackoffSlots(t *testing.T) {
+	s, st, mn, _ := rig(t, types.ModeSingle)
+	mn.mintErr = fmt.Errorf("要不到粘性出口: %w", types.ErrNoExit)
+
+	if _, err := s.Deliver(context.Background(), 1, "", false); !errors.Is(err, ErrNoFullSlot) {
+		t.Fatalf("该回 503: %v", err)
+	}
+	for key, sl := range st.slots {
+		if !sl.BackoffUntil.IsZero() {
+			t.Fatalf("出口故障却给槽位 %s 记了退避到 %v", key, sl.BackoffUntil)
+		}
+	}
+	// 出口回来了就该立刻能交付，不用等退避。
+	mn.mintErr = nil
+	if _, err := s.Deliver(context.Background(), 1, "", false); err != nil {
+		t.Fatalf("出口恢复后仍然交付不了: %v", err)
 	}
 }

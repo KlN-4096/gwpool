@@ -268,10 +268,27 @@ func TestProxyUserPerKind(t *testing.T) {
 	if err != nil || got != "u100806-region-JP-sid-zz99-t-7" {
 		t.Errorf("novproxy 不带城市: %q err=%v", got, err)
 	}
-	// webshare 没有城市段，只能按国家定向——这正是它只配做粗粒度扫描的原因。
-	got, err = proxyUser(wsProxy, types.Exit{Region: "DE", City: "Berlin"}, "sid", 5)
-	if err != nil || got != "wsu-DE-rotate" {
-		t.Errorf("webshare: %q err=%v", got, err)
+	// webshare 没有城市段，只能按国家定向；尾段是会话号，**必须纯数字**
+	// （2026-10-01 实测字母数字的会话号在 SOCKS5 认证就被拒）。
+	got, err = proxyUser(wsProxy, types.Exit{Region: "DE", City: "Berlin"}, "ab12cd34", 5)
+	if err != nil {
+		t.Fatalf("webshare: %v", err)
+	}
+	tail, ok := strings.CutPrefix(got, "wsu-DE-")
+	if !ok {
+		t.Fatalf("webshare 用户名形状不对: %q", got)
+	}
+	if tail == "" || strings.TrimLeft(tail, "0123456789") != "" {
+		t.Errorf("会话号不是纯数字，认证会被拒: %q", got)
+	}
+	// 同 sid 必须映到同一个号：铸票和随后那一发 state-echo 靠它共用出口 IP。
+	again, _ := proxyUser(wsProxy, types.Exit{Region: "DE"}, "ab12cd34", 5)
+	if again != got {
+		t.Errorf("同 sid 映出两个会话号: %q / %q", got, again)
+	}
+	other, _ := proxyUser(wsProxy, types.Exit{Region: "DE"}, "zz99", 5)
+	if other == got {
+		t.Errorf("不同 sid 映到同一个会话号，换不了出口: %q", other)
 	}
 	if _, err := proxyUser(wsProxy, types.Exit{}, "sid", 5); err == nil {
 		t.Error("webshare 没国家该报错")
@@ -303,7 +320,8 @@ func TestNewSIDRotatesAndRespectsSticky(t *testing.T) {
 		{Name: "nov2", Kind: config.KindNovproxy, Host: "h", User: "u2", Pass: "p", Enabled: true},
 		{Name: "off", Kind: config.KindNovproxy, Host: "h", User: "u3", Pass: "p", Enabled: false}}}
 
-	// sticky=true：只在两条 novproxy 之间轮，webshare 和停用的都跳过。
+	// 三家都能粘（webshare 的数字会话号 2026-10-01 实测固定 IP），停用的那条跳过。
+	// 这正是要的：一家熔断了还有另外两家顶着，不至于整池停摆。
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
 		sid, err := c.NewSID(true)
@@ -315,30 +333,20 @@ func TestNewSIDRotatesAndRespectsSticky(t *testing.T) {
 		}
 		seen[c.proxyName(sid)]++
 	}
-	if seen["nov"] != 3 || seen["nov2"] != 3 {
-		t.Errorf("该在两条粘性出口之间轮询，得到 %v", seen)
+	if seen["nov"] != 2 || seen["nov2"] != 2 || seen["ws"] != 2 {
+		t.Errorf("该在三条粘性出口之间轮询，得到 %v", seen)
 	}
-
-	// sticky=false：webshare 也进轮转，否则它那批独占网关（121/71）永远摸不到。
-	hitWS := false
-	for i := 0; i < 6; i++ {
-		sid, err := c.NewSID(false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if c.proxyName(sid) == "ws" {
-			hitWS = true
-		}
-	}
-	if !hitWS {
-		t.Error("非粘性轮转该能摸到 webshare")
+	if seen["off"] != 0 {
+		t.Errorf("停用的出口被选中了: %v", seen)
 	}
 }
 
 func TestNewSIDNoProxyAvailable(t *testing.T) {
-	c := &Client{Proxies: []config.Proxy{wsProxy}}
+	off := wsProxy
+	off.Enabled = false
+	c := &Client{Proxies: []config.Proxy{off}}
 	if _, err := c.NewSID(true); !errors.Is(err, ErrNoProxy) {
-		t.Fatalf("只有非粘性出口时要粘性该报 ErrNoProxy，得到 %v", err)
+		t.Fatalf("出口全停用时该报 ErrNoProxy，得到 %v", err)
 	}
 	if _, err := (&Client{}).NewSID(false); !errors.Is(err, ErrNoProxy) {
 		t.Fatal("一条出口都没有该报 ErrNoProxy")

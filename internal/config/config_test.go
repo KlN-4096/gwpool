@@ -52,8 +52,9 @@ func TestLoadRejectsBadInput(t *testing.T) {
 		"粘性分钟为 0":    `{"sticky_minutes":0,` + okProxies + `}`,
 		// 一个粘性供应商都没有时铸票和 state-echo 配不成对，整个交付路径是坏的
 		"没有代理": `{"proxies":[]}`,
-		"只有非粘性供应商": `{"proxies":[{"name":"ws","kind":"webshare","host":"p.webshare.io:1080",
-			"user":"u","pass":"p","enabled":true}]}`,
+		"供应商全关掉": `{"proxies":[
+			{"name":"ws","kind":"webshare","host":"p.webshare.io:1080","user":"u","pass":"p","enabled":false},
+			{"name":"nov","kind":"novproxy","host":"h","user":"u","pass":"p","enabled":false}]}`,
 		"粘性供应商被关掉": `{"proxies":[{"name":"nov","kind":"novproxy","host":"h","user":"u",
 			"pass":"p","enabled":false}]}`,
 		"代理缺 name": `{"proxies":[{"kind":"novproxy","host":"h","user":"u","pass":"p","enabled":true}]}`,
@@ -84,12 +85,20 @@ func TestProxySelection(t *testing.T) {
 	if got := cfg.EnabledProxies(); len(got) != 2 {
 		t.Errorf("启用着的该有 2 条，得到 %d", len(got))
 	}
+	// 两家都能粘：webshare 的用户名尾段给个数字会话号就固定 IP（2026-10-01 实测）。
+	// 这条很要紧——只有一家粘性供应商时它一熔断整池就停摆。
 	sticky := cfg.StickyProxies()
-	if len(sticky) != 1 || sticky[0].Name != "nov" {
-		t.Errorf("粘性的只该有 nov，得到 %+v", sticky)
+	if len(sticky) != 2 {
+		t.Errorf("启用着的两家都该算粘性，得到 %+v", sticky)
 	}
-	if !cfg.Proxies[0].Sticky() || cfg.Proxies[1].Sticky() {
-		t.Error("粘性只由 kind 决定：novproxy 有、webshare 没有")
+	if !cfg.Proxies[0].Sticky() || !cfg.Proxies[1].Sticky() {
+		t.Error("novproxy 和 webshare 都该是粘性")
+	}
+	// 停用的那条不进粘性清单：熔断兜底靠的是**还能用**的那几条。
+	for _, p := range sticky {
+		if p.Name == "off" {
+			t.Error("停用的代理混进粘性清单了")
+		}
 	}
 }
 
