@@ -434,9 +434,15 @@ func (s *Scheduler) idle() bool {
 // 用两把尺子量同一件事。
 func (s *Scheduler) livePairs() int { return s.FreeGateways() }
 
-// PairTarget 是目标活 pair 数：最忙那个号**真的用过**几张 pair，再加 SpareTarget。
+// PairTarget 是目标活 pair 数：最忙那个号**最近真的用过**几张 pair，再加 SpareTarget。
 //
 // 「用过」= 槽位上有 LastDeliver，也就是真的有人在这个网关上取走过一张票。
+// **只数最近一个 PairLifetime 之内的**：LastDeliver 只写不清（整个项目里只有
+// deliver 那一处写它），按「终身用过」数的话这个基数单调递增、永不回落 ⇒ 目标一路
+// 爬到 GatewayCeiling，预铸每轮都在追一个追不上的数（10-02 线上 target=63 而 live
+// 只有 53~58，而当时真正在取票的号远没用到 43 个网关）。
+// 窗口取 PairLifetime 是因为两者问的是同一件事：一张票只活这么久，所以「它这一小时
+// 取过几个网关」就是「它此刻同时需要几张活票」。需求停了，目标跟着回落。
 // **两条交付路径都算**：上传者自己取（验过满血的）和外部账号拿一把 key 替自己取
 // （池子没它的凭据、答不了它的满血，但它确实用掉了一张票，一样是供给压力）。
 // 早先按 LastVerdict 判，那会漏掉整条外部消费者的路——池子对外服务得越多，
@@ -449,9 +455,12 @@ func (s *Scheduler) livePairs() int { return s.FreeGateways() }
 // 所以封顶在 types.GatewayCeiling——不封的话最忙的号用遍全部网关之后目标永远够不着，
 // 每一轮保温都会为它白打几发。
 func (s *Scheduler) PairTarget() int {
+	// IsZero 要单独判：零值表示「从没交付过」，而测试里的假时钟可能把 cutoff
+	// 推到零值之前，那时 After 会把它算成「刚取过」。
+	cutoff := s.now().Add(-types.PairLifetime)
 	used := map[int64]int{}
 	for _, sl := range s.st.Slots() {
-		if !sl.LastDeliver.IsZero() {
+		if !sl.LastDeliver.IsZero() && sl.LastDeliver.After(cutoff) {
 			used[sl.AccountID]++
 		}
 	}

@@ -1950,6 +1950,34 @@ func TestPairTargetTracksBusiestConsumer(t *testing.T) {
 	}
 }
 
+// 目标深度数的是**最近**的需求，不是终身累计。
+//
+// LastDeliver 只写不清，按「曾经用过」数就单调递增、永不回落 ⇒ 目标一路爬到
+// GatewayCeiling，预铸每轮为追不上的那几张白打（10-02 线上 target=63 / live 53~58）。
+// 这条钉住窗口：过了一个 pair 寿命还没人再来取，那一格就不再算需求。
+func TestPairTargetForgetsStaleDemand(t *testing.T) {
+	s, st, _, clk := rig(t, types.ModePool)
+	for _, gw := range []string{"unified-1", "unified-2", "unified-3"} {
+		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw,
+			LastTouch: clk.now(), LastDeliver: clk.now()}
+	}
+	if got, want := s.PairTarget(), types.SpareTarget+3; got != want {
+		t.Fatalf("刚取过三张时目标应是 %d，实为 %d", want, got)
+	}
+
+	// 窗口内（差一点到期）还得算：边界不许把正在用的需求抹掉。
+	clk.add(types.PairLifetime - time.Minute)
+	if got, want := s.PairTarget(), types.SpareTarget+3; got != want {
+		t.Fatalf("窗口内目标应仍是 %d，实为 %d", want, got)
+	}
+
+	// 过了一个 pair 寿命，这三格全算陈旧需求，目标回落到纯富余。
+	clk.add(2 * time.Minute)
+	if got, want := s.PairTarget(), types.SpareTarget; got != want {
+		t.Fatalf("需求过期后目标应回落到 %d，实为 %d", want, got)
+	}
+}
+
 // 目标深度封顶在上游网关总数：最忙的号快用遍全部网关时，再加富余也铸不出来，
 // 不封顶的话每轮保温都会为够不着的那几张白打。
 func TestPairTargetCappedAtGatewayCeiling(t *testing.T) {
