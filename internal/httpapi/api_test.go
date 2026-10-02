@@ -2035,7 +2035,8 @@ func TestAdminGatewaysShowPlacesAndPair(t *testing.T) {
 	}
 }
 
-// 「账号×网关」按账号汇总：冷却按调度那把尺子（LastDeliver + 冷却时长），退避按 BackoffUntil。
+// 「账号×网关」按账号汇总：「近期取过」= LastDeliver 落在 slot_cooldown 窗口内（**读数，
+// 不是闸**，见 sched.burning），退避按 BackoffUntil（那个才是闸）。
 func TestSlotSummaries(t *testing.T) {
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 	slots := map[string]types.Slot{
@@ -2061,7 +2062,7 @@ func TestSlotSummaries(t *testing.T) {
 		t.Fatalf("1 号汇总不对：%+v", a)
 	}
 	if want := []string{
-		"unified-1 · 1.0 小时前用过 · 冷却中 · 正常",
+		"unified-1 · 1.0 小时前用过 · 近期取过 · 正常",
 		"unified-2 · 5.0 小时前用过 · 退避 10 分钟 · 降级",
 		"unified-105 · 从未用过",
 	}; strings.Join(a.Gateways, "\n") != strings.Join(want, "\n") {

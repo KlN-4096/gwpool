@@ -167,7 +167,9 @@ func TestAllCoolingCarriesWait(t *testing.T) {
 	if !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("CoolingError 不再是 ErrNoFullSlot，调用方的分流会全错: %v", err)
 	}
-	want := types.SlotCooldown - types.DeliverTTL - time.Second
+	// 一个满血窗口减掉已经过去的那段，不再是 SlotCooldown 减它：消费冷却那条闸
+	// 2026-10-03 删了（见 sched.burning），剩下的 Wait 上限就是 types.FullWindow。
+	want := types.FullWindow - types.DeliverTTL - time.Second
 	if cool.Wait != want {
 		t.Fatalf("Wait=%v，应为 %v", cool.Wait, want)
 	}
@@ -559,40 +561,76 @@ func TestExcludeBeatsGatewayHint(t *testing.T) {
 	}
 }
 
-// S-4：被自动停用的托管号的交付历史不许解开预铸的成本闸。
+// S-4：**消费冷却不再拦交付。** 全员在全部网关上刚取过票，照样发。
 //
-// 「有外部消费者在取票就不算白烧」这条豁免要按 types.AnonPrefix 认人。按
-// 「在不在 usable() 里」认的话，一个 400/401/403 停用掉的号也会被当成外部消费者
-// （mintOnce / scan 一发就能停用一个号）⇒ 只要有任一个号在近 4 小时内交付过之后
-// 被停用，这条闸就对整池永久失效。
-func TestDisabledAccountDoesNotReopenPremintGate(t *testing.T) {
-	s, st, _, clk := noVerifyRig(t)
+// 2026-10-03 按用户的决定删掉了那条闸：「我认为网关不应该记录消费，消费和账本是客户端侧
+// 记的，理由是给上游减轻负担」。原先这里躺着 TestDisabledAccountDoesNotReopenPremintGate
+// ——它测的是 premintWasted（「全员都在冷却里就别预铸」）里那条「外部消费者豁免」怎么认人，
+// 整个函数连带闸一起删了，所以那条用例也没了。
+//
+// 换成钉**删掉这件事本身**：这是最可能被人「顺手修回去」的一处（账本还在、字段还在、
+// 名字还叫 LastDeliver，看着就像漏了一道闸）。
+//
+// 池子仍然守的那一条由 TestBurningBlocksOnlyThePoolsOwnTouch 盯着：它自己在一个满血窗口内
+// 拿这个号的凭据打过上游的那些网关，不发。
+func TestDeliveryIgnoresConsumptionCooldown(t *testing.T) {
+	s, st, mn, clk := noVerifyRig(t)
+	seedPairs(st, clk)
+	// 两个号 × 三个网关全部「刚刚取过票」，而且 LastTouch 留空 —— 那一发不是池子打的
+	// （票是别人铸的，纯消费）。按老规则这是最硬的 all_cooling。
+	st.mu.Lock()
 	for _, id := range []int64{1, 2} {
 		for gw := range st.gws {
-			st.mu.Lock()
-			st.slots[slotKey(id, gw)] = types.Slot{AccountID: id, Gateway: gw, LastDeliver: clk.now()}
-			st.mu.Unlock()
+			st.slots[slotKey(id, gw)] = types.Slot{AccountID: id, Gateway: gw,
+				LastDeliver: clk.now()}
 		}
 	}
-	if !s.premintWasted() {
-		t.Fatal("全员在全部网关上都在冷却里，这一轮本该不预铸")
-	}
-	// 2 号被上游否决、自动停用：它的历史还在，但它不会再来取票。
-	if err := st.DisableAccount(2, "铸票 HTTP 403"); err != nil {
-		t.Fatal(err)
-	}
-	if !s.premintWasted() {
-		t.Fatal("一个被停用的号就把成本闸解开了：那不是外部消费者")
-	}
-	// 真正的外部消费者（匿名占位行）照旧解开它。
-	st.mu.Lock()
-	st.accounts = append(st.accounts, types.Account{ID: 99, Enabled: true,
-		Creds: types.Creds{AccountID: types.AnonPrefix + "outsider"}})
-	st.slots[slotKey(99, "unified-1")] = types.Slot{AccountID: 99, Gateway: "unified-1",
-		LastDeliver: clk.now()}
 	st.mu.Unlock()
-	if s.premintWasted() {
-		t.Fatal("有外部消费者在取票却停了预铸")
+
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("消费冷却又在拦交付了（这条闸已经删了）: %v", err)
+	}
+	if d.Gateway == "" {
+		t.Fatalf("交付了但没网关名: %+v", d)
+	}
+	// 而且不该为此白打一发上游：池子里三张活票都是候选。
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("手上有活票还铸了 %d 发", n)
+	}
+}
+
+// 池子仍然守着的那一条：**它自己**在一个满血窗口内拿这个号的凭据打过的网关不发。
+//
+// 和上面那条是一对，删错任何一边都会在这儿或那儿红。只有池子知道这一发发生过 ——
+// 删了它，池子会拿 A 的凭据铸一张落在 G 的票、然后立刻把 G 发给 A，而 (A × G) 的窗口
+// 正是刚才那一发烧掉的。
+func TestBurningBlocksOnlyThePoolsOwnTouch(t *testing.T) {
+	s, st, mn, clk := noVerifyRig(t)
+	seedPairs(st, clk)
+	st.mu.Lock()
+	for gw := range st.gws {
+		// LastTouch = 刚才，也就是「池子刚拿 1 号的凭据打过这一发」。
+		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw, LastTouch: clk.now()}
+	}
+	st.mu.Unlock()
+
+	_, err := s.Deliver(context.Background(), 1, Request{})
+	var cool *CoolingError
+	if !errors.As(err, &cool) {
+		t.Fatalf("池子刚烧过这三个窗口，不该发：err=%v", err)
+	}
+	// 等待时间是一个满血窗口量级，不再是小时量级（原先报 4 小时的冷却余量）。
+	if cool.Wait <= 0 || cool.Wait > types.FullWindow {
+		t.Fatalf("报的等待时间 %v 不在 (0, %v] 里", cool.Wait, types.FullWindow)
+	}
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("判了不发还铸了 %d 发", n)
+	}
+	// 窗口烧完就该放行，不必再歇冷却。
+	clk.add(types.FullWindow + time.Second)
+	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
+		t.Fatalf("满血窗口过完了还不发: %v", err)
 	}
 }
 

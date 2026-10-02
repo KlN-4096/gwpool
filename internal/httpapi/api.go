@@ -2138,7 +2138,9 @@ func facetLabel(s string) string {
 }
 
 // slotSummaries 把「账号×网关」按账号汇总，每个网关的明细压成一句话（点开才看）。
-// 「冷却中」只算 sched.notCooling 的第一道闸：LastDeliver 在冷却期内。页脚也只这么说。
+// 「近期取过」是**读数不是闸**：LastDeliver 落在 slot_cooldown 那个窗口内。
+// 2026-10-03 之前它确实是一道闸（调度据此不再派这个网关给这个账号），现在消费冷却
+// 归客户端账本管，池子不判（见 sched.burning）⇒ 这一列只告诉人「他最近在这儿取过票」。
 // 第二个返回值是全部槽位最近一次校验的分布：正常 / 降级 / 未知。
 func slotSummaries(all map[string]types.Slot, lastDeliver map[int64]time.Time, name func(int64) string,
 	cooldown time.Duration, now time.Time) ([]slotAccountRow, [3]int) {
@@ -2177,7 +2179,7 @@ func slotSummaries(all map[string]types.Slot, lastDeliver map[int64]time.Time, n
 		}
 		if !sl.LastDeliver.IsZero() && now.Sub(sl.LastDeliver) < cooldown {
 			row.Cooling++
-			note = append(note, "冷却中")
+			note = append(note, "近期取过")
 		}
 		if now.Before(sl.BackoffUntil) {
 			row.Backoff++

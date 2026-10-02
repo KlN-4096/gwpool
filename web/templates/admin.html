@@ -242,10 +242,10 @@
 
 <section id="tab-slots">
   <div class="card">
-    <header class="card-head"><div><h2>账号×网关 接触记录</h2><p>按账号汇总：碰过几个网关、其中几个还在冷却或退避、最近一次校验结果。<strong>点开</strong>看每个网关的明细。</p></div></header>
+    <header class="card-head"><div><h2>账号×网关 接触记录</h2><p>按账号汇总：碰过几个网关、其中几个近期取过票或还在退避、最近一次校验结果。<strong>点开</strong>看每个网关的明细。</p></div></header>
     {{if .SlotAccounts}}
     <div class="table-wrap"><table id="t-slots" data-grid data-placeholder="搜索账号或网关">
-      <thead><tr><th>账号</th><th class="num">碰过的网关</th><th class="num">冷却中</th><th class="num">退避中</th><th class="num">校验正常</th><th class="num">校验降级</th><th>最近一次交付（UTC）</th></tr></thead>
+      <thead><tr><th>账号</th><th class="num">碰过的网关</th><th class="num">近期取过</th><th class="num">退避中</th><th class="num">校验正常</th><th class="num">校验降级</th><th>最近一次交付（UTC）</th></tr></thead>
       <tbody>
       {{range .SlotAccounts}}
         <tr>
@@ -264,8 +264,8 @@
     {{else}}
     <p class="empty">暂无数据。</p>
     {{end}}
-    <p class="foot">冷却中：交付过、离上次交付还不到「账号×网关冷却」那个时长，调度不会再把它派给这个账号。退避中：校验未通过或请求失败后，该账号在这个网关上暂停使用。</p>
-    <p class="foot">这是一本<strong>烧账本，不是锁</strong>：每一行记的是「这个账号已经碰过这个网关了」，所以它在冷却完之前不会再被派出去。路由 Cookie 本身不互斥，同一张可以同时发给好几个账号。</p>
+    <p class="foot">近期取过：交付过、离上次交付还不到「账号×网关冷却」那个时长。<strong>这是读数不是闸</strong>——池子照样会把它再派给这个账号，躲不躲要客户端自己按账本决定。退避中：校验未通过或请求失败后，该账号在这个网关上暂停使用，<strong>这个才是闸</strong>。</p>
+    <p class="foot">这是一本<strong>台账，既不是锁也不再是闸</strong>：每一行记的是「这个账号已经碰过这个网关了」，供人和客户端查。2026-10-03 起池子<strong>不</strong>按它拒发——消费和账本归客户端记，池子只守一条：它自己在一个满血窗口（183 秒）内拿这个号的凭据打过上游的那些网关，不发。路由 Cookie 本身不互斥，同一张可以同时发给好几个账号。</p>
   </div>
 </section>
 
@@ -347,13 +347,13 @@
             <input name="models_extra" autocomplete="off" spellcheck="false"></label>
           <label>每账号每区域每小时上限 <span class="hint">0 = 用默认值 6（九个区域合起来 54）。安全阀，不是吞吐量目标</span>
             <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
-          <label>账号×网关冷却（分钟） <span class="hint">0 = 用默认值 240。一个账号在一个网关上取过票后，要歇多久才再派给它，实测 30 分钟到 3 小时都见过</span>
+          <label>账号×网关冷却（分钟） <span class="hint">0 = 用默认值 240。<strong>只管读数与统计窗口，不再拦交付</strong>（2026-10-03 起消费冷却交给客户端账本）：九区格子的「最近多久取过」和上面那张接触记录都按它算。实测真实恢复时长 30 分钟到 3 小时都见过</span>
             <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
           <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。<strong>交付前验证开着时</strong>每多试一个就多花一发上游（state-echo），关着时试的都是已有活票的网关、一发都不打</span>
             <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>
           <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2。目标张数 = 最忙的号用过的张数 + 这个数，最多 190（上游网关总共约 190–201 个）。填超过 190 = 停止预铸</span>
             <input name="spare_target" inputmode="numeric" value="{{.SpareTarget}}"></label>
-          <label>对外开放门槛（托管账号数） <span class="hint">托管账号少于这个数就只服务上传者。按账号数而不按活 pair 数：按需铸票的池子不囤票。默认按冷却推导，4 小时冷却 = 12 个</span>
+          <label>对外开放门槛（托管账号数） <span class="hint">托管账号少于这个数就只服务上传者。按账号数而不按活 pair 数：按需铸票的池子不囤票。默认 2（冗余底线）——实测单个账号就能摸到整张网关表（105/105），触达面不是瓶颈，只有「一个号被停用或被 429 按住就整池停摆」才是</span>
             <input name="min_accounts" inputmode="numeric" value="{{.MinAccounts}}"></label>
         </div>
         <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>

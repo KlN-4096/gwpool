@@ -93,8 +93,10 @@ func TestCookieFailureCodes(t *testing.T) {
 		// noGateways：池子是空的（冷启动）。
 		noGateways bool
 	}{
-		{name: "all_cooling", wantCode: codeAllCooling, wantRetry: 7200,
-			err: &sched.CoolingError{Gateways: 3, Cooldown: 4 * time.Hour, Wait: 2 * time.Hour}},
+		// retry_after 原样照 CoolingError.Wait 报。消费冷却那条闸删掉之后这个数降到一个满血
+		// 窗口量级（183 秒），不再是小时级 —— 这里就按那个量级铺。
+		{name: "all_cooling", wantCode: codeAllCooling, wantRetry: 183,
+			err: &sched.CoolingError{Gateways: 3, Wait: types.FullWindow}},
 		{name: "rate_limited", wantCode: codeRateLimited, wantRetry: 90,
 			err: fmt.Errorf("%w（最后一个原因：%w）", sched.ErrNoFullSlot,
 				&mint.RateLimited{Region: "europe", Limit: 6, Wait: 90 * time.Second})},
@@ -426,7 +428,7 @@ func TestWaitOnlyRetriesWhenATicketShowsUp(t *testing.T) {
 
 	t.Run("冷却不等", func(t *testing.T) {
 		srv, h, p, st, _ := rig(t, types.ModePool)
-		p.err = &sched.CoolingError{Gateways: 1, Cooldown: 4 * time.Hour, Wait: 3 * time.Hour}
+		p.err = &sched.CoolingError{Gateways: 1, Wait: types.FullWindow}
 		start := time.Now()
 		// wait 给到上限：冷却是几小时量级，等它等于把连接耗光。
 		w := do(h, authed(httptest.NewRequest("GET", "/cookie?wait=30", nil),

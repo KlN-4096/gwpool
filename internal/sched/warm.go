@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -50,11 +49,13 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 		s.opt.Log.Warn("可用账号不足两个，暂不保温（保温会烧掉这个号自己要用的窗口）", "accounts", n)
 		return
 	}
-	// 全员在全部已知网关上都还在冷却里 ⇒ 预铸出来的票交给谁都是降级的，白烧一发。
-	if s.premintWasted() {
-		s.opt.Log.Info("所有号在所有已知网关上都还在冷却期，本轮不预铸")
-		return
-	}
+	// 这里原先有一道 premintWasted：「全员在全部已知网关上都还在消费冷却里 ⇒ 预铸出来的票
+	// 交给谁都是降级的」。消费冷却那条闸 2026-10-03 删了（见 sched.burning），这个状态
+	// 不再存在 —— 剩下的那条闸是 183 秒量级、自己会过去，拿它判「本轮别铸」等于让池子
+	// 在最该补货的时候停工。那道闸 24 小时内触发 279 次，是铸票慢的三个原因之一。
+	//
+	// 刹车没有少：目标深度（PairTarget）仍然封顶，组合挑完 premintPick 就收尾。
+	//
 	// 目标活 pair 数 = 最忙那个号用过的 pair 数 + SpareTarget。够了就一发不打：
 	// 铸票不是免费的，每一发都在烧执行者的窗口、吃它那个区域的速率预算。
 	live, target := s.livePairs(), s.PairTarget()
@@ -453,57 +454,6 @@ func (s *Scheduler) PairTarget() int {
 		return 0
 	}
 	return min(busiest+spare, types.GatewayCeiling)
-}
-
-// premintWasted 报告这一轮预铸没人能用：所有托管号在所有已知网关上都还在
-// 冷却里，铸出来的票发给谁都是降级的。
-//
-// **只看 LastDeliver，不看 LastTouch**：冷却是「满血窗口被用掉了」才起算的，
-// 而 LastTouch 连失败的续期都记——拿它判会让保温自己把自己关掉（一发失败的续期
-// 把槽位标成刚碰过 ⇒ 下一轮不预铸 ⇒ 死 pair 永远攒不满失败预算）。
-//
-// **有外部消费者在取票就不算白烧**：pair 是纯路由，拿一把 key 替自己取票的外部账号
-// 在这些网关上大概率还是首次接触（2026-10-01 实测一张 pair 能同时服务多个账号），
-// 池子答不了它的满血，但不该替它判死。
-//
-// 「是不是外部消费者」按 types.AnonPrefix 判，**不能**按「是不是当前可用账号」：
-// usable() 要求 Enabled 且有凭据，而一个 400/401/403 就会自动停用一个托管号
-// （mintOnce / scan）。按可用性判的话，只要有任一个号在近 cooldown 内交付过之后被停用，
-// 这条成本闸就对整池永久失效。
-func (s *Scheduler) premintWasted() bool {
-	gws, hosted := s.st.Gateways(), s.usable()
-	if len(gws) == 0 || len(hosted) == 0 {
-		return false
-	}
-	ids := make(map[int64]bool, len(hosted))
-	for _, a := range hosted {
-		ids[a.ID] = true
-	}
-	external := map[int64]bool{}
-	for _, a := range s.st.Accounts() {
-		if strings.HasPrefix(a.Creds.AccountID, types.AnonPrefix) {
-			external[a.ID] = true
-		}
-	}
-	now, cooling := s.now(), 0
-	cooldown := s.cfg().SlotCooldown()
-	for _, sl := range s.st.Slots() {
-		if sl.LastDeliver.IsZero() || now.Sub(sl.LastDeliver) >= cooldown {
-			continue
-		}
-		if _, ok := gws[sl.Gateway]; !ok {
-			continue // 已经被遗忘的网关，不算在冷却里
-		}
-		if external[sl.AccountID] {
-			return false
-		}
-		if !ids[sl.AccountID] {
-			continue // 已停用的托管号：它不会再来取票，不该让它的历史解开这条闸
-		}
-		cooling++
-	}
-	// 槽位按 (账号 × 网关) 唯一，所以数够这个积就是全员都在冷却里。
-	return cooling >= len(ids)*len(gws)
 }
 
 // 「挑谁去铸」只有 minterFor 一份了。

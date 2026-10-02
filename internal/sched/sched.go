@@ -183,20 +183,23 @@ func (r Request) Skips(gateway, cookie string) bool {
 	return len(r.ExcludeVersions) > 0 && r.ExcludeVersions[types.CookieVersion(cookie)]
 }
 
-// CoolingError 是「这个账号在所有候选网关上都还在冷却里」。
+// CoolingError 是「这个账号在所有候选网关上的满血窗口此刻都在烧」。
 //
-// 带 Wait 是因为 HTTP 那头要把它变成 Retry-After：冷却是**小时**量级，
-// 让客户端按默认节奏重试等于白打几百发。
+// 2026-10-03 之前它说的是「都还在 SlotCooldown（4 小时）的消费冷却里」，而那条闸已经
+// 删了（见 burning）—— 现在只剩「池子此刻正在拿这个号的凭据打上游」，**183 秒量级**。
+// Cooldown 那个字段跟着删了：留着就会在错误串里打一个不再管事的 4h。
+//
+// 带 Wait 是因为 HTTP 那头要把它变成 Retry-After，而现在这个数小得多，
+// 客户端等一下真的能拿到票（原先报 7200 秒）。
 // Unwrap 回 ErrNoFullSlot ⇒ 调用方按它回 503、挂发现扫描，分流一个字都不用改。
 type CoolingError struct {
 	Gateways int           // 候选网关数
-	Cooldown time.Duration // 当前生效的冷却时长
-	Wait     time.Duration // 最早一个槽位出冷却还要多久；0 = 算不出来
+	Wait     time.Duration // 最早一个槽位烧完窗口还要多久；0 = 算不出来
 }
 
 func (e *CoolingError) Error() string {
-	return fmt.Sprintf("这个账号在 %d 个候选网关上都还在 %v 的冷却里（最早 %v 后出来）",
-		e.Gateways, e.Cooldown, e.Wait.Truncate(time.Second))
+	return fmt.Sprintf("池子此刻正在这个账号的 %d 个候选网关上烧满血窗口（最早 %v 后出来）",
+		e.Gateways, e.Wait.Truncate(time.Second))
 }
 
 func (e *CoolingError) Unwrap() error { return ErrNoFullSlot }
@@ -404,7 +407,6 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (
 		return types.Delivery{}, fmt.Errorf("%w（池子里没有可用网关，hint=%q）", ErrNoFullSlot, gatewayHint)
 	}
 
-	cooldown := s.cfg().SlotCooldown()
 	if force {
 		kept := make([]string, 0, len(cands))
 		for _, name := range cands {
@@ -414,21 +416,19 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (
 			kept = append(kept, name)
 		}
 		if len(kept) == 0 {
-			// 他手上那张就是唯一的候选 ⇒ 和「全在冷却里」是同一件事（刚交付过的
-			// 槽位本来就在冷却里），而且**等不起**：冷却是小时量级。
-			return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
-				Wait: s.coolingWait(consumer.ID, cands, cooldown)}
+			// 他手上那张就是唯一的候选 ⇒ 没得换，和「全在烧」归同一个码。
+			return types.Delivery{}, &CoolingError{Gateways: len(cands),
+				Wait: s.burnWait(consumer.ID, cands)}
 		}
 		cands = kept
 	}
 
-	// 冷却过滤：窗口用完的 (账号 × 网关) 要歇满 SlotCooldown 才重新给满血，
-	// 这期间它不参与挑选。**不给它开后门**——歇不够就发等于发降智的东西，
-	// 而池子宁可 503（SPEC 第 8 节）。全烧完就让发现路径去找新落点。
-	rested := s.notCooling(consumer.ID, cands, cooldown)
+	// 只滤掉池子此刻正在烧窗口的那些（183 秒量级，见 burning）。消费冷却不在这儿判了：
+	// 「这个号在这个网关上取过票了」归客户端账本管。
+	rested := s.notBurning(consumer.ID, cands)
 	if len(rested) == 0 {
-		return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
-			Wait: s.coolingWait(consumer.ID, cands, cooldown)}
+		return types.Delivery{}, &CoolingError{Gateways: len(cands),
+			Wait: s.burnWait(consumer.ID, cands)}
 	}
 	cands = rested
 
@@ -456,7 +456,7 @@ func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (
 	if len(withPair) == 0 {
 		// 点名了网关就定向铸（落点漂了算失败）：他点名是因为**他**知道自己没烧过那个
 		// 落点，给他换一个等于没听他说话。没点名才是抽签。
-		d, gateway, err := s.deliverByFreshMint(ctx, consumer, cands, cooldown, req)
+		d, gateway, err := s.deliverByFreshMint(ctx, consumer, cands, req)
 		if err == nil {
 			s.clearBackoff(consumer.ID, gateway)
 			return d, nil
@@ -542,12 +542,12 @@ func (s *Scheduler) HasCandidate(accountID int64, req Request) bool {
 	if len(cands) == 0 {
 		return false
 	}
-	withPair := s.gatewaysWithPair(s.notCooling(accountID, cands, s.cfg().SlotCooldown()), req.Floor())
+	withPair := s.gatewaysWithPair(s.notBurning(accountID, cands), req.Floor())
 	if len(withPair) == 0 {
 		return false
 	}
 	// 还要问一次「这里面挑得出槽位吗」：LongestRestedSlot 会跳过**正在退避**的槽位，
-	// 而闸 2 恰好对正在退避的槽位豁免（见 coolingSet）⇒ 少了这一问，刚失败过的槽位
+	// 而那条闸恰好对正在退避的槽位豁免（见 burning）⇒ 少了这一问，刚失败过的槽位
 	// 会被当成候选，等到的那一下重跑仍然是 503。
 	_, ok := s.st.LongestRestedSlot(accountID, withPair)
 	return ok
@@ -706,7 +706,6 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 	}
 
 	now := s.now()
-	cooldown := s.cfg().SlotCooldown()
 	cands := make([]string, 0, len(s.st.Gateways()))
 	for name := range s.st.Gateways() {
 		if gatewayHint != "" && name != gatewayHint {
@@ -721,9 +720,9 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 		}
 		cands = append(cands, name)
 	}
-	// force 和冷却分两步筛、各自报错：和上传者那条路同一条规则——
-	// 筛完为空就是「你的槽位全在冷却里」（等几小时，不可等待），
-	// 而「一张活票都没有」是另一码事（上面那个循环就把它筛成空了，等得起）。
+	// force 和「正在烧」分两步筛、各自报错：和上传者那条路同一条规则——
+	// 筛完为空就是「池子此刻正在为你烧这些窗口」，而「一张活票都没有」是另一码事
+	// （上面那个循环就把它筛成空了）。两个都等得起，只是该等多久不一样。
 	if force {
 		kept := make([]string, 0, len(cands))
 		for _, name := range cands {
@@ -733,17 +732,17 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 			kept = append(kept, name)
 		}
 		if len(kept) == 0 && len(cands) > 0 {
-			return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
-				Wait: s.coolingWait(a.ID, cands, cooldown)}
+			return types.Delivery{}, &CoolingError{Gateways: len(cands),
+				Wait: s.burnWait(a.ID, cands)}
 		}
 		cands = kept
 	}
-	// 冷却对占位行一视同仁：「这个上游账号在这个网关上烧过了」和他有没有上传凭据无关。
-	rested := s.notCooling(a.ID, cands, cooldown)
+	// 对占位行一视同仁：「池子刚拿这个上游账号的凭据打过一发」和他有没有上传凭据无关。
+	rested := s.notBurning(a.ID, cands)
 	if len(rested) == 0 && len(cands) > 0 {
 		// 告诉他最早什么时候回来，别让他按默认节奏重试。
-		return types.Delivery{}, &CoolingError{Gateways: len(cands), Cooldown: cooldown,
-			Wait: s.coolingWait(a.ID, cands, cooldown)}
+		return types.Delivery{}, &CoolingError{Gateways: len(cands),
+			Wait: s.burnWait(a.ID, cands)}
 	}
 	cands = rested
 	for len(cands) > 0 {
@@ -853,27 +852,27 @@ func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw t
 // 第二个返回值是这一发**实际落在**哪个网关上（落点还不知道时是空串，noteTryFailure 认它
 // = 没有槽位可记），调用方拿它记退避和交付——善后规则在 Deliver 那边，只有一份。
 func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Account,
-	cands []string, cooldown time.Duration, req Request) (types.Delivery, string, error) {
+	cands []string, req Request) (types.Delivery, string, error) {
 	sl, ok := s.st.LongestRestedSlot(consumer.ID, cands)
 	if !ok {
 		return types.Delivery{}, "", fmt.Errorf("%w（候选网关全在退避期）", ErrNoFullSlot)
 	}
 	floor := req.Floor()
 
-	// 冷却状态要在**铸票之前**定格：铸票那一发自己会 touch 消费者的槽位
-	// （铸票者就是他本人时），拿铸完之后的账本去判「他出冷却了吗」，
-	// 答案恒为否——自己把自己判死。
-	coolingBefore := s.coolingSet(consumer.ID, cooldown)
+	// 「正在烧」要在**铸票之前**定格：铸票那一发自己会 touch 消费者的槽位
+	// （铸票者就是他本人时），拿铸完之后的账本去判「他的窗口还在烧吗」，
+	// 答案恒为是——自己把自己判死。
+	burningBefore := s.burning(consumer.ID)
 
 	if req.Gateway != "" {
-		return s.mintToward(ctx, consumer, sl.Gateway, coolingBefore, cooldown, req, floor)
+		return s.mintToward(ctx, consumer, sl.Gateway, burningBefore, req, floor)
 	}
-	return s.mintByRegion(ctx, consumer, coolingBefore, cooldown, req, floor)
+	return s.mintByRegion(ctx, consumer, burningBefore, req, floor)
 }
 
 // mintToward 是定向铸：出口从目标网关的 ReachableExits 里挑，落点漂了算失败。
 func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gateway string,
-	coolingBefore map[string]bool, cooldown time.Duration, req Request,
+	burningBefore map[string]bool, req Request,
 	floor time.Duration) (types.Delivery, string, error) {
 	exit, ok := pickExit(s.st.Gateways()[gateway])
 	if !ok {
@@ -889,7 +888,7 @@ func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gate
 		// 判死；而池子模式下 minterFor 常常就挑中另一个消费者，于是等到的那张票恰好
 		// 是**他自己**刚铸的 ⇒ 他对这个网关的满血窗口已经烧了几十秒，再按 now() 起算
 		// 窗口会多报最多 57 秒（和 B-2 同类错，从另一条路进来）。
-		if s.coolingSet(consumer.ID, cooldown)[gateway] {
+		if s.burning(consumer.ID)[gateway] {
 			return types.Delivery{}, gateway, fmt.Errorf(
 				"等锁期间这个账号刚碰过 %s，窗口已经在烧", gateway)
 		}
@@ -910,7 +909,7 @@ func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gate
 	if err != nil {
 		return types.Delivery{}, gateway, err
 	}
-	return s.afterMint(ctx, consumer, got, "网关 "+gateway, coolingBefore, cooldown, req, floor)
+	return s.afterMint(ctx, consumer, got, "网关 "+gateway, burningBefore, req, floor)
 }
 
 // mintByRegion 是按区域铸：**先定派谁去，再从那个号终身没走过的区域出发**，落哪算哪。
@@ -930,7 +929,7 @@ func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gate
 // 也不带 pair 进去（裸铸）：带一张活票会让上游接受它、把落点钉回那张票的网关，
 // 正好抵消掉按区域铸的全部意义。
 func (s *Scheduler) mintByRegion(ctx context.Context, consumer types.Account,
-	coolingBefore map[string]bool, cooldown time.Duration, req Request,
+	burningBefore map[string]bool, req Request,
 	floor time.Duration) (types.Delivery, string, error) {
 	minter, region, ok := s.mintPlan(consumer)
 	if !ok {
@@ -961,14 +960,14 @@ func (s *Scheduler) mintByRegion(ctx context.Context, consumer types.Account,
 		}
 		return types.Delivery{}, "", err
 	}
-	return s.afterMint(ctx, consumer, got, "区域 "+region.Key, coolingBefore, cooldown, req, floor)
+	return s.afterMint(ctx, consumer, got, "区域 "+region.Key, burningBefore, req, floor)
 }
 
 // afterMint 是两条现铸路共用的尾段：落点出来之后的三道闸，然后交付。
 //
 // aim 只进日志，用来事后分辨这一发是定向铸还是按区域铸。
 func (s *Scheduler) afterMint(ctx context.Context, consumer types.Account, got pairMint,
-	aim string, coolingBefore map[string]bool, cooldown time.Duration, req Request,
+	aim string, burningBefore map[string]bool, req Request,
 	floor time.Duration) (types.Delivery, string, error) {
 	landed := got.pair.Gateway
 	if landed == "" {
@@ -986,22 +985,22 @@ func (s *Scheduler) afterMint(ctx context.Context, consumer types.Account, got p
 		return types.Delivery{}, landed,
 			fmt.Errorf("%w（现铸落到 %s，而调用方排除了它）", ErrNoLivePair, landed)
 	}
-	// 闸 1（真的交付过票）要在铸完之后**重查一次**：铸票那几十秒里同一个账号的另一路
-	// 交付可能刚在 landed 上取走过一张票，而那件事快照看不见 ⇒ 这里会 fail-open，
-	// 把一个刚烧掉的槽位当首次接触发出去。
-	//
-	// 闸 2（LastTouch 在一个满血窗口内）用哪一份账本，取决于**这一发是不是他自己打的**：
+	// 「池子刚烧过 (他 × landed)」用哪一份账本，取决于**这一发是不是他自己打的**：
 	// 是他自己就必须用快照，否则等于拿自己刚写的 touch 把自己判死；
 	// 不是他自己（别人代铸）那 20~90 秒里他一发都没打，现读才对——
 	// 并发的发现扫描（scan 直接写 LastTouch，而且裸铸不受网关锁约束）或者
 	// 「他正好被挑去给别人铸票」都会在这段时间里烧掉 (他 × landed)，而快照看不见。
-	burned := coolingBefore[landed]
+	//
+	// 原先这儿还有一问「铸完之后重查一次 LastDeliver」：铸票那几十秒里同一个账号的另一路
+	// 交付可能刚在 landed 上取走过一张票。那条闸 2026-10-03 整个删了（见 burning），
+	// 所以这里也不再问 —— 同一个号并发取两张落在同一网关的票现在是允许的，归客户端账本管。
+	burned := burningBefore[landed]
 	if !got.mintedBySelf {
-		burned = s.coolingSet(consumer.ID, cooldown)[landed]
+		burned = s.burning(consumer.ID)[landed]
 	}
-	if burned || s.coolingByDeliver(consumer.ID, landed, cooldown) {
+	if burned {
 		return types.Delivery{}, landed,
-			fmt.Errorf("现铸落到 %s，而这个账号在它上面还在 %v 的冷却里", landed, cooldown)
+			fmt.Errorf("现铸落到 %s，而池子刚在一个满血窗口内拿这个账号的凭据打过一发", landed)
 	}
 	var m minted
 	if got.mintedBySelf {
@@ -1799,19 +1798,16 @@ func (s *Scheduler) redeliver(accountID int64, req Request) (types.Delivery, boo
 	}, true
 }
 
-// notCooling 滤掉还在冷却里的候选网关。
+// notBurning 滤掉此刻正在烧窗口的候选网关。
 //
-// 冷却只看 LastDeliver（真的有人在这个网关上取走过一张票），**不看 LastTouch**：
-// 后者连失败的续期、保温、扫描都记，拿它当冷却起点会把一个从没交付过的好槽位
-// 按住几个小时。
-//
-// 匿名和跨账号的占位行一视同仁：它们的交付也写 LastDeliver，而「这个上游账号在
-// 这个网关上烧过了」这件事和他有没有上传凭据毫无关系。
-func (s *Scheduler) notCooling(accountID int64, cands []string, cooldown time.Duration) []string {
-	cooling := s.coolingSet(accountID, cooldown)
+// **只拦池子自己刚干的事。** 「这个消费号在这个网关上取过票了」那条闸 2026-10-03 删了
+// ——用户定的：消费和账本归客户端记，池子不替它判「哪个网关用过」，理由是给上游减轻负担
+// （见 burning）。
+func (s *Scheduler) notBurning(accountID int64, cands []string) []string {
+	burning := s.burning(accountID)
 	out := make([]string, 0, len(cands))
 	for _, name := range cands {
-		if cooling[name] {
+		if burning[name] {
 			continue
 		}
 		out = append(out, name)
@@ -1819,56 +1815,48 @@ func (s *Scheduler) notCooling(accountID int64, cands []string, cooldown time.Du
 	return out
 }
 
-// coolingSet 是这个账号此刻**不能**给满血的那些网关。
+// burning 是这个账号此刻**不能**给满血的那些网关：池子在一个满血窗口内拿这个号的凭据
+// 真打过一发上游，而且此刻不在退避中。
 //
-// 两条闸，各管一件事：
+// **只剩这一条闸了。** 原先还有一条「LastDeliver 在 SlotCooldown（4 小时）内」——
+// 票真发出去过就按住 4 小时。2026-10-03 按用户的决定删掉：那条闸记的是**消费**，
+// 而消费该由客户端自己的账本管，池子代劳只是替上游多扛一份判断。匿名消费者（拿别人
+// key 替自己取票、没有客户端账本的那些）因此不再有池子侧的烧灼保护——用户原话
+// 「躲是客户端的事情，它们没写池子不代劳」。
 //
-//  1. LastDeliver 在 cooldown 内——票真发出去过，窗口用完了，要歇满冷却
-//  2. LastTouch 在一个满血窗口内、**且此刻不在退避中**——预铸、扫描、别人的
-//     续期都会 touch，而那一发就在眼前（183 s 内），交出去等于明知故犯
+// 留下这一条的理由和那条正相反：**这一发是池子自己打的**，只有池子知道它发生过。
+// 删了它，池子会拿 A 的凭据铸一张落在 G 的票、然后立刻把 G 发给 A，而 (A × G) 的窗口
+// 正是刚才那一发烧掉的。那不是「不替客户端记账」，那是池子不知道自己干了什么。
+// 顺带它也是 LongestRestedSlot 轮转的依据（按 LastTouch 排），没有它同一个落点会被
+// 反复发给同一个人。
 //
-// 第 2 条的豁免是「**此刻仍在**退避中」，不是「有过退避记录」：触碰也可能来自一次
-// 失败的尝试（铸票超时按保守方向记了触碰），那种情形归指数退避管，两层闸叠起来会让
-// 退避永远到不了第二级。但 BackoffUntil 只被写、只在**该槽位成功交付时**才清零
-// ⇒ 按「字段非零」豁免等于让这条闸对任何失败过一次的槽位永久沉默：
-// 一次铸票超时同时写 LastTouch=T 和 BackoffUntil=T+10s，T+10s 之后退避到点、
-// 闸 1 没有 LastDeliver 不管、闸 2 被豁免 ⇒ 这个槽位在它自己正在烧的满血窗口里
-// （剩下 123 秒）被当成首次接触发出去。backoffMax 只有 1 分钟，管不到窗口尾部。
+// 豁免是「**此刻仍在**退避中」，不是「有过退避记录」：触碰也可能来自一次失败的尝试
+// （铸票超时按保守方向记了触碰），那种情形归指数退避管，两层闸叠起来会让退避永远到不了
+// 第二级。但 BackoffUntil 只被写、只在**该槽位成功交付时**才清零 ⇒ 按「字段非零」豁免
+// 等于让这条闸对任何失败过一次的槽位永久沉默：一次铸票超时同时写 LastTouch=T 和
+// BackoffUntil=T+10s，T+10s 之后退避到点、这条闸被豁免 ⇒ 这个槽位在它自己正在烧的满血
+// 窗口里（剩下 123 秒）被当成首次接触发出去。backoffMax 只有 1 分钟，管不到窗口尾部。
 // 正在退避的槽位 LongestRestedSlot 本来就跳过，豁免它不损失任何东西。
-//
-// 而且**不拿 LastTouch 当冷却起点**：它连失败的续期都记，那会把好槽位按住几个小时
-// （同一个坑在 premintWasted 那边也写着）。
-func (s *Scheduler) coolingSet(accountID int64, cooldown time.Duration) map[string]bool {
+func (s *Scheduler) burning(accountID int64) map[string]bool {
 	now := s.now()
 	out := map[string]bool{}
 	for _, sl := range s.st.Slots() {
 		if sl.AccountID != accountID {
 			continue
 		}
-		switch {
-		case !sl.LastDeliver.IsZero() && now.Sub(sl.LastDeliver) < cooldown:
-			out[sl.Gateway] = true
-		case !now.Before(sl.BackoffUntil) && !sl.LastTouch.IsZero() && now.Sub(sl.LastTouch) < types.FullWindow:
+		if !now.Before(sl.BackoffUntil) && !sl.LastTouch.IsZero() &&
+			now.Sub(sl.LastTouch) < types.FullWindow {
 			out[sl.Gateway] = true
 		}
 	}
 	return out
 }
 
-// coolingByDeliver 是闸 1 单独一问：这个槽位在 cooldown 内真的交付过票吗。
+// burnWait 是这些候选里最早一个烧完窗口还要多久。一个都算不出来就回 0。
 //
-// 给「铸完之后重查一次」用（见 deliverByFreshMint）：那条路必须用铸票前的快照判闸 2，
-// 但闸 1 在铸票那几十秒里可能被同账号另一路交付写上，而快照看不见。
-func (s *Scheduler) coolingByDeliver(accountID int64, gateway string, cooldown time.Duration) bool {
-	sl, ok := s.st.Slot(accountID, gateway)
-	return ok && !sl.LastDeliver.IsZero() && s.now().Sub(sl.LastDeliver) < cooldown
-}
-
-// coolingWait 是这些候选里最早一个出冷却还要多久。一个都算不出来就回 0。
-//
-// 只看闸 1（LastDeliver）：闸 2 那 183 秒和「等多久能再取票」不是一回事——
-// 它过去之后槽位仍然可能在闸 1 里躺着几个小时，报小了等于骗客户端马上再来一发。
-func (s *Scheduler) coolingWait(accountID int64, cands []string, cooldown time.Duration) time.Duration {
+// 上限就是一个满血窗口（183 秒），不再是小时量级 —— 消费冷却那条闸删掉之后
+// 「全员都不能给」只可能是「池子此刻正在为他铸票」，那是等得起的（见 burning）。
+func (s *Scheduler) burnWait(accountID int64, cands []string) time.Duration {
 	want := make(map[string]bool, len(cands))
 	for _, name := range cands {
 		want[name] = true
@@ -1876,10 +1864,14 @@ func (s *Scheduler) coolingWait(accountID int64, cands []string, cooldown time.D
 	now := s.now()
 	best := time.Duration(0)
 	for _, sl := range s.st.Slots() {
-		if sl.AccountID != accountID || !want[sl.Gateway] || sl.LastDeliver.IsZero() {
+		if sl.AccountID != accountID || !want[sl.Gateway] || sl.LastTouch.IsZero() {
 			continue
 		}
-		left := sl.LastDeliver.Add(cooldown).Sub(now)
+		// 正在退避的槽位 burning 本来就豁免 ⇒ 它不是「等窗口」等得出来的，别报进去。
+		if now.Before(sl.BackoffUntil) {
+			continue
+		}
+		left := sl.LastTouch.Add(types.FullWindow).Sub(now)
 		if left <= 0 {
 			continue
 		}

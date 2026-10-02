@@ -1980,72 +1980,28 @@ func TestSpareOverCeilingStopsPremint(t *testing.T) {
 	}
 }
 
-// 全员冷却就不预铸：两个号在三个网关上都刚取过票，铸出来的票发给谁都是降级的。
-func TestNoPremintWhileEveryoneCooling(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModePool)
-	addAccount(st, 2, "acct-2")
-	var buf bytes.Buffer
-	s.opt.Log = slog.New(slog.NewTextHandler(&buf, nil))
-	s.markDemand()
-	for _, id := range []int64{1, 2} {
-		for gw := range st.gws {
-			st.slots[slotKey(id, gw)] = types.Slot{AccountID: id, Gateway: gw,
-				LastDeliver: clk.now().Add(-types.SlotCooldown + time.Minute)}
-		}
-	}
-
-	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != 0 {
-		t.Fatalf("全员冷却却预铸了 %d 发", n)
-	}
-	if !strings.Contains(buf.String(), "都还在冷却") {
-		t.Fatalf("没留下为什么不预铸的记录: %s", buf.String())
-	}
-	// 一个槽位出了冷却就该恢复预铸。
-	st.slots[slotKey(2, "unified-2")] = types.Slot{AccountID: 2, Gateway: "unified-2",
-		LastDeliver: clk.now().Add(-types.SlotCooldown)}
-	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n == 0 {
-		t.Fatal("有号出了冷却却还是不预铸")
-	}
-}
-
-// 失败的续期不该把预铸闸关掉：它写 LastTouch 不写 LastDeliver。
-// 这是 TestDeadPairDroppedAfterRenewFailures 偶发失败的根因，单独钉一遍。
-func TestFailedRenewDoesNotCloseThePremintGate(t *testing.T) {
-	s, st, mn, _ := rig(t, types.ModePool)
-	addAccount(st, 2, "acct-2")
-	s.markDemand()
-	mn.mintErr = errors.New("上游 500")
-
-	s.warmOnce(context.Background())
-	if s.premintWasted() {
-		t.Fatal("一轮失败的续期就把预铸闸关了，死 pair 永远攒不满失败预算")
-	}
-}
-
-// 外部消费者在取票时冷却闸不适用：pair 是纯路由，它在这些网关上多半还是首次接触。
-func TestPremintKeepsServingExternalConsumers(t *testing.T) {
+// **全员刚取过票也照样预铸。** 这里原先是三条用例，钉的是 premintWasted 那道闸
+// （「全员在全部已知网关上都还在消费冷却里 ⇒ 这一轮别铸」）和它的两个豁免
+// （失败的续期不算、有外部消费者在取票不算）。2026-10-03 消费冷却整条删掉之后
+// 那个状态不存在了，闸和三条用例一起没了。
+//
+// 换成钉反面：铺出当年最硬的那个场景（两个号 × 三个网关全部刚取过票），预铸必须照打。
+// 那道闸 24 小时内触发 279 次，是铸票慢的三个原因之一；它最可能被人「顺手修回去」。
+func TestPremintRunsEvenWhenEveryoneJustFetched(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
 	s.markDemand()
+	// LastDeliver 铺满、LastTouch 留空：这些是**消费**，不是池子自己打的那一发。
 	for _, id := range []int64{1, 2} {
 		for gw := range st.gws {
 			st.slots[slotKey(id, gw)] = types.Slot{AccountID: id, Gateway: gw,
 				LastDeliver: clk.now()}
 		}
 	}
-	// 99 号是匿名占位行（sched.anonAccount 建的那种：带 AnonPrefix、没凭据），
-	// 它确实在取票。判据必须按**前缀**认它，不能按「在不在 usable() 里」——
-	// 后者会把被自动停用的托管号也算成外部消费者，于是整条成本闸失效。
-	st.accounts = append(st.accounts, types.Account{ID: 99, Label: "匿名 outsider",
-		Enabled: true, Creds: types.Creds{AccountID: types.AnonPrefix + "outsider"}})
-	st.slots[slotKey(99, "unified-1")] = types.Slot{AccountID: 99, Gateway: "unified-1",
-		LastDeliver: clk.now()}
 
 	s.warmOnce(context.Background())
 	if n := len(mn.mintedGateways()); n == 0 {
-		t.Fatal("有外部消费者在取票却停了预铸")
+		t.Fatal("全员刚取过票就不预铸了：消费冷却那道闸被修回来了")
 	}
 }
 
@@ -2248,11 +2204,15 @@ func TestCooldownAppliesToAnonymousToo(t *testing.T) {
 	}
 }
 
-// ---------- 冷却时长可配（第 10 条） ----------
+// ---------- 满血窗口过完就能再发（第 10 条） ----------
 
-// 冷却是配置项，改完立即生效：读它的地方必须现读 Live，不能把常量编进去
-// （用户实测 30 分钟到 3 小时都见过，4 小时只是保守的默认值）。
-func TestSlotCooldownComesFromConfig(t *testing.T) {
+// 交付完的槽位在**一个满血窗口**之内不再发第二张，过完就放行。
+//
+// 这条用例原名 TestSlotCooldownComesFromConfig，钉的是「slot_cooldown_minutes 要现读
+// Live、别把 4 小时编进去」。2026-10-03 消费冷却那条闸整个删了（见 sched.burning），
+// 那个配置项降级成读数与统计窗口、不再拦交付 ⇒ 这里配 10 分钟或 4 小时都一样，
+// 真正管事的是 types.FullWindow。配置项照旧设上，就为了证明它**不**再影响交付。
+func TestDeliverReopensAfterTheFullWindow(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)
 	mn := newMinter(clk)
@@ -2271,16 +2231,16 @@ func TestSlotCooldownComesFromConfig(t *testing.T) {
 	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
 		t.Fatalf("窗口刚过完就又发了一张: %v", err)
 	}
-	// 配的 10 分钟远短于默认的 4 小时：到点就该恢复，证明读的是配置不是常量。
-	clk.add(10 * time.Minute)
+	// 满血窗口一过就该恢复 —— 而且**早于**配置里那 10 分钟，证明拦它的不再是那个旋钮。
+	clk.add(types.FullWindow)
 	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
-		t.Fatalf("配的是 10 分钟冷却，歇满了还交付不了: %v", err)
+		t.Fatalf("满血窗口过完了还交付不了: %v", err)
 	}
 }
 
 // ---------- 一张活票都没有时只抽一次签（A 条） ----------
 
-// 回落**只铸一发**，哪怕 MaxTriesPerDeliver 开到 5、哪怕抽到的落点正好在冷却里。
+// 回落**只铸一发**，哪怕 MaxTriesPerDeliver 开到 5、哪怕抽到的落点正好不可用。
 //
 // 出口只能把落点「倾向」到某个网关、定不住 ⇒「先试 X 再试 Y」就是抽两次签、
 // 花两发请求烧两个铸票者槽位，而两次的分布一模一样。
@@ -2288,16 +2248,19 @@ func TestFreshMintDrawsOnlyOnce(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
 	s.opt.MaxTriesPerDeliver = 5
-	// 一张活 pair 都没有；1 号在 unified-3 上刚取过票（在冷却里），
+	// 一张活 pair 都没有；池子刚拿 1 号的凭据在 unified-3 上打过一发（LastTouch），
 	// 而这一发无论从哪个出口打都会落到 unified-3 ⇒ 抽到的签不可用。
+	//
+	// 铺的是 LastTouch 不是 LastDeliver：后者（「他取过票」）2026-10-03 起不再拦交付
+	// ——消费归客户端账本管（见 sched.burning），拿它铺这个场景会让用例什么都没拦住。
 	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3",
-		LastDeliver: clk.now()}
+		LastTouch: clk.now()}
 	for k := range mn.land {
 		mn.land[k] = "unified-3"
 	}
 
 	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v，抽到的落点在冷却里就该老实 503", err)
+		t.Fatalf("err=%v，抽到的落点正在烧窗口就该老实 503", err)
 	}
 	if n := len(mn.mintedGateways()); n != 1 {
 		t.Fatalf("打了 %d 发上游，回落只该抽一次签（还剩两个候选网关没碰）", n)

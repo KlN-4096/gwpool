@@ -252,7 +252,7 @@ func (s *Server) classify(err error) (code, msg string, retry time.Duration) {
 	case errors.Is(err, types.ErrNoExit):
 		return codeNoExit, "没有可用的出口代理（整池故障）", s.proxySkipLeft()
 	case errors.As(err, &cool):
-		return codeAllCooling, "你的槽位在所有候选网关上都还在冷却里", cool.Wait
+		return codeAllCooling, "池子此刻正在你的所有候选网关上烧满血窗口，稍后再来", cool.Wait
 	case errors.Is(err, sched.ErrDegraded):
 		return codeDegraded, "交付前的满血验证判了降级，不发降智的票", types.FullWindow
 	case errors.Is(err, sched.ErrUpstreamRejected):
@@ -280,8 +280,11 @@ func (s *Server) classify(err error) (code, msg string, retry time.Duration) {
 
 // waitableCode 报告这个码等一会儿有没有可能变好。
 //
-// **只有这一个**：all_cooling 是几小时量级，让一次 HTTP 请求挂在那儿等它纯属把
-// 连接耗光；rate_limited 同理（滑窗最长一小时）；upstream_rejected 等多久都一样。
+// **只有这一个。** all_cooling 2026-10-03 之后已经降到 183 秒量级（消费冷却那条闸删了，
+// 见 sched.burning），理论上等得起 —— 但仍然不挂：那 183 秒里池子正拿这个号的凭据打上游，
+// 等满了也只是**可能**有票，而一条连接挂三分钟的代价是确定的。retry_after 已经如实报了
+// 真实剩余时间（原先报的是 7200 秒），客户端按它重试比我们替它挂着便宜。
+// rate_limited 同理（滑窗最长一小时）；upstream_rejected 等多久都一样。
 //
 // no_gateway 也不等，而且是**结构性**的空等：它的定义就是「网关表是空的」，而判据
 // 要求命中的票属于表里的某个网关 ⇒ 恒为假、必然等满；能让表非空的发现扫描恰好要等
