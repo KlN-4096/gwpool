@@ -559,6 +559,14 @@ func (s *Server) authAdmin(w http.ResponseWriter, r *http.Request) bool {
 
 // ---------- 公开池视图 ----------
 
+// supplyWindow 是供给账前后两个数共用的窗口（见 supplyLedger）。
+//
+// 15 分钟：一张票在「可交付」里待约 55 分钟（PairLifetime − DeliverFloor），所以
+// 稳态下这个窗口两边各约占活票的 27%——几十张的池子里是两位数，看得出差别。
+// 取 5 分钟的话两边都是个位数，一次抖动就能让方向反过来；取 1 小时又把整池框进去、
+// 恒等于「全部」，两边都失去分辨力。
+const supplyWindow = 15 * time.Minute
+
 func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	gws := s.st.Gateways()
 	pairs := s.st.Pairs()
@@ -575,6 +583,10 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 
 	v := poolView{base: base{Title: "池子", Mode: s.pool.Mode()}}
+	v.Supply.WindowMin = int(supplyWindow / time.Minute)
+	v.Supply.LifeMin = int(types.PairLifetime / time.Minute)
+	v.Supply.FloorMin = int(types.DeliverFloor / time.Minute)
+	v.Supply.ReadyMin = v.Supply.LifeMin - v.Supply.FloorMin
 	for name, g := range gws {
 		row := gatewayRow{Name: name, Exits: len(g.ReachableExits), PairLeft: "—"}
 		if p, ok := pairs[name]; ok {
@@ -583,6 +595,16 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			row.PairReady = left >= types.DeliverFloor
 			if left > 0 {
 				row.PairLeft = shortDur(left)
+			}
+			if row.PairReady && left-types.DeliverFloor < supplyWindow {
+				v.Supply.Expiring++
+			}
+			// 铸出时刻按 __cflb 的死期倒推：它从铸出那一刻起恰好活 PairLifetime，
+			// 而续期**只补发 __oailb**（见 types.Pair.CflbExpiresAt），所以这个倒推
+			// 不会被续期带偏。零值 = 老 state.json 的记录，倒推不出来，不计。
+			if !p.CflbExpiresAt.IsZero() &&
+				p.CflbExpiresAt.After(now.Add(types.PairLifetime-supplyWindow)) {
+				v.Supply.Minted++
 			}
 		}
 		v.Gateways = append(v.Gateways, row)
@@ -602,6 +624,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
 	v.Accounts = hosted
+	v.Supply.Target = s.pool.PairTarget()
 	v.Model, v.Effort = s.probeModel(), probeEffort
 	v.BaseURL = s.publicBaseURL()
 	// 带着身份 cookie 来的人直接给按钮；没带的只给一个贴令牌的小表单。

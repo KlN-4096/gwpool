@@ -3003,6 +3003,76 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 	}
 }
 
+// 号池页的供给账：可交付网关数接下来会涨还是会降。
+//
+// 这张卡片存在的理由是「可交付网关一天里从 96 滑到 53，页面上只有那一个瞬时数，
+// 看的人只能猜」。所以要钉的不是文案在不在，而是两个数**真的按票的寿命算**：
+// 要掉下去的票算进退场、刚铸的票算进铸入、生命中段的票两边都不算。
+func TestPoolPageSupplyLedger(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	now := time.Now().UTC()
+	add := func(name string, expires, cflb time.Duration) {
+		st.gws[name] = types.Gateway{Name: name, FirstSeenBy: 1, FirstSeenAt: now.Add(-time.Hour)}
+		st.pairs[name] = types.Pair{Gateway: name, Cookie: liveCookie, MintedBy: 1,
+			ExpiresAt: now.Add(expires), CflbExpiresAt: now.Add(cflb)}
+	}
+	// 还够交付，但窗口内就会跌破门槛 ⇒ 退场。铸出时刻在 50 分钟前 ⇒ 不算铸入。
+	add("unified-expiring", 10*time.Minute, 10*time.Minute)
+	// 生命中段：既不退场也不算刚铸的，两个数都不许收它。
+	add("unified-midlife", 40*time.Minute, 40*time.Minute)
+	// 剩余已经不足门槛 ⇒ 已经退场了，不该再算进「即将退场」。
+	add("unified-dead", time.Minute, time.Minute)
+
+	// rig 自带的 unified-142 是 ExpiresAt/Cflb 都 +1h 的新票 ⇒ 唯一的铸入。
+	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	card := supplyCardOf(t, body)
+	for _, want := range []string{
+		`<b>−1</b>`, // 退场：只有 unified-expiring
+		`<b>+1</b>`, // 铸入：只有 unified-142
+		`<span class="badge">持平</span>`,
+	} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("供给账里找不到 %s：\n%s", want, card)
+		}
+	}
+
+	// 再补一张刚铸的票，方向就该翻成「在涨」。
+	add("unified-fresh", types.PairLifetime, types.PairLifetime)
+	card = supplyCardOf(t, do(h, httptest.NewRequest("GET", "/", nil)).Body.String())
+	if !strings.Contains(card, `<b>+2</b>`) || !strings.Contains(card, `<span class="badge ok">在涨</span>`) {
+		t.Fatalf("补一张新票后方向没翻过来：\n%s", card)
+	}
+
+	// 时长**不许写成字面量**：Go 模板没有算术，常量改了页面会继续说旧数，而读者
+	// 正是照这几个数推算涨落的。
+	life := int(types.PairLifetime / time.Minute)
+	floor := int(types.DeliverFloor / time.Minute)
+	for _, want := range []string{
+		fmt.Sprintf("<strong>%d 分钟</strong>", life),
+		fmt.Sprintf("不足 %d 分钟", floor),
+		fmt.Sprintf("待 %d 分钟", life-floor),
+	} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("供给账的说明里缺了 %q（时长被写死了？）：\n%s", want, card)
+		}
+	}
+}
+
+// supplyCardOf 切出供给账那张卡片：断言只能落在它身上，不然「在涨」这种词
+// 在整页里撞上别的文案也算过。
+func supplyCardOf(t *testing.T, body string) string {
+	t.Helper()
+	from := strings.Index(body, "<h2>供给账</h2>")
+	if from < 0 {
+		t.Fatalf("号池页没有供给账卡片：\n%s", body)
+	}
+	to := strings.Index(body[from:], "<h2>各区域的落点</h2>")
+	if to < 0 {
+		t.Fatal("供给账卡片没有收尾")
+	}
+	return body[from : from+to]
+}
+
 // 管理页账号页签一号一张紧凑卡：/u/ 那张卡的读数（九区域格子、接入 key、最近取票）
 // 全摊在这里，排查「谁的号在哪个区域还没落点」不用一个个点开 /a/。原来的
 // /admin/accounts 卡片页并了进来，旧链接跳过来。

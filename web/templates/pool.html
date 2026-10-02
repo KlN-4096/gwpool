@@ -49,6 +49,21 @@
 
 <section id="tab-gateways">
   <div class="card">
+    <header class="card-head"><div><h2>供给账</h2><p>上面那个「可交付网关」接下来会涨还是会降，以及为什么。<strong>现算，不留历史。</strong></p></div>
+      {{if gt .Supply.Minted .Supply.Expiring}}<span class="badge ok">在涨</span>{{else if gt .Supply.Expiring .Supply.Minted}}<span class="badge">在降</span>{{else}}<span class="badge">持平</span>{{end}}</header>
+    <div class="card-body">
+      <div class="kpis">
+        <div class="kpi ok"><b>{{.ReadyCount}}</b><span>此刻可交付</span></div>
+        <div class="kpi off"><b>−{{.Supply.Expiring}}</b><span>{{.Supply.WindowMin}} 分钟内退场</span><small>不补就会掉下去</small></div>
+        <div class="kpi{{if gt .Supply.Minted .Supply.Expiring}} ok{{end}}"><b>+{{.Supply.Minted}}</b><span>最近 {{.Supply.WindowMin}} 分钟铸入</span><small>同样长的时间里补了几张</small></div>
+        <div class="kpi"><b>{{.Supply.Target}}</b><span>预铸目标深度</span><small>高于可交付数 = 还在往上补</small></div>
+      </div>
+      <p class="foot">一张票铸出来活 <strong>{{.Supply.LifeMin}} 分钟</strong>，剩余不足 {{.Supply.FloorMin}} 分钟就不再算可交付 ⇒ 每张票在这个数里待 {{.Supply.ReadyMin}} 分钟，而<strong>到期是唯一的退场途径</strong>。所以可交付网关数 ≈ 铸入速度 × {{.Supply.ReadyMin}} 分钟，中间那两个数就是同一个 {{.Supply.WindowMin}} 分钟窗口的两边：补进来的不少于要掉下去的就在涨，反过来就在降。</p>
+      <p class="foot">铸入慢下来只发生在<strong>补票</strong>这一侧（上游拒了这一发、托管账号被停用、某个出口不通），已经发出去的票不受影响。目标深度 = 最近一小时真有人取过票的网关数 + 富余张数，所以没人用的时候它自己会回落，那不是池子缩水。</p>
+      <p class="foot muted">两个数都从此刻手上的票算出来。刻意没有「过去 N 分钟退场了几张」：一个网关只存一张票，补了新票旧票就被覆盖，那个数会把同一个网关重复计一次。</p>
+    </div>
+  </div>
+  <div class="card">
     <header class="card-head"><div><h2>各区域的落点</h2><p>各出口区域此刻可交付 / 已发现的网关数。<strong>点一格</strong>把下面的表收窄到该区域，悬停看网关名。</p></div></header>
     <div class="card-body">
       <div class="kpis region-kpis">

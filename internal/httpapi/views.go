@@ -81,6 +81,37 @@ type poolView struct {
 	// BaseURL 是要填进 sub2api 的那个根地址（config.PublicBaseURL）。
 	// 空 = 没配，页面上如实说「问管理员要」，绝不拿请求头猜一个。
 	BaseURL string
+	// Supply 是「可交付网关这个数接下来会涨还是会降」的账。
+	Supply supplyLedger
+}
+
+// supplyLedger 是可交付网关数的收支账，**全部现算、不留历史**。
+//
+// 为什么页面上非得有它：可交付网关数一天里从 96 滑到 53，页面上只有那一个瞬时数，
+// 看的人无从判断是池子坏了还是正常潮汐——只能猜。而它的涨落机制其实很简单：
+// 票到期是唯一的退场途径（寿命 PairLifetime，剩余不足 DeliverFloor 就不再算可交付
+// ⇒ 一张票只在这个数里待 55 分钟），所以这个数 = 铸入速率 × 55 分钟。
+// 把同一个时长窗口里「要掉下去几张」和「刚补进来几张」并排放，方向就自明了。
+//
+// **刻意不算「过去 N 分钟退场了几张」**：一个网关在 store 里只有一张 pair，补了新票
+// 旧票就被覆盖掉 ⇒ 那个数既漏记又会和「铸入」重复计一次同一个网关，净值不可信。
+// 现状里两个都成立的读数只有「现在手上这些票什么时候掉下去」和「哪几张是刚铸的」。
+type supplyLedger struct {
+	// WindowMin 是前后两个数共用的窗口长度（分钟），模板要照它写文案。
+	WindowMin int
+	// Expiring = 可交付的票里，窗口内就会跌破 DeliverFloor 的张数（不补就会掉下去）。
+	Expiring int
+	// Minted = 窗口内新铸出来的票的张数（按 __cflb 的死期倒推铸出时刻）。
+	Minted int
+	// Target 是预铸的目标深度（sched.PairTarget）。比可交付数高 = 池子还在往上补。
+	Target int
+	// 下面三个是算给人看的时长（分钟）：票寿命、不再算可交付的剩余门槛，以及
+	// 两者之差——一张票真正待在「可交付」里的时长。
+	// 模板里**不许**把它们写成字面量：Go 模板没有算术，改了常量页面会继续说旧数，
+	// 而「页面上的 60 分钟」正是读者推算涨落的依据。
+	LifeMin  int
+	FloorMin int
+	ReadyMin int
 }
 
 type gatewayRow struct {
