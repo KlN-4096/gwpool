@@ -177,6 +177,8 @@ type Server struct {
 
 	// 最近的交付失败，给页面回答「为什么客户端报 502」。
 	fails failLog
+	// started 写在管理页那张失败表上：失败只存在内存里，重启前的已经没了。
+	started time.Time
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate *template.Template
 }
@@ -208,7 +210,7 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if opt.Log == nil {
 		opt.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	s := &Server{pool: p, st: st, scan: sc, opt: opt}
+	s := &Server{pool: p, st: st, scan: sc, opt: opt, started: time.Now().UTC()}
 	var err error
 	// 每个页面单独和 layout 一起解析：三份 "content" 定义放一个集合里会撞名。
 	if s.tplPool, err = parse("pool.html"); err != nil {
@@ -260,6 +262,7 @@ func (s *Server) Handler() http.Handler {
 	// 不罩的话一个第三方页面就能让管理员的浏览器替他删号或改配置。
 	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
+	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
 	mux.HandleFunc("GET /admin/accounts", s.handleAdminAccounts)
 	mux.HandleFunc("GET /admin/", s.handleAdmin)
@@ -1258,7 +1261,7 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 		CanLogout: had && cur.ID == o.ID,
 		Upload:    uploadForm{PageToken: tok},
 	}
-	v.Accounts = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
+	v.Accounts, v.LastFetch = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
 	for _, row := range v.Accounts {
 		v.Requests += row.Requests
 		v.NewGateways += row.NewGateways
@@ -1296,7 +1299,7 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 			hosted = append(hosted, a)
 		}
 	}
-	v.Accounts = s.ownerAccountRows(hosted, samples)
+	v.Accounts, v.LastFetch = s.ownerAccountRows(hosted, samples)
 	for _, row := range v.Accounts {
 		v.Requests += row.Requests
 		v.NewGateways += row.NewGateways
@@ -1310,19 +1313,41 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 // 失败行两边都按**上传者口径**取（只要真失败、不带 Detail）：这张卡的标题就是
 // 「最近的取票失败」，把归还和续期混进来会让人读错；管理员要的 Detail 在管理页
 // 那张全量失败表里，带原始错误。
-func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) []ownerAccountRow {
+func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) ([]ownerAccountRow, string) {
 	// 请求数按账号先汇总一遍：账号可能有好几个，每个都扫一遍全量样本是 O(n×m)。
 	reqs := map[int64]int{}
 	for _, sm := range samples {
 		reqs[sm.AccountID]++
 	}
+	// 最近一次取票：自己的槽位，加上拿这个号的 key 替外部账号取的——那些记在占位行上，
+	// 占位行的 Via 指回最近一次替它取票的那个号。两种都说明上传者那边的对接是通的。
+	// ponytail: Via 只记最近一个号，一个外部账号先后被两把 key 取过时，早先那把 key 的
+	// 号就看不到这几次；要准就得按 (占位行, key) 记取票时间。
+	via := map[int64]int64{}
+	for _, a := range s.st.Accounts() {
+		if a.Via != 0 && a.Creds.AccessToken == "" {
+			via[a.ID] = a.Via
+		}
+	}
+	lastFetch := map[int64]time.Time{}
+	for _, sl := range s.st.Slots() {
+		id := sl.AccountID
+		if v, ok := via[id]; ok {
+			id = v
+		}
+		if sl.LastDeliver.After(lastFetch[id]) {
+			lastFetch[id] = sl.LastDeliver
+		}
+	}
 	mints := s.st.RegionMints()
 	gws := s.st.Gateways()
 	// 九宫格的滑窗 = 槽位冷却：和调度那把尺子同一个值（见 regionCells）。
 	window := s.slotCooldown()
+	now := time.Now().UTC()
+	var newest time.Time
 	out := make([]ownerAccountRow, 0, len(accs))
 	for _, a := range accs {
-		out = append(out, ownerAccountRow{
+		row := ownerAccountRow{
 			ID: a.ID, Label: a.Label, Plan: a.PlanType,
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
 			Since:       a.CreatedAt.Format(time.DateTime),
@@ -1332,11 +1357,30 @@ func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) 
 			NewGateways: s.foundBy(a.ID),
 			Regions:     regionCells(a.ID, mints, samples, gws, window),
 			Fails:       s.fails.failRows(a.ID, 20, false),
-		})
+		}
+		if t := lastFetch[a.ID]; !t.IsZero() {
+			row.LastFetch, row.LastFetchAt = ago(now, t), t.UTC().Format(time.DateTime)
+			if t.After(newest) {
+				newest = t
+			}
+		}
+		out = append(out, row)
 	}
 	// 稳定顺序：加入先后就是人心里的顺序，而 map 遍历不是。
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	if newest.IsZero() {
+		return out, ""
+	}
+	return out, ago(now, newest)
+}
+
+// ago 是「12 分钟前」。不到一分钟（含时钟略有偏差、t 比 now 还晚）一律「刚刚」：
+// shortDur 对非正数回「已过期」，拼上「前」就成了胡话。
+func ago(now, t time.Time) string {
+	if d := now.Sub(t); d >= time.Minute {
+		return shortDur(d) + "前"
+	}
+	return "刚刚"
 }
 
 // regionCells 画一个账号的九宫格：types.Regions 那九个区域，终身铸过票的算绿。
@@ -1714,19 +1758,18 @@ func (s *Server) handleAdminRescan(w http.ResponseWriter, r *http.Request) {
 // 为什么管理员要有这个而上传者只有「停用」：无效凭据（贴错的、过期的、free 的）
 // 是运维要清掉的垃圾，而上传者那边的语义是「我先不参与了」，两件事不一样。
 //
-// 表单提交 ⇒ 303 回管理页；带 Accept: json 的（curl、脚本）给 JSON。
+// 表单提交 ⇒ 303 回点按钮的那一页；带 Accept: json 的（curl、脚本）给 JSON。
 func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	if !s.authAdmin(w, r) {
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 ID 不是正整数"})
+	id, form, ok := s.adminAccountForm(w, r)
+	if !ok {
 		return
 	}
 	if err := s.st.DeleteAccount(id); err != nil {
-		s.opt.Log.Warn("删账号失败", "account", id, "err", err)
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		s.opt.Log.Error("删账号失败", "account", id, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	s.opt.Log.Info("删了账号", "account", id)
@@ -1734,7 +1777,75 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusOK, map[string]any{"account": id, "deleted": true})
 		return
 	}
-	http.Redirect(w, r, "/admin/", http.StatusSeeOther)
+	http.Redirect(w, r, adminBack(form), http.StatusSeeOther)
+}
+
+// handleAdminAccountEnabled 停用/启用一个账号：管理页账号表和「全部账号」卡片上直接点，
+// 不用再进账号详情页。和上传者自己点的是同一个方法（翻了开关才清自动停用的理由）。
+func (s *Server) handleAdminAccountEnabled(w http.ResponseWriter, r *http.Request) {
+	if !s.authAdmin(w, r) {
+		return
+	}
+	id, form, ok := s.adminAccountForm(w, r)
+	if !ok {
+		return
+	}
+	// 只收按钮发的 0 / 1：缺了这个字段就当「停用」的话，脚本发个 JSON 体就会把号静默停掉。
+	v := form.Get("enabled")
+	if v != "0" && v != "1" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "enabled 只收 0 或 1"})
+		return
+	}
+	enabled := v == "1"
+	if err := s.st.SetAccountEnabled(id, enabled); err != nil {
+		s.opt.Log.Error("改账号启用状态失败", "account", id, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.opt.Log.Info("管理员改了账号启用状态", "account", id, "enabled", enabled)
+	if strings.Contains(r.Header.Get("Accept"), "json") {
+		writeJSON(w, http.StatusOK, map[string]any{"account": id, "enabled": enabled})
+		return
+	}
+	http.Redirect(w, r, adminBack(form), http.StatusSeeOther)
+}
+
+// adminAccountForm 读管理页账号按钮的路径 ID 和表单，账号不存在就 404。失败时已经写好了响应。
+// 存在与否先查一遍：之后 store 再报错就只能是写盘失败（500），不会和「没这个号」混成一个 404。
+func (s *Server) adminAccountForm(w http.ResponseWriter, r *http.Request) (int64, url.Values, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 ID 不是正整数"})
+		return 0, nil, false
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
+	if err != nil {
+		http.Error(w, "请求体太大", http.StatusRequestEntityTooLarge)
+		return 0, nil, false
+	}
+	form, err := parseForm(body)
+	if err != nil {
+		http.Error(w, "表单解不开", http.StatusBadRequest)
+		return 0, nil, false
+	}
+	for _, a := range s.st.Accounts() {
+		if a.ID == id {
+			return id, form, true
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("账号 %d 不存在", id)})
+	return 0, nil, false
+}
+
+// adminBack 是点完按钮回哪一页。只认这几个固定值：拿表单里的字符串直接当地址就是开放重定向。
+func adminBack(form url.Values) string {
+	switch form.Get("back") {
+	case "accounts":
+		return "/admin/accounts"
+	case "external":
+		return "/admin/#external"
+	}
+	return "/admin/#accounts"
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -1770,11 +1881,11 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	for _, sm := range samples {
 		reqs[sm.AccountID]++
 	}
+	gws := s.st.Gateways()
 	found := map[int64]int{}
-	for _, g := range s.st.Gateways() {
+	for _, g := range gws {
 		found[g.FirstSeenBy]++
 	}
-	ownerAccounts := map[int64]int{}
 	accounts := s.st.Accounts()
 	byID, byUpstream := map[int64]types.Account{}, map[string]types.Account{}
 	for _, a := range accounts {
@@ -1783,8 +1894,16 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			byUpstream[a.Creds.AccountID] = a
 		}
 	}
+	name := func(id int64) string { return acctName(byID, id) }
+	owners := s.st.Owners()
+	ownerName := map[int64]string{}
+	for _, o := range owners {
+		ownerName[o.ID] = fmt.Sprintf("#%d %s", o.ID, o.Label)
+	}
+	covered := regionsCovered(s.st.RegionMints())
+	slots := s.st.Slots()
 	delivered, lastDeliver := map[int64]int{}, map[int64]time.Time{}
-	for _, sl := range s.st.Slots() {
+	for _, sl := range slots {
 		if sl.LastDeliver.IsZero() {
 			continue
 		}
@@ -1793,6 +1912,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			lastDeliver[sl.AccountID] = sl.LastDeliver
 		}
 	}
+	ownerAccounts := map[int64]int{}
 	for _, a := range accounts {
 		ownerAccounts[a.OwnerID]++
 		row := accountRow{
@@ -1803,6 +1923,13 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			Upstream: a.Creds.AccountID, OwnerID: a.OwnerID,
 		}
 		if a.Creds.AccessToken != "" {
+			row.Owner = ownerName[a.OwnerID]
+			if row.Owner == "" {
+				row.Owner = fmt.Sprintf("#%d", a.OwnerID)
+			}
+			n := covered[a.ID]
+			row.Covered = fmt.Sprintf("%d/%d", n, len(types.Regions))
+			row.Facet = accountFacet(a, n)
 			v.Accounts = append(v.Accounts, row)
 			continue
 		}
@@ -1810,11 +1937,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		row.Upstream = strings.TrimPrefix(a.Creds.AccountID, types.AnonPrefix)
 		row.Delivered = delivered[a.ID]
 		if a.Via != 0 {
-			if via, ok := byID[a.Via]; ok {
-				row.Via, row.ViaToken = fmt.Sprintf("#%d %s", via.ID, via.Label), via.ViewToken
-			} else {
-				row.Via = fmt.Sprintf("#%d（已删除）", a.Via)
-			}
+			row.Via, row.ViaToken = name(a.Via), byID[a.Via].ViewToken
 		}
 		if same, ok := byUpstream[row.Upstream]; ok {
 			row.SameAs = fmt.Sprintf("#%d %s", same.ID, same.Label)
@@ -1829,48 +1952,40 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
 	sort.Slice(v.External, func(i, j int) bool { return v.External[i].ID < v.External[j].ID })
+	v.AccountFacets = accountFacets(v.Accounts, owners)
 
 	// owner 的令牌必须在**这一页**看得见：迁移出来那个 owner 的令牌没人见过，
 	// 不显示就等于现有那几个账号的总览页谁都进不去。而 /a/ 那一页刻意**不**印它
 	// （见 handleAccount），所以这里是唯一的找回入口。
-	for _, o := range s.st.Owners() {
+	for _, o := range owners {
 		v.Owners = append(v.Owners, ownerRow{ID: o.ID, Label: o.Label, Token: o.Token,
 			Accounts: ownerAccounts[o.ID], Since: o.CreatedAt.Format(time.DateTime)})
 	}
 	sort.Slice(v.Owners, func(i, j int) bool { return v.Owners[i].ID < v.Owners[j].ID })
 
-	// pair 只报剩余时间和铸它的账号，cookie 本体一个字都不往页面上放。
-	for name, p := range s.st.Pairs() {
-		v.Pairs = append(v.Pairs, pairRow{Gateway: name, Left: shortDur(p.ExpiresAt.Sub(now)), MintedBy: p.MintedBy})
-	}
-	sort.Slice(v.Pairs, func(i, j int) bool { return v.Pairs[i].Gateway < v.Pairs[j].Gateway })
+	v.SlotAccounts, v.SlotVerdicts = slotSummaries(slots, lastDeliver, name, s.slotCooldown(), now)
+	v.SlotTotal = len(slots)
 
-	for _, sl := range s.st.Slots() {
-		row := slotRow{AccountID: sl.AccountID, Gateway: sl.Gateway, Verdict: sl.LastVerdict,
-			Rested: shortDur(now.Sub(sl.LastTouch))}
-		if sl.LastTouch.IsZero() {
-			row.Rested = "从未"
-		}
-		if now.Before(sl.BackoffUntil) {
-			row.Backoff = shortDur(sl.BackoffUntil.Sub(now))
-		}
-		v.Slots = append(v.Slots, row)
-	}
-	sort.Slice(v.Slots, func(i, j int) bool {
-		if v.Slots[i].AccountID != v.Slots[j].AccountID {
-			return v.Slots[i].AccountID < v.Slots[j].AccountID
-		}
-		return v.Slots[i].Gateway < v.Slots[j].Gateway
-	})
-
-	for _, g := range s.st.Gateways() {
+	// 网关表顺带报它手上那张 pair 的剩余时间和铸它的账号（原来单独一个页签），
+	// cookie 本体一个字都不往页面上放。
+	pairs := s.st.Pairs()
+	places := gatewayPlaces(samples)
+	for _, g := range gws {
 		exits := make([]string, 0, len(g.ReachableExits))
 		for _, e := range g.ReachableExits {
 			exits = append(exits, exitLabel(e))
 		}
 		sort.Strings(exits)
-		v.Gateways = append(v.Gateways, adminGatewayRow{Name: g.Name, FirstSeenBy: g.FirstSeenBy,
-			FirstSeen: g.FirstSeenAt.Format(time.DateTime), Exits: strings.Join(exits, " ")})
+		row := adminGatewayRow{Name: g.Name, FirstSeenBy: name(g.FirstSeenBy),
+			FirstSeen: g.FirstSeenAt.Format(time.DateTime), Exits: len(g.ReachableExits),
+			ExitLabels: strings.Join(exits, " "), PairState: "none", Places: places[g.Name]}
+		if p, ok := pairs[g.Name]; ok {
+			row.PairState, row.PairLeft, row.MintedBy = "expired", "已过期", name(p.MintedBy)
+			if left := p.ExpiresAt.Sub(now); left > 0 {
+				row.PairState, row.PairLeft = "live", shortDur(left)
+			}
+		}
+		v.Gateways = append(v.Gateways, row)
 	}
 	sort.Slice(v.Gateways, func(i, j int) bool { return v.Gateways[i].Name < v.Gateways[j].Name })
 
@@ -1885,7 +2000,239 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	if len(v.Samples) > 300 {
 		v.Samples = v.Samples[:300]
 	}
+	for i := range v.Samples {
+		v.Samples[i].Account = name(v.Samples[i].AccountID)
+	}
+	for i := range v.Fails {
+		v.Fails[i].Account = name(v.Fails[i].AccountID)
+	}
+	v.Started = s.started.Format(time.DateTime)
 	s.render(w, s.tplAdmin, v)
+}
+
+// acctName 是管理页各表里「账号」那一格：编号 + 名字。只写编号的话几十个号得来回对照。
+// 外部账号写「外部」+ 上游 ID 的头 8 个字符；0 = 没带 key 的匿名，交给模板写。
+func acctName(byID map[int64]types.Account, id int64) string {
+	if id == 0 {
+		return ""
+	}
+	a, ok := byID[id]
+	switch {
+	case !ok:
+		return fmt.Sprintf("#%d（已删除）", id)
+	case a.Creds.AccessToken == "":
+		ref := []rune(strings.TrimPrefix(a.Creds.AccountID, types.AnonPrefix))
+		if len(ref) > 8 {
+			ref = append(ref[:8], '…')
+		}
+		return fmt.Sprintf("#%d 外部 %s", id, string(ref))
+	}
+	return fmt.Sprintf("#%d %s", id, a.Label)
+}
+
+// regionsCovered 数每个账号铸出过票的区域：只数 types.Regions 那九个，和九宫格同一张台账
+// （NoteRegionMint 只记成功的铸票）。
+func regionsCovered(mints map[string]types.RegionMint) map[int64]int {
+	known := make(map[string]bool, len(types.Regions))
+	for _, r := range types.Regions {
+		known[r.Key] = true
+	}
+	out := map[int64]int{}
+	for _, m := range mints {
+		if m.Count > 0 && known[m.RegionKey] {
+			out[m.AccountID]++
+		}
+	}
+	return out
+}
+
+// accountFacet 是账号表一行的筛选标签，一组一个、空格分隔：状态、套餐、区域覆盖、上传者。
+// 和 accountFacets 拼出来的按钮一一对应，改一边要改另一边。
+func accountFacet(a types.Account, covered int) string {
+	state := "on"
+	if !a.Enabled {
+		state = "off"
+	}
+	cover := "cov-part"
+	switch {
+	case covered == 0:
+		cover = "cov-none"
+	case covered >= len(types.Regions):
+		cover = "cov-all"
+	}
+	return fmt.Sprintf("%s %s %s o%d", state, planFacet(a.PlanType), cover, a.OwnerID)
+}
+
+// planFacet 把套餐名变成筛选标签：只留小写字母和数字，套餐名来自票里的声明，不可控。
+func planFacet(plan string) string {
+	key := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, strings.ToLower(plan))
+	if key == "" {
+		key = "unknown"
+	}
+	return "plan-" + key
+}
+
+// accountFacets 拼账号表那几组筛选按钮（格式见 layout.html 的 grid()；「状态=」是组名）。
+// 套餐和上传者只列表里真有的：按钮点下去一行都没有，等于没给。
+func accountFacets(rows []accountRow, owners []types.Owner) string {
+	plans := map[string]string{}
+	inTable := map[int64]bool{}
+	for _, r := range rows {
+		label := r.Plan
+		if label == "" {
+			label = "未知"
+		}
+		plans[planFacet(r.Plan)] = label
+		inTable[r.OwnerID] = true
+	}
+	planKeys := make([]string, 0, len(plans))
+	for k := range plans {
+		planKeys = append(planKeys, k)
+	}
+	sort.Strings(planKeys)
+	var planGroup []string
+	for _, k := range planKeys {
+		planGroup = append(planGroup, k+":"+facetLabel(plans[k]))
+	}
+	var ownerGroup []string
+	for _, o := range owners {
+		if inTable[o.ID] {
+			ownerGroup = append(ownerGroup, fmt.Sprintf("o%d:#%d %s", o.ID, o.ID, facetLabel(o.Label)))
+		}
+	}
+	return strings.Join([]string{
+		"状态=on:启用:ok|off:已停用:bad",
+		"套餐=" + strings.Join(planGroup, "|"),
+		"区域=cov-all:九区都铸过:ok|cov-part:没覆盖全:warn|cov-none:从没铸出过票:bad",
+		"上传者=" + strings.Join(ownerGroup, "|"),
+	}, ";")
+}
+
+// facetLabel 去掉会把筛选串拆坏的三个分隔符，再截到按钮放得下的长度。
+func facetLabel(s string) string {
+	s = strings.NewReplacer(":", "：", "|", "｜", ";", "；").Replace(s)
+	if r := []rune(s); len(r) > 16 {
+		s = string(r[:16]) + "…"
+	}
+	return s
+}
+
+// slotSummaries 把「账号×网关」按账号汇总，每个网关的明细压成一句话（点开才看）。
+// 「冷却中」只算 sched.notCooling 的第一道闸：LastDeliver 在冷却期内。页脚也只这么说。
+// 第二个返回值是全部槽位最近一次校验的分布：正常 / 降级 / 未知。
+func slotSummaries(all map[string]types.Slot, lastDeliver map[int64]time.Time, name func(int64) string,
+	cooldown time.Duration, now time.Time) ([]slotAccountRow, [3]int) {
+	slots := make([]types.Slot, 0, len(all))
+	for _, sl := range all {
+		slots = append(slots, sl)
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		if slots[i].AccountID != slots[j].AccountID {
+			return slots[i].AccountID < slots[j].AccountID
+		}
+		// 网关名按自然序：先比长度再比字面，unified-14 排在 unified-105 前面。
+		a, b := slots[i].Gateway, slots[j].Gateway
+		if len(a) != len(b) {
+			return len(a) < len(b)
+		}
+		return a < b
+	})
+	var out []slotAccountRow
+	var verdicts [3]int
+	for i, sl := range slots {
+		if i == 0 || sl.AccountID != slots[i-1].AccountID {
+			row := slotAccountRow{Account: name(sl.AccountID)}
+			if t := lastDeliver[sl.AccountID]; !t.IsZero() {
+				row.LastDeliver = t.UTC().Format(time.DateTime)
+			}
+			out = append(out, row)
+		}
+		row := &out[len(out)-1]
+		note := []string{sl.Gateway}
+		if sl.LastTouch.IsZero() {
+			note = append(note, "从未用过")
+		} else {
+			row.Touched++
+			note = append(note, ago(now, sl.LastTouch)+"用过")
+		}
+		if !sl.LastDeliver.IsZero() && now.Sub(sl.LastDeliver) < cooldown {
+			row.Cooling++
+			note = append(note, "冷却中")
+		}
+		if now.Before(sl.BackoffUntil) {
+			row.Backoff++
+			note = append(note, "退避 "+shortDur(sl.BackoffUntil.Sub(now)))
+		}
+		switch sl.LastVerdict {
+		case types.VerdictFull:
+			row.Full++
+			verdicts[0]++
+			note = append(note, "正常")
+		case types.VerdictDegraded:
+			row.Degraded++
+			verdicts[1]++
+			note = append(note, "降级")
+		case types.VerdictUnknown:
+			verdicts[2]++
+			note = append(note, "未知")
+		}
+		row.Gateways = append(row.Gateways, strings.Join(note, " · "))
+	}
+	return out, verdicts
+}
+
+// gatewayPlaces 汇总「从哪些国家/城市到达过这个网关」。地理用 ipinfo 观测到的那份
+// （Observed），不用请求时报的出口：请求 US 实际可能从任何一个美国城市出去，城市库存
+// 不够时上游甚至换国家。Gateway 非空就是这一发真落到了这个网关（同 regionCells）。
+// 城市多的国家排前面。
+func gatewayPlaces(samples []types.Sample) map[string][]gatewayPlace {
+	const cityUnknown = "（城市不明）" // ipinfo 没给城市；列出来，但不算进「几城」
+	seen := map[string]map[string]map[string]bool{}
+	for _, sm := range samples {
+		cc := sm.Observed.Country
+		if sm.Gateway == "" || cc == "" {
+			continue
+		}
+		if seen[sm.Gateway] == nil {
+			seen[sm.Gateway] = map[string]map[string]bool{}
+		}
+		if seen[sm.Gateway][cc] == nil {
+			seen[sm.Gateway][cc] = map[string]bool{}
+		}
+		city := sm.Observed.City
+		if city == "" {
+			city = cityUnknown
+		}
+		seen[sm.Gateway][cc][city] = true
+	}
+	out := make(map[string][]gatewayPlace, len(seen))
+	for gw, byCC := range seen {
+		places := make([]gatewayPlace, 0, len(byCC))
+		for cc, cities := range byCC {
+			p := gatewayPlace{Country: cc}
+			for c := range cities {
+				p.Cities = append(p.Cities, c)
+				if c != cityUnknown {
+					p.Known++
+				}
+			}
+			sort.Strings(p.Cities)
+			places = append(places, p)
+		}
+		sort.Slice(places, func(i, j int) bool {
+			if places[i].Known != places[j].Known {
+				return places[i].Known > places[j].Known
+			}
+			return places[i].Country < places[j].Country
+		})
+		out[gw] = places
+	}
+	return out
 }
 
 // ---------- 小工具 ----------

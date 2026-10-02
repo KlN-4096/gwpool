@@ -75,22 +75,28 @@
 
       <h3>2. 响应</h3>
       <pre class="mono">{
-  "gateway":         "unified-142",
-  "cookie":          "__cflb=…; __oailb=…",
-  "expires_at":      "2026-10-01T12:44:40Z",
-  "valid_for_s":     150,
-  "verified_full":   true,
-  "ttl_is_advisory": true
+  "gateway":          "unified-142",
+  "region":           "europe",
+  "cookie":           "__cflb=…; __oailb=…",
+  "expires_at":       "2026-10-01T12:44:40Z",
+  "valid_for_s":      150,
+  "verified_full":    true,
+  "ttl_is_advisory":  true,
+  "cookie_version":   "…",
+  "pair_remaining_s": 3412
 }</pre>
       <div class="table-wrap"><table class="spec">
         <thead><tr><th>字段</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td class="mono">gateway</td><td>本次分配的网关。</td></tr>
+          <tr><td class="mono">region</td><td>铸这张票的出口所属区域，如 <code>us-east</code>、<code>europe</code>。只说明票是从哪儿铸的，不保证你这一发也落在这个区域；池子不知道时没有这个字段。</td></tr>
           <tr><td class="mono">cookie</td><td>路由 Cookie，原样放入上游请求的 <code>Cookie</code> 请求头。</td></tr>
           <tr><td class="mono">expires_at</td><td>本次分配的到期时间（UTC）。</td></tr>
           <tr><td class="mono">valid_for_s</td><td>建议使用时长，单位秒，到期重新取。</td></tr>
           <tr><td class="mono">verified_full</td><td>分配前是否已对该网关完成可用性校验。</td></tr>
           <tr><td class="mono">ttl_is_advisory</td><td>固定 <code>true</code>：有效期只是建议值，以上游响应为准。</td></tr>
+          <tr><td class="mono">cookie_version</td><td>这张票的标识。sub2api 用它指名「别再给我这张」或归还，手动调用用不到。</td></tr>
+          <tr><td class="mono">pair_remaining_s</td><td>这张路由 Cookie 本身还能用多少秒（小时量级）。和 <code>valid_for_s</code> 不是一回事：<code>valid_for_s</code> 到了该换票，这个到了 Cookie 谁都用不了。池子算不出来时给 <code>0</code>，意思是「不知道」，不是已经过期。</td></tr>
         </tbody>
       </table></div>
 

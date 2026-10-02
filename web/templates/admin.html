@@ -11,8 +11,7 @@
   <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
   <a href="#external">外部账号 <span class="n">{{len .External}}</span></a>
   <a href="#gateways">网关 <span class="n">{{len .Gateways}}</span></a>
-  <a href="#pairs">路由 Cookie <span class="n">{{len .Pairs}}</span></a>
-  <a href="#slots">账号×网关 <span class="n">{{len .Slots}}</span></a>
+  <a href="#slots">账号×网关 <span class="n">{{.SlotTotal}}</span></a>
   <a href="#samples">采样记录 <span class="n">{{.TotalSamples}}</span></a>
   <a href="#fails">取票失败 <span class="n">{{len .Fails}}</span></a>
   <a href="#config">配置</a>
@@ -24,9 +23,11 @@
     <a class="kpi" href="#owners"><b>{{len .Owners}}</b><span>上传者</span><small>每人名下可以挂好几份凭据</small></a>
     <a class="kpi" href="#accounts"><b>{{len .Accounts}}</b><span>账号</span><small>托管着凭据、参与探测的账号</small><small class="facets" data-facets-of="t-accounts"></small></a>
     <a class="kpi" href="#external"><b>{{len .External}}</b><span>外部账号</span><small>借别的账号的接入 key 来取票、池里没有凭据的上游账号</small></a>
-    <a class="kpi" href="#gateways"><b>{{len .Gateways}}</b><span>网关</span><small>探测过程中发现的上游网关</small></a>
-    <a class="kpi" href="#pairs"><b>{{len .Pairs}}</b><span>路由 Cookie</span><small>各网关当前持有的路由 Cookie</small><small class="facets" data-facets-of="t-pairs"></small></a>
-    <a class="kpi" href="#slots"><b>{{len .Slots}}</b><span>账号×网关</span><small>每个账号在各网关上的使用与校验状态</small><small class="facets" data-facets-of="t-slots"></small></a>
+    <a class="kpi" href="#gateways"><b>{{len .Gateways}}</b><span>网关</span><small>探测过程中发现的上游网关，以及各自手上的路由 Cookie</small><small class="facets" data-facets-of="t-gateways"></small></a>
+    <a class="kpi" href="#slots"><b>{{.SlotTotal}}</b><span>账号×网关</span><small>每个账号在各网关上的使用与校验状态</small><small class="facets">
+      {{- with index .SlotVerdicts 0}}<span class="badge ok">正常 {{.}}</span>{{end}}
+      {{- with index .SlotVerdicts 1}}<span class="badge bad">降级 {{.}}</span>{{end}}
+      {{- with index .SlotVerdicts 2}}<span class="badge">未知 {{.}}</span>{{end}}</small></a>
     <a class="kpi" href="#samples"><b>{{.TotalSamples}}</b><span>采样记录</span><small>探测请求明细（统计范围为最近 {{len .Samples}} 条）</small><small class="facets" data-facets-of="t-samples"></small></a>
   </div>
 </section>
@@ -92,25 +93,30 @@
     <header class="card-head"><div><h2>账号</h2><p>池里托管着凭据的账号。只来取票、池里没有凭据的在「外部账号」那一页。</p></div>
       <a class="btn" href="/admin/accounts">查看全部账号 →</a></header>
     {{if .Accounts}}
-    <div class="table-wrap"><table id="t-accounts" data-grid data-facets="on:启用:ok|off:已停用:bad" data-placeholder="搜索名称、套餐或上游账号 ID">
+    <div class="table-wrap"><table id="t-accounts" data-grid data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、套餐或上游账号 ID">
       <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>上游账号 ID</th>
-        <th class="num">上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th>添加时间（UTC）</th><th data-nosort>账号页</th><th data-nosort></th></tr></thead>
+        <th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间（UTC）</th><th data-nosort>账号页</th><th data-nosort></th></tr></thead>
       <tbody>
       {{range .Accounts}}
-        <tr data-facet="{{if .Enabled}}on{{else}}off{{end}}">
+        <tr data-facet="{{.Facet}}">
           <td class="num">{{.ID}}</td>
           <td class="text">{{.Label}}
             {{- if not .Enabled}} <span class="badge bad">已停用</span>{{if .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}{{end}}</td>
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else}}{{.Plan}}{{end}}</td>
           <td class="mono text">{{.Upstream}}</td>
-          <td class="num">{{.OwnerID}}</td>
+          <td>{{.Owner}}</td>
           <td class="num">{{.Requests}}</td>
           <td class="num">{{.Found}}</td>
+          <td class="num" title="九个区域里铸出过票的有几个">{{.Covered}}</td>
           <td class="mono">{{.Since}}</td>
           <td>{{if .ViewToken}}<a href="/a/{{.ViewToken}}">打开</a>{{else}}<span class="muted">—</span>{{end}}</td>
-          <td><form method="post" action="/admin/accounts/{{.ID}}/delete"
+          <td><div class="row-actions">
+            <form method="post" action="/admin/accounts/{{.ID}}/enabled"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
+              <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
+            <form method="post" action="/admin/accounts/{{.ID}}/delete"
                 onsubmit="return confirm('确定删除账号 {{.ID}}（{{.Label}}）？此操作无法撤销。')">
-            <button class="danger sm" type="submit">删除</button></form></td>
+              <button class="danger sm" type="submit">删除</button></form>
+          </div></td>
         </tr>
       {{end}}
       </tbody>
@@ -140,6 +146,7 @@
           <td class="mono">{{.Since}}</td>
           <td><form method="post" action="/admin/accounts/{{.ID}}/delete"
                 onsubmit="return confirm('确定删除外部账号 {{.ID}}（{{.Upstream}}）？下次有人替它取票会重建，烧过的网关记录会丢。')">
+            <input type="hidden" name="back" value="external">
             <button class="danger sm" type="submit">删除</button></form></td>
         </tr>
       {{end}}
@@ -155,7 +162,7 @@
 <section id="tab-gateways">
   <div class="card">
     <header class="card-head">
-      <div><h2>网关</h2><p>探测过程中发现的全部网关，以及能连通各网关的出口地区。</p></div>
+      <div><h2>网关</h2><p>探测过程中发现的全部网关、各自手上的路由 Cookie，以及实际从哪些国家/城市到达过它（只有这一页看得到，首页只给出口数）。Cookie 内容不在页面显示，只能通过 <code>/cookie</code> 接口获取。</p></div>
       <form method="post" action="/admin/rescan">
         <button type="submit" class="primary">找新网关</button>
       </form>
@@ -170,14 +177,21 @@
       （派他自己的话，找到的落点被那一发当场烧掉），所以只有一个账号时它永远挑不出人。
       这个按钮就是那时候唯一的出路——另一条是再传一份凭据。每踢一次会花掉被派中那个号的一发上游。</p></div>
     {{if .Gateways}}
-    <div class="table-wrap"><table id="t-gateways" class="tiles gw" data-grid data-natsort data-size="240"
-        data-placeholder="搜索网关或出口地区">
-      <thead><tr><th>网关</th><th class="num">首次发现账号</th><th>首次发现时间（UTC）</th><th>可达出口</th></tr></thead>
+    <div class="table-wrap"><table id="t-gateways" data-grid data-natsort data-size="100"
+        data-facets="live:Cookie 有效:ok|expired:Cookie 已过期|none:没有 Cookie" data-placeholder="搜索网关、国家或城市">
+      <thead><tr><th>网关</th><th>Cookie 剩余</th><th>铸票账号</th><th class="num">出口</th><th>到达过的国家/城市</th><th>首次发现（UTC）</th></tr></thead>
       <tbody>
       {{range .Gateways}}
-        <tr title="{{.Name}}　首次发现 账号 {{.FirstSeenBy}}　{{.FirstSeen}} UTC　可达出口 {{.Exits}}">
-          <td class="mono">{{.Name}}</td><td>{{.FirstSeenBy}}</td>
-          <td class="mono">{{.FirstSeen}}</td><td class="mono">{{.Exits}}</td></tr>
+        <tr data-facet="{{.PairState}}">
+          <td class="mono">{{.Name}}</td>
+          <td>{{if eq .PairState "live"}}{{.PairLeft}}{{else if eq .PairState "expired"}}<span class="muted">已过期</span>{{else}}<span class="muted">没有</span>{{end}}</td>
+          <td>{{if .MintedBy}}{{.MintedBy}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="num" title="请求过的出口：{{.ExitLabels}}">{{.Exits}}</td>
+          <td class="text">{{if .Places}}<details class="places"><summary>{{range $i, $p := .Places}}{{if $i}} · {{end}}{{$p.Country}}{{if $p.Known}}（{{$p.Known}} 城）{{end}}{{end}}</summary>
+            {{- range .Places}}<div class="sub"><b>{{.Country}}</b>：{{range $i, $c := .Cities}}{{if $i}}、{{end}}{{$c}}{{end}}</div>{{end}}</details>
+            {{- else}}<span class="muted">—</span>{{end}}</td>
+          <td><span class="mono">{{.FirstSeen}}</span>{{if .FirstSeenBy}}<div class="sub">{{.FirstSeenBy}}</div>{{end}}</td>
+        </tr>
       {{end}}
       </tbody>
     </table></div>
@@ -187,46 +201,23 @@
   </div>
 </section>
 
-<section id="tab-pairs">
-  <div class="card">
-    <header class="card-head"><div><h2>路由 Cookie</h2><p>各网关当前持有的路由 Cookie。Cookie 内容不在页面显示，只能通过 <code>/cookie</code> 接口获取。</p></div></header>
-    {{if .Pairs}}
-    <div class="table-wrap"><table id="t-pairs" data-grid data-natsort data-facets="live:有效:ok|expired:已过期" data-placeholder="搜索网关">
-      <thead><tr><th>网关</th><th>剩余有效期</th><th class="num">获取账号</th></tr></thead>
-      <tbody>
-      {{range .Pairs}}
-        <tr data-facet="{{if eq .Left "已过期"}}expired{{else}}live{{end}}">
-          <td class="mono">{{.Gateway}}</td>
-          <td>{{if eq .Left "已过期"}}<span class="muted">已过期</span>{{else}}{{.Left}}{{end}}</td>
-          <td class="num">{{.MintedBy}}</td>
-        </tr>
-      {{end}}
-      </tbody>
-    </table></div>
-    {{else}}
-    <p class="empty">暂无路由 Cookie。</p>
-    {{end}}
-  </div>
-</section>
-
 <section id="tab-slots">
   <div class="card">
-    <header class="card-head"><div><h2>账号×网关 接触记录</h2><p>每个账号在每个网关上的最近使用时间、校验结果和退避状态。</p></div></header>
-    {{if .Slots}}
-    <div class="table-wrap"><table id="t-slots" data-grid data-natsort data-facets="full:正常:ok|degraded:降级:bad|unknown:未知" data-placeholder="搜索账号或网关">
-      <thead><tr><th class="num">账号</th><th>网关</th><th>距上次使用</th><th>最近校验</th><th>退避剩余</th></tr></thead>
+    <header class="card-head"><div><h2>账号×网关 接触记录</h2><p>按账号汇总：碰过几个网关、其中几个还在冷却或退避、最近一次校验结果。<strong>点开</strong>看每个网关的明细。</p></div></header>
+    {{if .SlotAccounts}}
+    <div class="table-wrap"><table id="t-slots" data-grid data-placeholder="搜索账号或网关">
+      <thead><tr><th>账号</th><th class="num">碰过的网关</th><th class="num">冷却中</th><th class="num">退避中</th><th class="num">校验正常</th><th class="num">校验降级</th><th>最近一次交付（UTC）</th></tr></thead>
       <tbody>
-      {{range .Slots}}
-        <tr data-facet="{{.Verdict}}">
-          <td class="num">{{.AccountID}}</td>
-          <td class="mono">{{.Gateway}}</td>
-          <td>{{.Rested}}</td>
-          <td>{{if eq .Verdict "full"}}<span class="badge ok" title="full">正常</span>
-            {{- else if eq .Verdict "degraded"}}<span class="badge bad" title="degraded">降级</span>
-            {{- else if eq .Verdict "unknown"}}<span class="badge" title="unknown">未知</span>
-            {{- else if .Verdict}}<span class="badge">{{.Verdict}}</span>
-            {{- else}}<span class="muted">—</span>{{end}}</td>
-          <td>{{if .Backoff}}<span class="badge warn">{{.Backoff}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+      {{range .SlotAccounts}}
+        <tr>
+          <td class="text"><details class="places"><summary>{{.Account}}</summary>
+            {{- range .Gateways}}<div class="sub">{{.}}</div>{{end}}</details></td>
+          <td class="num">{{.Touched}}</td>
+          <td class="num">{{.Cooling}}</td>
+          <td class="num {{if .Backoff}}bad{{end}}">{{.Backoff}}</td>
+          <td class="num">{{.Full}}</td>
+          <td class="num {{if .Degraded}}bad{{end}}">{{.Degraded}}</td>
+          <td class="mono">{{if .LastDeliver}}{{.LastDeliver}}{{else}}<span class="muted">没取过</span>{{end}}</td>
         </tr>
       {{end}}
       </tbody>
@@ -234,7 +225,7 @@
     {{else}}
     <p class="empty">暂无数据。</p>
     {{end}}
-    <p class="foot">退避剩余：校验未通过或请求失败后，该账号在这个网关上暂停使用的剩余时间。</p>
+    <p class="foot">冷却中：交付过、离上次交付还不到「账号×网关冷却」那个时长，调度不会再把它派给这个账号。退避中：校验未通过或请求失败后，该账号在这个网关上暂停使用。</p>
     <p class="foot">这是一本<strong>烧账本，不是锁</strong>：每一行记的是「这个账号已经碰过这个网关了」，所以它在冷却完之前不会再被派出去。路由 Cookie 本身不互斥，同一张可以同时发给好几个账号。</p>
   </div>
 </section>
@@ -244,12 +235,12 @@
     <header class="card-head"><div><h2>采样记录</h2><p>探测请求明细，按时间倒序排列。显示最近 {{len .Samples}} 条，共 {{.TotalSamples}} 条。</p></div></header>
     {{if .Samples}}
     <div class="table-wrap"><table id="t-samples" data-grid data-facets="ok:成功:ok|err:失败:bad" data-placeholder="搜索地区、ASN 或网关">
-      <thead><tr><th>时间（UTC）</th><th class="num">账号</th><th>区域</th><th>出口位置</th><th>ASN</th><th>网关</th><th class="num">HTTP</th></tr></thead>
+      <thead><tr><th>时间（UTC）</th><th>账号</th><th>区域</th><th>出口位置</th><th>ASN</th><th>网关</th><th class="num">HTTP</th></tr></thead>
       <tbody>
       {{range .Samples}}
         <tr data-facet="{{if eq .Status 200}}ok{{else}}err{{end}}">
           <td class="mono">{{.At}}</td>
-          <td class="num">{{.AccountID}}</td>
+          <td>{{.Account}}</td>
           <td class="mono">{{.Region}}</td>
           <td>{{.Where}}</td>
           <td class="mono">{{.ASN}}</td>
@@ -270,11 +261,11 @@
     <header class="card-head"><div><h2>取票失败</h2><p><code>/cookie</code> 没给出票的那几次，按时间倒序。客户端那头只会看到一个 502/503，原因在这里。</p></div></header>
     {{if .Fails}}
     <div class="table-wrap"><table id="t-fails" data-grid data-placeholder="搜索原因或网关">
-      <thead><tr><th>时间（UTC）</th><th class="num">账号</th><th>指定网关</th><th>错误码</th><th>原因</th><th>原始错误</th></tr></thead>
+      <thead><tr><th>时间（UTC）</th><th>账号</th><th>指定网关</th><th>错误码</th><th>原因</th><th>原始错误</th></tr></thead>
       <tbody>
       {{range .Fails}}
         <tr><td class="mono">{{.At}}</td>
-          <td class="num">{{if .AccountID}}{{.AccountID}}{{else}}<span class="muted" title="没带 key 的匿名取用">匿名</span>{{end}}</td>
+          <td>{{if .Account}}{{.Account}}{{else}}<span class="muted" title="没带 key 的匿名取用">匿名</span>{{end}}</td>
           <td class="mono">{{if .Gateway}}{{.Gateway}}{{else}}<span class="muted">未指定</span>{{end}}</td>
           <td class="mono">{{if .Code}}{{.Code}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td>{{.Reason}}</td>
@@ -285,7 +276,7 @@
     {{else}}
     <p class="empty">最近没有失败记录。</p>
     {{end}}
-    <p class="foot">进程内存态，只留最近 200 条，重启清零。上传者自己那一页只给「原因」，不给原始错误。</p>
+    <p class="foot">进程内存态，只留最近 200 条，重启清零：这个进程 {{.Started}} UTC 启动，更早的记录已经没了。上传者自己那一页只给「原因」，不给原始错误。</p>
   </div>
 </section>
 
@@ -317,7 +308,7 @@
             <input name="models_extra" autocomplete="off" spellcheck="false"></label>
           <label>每账号每区域每小时上限 <span class="hint">0 = 用默认值 6（九个区域合起来 54）。安全阀，不是吞吐量目标</span>
             <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
-          <label>槽位冷却（分钟） <span class="hint">0 = 用默认值 240。账号×网关 烧掉后要歇多久，实测 30 分钟到 3 小时都见过</span>
+          <label>账号×网关冷却（分钟） <span class="hint">0 = 用默认值 240。一个账号在一个网关上取过票后，要歇多久才再派给它，实测 30 分钟到 3 小时都见过</span>
             <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
           <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。<strong>交付前验证开着时</strong>每多试一个就多花一发上游（state-echo），关着时试的都是已有活票的网关、一发都不打</span>
             <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>

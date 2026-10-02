@@ -743,7 +743,7 @@ func TestOwnerPageIsScopedToItsOwnAccounts(t *testing.T) {
 		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{"pro1", k1, "/a/vt-1", "1 次请求", "0</b><span>消耗 token"} {
+	for _, want := range []string{"pro1", k1, "/a/vt-1", "1 次请求", "<span>最近一次取票</span>"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("自己的总览页缺了 %q", want)
 		}
@@ -856,7 +856,8 @@ func TestCrossSitePostsAreRejected(t *testing.T) {
 		return do(h, r)
 	}
 
-	for _, path := range []string{"/enter", "/logout", "/upload", "/admin/rescan", "/admin/config"} {
+	for _, path := range []string{"/enter", "/logout", "/upload", "/admin/rescan", "/admin/config",
+		"/admin/accounts/1/enabled", "/admin/accounts/1/delete"} {
 		// 现代浏览器：Sec-Fetch-Site 说了实话。
 		w := post(path, func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "cross-site") })
 		if w.Code != http.StatusForbidden {
@@ -1264,7 +1265,10 @@ func TestAdminView(t *testing.T) {
 		t.Fatalf("Basic 进不去 %d: %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{"unified-142", "acct-upstream", "/a/vt-1", "full"} {
+	for _, want := range []string{"unified-142", "acct-upstream", "/a/vt-1", "unified-142 · 3.0 小时前用过 · 正常",
+		`action="/admin/accounts/1/enabled"`,
+		// 取票失败只在内存里：写明进程哪天起的，空表才不会被读成「最近没失败」。
+		"这个进程 " + srv.started.Format(time.DateTime) + " UTC 启动"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("管理页缺了 %q", want)
 		}
@@ -1766,11 +1770,17 @@ func TestAdminDeleteAccount(t *testing.T) {
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("删账号拿到 %d: %s", w.Code, w.Body.String())
 	}
-	if loc := w.Header().Get("Location"); loc != "/admin/" {
-		t.Fatalf("没跳回管理页: %q", loc)
+	if loc := w.Header().Get("Location"); loc != "/admin/#accounts" {
+		t.Fatalf("没跳回管理页的账号表: %q", loc)
 	}
 	if len(st.deleted) != 1 || st.deleted[0] != id {
 		t.Fatalf("store 收到的删除请求: %v", st.deleted)
+	}
+	// 从外部账号那一页删的，回外部账号那一页。
+	r := httptest.NewRequest("POST", fmt.Sprintf("/admin/accounts/%d/delete", st.accounts[0].ID),
+		strings.NewReader("back=external"))
+	if loc := do(h, authed(r, "akey")).Header().Get("Location"); loc != "/admin/#external" {
+		t.Fatalf("从外部账号页删完没回那一页: %q", loc)
 	}
 	// 不存在的 ID 要 404，不能静默成功。
 	if w := do(h, authed(httptest.NewRequest("POST", "/admin/accounts/99999/delete", nil),
@@ -1781,6 +1791,243 @@ func TestAdminDeleteAccount(t *testing.T) {
 	if w := do(h, authed(httptest.NewRequest("POST", "/admin/accounts/abc/delete", nil),
 		"akey")); w.Code != 400 {
 		t.Fatalf("乱填 ID 拿到 %d", w.Code)
+	}
+}
+
+// 管理员在账号表上直接停用/启用：要 admin key，开关真的翻了，回到点按钮的那一页。
+func TestAdminAccountEnabledToggle(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	post := func(path, form string) *httptest.ResponseRecorder {
+		return do(h, authed(httptest.NewRequest("POST", path, strings.NewReader(form)), "akey"))
+	}
+	adminPage := func() string {
+		return do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	}
+	const toggle = `action="/admin/accounts/1/enabled"><input type="hidden" name="enabled" value="`
+	if !strings.Contains(adminPage(), toggle+`0">`) {
+		t.Fatal("启用着的号，按钮该发 enabled=0（停用）")
+	}
+	if w := do(h, httptest.NewRequest("POST", "/admin/accounts/1/enabled", strings.NewReader("enabled=0"))); w.Code != 401 {
+		t.Fatalf("没带 key 停用拿到 %d", w.Code)
+	}
+	if !st.accounts[0].Enabled {
+		t.Fatal("没带 key 居然停掉了")
+	}
+	// 只收 0 / 1：缺字段或乱填都不许当成「停用」。
+	for _, form := range []string{"", "enabled=true", `{"enabled":true}`} {
+		if w := post("/admin/accounts/1/enabled", form); w.Code != 400 || !st.accounts[0].Enabled {
+			t.Fatalf("表单 %q 拿到 %d，启用状态 %v", form, w.Code, st.accounts[0].Enabled)
+		}
+	}
+	w := post("/admin/accounts/1/enabled", "enabled=0")
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/admin/#accounts" {
+		t.Fatalf("停用拿到 %d，跳到 %q", w.Code, w.Header().Get("Location"))
+	}
+	if st.accounts[0].Enabled {
+		t.Fatal("没停掉")
+	}
+	cards := httptest.NewRequest("GET", "/admin/accounts", nil)
+	cards.SetBasicAuth("admin", "akey")
+	if !strings.Contains(adminPage(), toggle+`1">`) || !strings.Contains(do(h, cards).Body.String(), toggle+`1">`) {
+		t.Fatal("停用了的号，两页上的按钮都该发 enabled=1（启用）")
+	}
+	// 表单体有上限。
+	if w := post("/admin/accounts/1/enabled", "enabled=1&pad="+strings.Repeat("x", 5<<10)); w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大表单拿到 %d", w.Code)
+	}
+	// 从「全部账号」卡片页点的，回那一页。
+	if loc := post("/admin/accounts/1/enabled", "enabled=1&back=accounts").Header().Get("Location"); loc != "/admin/accounts" {
+		t.Fatalf("从全部账号页启用完跳到 %q", loc)
+	}
+	if !st.accounts[0].Enabled {
+		t.Fatal("没启用回来")
+	}
+	// back 只认固定值：表单里随便填的地址不许拿来跳（开放重定向）。
+	if loc := post("/admin/accounts/1/enabled", "enabled=1&back=https://evil.example/").Header().Get("Location"); loc != "/admin/#accounts" {
+		t.Fatalf("back 乱填跳到了 %q", loc)
+	}
+	if w := post("/admin/accounts/99999/enabled", "enabled=0"); w.Code != 404 {
+		t.Fatalf("停用不存在的账号拿到 %d", w.Code)
+	}
+	if w := post("/admin/accounts/abc/enabled", "enabled=0"); w.Code != 400 {
+		t.Fatalf("乱填 ID 拿到 %d", w.Code)
+	}
+	// 「全部账号」卡片上也有这两个按钮，不用再进详情页。
+	r := httptest.NewRequest("GET", "/admin/accounts", nil)
+	r.SetBasicAuth("admin", "akey")
+	body := do(h, r).Body.String()
+	for _, want := range []string{toggle + `0">`, `action="/admin/accounts/1/delete"`, `name="back" value="accounts"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/admin/accounts 缺了 %q", want)
+		}
+	}
+	// 上传者自己的总览页上不许有管理员按钮。
+	if strings.Contains(do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String(), "/admin/accounts/") {
+		t.Fatal("上传者总览页上出现了管理员按钮")
+	}
+}
+
+// 账号表的筛选：每行带状态 / 套餐 / 区域覆盖 / 上传者四个标签，按钮只列表里真有的。
+func TestAdminAccountFacets(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	now := time.Now()
+	// 1 号：pro、owner 1、只铸过 europe（还有一行反查不到区域的台账，不算）⇒ 没覆盖全
+	// 2 号：plus、owner 2、停用、九区都铸过；3 号：套餐不明、owner 2、一张都没铸过
+	st.accounts[1].Enabled = false
+	for _, r := range types.Regions {
+		st.mints["2|"+r.Key] = types.RegionMint{AccountID: 2, RegionKey: r.Key, Count: 1, LastAt: now}
+	}
+	// 台账里次数为 0 的格子不算铸出过。
+	st.mints["1|us-east"] = types.RegionMint{AccountID: 1, RegionKey: "us-east"}
+	st.accounts = append(st.accounts, types.Account{ID: 3, Label: "新号", Enabled: true, OwnerID: 2,
+		ViewToken: "vt-3", Creds: types.Creds{AccessToken: "x", AccountID: "acct-c"}})
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	for _, want := range []string{
+		`data-facet="on plan-pro cov-part o1"`,
+		`data-facet="off plan-plus cov-all o2"`,
+		`data-facet="on plan-unknown cov-none o2"`,
+		`状态=on:启用:ok|off:已停用:bad;`,
+		`;套餐=plan-plus:plus|plan-pro:pro|plan-unknown:未知;`,
+		`;区域=cov-all:九区都铸过:ok|cov-part:没覆盖全:warn|cov-none:从没铸出过票:bad;`,
+		`;上传者=o1:#1 我|o2:#2 朋友"`,
+		">1/9<", ">9/9<", ">0/9<",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("账号表筛选缺了 %q", want)
+		}
+	}
+}
+
+// 筛选按钮的文字来自上传者起的名字：里面的分隔符会把整串筛选拆坏。
+func TestFacetLabelStripsSeparators(t *testing.T) {
+	if got := facetLabel("a:b|c;d"); got != "a：b｜c；d" {
+		t.Fatalf("分隔符没换掉：%q", got)
+	}
+	if got := facetLabel("一二三四五六七八九十一二三四五六七"); got != "一二三四五六七八九十一二三四五六…" {
+		t.Fatalf("没按字符截：%q", got)
+	}
+	if got := planFacet(" Pro+ "); got != "plan-pro" {
+		t.Fatalf("套餐标签没清洗：%q", got)
+	}
+}
+
+// 网关表并进了路由 Cookie（剩余时间、谁铸的），还列出实际从哪些国家/城市到达过；
+// 国家/城市只给管理员，首页只给出口数。
+func TestAdminGatewaysShowPlacesAndPair(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	st.samples = append(st.samples,
+		types.Sample{AccountID: 1, Observed: types.Observed{Country: "IT", City: "Rome"}, Gateway: "unified-142", Status: 200},
+		types.Sample{AccountID: 1, Observed: types.Observed{Country: "SA"}, Gateway: "unified-142", Status: 200},
+		// 没落到网关的那一发不算到达过。
+		types.Sample{AccountID: 1, Observed: types.Observed{Country: "FR", City: "Paris"}, Status: 0},
+	)
+	// 票过期了的网关、手上没票的网关，筛选标签各是各的。
+	st.gws["unified-7"] = types.Gateway{Name: "unified-7", FirstSeenBy: 1}
+	st.gws["unified-8"] = types.Gateway{Name: "unified-8", FirstSeenBy: 77} // 发现它的号后来删了
+	st.pairs["unified-7"] = types.Pair{Gateway: "unified-7", MintedBy: 2, ExpiresAt: time.Now().Add(-time.Minute)}
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	_, gw, _ := strings.Cut(body, `id="tab-gateways"`)
+	gw, _, _ = strings.Cut(gw, "<section")
+	for _, want := range []string{
+		// 「城市不明」列在明细里，但不算进几城。
+		"IT（2 城） · SA</summary>", "Milan、Rome", "（城市不明）",
+		`<td>#1 pro1</td>`, `<td>#2 朋友的号</td>`, "#77（已删除）",
+		`data-facet="live"`, `data-facet="expired"`, `data-facet="none"`,
+	} {
+		if !strings.Contains(gw, want) {
+			t.Fatalf("网关表缺了 %q：\n%s", want, gw)
+		}
+	}
+	if strings.Contains(gw, "Paris") {
+		t.Fatal("没落到网关的采样被算成到达过")
+	}
+	if strings.Contains(body, `id="tab-pairs"`) {
+		t.Fatal("路由 Cookie 页签还在")
+	}
+	home := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	for _, leak := range []string{"Milan", "Rome"} {
+		if strings.Contains(home, leak) {
+			t.Fatalf("首页漏了城市 %q", leak)
+		}
+	}
+}
+
+// 「账号×网关」按账号汇总：冷却按调度那把尺子（LastDeliver + 冷却时长），退避按 BackoffUntil。
+func TestSlotSummaries(t *testing.T) {
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	slots := map[string]types.Slot{
+		"1|unified-1": {AccountID: 1, Gateway: "unified-1", LastTouch: now.Add(-time.Hour),
+			LastDeliver: now.Add(-time.Hour), LastVerdict: "full"},
+		// 交付过但早过了冷却期；正在退避；校验降级
+		"1|unified-2": {AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-5 * time.Hour),
+			LastDeliver: now.Add(-5 * time.Hour), BackoffUntil: now.Add(10 * time.Minute), LastVerdict: "degraded"},
+		// 从没用过的不算「碰过」；名字按自然序排在 unified-2 后面
+		"1|unified-105": {AccountID: 1, Gateway: "unified-105"},
+		// 时钟偏差让 LastTouch 比 now 还晚：写「刚刚」，不写「已过期前」
+		"2|unified-1": {AccountID: 2, Gateway: "unified-1", LastTouch: now.Add(time.Second), LastVerdict: "unknown"},
+	}
+	last := map[int64]time.Time{1: now.Add(-time.Hour)}
+	name := func(id int64) string { return fmt.Sprintf("#%d", id) }
+	rows, verdicts := slotSummaries(slots, last, name, 4*time.Hour, now)
+	if len(rows) != 2 || rows[0].Account != "#1" || rows[1].Account != "#2" {
+		t.Fatalf("没按账号汇总：%+v", rows)
+	}
+	a := rows[0]
+	if a.Touched != 2 || a.Cooling != 1 || a.Backoff != 1 || a.Full != 1 || a.Degraded != 1 ||
+		a.LastDeliver != "2026-10-02 11:00:00" {
+		t.Fatalf("1 号汇总不对：%+v", a)
+	}
+	if want := []string{
+		"unified-1 · 1.0 小时前用过 · 冷却中 · 正常",
+		"unified-2 · 5.0 小时前用过 · 退避 10 分钟 · 降级",
+		"unified-105 · 从未用过",
+	}; strings.Join(a.Gateways, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("明细 %q，要 %q", a.Gateways, want)
+	}
+	if rows[1].Gateways[0] != "unified-1 · 刚刚用过 · 未知" || rows[1].Touched != 1 || rows[1].LastDeliver != "" {
+		t.Fatalf("2 号明细不对：%+v", rows[1])
+	}
+	if verdicts != [3]int{1, 1, 1} {
+		t.Fatalf("校验分布 %v", verdicts)
+	}
+}
+
+// /u 的「最近一次取票」：自己的槽位，加上拿这个号的 key 替外部账号取的（记在占位行上，
+// Via 指回这个号）。上传者靠它判断自己那边的对接通没通。
+func TestOwnerPageShowsLastFetch(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	page := func(tok string) string { return do(h, httptest.NewRequest("GET", "/u/"+tok, nil)).Body.String() }
+	if body := page(ownerTok1); !strings.Contains(body, "还没用接入 key 取到过票") {
+		t.Fatal("还没取过票时没说清楚")
+	}
+	now := time.Now()
+	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 x", Enabled: true, Via: 1,
+		Creds: types.Creds{AccountID: types.AnonPrefix + "x"}})
+	st.slots["9|unified-7"] = types.Slot{AccountID: 9, Gateway: "unified-7", LastDeliver: now.Add(-5 * time.Minute)}
+	body := page(ownerTok1)
+	for _, want := range []string{"<b>5 分钟前</b><span>最近一次取票</span>", "最近一次取票 <strong>5 分钟前</strong>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("经外部账号取票：总览页缺了 %q", want)
+		}
+	}
+	// 别人的总览页不许沾上这次取票。
+	if !strings.Contains(page(ownerTok2), "还没用接入 key 取到过票") {
+		t.Fatal("2 号的总览页算上了 1 号的 key 取的票")
+	}
+	// 自己的槽位那一路：比经外部账号那次更新，就报它。
+	st.slots["1|unified-9"] = types.Slot{AccountID: 1, Gateway: "unified-9", LastDeliver: now.Add(-2 * time.Minute)}
+	if body := page(ownerTok1); !strings.Contains(body, "<b>2 分钟前</b><span>最近一次取票</span>") {
+		t.Fatal("自己槽位上更近的那次取票没算进来")
+	}
+	// 名下好几个号：顶上那格报最近的一个，各卡片报各自的。
+	st.accounts = append(st.accounts, types.Account{ID: 4, Label: "pro4", Enabled: true, OwnerID: 1, ViewToken: "vt-4",
+		Creds: types.Creds{AccessToken: "x", AccountID: "acct-d"}})
+	st.slots["4|unified-9"] = types.Slot{AccountID: 4, Gateway: "unified-9", LastDeliver: now.Add(-90 * time.Second)}
+	body = page(ownerTok1)
+	for _, want := range []string{"<b>1 分钟前</b><span>最近一次取票</span>", "最近一次取票 <strong>2 分钟前</strong>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("两个号：总览页缺了 %q", want)
+		}
 	}
 }
 

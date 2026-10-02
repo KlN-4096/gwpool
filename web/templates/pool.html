@@ -99,7 +99,7 @@
       <header class="card-head"><div><h2>调用流程</h2><p>适用于已上传账号的调用方。</p></div></header>
       <div class="card-body">
         <h3>1. 获取接入 key</h3>
-        <p>在「上传账号」提交凭据，成功后跳转到该账号的页面，接入 key 在那里。</p>
+        <p>在「上传账号」提交凭据，成功后跳到账号总览页，每个账号的接入 key 都在那里。</p>
         <h3>2. 请求路由 Cookie</h3>
         <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
         <p>返回 JSON，<code>cookie</code> 字段即路由 Cookie。可选参数：<code>gateway=&lt;网关名&gt;</code> 指定网关；<code>force=1</code> 换一个网关。</p>

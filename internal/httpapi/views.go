@@ -171,8 +171,10 @@ type ownerView struct {
 	// Requests / NewGateways 是名下所有账号的合计。
 	Requests    int
 	NewGateways int
-	Model       string
-	Effort      string
+	// LastFetch 是名下所有账号里最近的那次取票（人读），空 = 一次都没有。
+	LastFetch string
+	Model     string
+	Effort    string
 	// BaseURL 见 poolView.BaseURL。
 	BaseURL string
 	// CanLogout：访客的身份 cookie 正好是这个 owner，给一个「登出」按钮。
@@ -198,6 +200,10 @@ type ownerAccountRow struct {
 	ConsumerKey string
 	Requests    int
 	NewGateways int
+	// LastFetch 是最近一次拿这个号的接入 key 取到票（人读的「12 分钟前」），空 = 还没取到过。
+	// 上传者拿它判断自己那边 sub2api 对接通没通：探测请求数只说明池子在用他的号。
+	LastFetch   string
+	LastFetchAt string // 同一时刻的绝对时间（UTC），给悬停
 	// Regions 恒为 types.Regions 那九个，顺序一致。
 	Regions regionGrid
 	Fails   []failRow
@@ -274,6 +280,7 @@ func regionLabel(key string) string {
 type failRow struct {
 	At        string
 	AccountID int64
+	Account   string // 「#3 xxx」，只有管理页填
 	Gateway   string
 	// Code 是回给客户端的那个闭集错误码；"release" 表示这行是一次归还。
 	Code   string
@@ -295,16 +302,24 @@ type adminView struct {
 	Config configView
 
 	base
-	Proxies      []proxyRow
-	Owners       []ownerRow
-	Accounts     []accountRow // 托管着凭据的
-	External     []accountRow // 匿名占位行：池里没凭据、只来取票的上游账号
-	Gateways     []adminGatewayRow
-	Pairs        []pairRow
-	Slots        []slotRow
+	Proxies  []proxyRow
+	Owners   []ownerRow
+	Accounts []accountRow // 托管着凭据的
+	// AccountFacets 是账号表的几组筛选（状态 / 套餐 / 区域覆盖 / 上传者），组之间用 ";" 隔开，
+	// 格式见 layout.html 里的 grid()。服务端拼好：上传者名字里的 ":" "|" ";" 会把它拆坏。
+	AccountFacets string
+	External      []accountRow // 匿名占位行：池里没凭据、只来取票的上游账号
+	Gateways      []adminGatewayRow
+	// SlotAccounts 是「账号×网关」按账号汇总：明细一千多行，平铺会占掉整页一大半体积。
+	SlotAccounts []slotAccountRow
+	SlotTotal    int
+	SlotVerdicts [3]int // 全部槽位最近一次校验：正常 / 降级 / 未知
 	Samples      []adminSampleRow
 	TotalSamples int
 	Fails        []failRow
+	// Started 是这个进程什么时候起的（UTC）。取票失败只在内存里，重启就清空——
+	// 不写明的话，空表会被读成「最近没失败」。
+	Started string
 	// Rescan 是刚点过「找新网关」按钮之后的回话："queued" = 真排进去了，
 	// 其余非空串是没派出去的原因。空 = 这一次打开不是从那个按钮跳回来的。
 	Rescan string
@@ -334,6 +349,9 @@ type accountRow struct {
 	ViewToken      string
 	Since          string
 	Upstream       string // 上游账号标识；外部账号去掉了 anon: 前缀
+	Owner          string // 「#6 xxx」：上传者
+	Covered        string // 「4/9」：九个区域里铸出过票的有几个
+	Facet          string // 账号表筛选用的标签，空格分隔（见 adminView.AccountFacets）
 	// 下面几个只给外部账号（匿名占位行）：它不探测，「请求数」「发现网关」恒为 0，
 	// 有用的是谁在替它取票、取了多少、最近一次在什么时候。
 	Via         string // 「#20 free-kl1」；空 = 不带 key 取的或没记录到
@@ -359,28 +377,42 @@ type proxyRow struct {
 
 type adminGatewayRow struct {
 	Name        string
-	FirstSeenBy int64
+	FirstSeenBy string // 「#2 xxx」
 	FirstSeen   string
-	Exits       string
+	Exits       int    // 请求过的出口数，和首页那个「出口 N」是同一个数
+	ExitLabels  string // 那几个出口本身，给悬停
+	// 这个网关手上那张路由 Cookie（原来单独一个页签，一个网关最多一张，就并进来了）。
+	// PairState 是筛选用的 live / expired / none；cookie 本体一个字都不往页面上放。
+	PairState string
+	PairLeft  string
+	MintedBy  string
+	// Places 是实际从哪些国家/城市到达过这个网关，只给管理员看（首页只给出口数）。
+	Places []gatewayPlace
 }
 
-type pairRow struct {
-	Gateway  string
-	Left     string
-	MintedBy int64
+// gatewayPlace 是到达过某个网关的一个国家，和从那个国家出去的城市。
+type gatewayPlace struct {
+	Country string
+	Cities  []string
+	Known   int // 城市名已知的有几个（「城市不明」那一项列出来但不算数）
 }
 
-type slotRow struct {
-	AccountID int64
-	Gateway   string
-	Rested    string
-	Verdict   string
-	Backoff   string
+// slotAccountRow 是「账号×网关」按账号汇总的一行，明细（每个网关一句话）点开才看。
+type slotAccountRow struct {
+	Account     string // 「#3 xxx」
+	Touched     int    // 碰过的网关数
+	Cooling     int    // 交付过、还在冷却期里的
+	Backoff     int    // 退避中的
+	Full        int    // 最近一次校验：正常
+	Degraded    int    // 降级
+	LastDeliver string // 最近一次取票（UTC）；空 = 一张都没取过
+	Gateways    []string
 }
 
 type adminSampleRow struct {
 	At        string
 	AccountID int64
+	Account   string // 「#3 xxx」
 	Region    string
 	Where     string
 	ASN       string

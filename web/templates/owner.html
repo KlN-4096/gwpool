@@ -8,7 +8,7 @@
 <div class="kpis">
   <div class="kpi"><b>{{len .Accounts}}</b><span>托管凭据</span></div>
   <div class="kpi"><b>{{.Requests}}</b><span>探测请求</span></div>
-  <div class="kpi ok"><b>0</b><span>消耗 token</span></div>
+  <div class="kpi"><b>{{if .LastFetch}}{{.LastFetch}}{{else}}—{{end}}</b><span>最近一次取票</span>{{if not .LastFetch}}<small>还没用接入 key 取到过票</small>{{end}}</div>
   <div class="kpi"><b>{{.NewGateways}}</b><span>新发现网关</span></div>
 </div>
 
@@ -63,7 +63,7 @@
   {{/* summary 里只放标题和行内元素（规范只许这些），所以元信息是 span 不是 p */}}
   <summary class="card-head acct-head">
     <h2>{{.Label}}</h2>
-    <span class="meta">{{if .Plan}}套餐 {{.Plan}} · {{end}}添加于 {{.Since}} UTC · 累计 <strong>{{.Requests}} 次请求</strong>（消耗 <strong>0 token</strong>）· 发现 <strong>{{.NewGateways}} 个新网关</strong></span>
+    <span class="meta">{{if .Plan}}套餐 {{.Plan}} · {{end}}添加于 {{.Since}} UTC · 累计 <strong>{{.Requests}} 次请求</strong>（消耗 <strong>0 token</strong>）· 发现 <strong>{{.NewGateways}} 个新网关</strong> · {{if .LastFetch}}<span title="{{.LastFetchAt}} UTC">最近一次取票 <strong>{{.LastFetch}}</strong></span>{{else}}还没取到过票{{end}}</span>
     {{if .Enabled}}<span class="badge ok">已启用</span>{{else}}<span class="badge bad">已停用</span>{{end}}
   </summary>
   <div class="card-body">
@@ -97,7 +97,18 @@
     </table></div>
     {{end}}
   </div>
-  <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明、停用开关在那边）</p>
+  <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明{{if not $.Admin}}、停用开关{{end}}在那边）</p>
+  {{if $.Admin}}
+  <div class="foot row-actions">
+    <form method="post" action="/admin/accounts/{{.ID}}/enabled"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
+      <input type="hidden" name="back" value="accounts">
+      <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
+    <form method="post" action="/admin/accounts/{{.ID}}/delete"
+        onsubmit="return confirm('确定删除账号 {{.ID}}（{{.Label}}）？此操作无法撤销。')">
+      <input type="hidden" name="back" value="accounts">
+      <button class="danger sm" type="submit">删除</button></form>
+  </div>
+  {{end}}
 </details>
 {{end}}
 {{else}}
