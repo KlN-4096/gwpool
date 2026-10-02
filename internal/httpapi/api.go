@@ -550,34 +550,16 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	pairs := s.st.Pairs()
 	accounts := s.st.Accounts()
 	now := time.Now().UTC()
-	// 按值建索引，不去拼 "<id>|<网关>"：那个键格式是存储层的事，抄一份迟早对不上。
-	slots := map[int64]map[string]types.Slot{}
-	for _, sl := range s.st.Slots() {
-		if slots[sl.AccountID] == nil {
-			slots[sl.AccountID] = map[string]types.Slot{}
-		}
-		slots[sl.AccountID][sl.Gateway] = sl
-	}
 
 	// 只数**托管**账号：匿名调用方的占位行（sched.anonAccount）没有凭据，既铸不了票
-	// 也不是谁托管的。算进来的话这张对外的页面上「托管账号」会虚高一大截，
-	// 「歇着的槽位」也会多出一堆永远用不上的槽。
-	hosted := accounts[:0:0]
+	// 也不是谁托管的。算进来的话这张对外的页面上「托管账号」会虚高一大截。
+	hosted := 0
 	for _, a := range accounts {
 		if a.Creds.AccessToken != "" {
-			hosted = append(hosted, a)
+			hosted++
 		}
 	}
 
-	// 「空闲槽位」这一格**必须和调度那把尺子是同一把**。从前它是写死的 1 小时常量 + 按
-	// LastTouch 算，而真实闸是 slot_cooldown_minutes（默认 240）+ 按 LastDeliver 算
-	// （sched.notCooling / coolingByDeliver）。字段和时长同时错 ⇒ 两个方向都说谎：
-	//   - 两小时前取过票的槽位 → 页面显示「空闲槽位 1」，而接下来两小时每次取票都 503
-	//     （2026-10-02 本地实测：首页 1，/cookie 回 all_cooling retry_after 7190）；
-	//   - 只被一次失败续期 touch 过的槽位 → 页面显示 0，而它其实照常能发
-	//     （notCooling 刻意不拿 LastTouch 当冷却起点，见 sched.go 那段注释）。
-	// 图例那句「还能用这个网关的账号数」是对使用者的承诺，不是内部读数，不能"纯展示"。
-	cooldown := s.slotCooldown()
 	v := poolView{base: base{Title: "池子", Mode: s.pool.Mode()}}
 	for name, g := range gws {
 		row := gatewayRow{Name: name, Exits: len(g.ReachableExits), PairLeft: "—"}
@@ -588,19 +570,6 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			if left > 0 {
 				row.PairLeft = shortDur(left)
 			}
-		}
-		for _, a := range hosted {
-			if !a.Enabled {
-				continue
-			}
-			sl, seen := slots[a.ID][name]
-			// 判据和 sched 的冷却闸对齐：LastDeliver（真的有人在这个网关上取走过票）
-			// 而不是 LastTouch（它连失败的续期都记）。
-			if seen && (now.Before(sl.BackoffUntil) ||
-				(!sl.LastDeliver.IsZero() && now.Sub(sl.LastDeliver) < cooldown)) {
-				continue
-			}
-			row.RestedSlots++
 		}
 		v.Gateways = append(v.Gateways, row)
 	}
@@ -618,8 +587,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
-	v.Accounts = len(hosted)
-	v.RestedLabel = shortDur(cooldown)
+	v.Accounts = hosted
 	v.Model, v.Effort = s.probeModel(), probeEffort
 	v.BaseURL = s.publicBaseURL()
 	// 带着身份 cookie 来的人直接给按钮；没带的只给一个贴令牌的小表单。
@@ -1320,7 +1288,15 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 		BaseURL: s.publicBaseURL(),
 		Admin:   true,
 	}
-	v.Accounts = s.ownerAccountRows(s.st.Accounts(), samples)
+	// 外部账号（匿名占位行）不上这一页：它没凭据，卡片上的接入 key、九宫格、请求数全是空的。
+	// 它们在管理页的「外部账号」页签。
+	var hosted []types.Account
+	for _, a := range s.st.Accounts() {
+		if a.Creds.AccessToken != "" {
+			hosted = append(hosted, a)
+		}
+	}
+	v.Accounts = s.ownerAccountRows(hosted, samples)
 	for _, row := range v.Accounts {
 		v.Requests += row.Requests
 		v.NewGateways += row.NewGateways
@@ -1800,9 +1776,12 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	ownerAccounts := map[int64]int{}
 	accounts := s.st.Accounts()
-	labels := map[int64]string{}
+	byID, byUpstream := map[int64]types.Account{}, map[string]types.Account{}
 	for _, a := range accounts {
-		labels[a.ID] = a.Label
+		byID[a.ID] = a
+		if a.Creds.AccessToken != "" {
+			byUpstream[a.Creds.AccountID] = a
+		}
 	}
 	delivered, lastDeliver := map[int64]int{}, map[int64]time.Time{}
 	for _, sl := range s.st.Slots() {
@@ -1821,21 +1800,35 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
 			Requests: reqs[a.ID], Found: found[a.ID],
 			ViewToken: a.ViewToken, Since: a.CreatedAt.Format(time.DateTime),
-			HasCreds: a.Creds.AccessToken != "", Upstream: a.Creds.AccountID,
-			OwnerID: a.OwnerID, Delivered: delivered[a.ID],
+			Upstream: a.Creds.AccountID, OwnerID: a.OwnerID,
 		}
+		if a.Creds.AccessToken != "" {
+			v.Accounts = append(v.Accounts, row)
+			continue
+		}
+		// 外部账号单独一张表：混在账号表里，它那几格请求数、发现网关、账号页全是空的。
+		row.Upstream = strings.TrimPrefix(a.Creds.AccountID, types.AnonPrefix)
+		row.Delivered = delivered[a.ID]
 		if a.Via != 0 {
-			row.Via = fmt.Sprintf("#%d %s", a.Via, labels[a.Via])
-			if _, ok := labels[a.Via]; !ok {
+			if via, ok := byID[a.Via]; ok {
+				row.Via, row.ViaToken = fmt.Sprintf("#%d %s", via.ID, via.Label), via.ViewToken
+			} else {
 				row.Via = fmt.Sprintf("#%d（已删除）", a.Via)
+			}
+		}
+		if same, ok := byUpstream[row.Upstream]; ok {
+			row.SameAs = fmt.Sprintf("#%d %s", same.ID, same.Label)
+			if !same.Enabled {
+				row.SameAs += "（已停用）"
 			}
 		}
 		if t := lastDeliver[a.ID]; !t.IsZero() {
 			row.LastDeliver = t.UTC().Format(time.DateTime)
 		}
-		v.Accounts = append(v.Accounts, row)
+		v.External = append(v.External, row)
 	}
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
+	sort.Slice(v.External, func(i, j int) bool { return v.External[i].ID < v.External[j].ID })
 
 	// owner 的令牌必须在**这一页**看得见：迁移出来那个 owner 的令牌没人见过，
 	// 不显示就等于现有那几个账号的总览页谁都进不去。而 /a/ 那一页刻意**不**印它

@@ -452,11 +452,17 @@ func TestConsumerKeyDerivation(t *testing.T) {
 }
 
 // 匿名占位行没凭据、没归属，管理页上原来只剩一串上游 ID，看不出是谁在用（用户问过
-// 「匿名 e44acf05… 是什么」）。拿谁的 key 替它取票、取了多少、最近一次，都得摆出来。
+// 「匿名 e44acf05… 是什么」）。拿谁的 key 替它取票、取了多少、最近一次，都得摆出来；
+// 而且它单独一张表，不混在账号表里（那几格请求数、账号页对它全是空的）。
 func TestAdminShowsWhoFetchesForAnonymousRows(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModePool)
-	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 acct-outside",
-		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-outside"}, Enabled: true, ViewToken: "vt-9"})
+	st.accounts[1].Enabled = false
+	st.accounts = append(st.accounts,
+		types.Account{ID: 9, Label: "匿名 acct-outside",
+			Creds: types.Creds{AccountID: types.AnonPrefix + "acct-outside"}, Enabled: true, ViewToken: "vt-9"},
+		// 报上来的上游 ID 正好是池里 2 号的：管理员要能看出「这就是那个停用了的号」。
+		types.Account{ID: 10, Label: "匿名 acct-b",
+			Creds: types.Creds{AccountID: types.AnonPrefix + "acct-b"}, Enabled: true, ViewToken: "vt-10"})
 	st.slots = map[string]types.Slot{"9|unified-7": {AccountID: 9, Gateway: "unified-7",
 		LastDeliver: time.Date(2026, 10, 2, 12, 37, 36, 0, time.UTC)}}
 	ka := srv.ConsumerKeyFor(st.accounts[0])
@@ -467,10 +473,23 @@ func TestAdminShowsWhoFetchesForAnonymousRows(t *testing.T) {
 		t.Fatalf("没记下是账号 1 的 key 在替它取: Via=%d", got)
 	}
 	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
-	for _, want := range []string{"经 #1 pro1 的接入 key 取票", "取过 1 个网关的票，最近一次 2026-10-02 12:37:36 UTC"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("管理页的外部账号行缺了 %q", want)
+	_, rest, _ := strings.Cut(body, `id="tab-accounts"`)
+	acc, rest, _ := strings.Cut(rest, `id="tab-external"`)
+	ext, _, _ := strings.Cut(rest, `id="tab-gateways"`)
+	if strings.Contains(acc, "acct-outside") || strings.Contains(acc, "匿名") {
+		t.Fatalf("外部账号还混在账号表里：\n%s", acc)
+	}
+	for _, want := range []string{`<a href="/a/vt-1">#1 pro1</a>`, "用它的接入 key 取票", ">acct-outside<",
+		"2026-10-02 12:37:36", "报的上游 ID 和池里 #2 朋友的号（已停用） 相同"} {
+		if !strings.Contains(ext, want) {
+			t.Fatalf("管理页的外部账号表缺了 %q：\n%s", want, ext)
 		}
+	}
+	if want := `<a href="#external">外部账号 <span class="n">2</span>`; !strings.Contains(body, want) {
+		t.Fatalf("页签上没有外部账号计数 %q", want)
+	}
+	if strings.Contains(ext, types.AnonPrefix) {
+		t.Fatal("上游 ID 带着内部的 anon: 前缀")
 	}
 }
 
@@ -1707,63 +1726,6 @@ func TestPublicPageCountsOnlyHostedAccounts(t *testing.T) {
 	if !strings.Contains(body, "<b>2</b><span>托管账号") {
 		t.Fatalf("2 个真上传者 + 3 个匿名占位，托管账号没报 2：\n%s", body)
 	}
-	// 占位行铸不了票，也不该算成这个网关「歇着的槽位」：两个托管号都没被交付过票，
-	// 该是 2，把占位行算进来就是 5。
-	if !strings.Contains(body, `<td class="num">2</td>`) {
-		t.Fatalf("歇着的槽位没报 2，占位行被算进去了：\n%s", body)
-	}
-}
-
-// 「空闲槽位」必须和真正发票那把尺子一致：slot_cooldown_minutes（可配）+ LastDeliver，
-// 而不是写死的 1 小时 + LastTouch。
-//
-// 两把尺子的话两个方向都会说谎：两小时前取过票的槽位在页面上显示「可用」，而接下来两小时
-// 每次取票都 503（2026-10-02 本地实测：首页 1，/cookie 回 all_cooling retry_after 7190）；
-// 反过来，只被一次失败续期 touch 过的槽位显示 0，其实照常能发——notCooling 刻意不拿
-// LastTouch 当冷却起点。图例那句「还能用这个网关的账号数」是对使用者的承诺，不是内部读数。
-func TestPublicPageRestedSlotsUseTheSameRulerAsDelivery(t *testing.T) {
-	now := time.Now()
-	// rig 有两个托管号。每个用例只给**一个**号铺槽位，另一个号没有槽位行 ⇒ 恒为「可用」，
-	// 于是两把尺子算出来的总数一定不同，不会像「两边都算 1」那样互相遮住。
-	cases := []struct {
-		name string
-		slot types.Slot
-		want int // 新尺子（slot_cooldown + LastDeliver）下的空闲槽位数
-	}{
-		{
-			// 两小时前取走过票 ⇒ 4 小时冷却下不可用。旧尺子（1 小时 + LastTouch）会算成
-			// 可用，而取票实际 503（2026-10-02 本地实测：首页 1，/cookie 回 all_cooling）。
-			name: "取过票的还在冷却里",
-			slot: types.Slot{AccountID: 1, Gateway: "unified-142",
-				LastDeliver: now.Add(-2 * time.Hour), LastTouch: now.Add(-2 * time.Hour)},
-			want: 1,
-		},
-		{
-			// 只被一次失败的续期碰过：LastTouch 很新、LastDeliver 为零 ⇒ 照常能发。
-			// 旧尺子会算成不可用 —— notCooling 刻意不拿 LastTouch 当冷却起点。
-			name: "只被 touch 过的照样能发",
-			slot: types.Slot{AccountID: 1, Gateway: "unified-142", LastTouch: now.Add(-time.Minute)},
-			want: 2,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, h, _, st, _ := rig(t, types.ModePool)
-			st.slots = map[string]types.Slot{"1|unified-142": tc.slot}
-
-			body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
-			if want := fmt.Sprintf("空闲槽位 %d　", tc.want); !strings.Contains(body, want) {
-				t.Fatalf("没报 %q：\n%s", want, body)
-			}
-		})
-	}
-
-	// 图例上那个门槛也要跟着冷却走，不能是写死的「1.0 小时」。
-	_, h, _, _, _ := rig(t, types.ModePool)
-	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
-	if want := shortDur(types.SlotCooldown); !strings.Contains(body, want) {
-		t.Fatalf("图例门槛不是 %s：\n%s", want, body)
-	}
 }
 
 // sanitizeLabel 按**字符**截。按字节截（`v[:labelMaxRunes]`）会把末尾那个汉字
@@ -2689,7 +2651,9 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 // /admin/accounts 是「所有账号一人一张卡」：管理页那张扁平表看不见九宫格、
 // 接入 key 和取票失败，排查「谁的号在哪个区域还没落点」只能一个个点开 /a/。
 func TestAdminAccountsPage(t *testing.T) {
-	_, h, _, _, _ := rig(t, types.ModePool)
+	_, h, _, st, _ := rig(t, types.ModePool)
+	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 acct-outside",
+		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-outside"}, Enabled: true, ViewToken: "vt-9"})
 	// 没带 admin key 一律 401：这一页上有每个账号的接入 key。
 	if w := do(h, httptest.NewRequest("GET", "/admin/accounts", nil)); w.Code != http.StatusUnauthorized {
 		t.Fatalf("/admin/accounts 没鉴权就给了：%d", w.Code)
@@ -2714,6 +2678,10 @@ func TestAdminAccountsPage(t *testing.T) {
 	// 上传表单只属于某个人的 /u/ 页：管理员这页传上去该挂给谁，答不出来。
 	if strings.Contains(body, `id="upload"`) {
 		t.Fatal("/admin/accounts 混进了上传表单")
+	}
+	// 外部账号没凭据，卡片上全是空的：它们在管理页「外部账号」页签，不上这一页。
+	if strings.Contains(body, "acct-outside") || strings.Contains(body, `data-acct="9"`) {
+		t.Fatal("/admin/accounts 混进了外部账号")
 	}
 	// 凭据一个字都不许出现（和其他页面同一条哨兵）。
 	if strings.Contains(body, secretToken) {

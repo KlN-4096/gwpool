@@ -69,15 +69,14 @@
     {{if .Shown}}
     <div class="table-wrap"><table class="tiles pool" data-grid data-natsort data-facet-first data-size="240"
         data-facets="ready:可交付:ok|idle:暂不可交付" data-placeholder="搜索网关名称">
-      <thead><tr><th>网关</th><th>状态</th><th>剩余有效期</th><th class="num">空闲槽位</th><th class="num">可达出口</th></tr></thead>
+      <thead><tr><th>网关</th><th>状态</th><th>剩余有效期</th><th class="num">可达出口</th></tr></thead>
       <tbody>
       {{range .Shown}}
         <tr class="{{if .PairReady}}ready{{end}}" data-facet="{{if .PairReady}}ready{{else}}idle{{end}}"
-            title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　空闲槽位 {{.RestedSlots}}　可达出口 {{.Exits}}　区域 {{if .Regions}}{{range $i, $r := .Regions}}{{if $i}} / {{end}}{{$r}}{{end}}{{else}}未归类{{end}}">
+            title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　可达出口 {{.Exits}}　区域 {{if .Regions}}{{range $i, $r := .Regions}}{{if $i}} / {{end}}{{$r}}{{end}}{{else}}未归类{{end}}">
           <td class="mono">{{.Name}}</td>
           <td>{{if .PairReady}}<span class="badge ok">可交付</span>{{else}}<span class="badge">暂不可交付</span>{{end}}</td>
           <td>{{.PairLeft}}</td>
-          <td class="num">{{.RestedSlots}}</td>
           <td class="num">{{.Exits}}</td>
         </tr>
       {{end}}
@@ -86,7 +85,6 @@
     <div class="legend">
       <span><i class="sw ok"></i>可交付：路由 Cookie 剩余有效期充足</span>
       <span><i class="sw"></i>暂不可交付：没有路由 Cookie，或剩余不足</span>
-      <span title="距上次取走票超过 {{.RestedLabel}}、且不在退避期的账号数。这是接触记录不是锁——路由 Cookie 不互斥，一张可以同时发给好几个账号，所以 0 是「每个账号最近都取过它」，不是「被谁占着」"><b>槽位</b>还能用这个网关的账号数（{{.RestedLabel}}内没取过）</span>
       <span><b>出口</b>能连通这个网关的出口地区数</span>
     </div>
     {{else}}

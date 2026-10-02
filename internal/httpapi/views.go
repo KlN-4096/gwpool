@@ -68,11 +68,10 @@ type poolView struct {
 	// 而且表格那套 data-grid 的搜索/分面/计数全都照常工作——它只是拿到了更少的行。
 	Regions []poolRegionCell
 	// ReadyCount 在服务端算好。原来这张卡片靠 JS 数表格行，关掉 JS 就只剩「—」。
-	ReadyCount  int
-	Accounts    int
-	RestedLabel string
-	Model       string
-	Effort      string
+	ReadyCount int
+	Accounts   int
+	Model      string
+	Effort     string
 	// OwnerToken 非空 = 这个浏览器带着身份 cookie，直接给一个进总览页的按钮。
 	// 空则只给贴令牌的小表单。
 	OwnerToken string
@@ -85,11 +84,10 @@ type poolView struct {
 }
 
 type gatewayRow struct {
-	Name        string
-	Exits       int
-	PairReady   bool   // 池里有剩余 ≥ DeliverFloor 的 pair
-	PairLeft    string // 人读的剩余时间；**不含 cookie 本体**
-	RestedSlots int
+	Name      string
+	Exits     int
+	PairReady bool   // 池里有剩余 ≥ DeliverFloor 的 pair
+	PairLeft  string // 人读的剩余时间；**不含 cookie 本体**
 	// Regions 是这个网关能从哪几个区域连通（人读的区域名），给行的悬停用。
 	// 空 = 它的出口一个都反查不到区域（见 types.RegionKeyOf 的精确匹配）。
 	Regions []string
@@ -299,7 +297,8 @@ type adminView struct {
 	base
 	Proxies      []proxyRow
 	Owners       []ownerRow
-	Accounts     []accountRow
+	Accounts     []accountRow // 托管着凭据的
+	External     []accountRow // 匿名占位行：池里没凭据、只来取票的上游账号
 	Gateways     []adminGatewayRow
 	Pairs        []pairRow
 	Slots        []slotRow
@@ -334,11 +333,12 @@ type accountRow struct {
 	Found          int
 	ViewToken      string
 	Since          string
-	HasCreds       bool   // 只说有没有，不说是什么
-	Upstream       string // 上游账号标识，匿名消费者按它认账号
-	// 下面三个只给没凭据的行（匿名占位行）：它不探测，「请求数」「发现网关」恒为 0，
+	Upstream       string // 上游账号标识；外部账号去掉了 anon: 前缀
+	// 下面几个只给外部账号（匿名占位行）：它不探测，「请求数」「发现网关」恒为 0，
 	// 有用的是谁在替它取票、取了多少、最近一次在什么时候。
 	Via         string // 「#20 free-kl1」；空 = 不带 key 取的或没记录到
+	ViaToken    string // Via 那个账号的 /a/ 令牌；空 = 那个账号已删除
+	SameAs      string // 报上来的上游 ID 正好是池里某个托管账号的：「#3 xxx（已停用）」
 	Delivered   int    // 取过票的网关数（槽位台账里 LastDeliver 非零的）
 	LastDeliver string // 最近一次取票（UTC）；空 = 一张都没取到过
 }

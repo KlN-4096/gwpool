@@ -365,7 +365,7 @@ type State struct {
 
 | 路由 | 鉴权 | 作用 |
 |---|---|---|
-| `GET /` | 无 | 公开池视图：网关列表、各自有没有空闲槽位。**不下发 pair** |
+| `GET /` | 无 | 公开池视图：网关列表、各自能不能交付、剩余有效期。**不下发 pair** |
 | `POST /upload` | 无 | 上传凭据 JSON，建账号，返回 `view_token` + owner 令牌（**不排首扫**，见第 8 节） |
 | `GET /a/{view_token}` | token | 上传者信任视图（**一个账号**） |
 | `GET /u/{owner_token}` | token | 一个人名下**全部**凭据的总览；owner 令牌和 view_token 是两件东西 |

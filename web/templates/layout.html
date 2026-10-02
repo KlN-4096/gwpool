@@ -204,14 +204,12 @@ table.tiles td:nth-child(1) { grid-area: name; color: var(--fg); font-size: 12.5
 /* 池子页：状态那列只留给搜索用，视觉上由左侧色条和底色表达 */
 table.tiles.pool td:nth-child(2) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 /* 名字独占首行：和剩余时间挤一行时，长一点的时间就把名字截成「unified-1…」。 */
-table.tiles.pool tbody tr { grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "name name name" "left slots exits"; column-gap: .6rem; }
+table.tiles.pool tbody tr { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "name name" "left exits"; column-gap: .6rem; }
 table.tiles.pool td:nth-child(3) { grid-area: left; text-align: left; overflow: hidden; text-overflow: ellipsis; }
 table.tiles.pool tr.ready td:nth-child(3)::before { content: "剩 "; color: var(--muted); font-weight: 400; }
 table.tiles.pool tr.ready td:nth-child(3) { color: var(--ok); font-weight: 600; }
-table.tiles.pool td:nth-child(4) { grid-area: slots; text-align: right; }
-table.tiles.pool td:nth-child(5) { grid-area: exits; text-align: right; }
-table.tiles.pool td:nth-child(4)::before { content: "槽位 "; }
-table.tiles.pool td:nth-child(5)::before { content: "出口 "; }
+table.tiles.pool td:nth-child(4) { grid-area: exits; text-align: right; }
+table.tiles.pool td:nth-child(4)::before { content: "出口 "; }
 /* 管理页网关：名字 + 出口在首行，发现者与时间各占一行 */
 table.tiles.gw tbody { grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); }
 table.tiles.gw tbody tr { grid-template-areas: "name exits" "by by" "seen seen"; }
