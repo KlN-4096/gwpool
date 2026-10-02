@@ -1395,7 +1395,10 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		p = types.Pair{Gateway: res.Gateway, Cookie: res.NewPair,
 			ExpiresAt: route, CflbExpiresAt: cflb, MintedBy: a.ID,
 			// 区域取**这一发实际用的出口**，和上面那条区域台账同一个口径。
-			RegionKey: types.RegionKeyOf(e)}
+			// 走 sampleRegion 的兜底：续期型铸票的出口取自 ReachableExits，不保证
+			// 正好等于 Regions 里那九个代表出口，RegionKeyOf 会回空串 ⇒ 消费端整片
+			// 画成「未归类」。退回「国家[:城市]」比空着能认。
+			RegionKey: sampleRegion(e)}
 		if err := s.st.PutPair(p); err != nil {
 			s.opt.Log.Warn("写 pair 失败", "gateway", p.Gateway, "err", err)
 		}
