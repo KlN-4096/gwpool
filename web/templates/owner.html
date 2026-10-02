@@ -1,7 +1,7 @@
 {{define "content"}}
 <div class="page-head">
   <h1>{{.Title}}<span class="badge">{{len .Accounts}} 份凭据</span></h1>
-  {{if .Admin}}<p>池子里全部账号，一份凭据一张卡。<a href="/admin/">← 回管理页</a></p>
+  {{if .Admin}}<p>池内全部账号，每份凭据一张卡片。<a href="/admin/">← 返回管理页</a></p>
   {{else}}<p>创建于 {{.Since}} UTC。</p>{{end}}
 </div>
 
@@ -88,7 +88,7 @@
 </div>
 {{end}}
 {{else}}
-<div class="card"><p class="empty">{{if .Admin}}池子里还没有账号。{{else}}你名下还没有凭据。回<a href="/">首页</a>上传一份。{{end}}</p></div>
+<div class="card"><p class="empty">{{if .Admin}}池内暂无账号。{{else}}你名下还没有凭据。回<a href="/">首页</a>上传一份。{{end}}</p></div>
 {{end}}
 
 {{if not .Admin}}

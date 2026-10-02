@@ -593,16 +593,16 @@ button[type=submit]:disabled { cursor: progress; }
 {{range .Cells}}
   <div class="region{{if .Fresh}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
     <b>{{.Label}}</b>
-    <span>{{if .Fresh}}{{.Ago}}前取过{{else}}可去铸{{end}}</span>
+    <span>{{if .Fresh}}{{.Ago}}前取得{{else}}可铸票{{end}}</span>
     {{if .Gateways}}<span class="gws">
       {{- range .Gateways}}
-      {{- if .Dup}}<code class="dup" title="重复：池子里已经有这个网关了">{{.Name}} 重</code>
-      {{- else}}<code title="这个账号第一个发现它">{{.Name}} 新</code>{{end}}
+      {{- if .Dup}}<code class="dup" title="重复：池中已有此网关">{{.Name}} 重复</code>
+      {{- else}}<code title="由该账号首次发现">{{.Name}} 新增</code>{{end}}
       {{- end}}
     </span>{{end}}
   </div>
 {{end}}
 </div>
-<p class="foot">绿＝最近 {{.Window}}内这个账号在该区域取到过路由 Cookie；灰＝没取到过，<strong>可以派它去这个区域铸</strong>（窗口＝槽位冷却）。悬停看终身次数和最近时间。
-格子里列的是这个账号在那个区域<strong>历史上</strong>见过的网关：<code>新</code>＝由它第一个发现，<code>重</code>＝池子里已经有了（别人先发现，或它自己在更早的区域撞到过）。</p>
+<p class="foot">绿色表示最近 {{.Window}}内该账号在此区域取得过路由 Cookie；灰色表示窗口内未取得，<strong>可安排该账号前往此区域铸票</strong>（窗口长度等于槽位冷却）。悬停可查看累计次数与最近一次时间。
+格子内列出该账号在此区域<strong>历史上</strong>接触过的网关：<code>新增</code>表示由该账号首次发现，<code>重复</code>表示池中已有（其他账号先发现，或该账号已在更早的区域接触过）。</p>
 {{- end}}

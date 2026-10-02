@@ -728,13 +728,13 @@ func TestOwnerPageDrawsNineRegionCells(t *testing.T) {
 		t.Fatalf("画了 %d 个格子，该是 %d 个：台账里那条空 RegionKey 画成了第十个？", n, len(types.Regions))
 	}
 	// europe 的最近一次在窗口内 ⇒ 绿 + 文字 + 带时间的 title；别的区域是灰的。
-	if !strings.Contains(body, `class="region on"`) || !strings.Contains(body, "前取过") {
+	if !strings.Contains(body, `class="region on"`) || !strings.Contains(body, "前取得") {
 		t.Fatalf("europe 该标成窗口内取过票：\n%s", body)
 	}
-	if !strings.Contains(body, "终身 3 次，最近 ") {
-		t.Fatal("格子的 title 里没有终身次数和最近一次什么时候")
+	if !strings.Contains(body, "累计 3 次，最近一次 ") {
+		t.Fatal("格子的 title 里没有累计次数和最近一次时间")
 	}
-	if !strings.Contains(body, "可去铸") {
+	if !strings.Contains(body, "可铸票") {
 		t.Fatal("窗口内没取过的区域该有文字说明，不能只靠颜色")
 	}
 	// 2 号的那一格（oceania）不许串到 1 号的页面上。
@@ -2257,19 +2257,19 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	if !strings.Contains(eu, "region on") {
 		t.Fatalf("窗口内取到过票的格子没变绿：%s", eu)
 	}
-	if !strings.Contains(eu, "前在这里取到过票") || !strings.Contains(eu, "终身 3 次") {
+	if !strings.Contains(eu, "前在此区域取得路由 Cookie") || !strings.Contains(eu, "累计 3 次") {
 		t.Fatalf("欧洲那一格的读数不对：%s", eu)
 	}
-	if !strings.Contains(eu, "unified-142 新") {
+	if !strings.Contains(eu, "unified-142 新增") {
 		t.Fatalf("欧洲那一格没标出自己发现的网关：%s", eu)
 	}
 
 	// 同一个网关在更晚的区域再出现 ⇒ 重复。
-	if us := regionCellOf(t, body, "美国东部"); !strings.Contains(us, "unified-142 重") {
+	if us := regionCellOf(t, body, "美国东部"); !strings.Contains(us, "unified-142 重复") {
 		t.Fatalf("美东那一格没把重复网关标出来：%s", us)
 	}
 	// 别人先发现的 ⇒ 重复。
-	if sa := regionCellOf(t, body, "南美"); !strings.Contains(sa, "unified-73 重") {
+	if sa := regionCellOf(t, body, "南美"); !strings.Contains(sa, "unified-73 重复") {
 		t.Fatalf("南美那一格没把别人先发现的网关标成重复：%s", sa)
 	}
 
@@ -2278,7 +2278,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	if strings.Contains(me, "region on") {
 		t.Fatalf("窗口外的格子不该是绿的：%s", me)
 	}
-	if !strings.Contains(me, "unified-900") || !strings.Contains(me, win+"内没在这里取到过票，可以派去这里铸") {
+	if !strings.Contains(me, "unified-900") || !strings.Contains(me, win+"内未在此区域取得路由 Cookie，可安排铸票") {
 		t.Fatalf("中东那一格丢了终身网关名或没说可以去铸：%s", me)
 	}
 
@@ -2287,7 +2287,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	if strings.Contains(uw, "region on") {
 		t.Fatalf("最近一次在窗口外，格子不该是绿的：%s", uw)
 	}
-	if !strings.Contains(uw, "终身 5 次") {
+	if !strings.Contains(uw, "累计 5 次") {
 		t.Fatalf("美西那一格丢了终身读数：%s", uw)
 	}
 

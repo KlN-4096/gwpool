@@ -1215,18 +1215,18 @@ func regionCells(accountID int64, mints map[string]types.RegionMint,
 		c.Fresh = had && m.Count > 0 && !m.LastAt.IsZero() && now.Sub(m.LastAt) < window
 		if c.Fresh {
 			c.Ago = shortDur(now.Sub(m.LastAt))
-			c.Note = c.Ago + "前在这里取到过票"
+			c.Note = c.Ago + "前在此区域取得路由 Cookie"
 		} else {
-			c.Note = grid.Window + "内没在这里取到过票，可以派去这里铸"
+			c.Note = grid.Window + "内未在此区域取得路由 Cookie，可安排铸票"
 		}
 		// 终身读数退到悬停：窗口是「现在能不能去」，终身是「以前去过没有」。
 		if had && m.Count > 0 {
-			c.Note += fmt.Sprintf("；终身 %d 次", m.Count)
+			c.Note += fmt.Sprintf("；累计 %d 次", m.Count)
 			if !m.LastAt.IsZero() {
-				c.Note += "，最近 " + m.LastAt.UTC().Format(time.DateTime) + " UTC"
+				c.Note += "，最近一次 " + m.LastAt.UTC().Format(time.DateTime) + " UTC"
 			}
 		} else {
-			c.Note += "；终身也没取到过"
+			c.Note += "；累计未取得过"
 		}
 		for name := range inRegion[r.Key] {
 			dup := firstRegion[name] != r.Key
