@@ -344,14 +344,18 @@ type accountRow struct {
 	OwnerID int64
 	// DisabledReason 让管理员一眼看出是「上游否决」还是「上传者自己关的」。
 	DisabledReason string
-	Requests       int
-	Found          int
-	ViewToken      string
-	Since          string
-	Upstream       string // 上游账号标识；外部账号去掉了 anon: 前缀
-	Owner          string // 「#6 xxx」：上传者
-	Covered        string // 「4/9」：九个区域里铸出过票的有几个
-	Facet          string // 账号表筛选用的标签，空格分隔（见 adminView.AccountFacets）
+	// Held 是「上游 429 按住了它，还要等 X」。空 = 没被按住。
+	// 和 DisabledReason 分开：被按住的号**仍然是启用的**，等额度窗口过去自己就好，
+	// 不需要人去点恢复。没有这一格的话它在表里就是个「健康但不干活」的号。
+	Held      string
+	Requests  int
+	Found     int
+	ViewToken string
+	Since     string
+	Upstream  string // 上游账号标识；外部账号去掉了 anon: 前缀
+	Owner     string // 「#6 xxx」：上传者
+	Covered   string // 「4/9」：九个区域里铸出过票的有几个
+	Facet     string // 账号表筛选用的标签，空格分隔（见 adminView.AccountFacets）
 	// 下面几个只给外部账号（匿名占位行）：它不探测，「请求数」「发现网关」恒为 0，
 	// 有用的是谁在替它取票、取了多少、最近一次在什么时候。
 	Via         string // 「#20 free-kl1」；空 = 不带 key 取的或没记录到

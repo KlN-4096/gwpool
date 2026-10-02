@@ -324,6 +324,7 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		// 非 2xx 的体是一小段 JSON，不是 SSE 流，读它不会挂住。
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
 		res.ErrBody = strings.TrimSpace(string(b))
+		res.RetryAfter = retryAfterOf(resp.Header.Get("Retry-After"), at)
 	}
 	fresh := newCookies(resp)
 	if oailb := fresh[cookieOailb]; oailb != nil {
@@ -768,6 +769,28 @@ func isProxyToken(s string) bool {
 }
 
 // ---------- cookie / JWT ----------
+
+// retryAfterOf 解 Retry-After：RFC 7231 允许「秒数」和「HTTP-date」两种写法，
+// 上游两种都用过，只认秒数会在它发日期时静默回落到默认时长。
+// 负数和解不开的一律回 0 = 「上游没给」，钳上限的事归调用方（见 sched.acctHoldMax）。
+func retryAfterOf(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
 
 // newCookies 收本次响应下发的 __cflb / __oailb。
 // newCookies 留着整个 *http.Cookie 而不只是值：__cflb 的死期要从它的 Max-Age 读

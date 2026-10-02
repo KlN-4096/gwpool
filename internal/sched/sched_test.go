@@ -301,6 +301,9 @@ type fakeMinter struct {
 	mintStatus int           // 非 0 时顶替 200，用来模拟上游否决
 	mintBody   string        // 上游那段 JSON
 	mintCost   time.Duration // 一发铸票的往返耗时，推进假时钟
+	// mintRetryAfter 是非 2xx 时上游 Retry-After 头折算出来的时长。
+	// 零值 = 上游没给（429 的账号级退避该回落到默认时长）。
+	mintRetryAfter time.Duration
 
 	sidErr    error
 	sidSeq    int
@@ -414,7 +417,10 @@ func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid,
 		return types.MintResult{}, err
 	}
 	if st := m.status(); st != 0 && st != 200 {
-		return types.MintResult{Status: st, Gateway: gw, ErrBody: m.body()}, nil
+		m.mu.Lock()
+		ra := m.mintRetryAfter
+		m.mu.Unlock()
+		return types.MintResult{Status: st, Gateway: gw, ErrBody: m.body(), RetryAfter: ra}, nil
 	}
 	if noNew && sentPair != "" {
 		// 上游接受了送进去的 pair、不换 cookie。**只有那张的 __cflb 可证还活着**
@@ -2020,8 +2026,9 @@ func TestExitOutageDoesNotBackoffSlots(t *testing.T) {
 // 默认不验：一发 echo 都不打，判定如实写 unknown（**不是** degraded——我们没验，
 // 不是验坏了），对外也不声称 verified_full。
 //
-// 验证要用消费者自己的凭据先铸一张活票再 echo，那两发恰好烧掉它马上要用的那个窗口；
-// 而它在一个没碰过的网关上本来就是满血。state-echo 有假阴无假阳，关掉只少一个读数。
+// 验证要用消费者自己的凭据先铸一张活票再 echo，那是 2 发上游请求，花在与铸票共用的
+// 区域预算上；而它在一个没碰过的网关上本来就是满血。state-echo 有假阴无假阳，关掉只少一个
+// 读数。（那两发**不**烧窗口 —— 2026-10-02 实测窗口内连打多发都是满血。）
 func TestDeliverWithoutVerifyNeverEchoes(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)

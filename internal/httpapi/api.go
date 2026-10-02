@@ -65,6 +65,9 @@ type Pool interface {
 	Public() sched.PublicState
 	// PairTarget 是目标活 pair 数，只给 /gateways 的读数用。
 	PairTarget() int
+	// AccountHolds 是被上游 429 按住的账号 → 还要等多久。只给管理页的读数用：
+	// 被按住的号在表里看起来健康且启用，却一发都不铸。
+	AccountHolds() map[int64]time.Duration
 	Mode() types.Mode
 }
 
@@ -1877,6 +1880,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			lastDeliver[sl.AccountID] = sl.LastDeliver
 		}
 	}
+	holds := s.pool.AccountHolds()
 	ownerAccounts := map[int64]int{}
 	for _, a := range accounts {
 		ownerAccounts[a.OwnerID]++
@@ -1886,6 +1890,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			Requests: reqs[a.ID], Found: found[a.ID],
 			ViewToken: a.ViewToken, Since: a.CreatedAt.Format(time.DateTime),
 			Upstream: a.Creds.AccountID, OwnerID: a.OwnerID,
+		}
+		if d := holds[a.ID]; d > 0 {
+			row.Held = shortDur(d)
 		}
 		if a.Creds.AccessToken != "" {
 			row.Owner = ownerName[a.OwnerID]

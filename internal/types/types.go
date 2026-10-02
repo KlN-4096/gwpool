@@ -146,6 +146,9 @@ type MintResult struct {
 	// ErrBody 是非 2xx 时上游回的那段 JSON（截断）。只在失败路径填。
 	// 没有它的话一个 400 什么都不告诉人——2026-10-01 首扫全军覆没就查了半天。
 	ErrBody string
+	// RetryAfter 是上游 Retry-After 头折算出来的时长，零值 = 它没给。
+	// 429 的账号级退避要听它的：不听 Retry-After 正是被封的典型走法。
+	RetryAfter time.Duration
 }
 
 // RouteDeadline 算这一发之后那张 pair 的两个死期：钉路由那个 cookie 自己的（cflb），

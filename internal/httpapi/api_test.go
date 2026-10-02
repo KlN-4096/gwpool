@@ -51,6 +51,7 @@ type fakePool struct {
 	err      error
 	public   sched.PublicState
 	target   int
+	holds    map[int64]time.Duration
 	anon     []string
 	// 按账号记流水：调度正确性全看池子有没有认出是谁在要。
 	delivered []string
@@ -124,6 +125,34 @@ func (p *fakePool) Public() sched.PublicState { return p.public }
 func (p *fakePool) Mode() types.Mode { return p.mode }
 
 func (p *fakePool) PairTarget() int { return p.target }
+
+// holds 是「被上游 429 按住的账号 → 还要等多久」。nil = 谁都没被按住。
+func (p *fakePool) AccountHolds() map[int64]time.Duration { return p.holds }
+
+// 上游 429 按住的号在管理页上必须看得见：它**仍然是启用的**，表里看起来健康，
+// 却一发都不铸。没有这一格的话运维只能看出「不干活」，查不出是上游按住了。
+func TestAdminShowsUpstreamHold(t *testing.T) {
+	_, h, pool, _, _ := rig(t, types.ModePool)
+	pool.holds = map[int64]time.Duration{1: 47 * time.Minute}
+
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	_, rest, _ := strings.Cut(body, `id="tab-accounts"`)
+	acc, _, _ := strings.Cut(rest, `id="tab-external"`)
+	if !strings.Contains(acc, "上游按住 47 分钟") {
+		t.Fatalf("账号 1 该显示上游按住的剩余时长：\n%s", acc)
+	}
+	// 按行切：表头上方的筛选芯片里本来就有「已停用」字样，整段 acc 判不出东西来。
+	row1 := acc[strings.Index(acc, "/a/vt-1"):strings.Index(acc, "朋友的号")]
+	row2 := acc[strings.Index(acc, "朋友的号"):]
+	// 没被按住的号不许冒出这个徽章。
+	if strings.Contains(row2, "上游按住") {
+		t.Fatalf("账号 2 没被按住，不该有这个徽章：\n%s", row2)
+	}
+	// 按住 ≠ 停用：被按住的号不许被标成已停用（它到点自己就好，不用人去点）。
+	if strings.Contains(row1, "已停用") {
+		t.Fatalf("被上游按住的号被错标成已停用了：\n%s", row1)
+	}
+}
 
 type fakeStore struct {
 	accounts []types.Account

@@ -267,7 +267,27 @@ type Scheduler struct {
 	// 是个**标记**不是锁：裸铸出手前不知道落哪，拦不住只能按区域拦，
 	// 而按区域上真锁会让两路交付在走到账号锁之前就互等（见 claimRegion 的注释）。
 	mintingRegions map[string]bool
+	// acctHold 是「上游 429 把这个账号按住了」的到点，见 holdAccount。
+	//
+	// 为什么要**账号级**而不是继续用槽位级的 bumpBackoff：槽位退避封顶只有 60 秒
+	// （backoffMax），而额度窗口是小时级的 ⇒ 池子会对着一个彻底打不动的号按
+	// 「每槽位每分钟一发」的节奏白打，上限只被速率闸挡着（6 发/区/时 × 9 区 = 54 发/时）。
+	// 那 54 发不只是浪费，它们**吃掉的正是这个号本来能干正经铸票的配额**。
+	//
+	// 不落盘：进程重启本来就该重新探一遍（同 backoff 的理由），而落盘会把一次
+	// 误判带过重启。
+	acctHold map[int64]time.Time
 }
+
+// 上游 429 的账号级退避时长。
+const (
+	// acctHoldDefault 是上游没给 Retry-After 时的默认时长。按一小时：速率闸的窗口
+	// 就是一小时，而 free 的额度窗口也是这个量级。
+	acctHoldDefault = time.Hour
+	// acctHoldMax 钳住上游给的 Retry-After。不钳的话上游报一个 72 小时就把这个号
+	// **永久饿死**（同 sub2api 的 gwpool.MaxRetryAfter 一个道理）。
+	acctHoldMax = 2 * time.Hour
+)
 
 func New(st Store, m Minter, opt Options) *Scheduler {
 	if opt.Mode == "" {
@@ -300,7 +320,8 @@ func New(st Store, m Minter, opt Options) *Scheduler {
 		opt.Live = config.NewLive("", config.Defaults())
 	}
 	return &Scheduler{st: st, mint: m, opt: opt,
-		backoff: map[string]time.Duration{}, lastMintedAt: map[int64]time.Time{}}
+		backoff: map[string]time.Duration{}, lastMintedAt: map[int64]time.Time{},
+		acctHold: map[int64]time.Time{}}
 }
 
 func (s *Scheduler) Mode() types.Mode { return s.opt.Mode }
@@ -313,8 +334,8 @@ func (s *Scheduler) cfg() config.Config { return s.opt.Live.Get() }
 // Deliver 为 accountID 这个账号交付一张 pair。req.Gateway 非空时只考虑那个网关。
 //
 // **「验过满血」不是这条路的承诺**：verify_full_at_deliver 默认**关**
-// （验证要用消费者自己的凭据打两发，恰好烧掉它马上要用的那个窗口），所以默认
-// 交出去的票 verified_full=false。保证来自调度本身：候选都出了冷却、都不在
+// （验证要用消费者自己的凭据多打两发上游，是成本取舍，见 config.Config.VerifyFullAtDeliver），
+// 所以默认交出去的票 verified_full=false。保证来自调度本身：候选都出了冷却、都不在
 // 自己的满血窗口里。任何「反正交付前会验一次」的兜底推理都不成立。
 //
 // **账号必须是参数，不能由调度器自己挑**：槽位是 (账号 × 网关) 二元组，
@@ -1019,10 +1040,15 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 
 	// 没开验证就到这儿为止：**一发上游都不再打**。
 	//
-	// 这不是偷懒，是算过账的：消费账号在一个它没碰过的网关上本来就是满血，而验证
-	// 要用它自己的凭据打一发（先铸一张属于它的活票、再 echo）——那两发恰好烧掉
-	// 它马上要用的那个窗口，验完交出去的已经是个二手落点。加上 state-echo 有假阴
-	// 无假阳（SPEC 第 3 节），关掉只少一个读数，不会把降智的东西放出去。
+	// 这不是偷懒，是算过账的：消费账号在一个它没碰过的网关上本来就是满血，而验证要用它
+	// 自己的凭据打两发（先铸一张属于它的活票、再 echo）—— 那是 2 发上游请求，花在
+	// 「每区每小时 6 发」那个共用预算上。加上 state-echo 有假阴无假阳（SPEC 第 3 节），
+	// 关掉只少一个读数，不会把降智的东西放出去。
+	//
+	// **2026-10-02 修掉的一条过时理由**：这里原先还写着「那两发恰好烧掉它马上要用的那个
+	// 窗口，验完交出去的已经是个二手落点」。那是错的 —— 当天实测满血窗口内连打多发都是满血
+	// （窗口 ≥200s、窗口内 7/7），所以那两发不烧窗口，只是把窗口的计时提前启动。
+	// 要不要开纯粹是成本取舍（见 config.Config.VerifyFullAtDeliver）。
 	// 所以判定如实写 unknown（**不是** degraded：我们没验，不是验坏了，见 markUnverified），
 	// 交付照样记一次触碰——票交出去了，窗口就算烧了，少记一次会让它被当成新鲜的再发一遍。
 	if !s.cfg().VerifyFullAtDeliver {
@@ -1222,6 +1248,18 @@ func (s *Scheduler) lockGateway(name string) func() {
 // 把这件事挂在 want 上会让抽签那条路漏记触碰，下次就把烧过的槽位当新鲜的发出去。
 func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit, sid string,
 	cur types.Pair, want, bias string) (minted, error) {
+	// 被上游 429 按住的号一发都不许打。守卫放在这里而不是各个挑人的地方：mintOnce 是
+	// 所有真实铸票的唯一出口（minterFor 挑的、mintPlan 回落自己上的、scan 和保温的
+	// 都从这儿走），放在挑人处就会漏掉「找不到别人就自己上」那条。
+	//
+	// 包 ErrRateLimited 而不另造一个错：六个 errors.Is 调用点对「这个号铸不动、而且
+	// 一发都没出站」的处理已经全对了（不记触碰、不罚槽位、回 rate_limited），
+	// 新造一个 sentinel 要把那六处挨个补一遍。
+	if left := s.accountHeldFor(a.ID); left > 0 {
+		return minted{}, fmt.Errorf("%w（上游 429 按住了这个账号，还要等 %s）",
+			types.ErrRateLimited, left.Round(time.Second))
+	}
+
 	// 地理只用来给上传者看账本，查不到不影响铸票（同 sid ⇒ 同出口 IP）。
 	obs, gerr := s.mint.Geo(ctx, e, sid)
 	if gerr != nil {
@@ -1273,8 +1311,16 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		if res.ErrBody != "" {
 			msg += "：" + res.ErrBody
 		}
+		// 上游 429 = 这个号现在打不动（额度耗尽 / 打太猛），但它会自己好 ⇒ 不停用，
+		// 按住整个账号等一轮。原来只给**槽位**记一次退避（封顶 60 秒），而额度窗口
+		// 是小时级的，于是池子对着一个打不动的号每分钟重试一遍它的每个槽位，把速率闸
+		// 的配额白白吃光——那个配额本来是留给正经铸票的。
+		if res.Status == 429 {
+			s.holdAccount(a, res.RetryAfter, msg)
+			return minted{}, fmt.Errorf("%w（%s）", types.ErrRateLimited, msg)
+		}
 		// 上游否决这个账号就当场停用：保温/续期是个循环，不停用它会一直按这个
-		// 节奏白打下去（SPEC 第 7 节）。429/5xx 不走这条，那是退避管的事。
+		// 节奏白打下去（SPEC 第 7 节）。5xx 不走这条，那是退避管的事。
 		if types.RejectedByUpstream(res.Status) {
 			if derr := s.st.DisableAccount(a.ID, msg); derr != nil {
 				s.opt.Log.Error("自动停用失败", "account", a.ID, "err", derr)
@@ -1443,6 +1489,11 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 			continue
 		}
 		if throttle > 0 && now.Sub(lastUsed[a.ID]) < throttle {
+			continue
+		}
+		// 被上游 429 按住的号挑了也白挑：mintOnce 的守卫会把它原地撞回来，
+		// 而要票的人已经等了一个往返。池子里还有别人时要挑别人。
+		if s.accountHeldFor(a.ID) > 0 {
 			continue
 		}
 		perRegion, limit := s.mint.Rate(a.Creds.AccountID)
@@ -1791,7 +1842,9 @@ func backoffKey(accountID int64, gateway string) string {
 	return strconv.FormatInt(accountID, 10) + "|" + gateway
 }
 
-// bumpBackoff 翻倍退避，上限 20 分钟。只给硬失败用（非 200、网络错、落点漂移）。
+// bumpBackoff 翻倍退避，从 backoffBase 起、封顶 backoffMax。只给硬失败用
+// （非 200、网络错、落点漂移）。**上游 429 不走这条**，它按住整个账号（holdAccount）：
+// 槽位退避封顶才 1 分钟，而额度窗口是小时级的。
 // 退避时长只记在内存里：进程重启本来就该重新探一遍，落盘反而会把误判带过重启。
 func (s *Scheduler) bumpBackoff(accountID int64, gateway string) {
 	k := backoffKey(accountID, gateway)
@@ -1813,6 +1866,59 @@ func (s *Scheduler) bumpBackoff(accountID int64, gateway string) {
 func (s *Scheduler) holdSlot(accountID int64, gateway string, d time.Duration) {
 	until := s.now().Add(d)
 	_ = s.updateSlot(accountID, gateway, func(sl *types.Slot) { sl.BackoffUntil = until })
+}
+
+// holdAccount 按住整个账号：上游 429 说的是「这个号现在打不动」，不是某个槽位的事。
+// 听上游的 Retry-After，没给就按 acctHoldDefault，一律钳进 (0, acctHoldMax]。
+func (s *Scheduler) holdAccount(a types.Account, retryAfter time.Duration, reason string) {
+	d := retryAfter
+	if d <= 0 {
+		d = acctHoldDefault
+	}
+	if d > acctHoldMax {
+		d = acctHoldMax
+	}
+	until := s.now().Add(d)
+	s.mu.Lock()
+	// 取更晚的那个：同一轮里几个槽位并发撞 429 时别把已经记下的长退避改短。
+	if cur, ok := s.acctHold[a.ID]; !ok || until.After(cur) {
+		s.acctHold[a.ID] = until
+	}
+	s.mu.Unlock()
+	s.opt.Log.Warn("上游按住了这个账号，本轮不再派它铸票", "account", a.ID, "label", a.Label,
+		"hold", d.Round(time.Second), "retry_after", retryAfter.Round(time.Second), "reason", reason)
+}
+
+// AccountHolds 是此刻被上游按住的账号 → 还要等多久。只给管理页的读数用。
+//
+// 为什么非要上页面：这个退避一开，那个号在表里看起来**健康且启用**，却一发都不铸。
+// 没有这一格的话运维对着它只能看出「不干活」，查不出是上游按住了（槽位退避有
+// 「退避 X」那一格，账号级的原来只在 WARN 日志里）。
+func (s *Scheduler) AccountHolds() map[int64]time.Duration {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int64]time.Duration, len(s.acctHold))
+	for id, until := range s.acctHold {
+		if d := until.Sub(now); d > 0 {
+			out[id] = d
+		}
+	}
+	return out
+}
+
+// accountHeldFor 报告这个账号还要被按住多久（0 = 可以用）。
+func (s *Scheduler) accountHeldFor(id int64) time.Duration {
+	s.mu.Lock()
+	until, ok := s.acctHold[id]
+	s.mu.Unlock()
+	if !ok {
+		return 0
+	}
+	if d := until.Sub(s.now()); d > 0 {
+		return d
+	}
+	return 0
 }
 
 func (s *Scheduler) clearBackoff(accountID int64, gateway string) {

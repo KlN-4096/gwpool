@@ -135,6 +135,7 @@
           <td class="a-id">{{.ID}}</td>
           <td class="a-name">{{if .ViewToken}}<a class="clip" href="/a/{{.ViewToken}}" title="{{.Label}}（打开账号页）">{{.Label}}</a>{{else}}<span class="clip" title="{{.Label}}">{{.Label}}</span>{{end}}
             {{- if not .Enabled}} <span class="badge bad">已停用</span>{{end}}
+            {{- if .Held}} <span class="badge warn" title="上游 429 把它按住了（额度耗尽或打太猛）。仍是启用状态，到点自己恢复，不用人去点。">上游按住 {{.Held}}</span>{{end}}
             {{- with .Card.Fails}} <a class="badge bad" href="#fails" title="最近几次没给出票，明细在「取票失败」页签">取票失败 {{len .}}</a>{{end}}</td>
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else if .Plan}}<span class="badge">{{.Plan}}</span>{{end}}</td>
           <td class="a-fetch" data-sort="{{.Card.LastFetchAt}}">{{if .Card.LastFetch}}<span title="{{.Card.LastFetchAt}} UTC">{{.Card.LastFetch}}</span>{{else}}还没取到过{{end}}</td>
@@ -357,7 +358,7 @@
         <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
           <span>票富裕时允许没上传凭据的人取</span></label>
         <label class="choice"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}>
-          <span>交付前用 state-echo 验一次满血 <span class="hint">多花两发上游，而那两发恰好烧掉要交付的那个窗口</span></span></label>
+          <span>交付前用 state-echo 验一次满血 <span class="hint">每次交付多花两发上游（和铸票共用每区每小时那份预算）。不会烧掉窗口，只是让窗口提前开始计时</span></span></label>
         <label class="choice"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}>
           <span>保温时续期已有的路由 Cookie <span class="hint">关掉则只裸铸：同样一发上游花在摸新落点上</span></span></label>
         <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>
