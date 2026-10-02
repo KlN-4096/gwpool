@@ -243,8 +243,14 @@ func (s *Scheduler) PairTarget() int {
 			busiest = n
 		}
 	}
-	// 富余张数是配置项：0 就是「全按需，一发预铸都不打」。见 config.Config.SpareTarget。
-	return min(busiest+s.cfg().SpareTarget, types.GatewayCeiling)
+	// 富余张数是配置项：0 就是「全按需，只补被人用掉的」。见 config.Config.SpareTarget。
+	spare := s.cfg().SpareTarget
+	// 填得比网关总数还大 = 停止预铸，不报错（用户 10-03 定的）：那个数本来就铸不出来，
+	// 照着它补只会每轮白打。目标归零，warmOnce 一发都不打；交付路径的现铸不受影响。
+	if spare > types.GatewayCeiling {
+		return 0
+	}
+	return min(busiest+spare, types.GatewayCeiling)
 }
 
 // premintWasted 报告这一轮预铸没人能用：所有托管号在所有已知网关上都还在

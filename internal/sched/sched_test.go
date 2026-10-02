@@ -1857,6 +1857,23 @@ func TestPairTargetCappedAtGatewayCeiling(t *testing.T) {
 	}
 }
 
+// 富余张数填超过网关总数上限 = 停止预铸（不报错）：目标归零，保温一发都不打。
+func TestSpareOverCeilingStopsPremint(t *testing.T) {
+	s, st, mn, _ := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	s.markDemand()
+	c := s.opt.Live.Get()
+	c.SpareTarget = types.GatewayCeiling + 1
+	s.opt.Live = config.NewLive("", c)
+	if got := s.PairTarget(); got != 0 {
+		t.Fatalf("富余张数超过上限时目标应是 0（停止预铸），实为 %d", got)
+	}
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("富余张数超过上限还预铸了 %d 发", n)
+	}
+}
+
 // 续期失败预算：同一张 pair 连败 RenewFailBudget 次就把它丢掉，下一轮改裸铸。
 // **网关不许被拉黑**——续不上的是这张票，别的号随时可能在这个网关上铸出新的。
 func TestDeadPairDroppedAfterRenewFailures(t *testing.T) {

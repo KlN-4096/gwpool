@@ -506,7 +506,8 @@ const AnonPrefix = "anon:"
 // 来取票时不用现等铸票（一发上游要几秒到几十秒）。
 //
 // 目标超过**已知**网关数时，缺口靠裸铸和探索扫描摸新网关来补；超过**上游网关总数**
-// 的那部分永远补不上，所以封顶在 GatewayCeiling。
+// 的那部分永远补不上，所以封顶在 GatewayCeiling。SpareTarget 自己填得比 GatewayCeiling
+// 还大 = 停止预铸（不报错）。
 const SpareTarget = 2
 
 // GatewayCeiling 是上游网关总数的保守上限：活 pair 数（一个网关一张）不可能超过它。

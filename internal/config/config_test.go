@@ -385,15 +385,16 @@ func TestSpareTargetZeroIsMeaningful(t *testing.T) {
 	}
 }
 
-// 富余张数超过网关总数上限就拒：多半是把「目标总张数」填进了「富余几张」。
-func TestSpareTargetCappedAtGatewayCeiling(t *testing.T) {
-	over := fmt.Sprintf(`{"spare_target":%d,`, types.GatewayCeiling+1) + okProxies + `}`
-	if _, err := Load(writeCfg(t, over)); err == nil {
-		t.Fatal("超过网关总数上限的 spare_target 没被拒")
+// 富余张数填超过网关总数上限不报错：那表示停止预铸（见 sched.PairTarget），
+// 不该让整份配置存不进去。
+func TestSpareTargetOverCeilingIsAccepted(t *testing.T) {
+	body := fmt.Sprintf(`{"spare_target":%d,`, types.GatewayCeiling+1) + okProxies + `}`
+	cfg, err := Load(writeCfg(t, body))
+	if err != nil {
+		t.Fatalf("超过上限的 spare_target 被拒了: %v", err)
 	}
-	at := fmt.Sprintf(`{"spare_target":%d,`, types.GatewayCeiling) + okProxies + `}`
-	if _, err := Load(writeCfg(t, at)); err != nil {
-		t.Fatalf("恰好等于上限也被拒了: %v", err)
+	if cfg.SpareTarget != types.GatewayCeiling+1 {
+		t.Fatalf("读出来变成了 %d", cfg.SpareTarget)
 	}
 }
 

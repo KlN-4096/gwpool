@@ -350,7 +350,7 @@
             <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
           <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。<strong>交付前验证开着时</strong>每多试一个就多花一发上游（state-echo），关着时试的都是已有活票的网关、一发都不打</span>
             <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>
-          <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2。目标张数 = 最忙的号用过的张数 + 这个数，最多 190：上游网关总共约 190–201 个，再多也铸不出来</span>
+          <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2。目标张数 = 最忙的号用过的张数 + 这个数，最多 190（上游网关总共约 190–201 个）。填超过 190 = 停止预铸</span>
             <input name="spare_target" inputmode="numeric" value="{{.SpareTarget}}"></label>
           <label>对外开放门槛（托管账号数） <span class="hint">托管账号少于这个数就只服务上传者。按账号数而不按活 pair 数：按需铸票的池子不囤票。默认按冷却推导，4 小时冷却 = 12 个</span>
             <input name="min_accounts" inputmode="numeric" value="{{.MinAccounts}}"></label>
