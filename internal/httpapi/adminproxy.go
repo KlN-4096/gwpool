@@ -167,8 +167,9 @@ func proxyFromForm(form url.Values, cur config.Config) (config.Proxy, error) {
 		return p, errors.New("表单里有不是 UTF-8 的字节")
 	case p.Name == "" || utf8.RuneCountInString(p.Name) > 32 || strings.ContainsFunc(p.Name, unicode.IsControl):
 		return p, errors.New("名称必填，不超过 32 个字，不能有控制字符")
-	case p.Kind != config.KindNovproxy && p.Kind != config.KindWebshare:
-		return p, fmt.Errorf("类型只能是 %s 或 %s：别家供应商的用户名拼法得先加进代码", config.KindNovproxy, config.KindWebshare)
+	case p.Kind != config.KindNovproxy && p.Kind != config.KindWebshare && p.Kind != config.KindSeed:
+		return p, fmt.Errorf("类型只能是 %s、%s 或 %s：别家供应商的用户名拼法得先加进代码",
+			config.KindNovproxy, config.KindWebshare, config.KindSeed)
 	case !hostPort(p.Host):
 		return p, errors.New("地址要写成「主机:端口」，例如 us.novproxy.io:1000，不带 socks5://")
 	case p.User == "" || pass == "":
@@ -177,6 +178,14 @@ func proxyFromForm(form url.Values, cur config.Config) (config.Proxy, error) {
 	case len(p.User) > 200 || len(pass) > 255 ||
 		strings.ContainsFunc(p.User, unicode.IsControl) || strings.ContainsFunc(pass, unicode.IsControl):
 		return p, errors.New("用户名或密码太长，或者含控制字符")
+	}
+	// 种子出口只有第一条启用着的会被用到（config.SeedProxy），加第二条是静默无效的，
+	// 在这儿说出来，别让人加完以后去查「为什么没生效」。
+	if p.Kind == config.KindSeed {
+		if q, ok := cur.SeedProxy(); ok {
+			return p, fmt.Errorf("已经有一条启用着的种子出口 %q 了：这一类只会用第一条，"+
+				"要换先把它停用", q.Name)
+		}
 	}
 	for _, q := range cur.Proxies {
 		if q.Name == p.Name {

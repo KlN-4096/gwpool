@@ -29,6 +29,8 @@ var novProxy = config.Proxy{Name: "nov", Kind: config.KindNovproxy,
 	Host: "us.novproxy.io:1000", User: "u100806", Pass: "pw", Enabled: true}
 var wsProxy = config.Proxy{Name: "ws", Kind: config.KindWebshare,
 	Host: "p.webshare.io:1080", User: "wsu", Pass: "wsp", Enabled: true}
+var seedProxy = config.Proxy{Name: "bv", Kind: config.KindSeed,
+	Host: "127.0.0.1:35444", User: "su", Pass: "sp", Enabled: true}
 
 // fakeOailb 造一个形状正确的 __oailb：ES256 JWT，payload.host 的第三段是网关名。
 // 签名是假的——实现刻意不校验签名（密钥在上游手里，校验不了）。
@@ -51,6 +53,139 @@ func newClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server) {
 // 这个参数不是装饰：「上游没下发新 cookie」只有在它可证还活着时才等于「路由没变」，
 // 死了的话那一发是随机路由走的（见 Mint 里那段注释）。
 func liveCflb() time.Time { return time.Now().Add(types.PairLifetime) }
+
+func TestCflbOnlyKeepsOnlyTheRoutingCookie(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"__cflb=CF; __oailb=OAI", "__cflb=CF"},
+		{"__oailb=OAI; __cflb=CF", "__cflb=CF"},
+		{"__cflb=CF", "__cflb=CF"},
+		{"__oailb=OAI", ""}, // 没有 __cflb 就钉不住任何路由，当种子是零价值的
+		{"", ""},
+	} {
+		if got := CflbOnly(tc.in); got != tc.want {
+			t.Errorf("CflbOnly(%q) = %q，想要 %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// 绑在种子出口上的 sid，出站**必须**只带 __cflb。
+//
+// 为什么要在这一层钉死：两件齐送时上游一个 cookie 都不回（2026-10-02 实测），落点就
+// 读不出来，而带种子铸票唯一想要的就是那个读数 —— 漏摘的话这一发静默白打，没人会发现。
+// 顺带钉住第二件事：回来那张新 pair 不能带着种子那张**别人的** __oailb。
+func TestSeedBoundSIDSendsOnlyTheCflb(t *testing.T) {
+	exp := time.Now().Add(types.OailbLifetime).Truncate(time.Second).UTC()
+	var gotCookie string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("cookie")
+		// 只送 cflb 时上游必回新 __oailb（这正是落点读得出来的原因），不回新 cflb。
+		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-94", exp)+"; Path=/")
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{Upstream: srv.URL, GeoURL: srv.URL, HTTP: srv.Client(),
+		Proxies: []config.Proxy{seedProxy}}
+
+	sid, err := c.NewSeedSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := "__cflb=SEEDCF; __oailb=" + fakeOailb("unified-88", exp)
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "JP"}, sid, seed, liveCflb())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCookie != "__cflb=SEEDCF" {
+		t.Errorf("出站 cookie 该只有 __cflb，得到 %q", gotCookie)
+	}
+	// 落点是这一发自己摸到的那个，不是种子票指向的 unified-88。
+	if res.Gateway != "unified-94" {
+		t.Errorf("落点该是 unified-94，得到 %q", res.Gateway)
+	}
+	if strings.Contains(res.NewPair, "unified-88") {
+		t.Errorf("新 pair 不该带着种子那张别人的 __oailb: %q", res.NewPair)
+	}
+	if !strings.Contains(res.NewPair, "__cflb=SEEDCF") {
+		t.Errorf("新 pair 该留着钉路由的 __cflb（上游没补发）: %q", res.NewPair)
+	}
+}
+
+// 非种子出口一个字都不该变：照旧两件齐送。
+func TestNonSeedSIDStillSendsTheWholePair(t *testing.T) {
+	exp := time.Now().Add(types.OailbLifetime).Truncate(time.Second).UTC()
+	var gotCookie string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("cookie")
+		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-88", exp)+"; Path=/")
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{Upstream: srv.URL, GeoURL: srv.URL, HTTP: srv.Client(),
+		Proxies: []config.Proxy{novProxy}}
+
+	sid, err := c.NewSID(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := "__cflb=CF; __oailb=" + fakeOailb("unified-88", exp)
+	if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "JP"}, sid, seed, liveCflb()); err != nil {
+		t.Fatal(err)
+	}
+	if gotCookie != seed {
+		t.Errorf("住宅出口该原样两件齐送，得到 %q", gotCookie)
+	}
+}
+
+// 种子那条路上游没回新 __oailb ⇒ 落点读不出来 ⇒ 必须报 ErrNoLanding。
+//
+// 不能把种子票里那个旧名字当落点：那是**别人的**网关，认下来就等于把一张没有落点的票
+// 写进账本，还会把触碰记在没打到的网关上。
+func TestSeedShotWithoutNewOailbHasNoLanding(t *testing.T) {
+	exp := time.Now().Add(types.OailbLifetime).Truncate(time.Second).UTC()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200) // 一个 cookie 都不回
+	}))
+	t.Cleanup(srv.Close)
+	c := &Client{Upstream: srv.URL, GeoURL: srv.URL, HTTP: srv.Client(),
+		Proxies: []config.Proxy{seedProxy}}
+
+	sid, err := c.NewSeedSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := "__cflb=SEEDCF; __oailb=" + fakeOailb("unified-88", exp)
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "JP"}, sid, seed, liveCflb())
+	if !errors.Is(err, ErrNoLanding) {
+		t.Fatalf("该报 ErrNoLanding，得到 err=%v res=%+v", err, res)
+	}
+	if res.Gateway != "" {
+		t.Errorf("落点该留空，不该认种子票里那个别人的网关，得到 %q", res.Gateway)
+	}
+}
+
+// 没配种子出口时 NewSeedSID 要报 ErrNoProxy，调用方据此回落住宅。
+func TestNewSeedSIDNeedsASeedProxy(t *testing.T) {
+	if _, err := (&Client{Proxies: []config.Proxy{novProxy}}).NewSeedSID(); !errors.Is(err, ErrNoProxy) {
+		t.Fatalf("只有住宅出口时该报 ErrNoProxy，得到 %v", err)
+	}
+	off := seedProxy
+	off.Enabled = false
+	if _, err := (&Client{Proxies: []config.Proxy{off}}).NewSeedSID(); !errors.Is(err, ErrNoProxy) {
+		t.Fatalf("种子出口停用了也该报 ErrNoProxy，得到 %v", err)
+	}
+}
+
+// 种子出口的用户名原样是 p.User：不带 region/sid 段，也不该被出口合法性闸拦下来。
+func TestSeedProxyUserIsVerbatim(t *testing.T) {
+	// 带城市的出口：住宅那边会把它拼进用户名，种子这边必须一个字节都不拼。
+	got, err := proxyUser(seedProxy, types.Exit{Region: "US", City: "Seattle"}, "sid1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != seedProxy.User {
+		t.Fatalf("种子出口用户名该是 %q，得到 %q", seedProxy.User, got)
+	}
+}
 
 // SPEC 第 2 节第一条：下发了新 __oailb ⇒ 落点 = JWT host 第三段。
 func TestMintNewCookieGivesGateway(t *testing.T) {

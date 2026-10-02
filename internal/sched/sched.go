@@ -53,7 +53,7 @@ type Store interface {
 	RegionMints() map[string]types.RegionMint
 
 	// NoteRegionMint 记一次成功的铸票：挑下一个铸票者就看这本账。
-	NoteRegionMint(accountID int64, regionKey string, at time.Time) error
+	NoteRegionMint(accountID int64, regionKey, gateway string, at time.Time) error
 
 	// UpdateSlot 在存储的写锁内读-改-写一个槽位。
 	// 必须是原子的：交付（写 LastTouch）、判定（写 LastVerdict）、续期循环会并发改
@@ -90,6 +90,13 @@ type Store interface {
 type Minter interface {
 	types.Minter
 	NewSID(sticky bool) (string, error)
+
+	// NewSeedSID 要一个绑在普通机房出口上的 sid，给「带种子 `__cflb` 铸票」用。
+	//
+	// 它**不粘性**（同一个 sid 不保证同一个出口 IP），所以只能用在「路由由 cookie
+	// 决定、出口无所谓」的场合，不能用来做需要配对的 state-echo。
+	// 没配这条出口就回错，调用方据此回落到住宅出口。
+	NewSeedSID() (string, error)
 
 	// Rate 报这个上游账号本小时**各区域**各打了几发，以及每区的上限。
 	// 挑铸票者要据此跳过「九个区域全打满」的号——不先问一声的话，
@@ -589,15 +596,22 @@ func (s *Scheduler) noteTryFailure(ctx context.Context, consumer types.Account, 
 // 和保温的「深度目标」是同一个读数（livePairs 就是它的别名）：两份实现会让
 // 「硬筛」和「该不该预铸」用两把尺子量同一件事。
 // 门槛**不跟 min_remaining 走**：这是池子自己的健康度，不是某一个调用方的偏好。
-func (s *Scheduler) FreeGateways() int {
+func (s *Scheduler) FreeGateways() int { return len(s.liveGateways()) }
+
+// liveGateways 是此刻有一张「还够交付」的 pair 的网关集合。
+//
+// 预铸要的是集合不只是个数：「我预测要落到的那个网关现在有没有活票」才是
+// 「这一发会不会白打」的判据，而旧版那个「铸完看总数涨没涨」的比对会把
+// 「别的票刚好在这几秒里过期」算成自己白打了。
+func (s *Scheduler) liveGateways() map[string]bool {
 	now := s.now()
-	n := 0
+	out := map[string]bool{}
 	for name := range s.st.Gateways() {
 		if p, ok := s.st.Pair(name); ok && p.ExpiresAt.Sub(now) >= types.DeliverFloor {
-			n++
+			out[name] = true
 		}
 	}
-	return n
+	return out
 }
 
 // PublicState 是「此刻对外开不开放」的全部读数。公开页要显示它，这是对外承诺。
@@ -887,7 +901,7 @@ func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gate
 		// 补 pair 那一发交给别人打：它会烧掉铸票者在这个网关上的窗口，
 		// 烧消费者自己的就等于白跑一趟。出口已经由网关定死，所以只要人、不要它挑的区域。
 		// 交付路径不节流：有人在等着拿 pair。
-		if sc, _, ok := s.minterFor(exit, consumer.ID, 0); ok {
+		if sc, _, ok := s.minterFor(exit, consumer.ID, 0, nil); ok {
 			minter = sc
 		}
 	}
@@ -1340,8 +1354,9 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	if _, err := s.st.UpsertGateway(res.Gateway, a.ID, e); err != nil {
 		s.opt.Log.Warn("记网关失败", "gateway", res.Gateway, "err", err)
 	}
-	// 记进 (账号 × 区域) 台账：挑下一个铸票者时「这个号哪个区域还没走过」全靠它。
-	if err := s.st.NoteRegionMint(a.ID, types.RegionKeyOf(e), at); err != nil {
+	// 记进 (账号 × 区域) 台账：挑下一个铸票者时「这个号哪个区域还没走过」、
+	// 以及「再派这个组合会落到哪」全靠它。
+	if err := s.st.NoteRegionMint(a.ID, types.RegionKeyOf(e), res.Gateway, at); err != nil {
 		s.opt.Log.Warn("记区域台账失败", "account", a.ID, "err", err)
 	}
 
@@ -1408,7 +1423,7 @@ func (s *Scheduler) usable() []types.Account {
 // exclude 是要票的那个账号：铸票那一发会烧掉执行者在新落点上的窗口，让要票的人
 // 自己去就等于白跑一趟——它找到的每个新网关都被那一发当场烧掉。
 func (s *Scheduler) PickMinter(exclude int64) (types.Account, types.Region, bool) {
-	return s.minterFor(types.Exit{}, exclude, 0)
+	return s.minterFor(types.Exit{}, exclude, 0, nil)
 }
 
 // mintPlan 给按区域铸定「派谁去、从哪个区域出发」（见 mintByRegion）。
@@ -1418,7 +1433,7 @@ func (s *Scheduler) PickMinter(exclude int64) (types.Account, types.Region, bool
 // 那几个区域里反复抽签强：前者有机会落到没烧过的网关，后者几乎必然落回烧过的。
 func (s *Scheduler) mintPlan(consumer types.Account) (types.Account, types.Region, bool) {
 	if s.opt.Mode == types.ModePool {
-		if a, r, ok := s.minterFor(types.Exit{}, consumer.ID, 0); ok {
+		if a, r, ok := s.minterFor(types.Exit{}, consumer.ID, 0, nil); ok {
 			return a, r, true
 		}
 	}
@@ -1436,7 +1451,7 @@ func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
 			lifetime[m.RegionKey] = m.Count
 		}
 	}
-	r, _, ok := bestRegion(types.Exit{}, perRegion, limit, lifetime)
+	r, _, ok := bestRegion(types.Exit{}, perRegion, limit, lifetime, nil)
 	return r, ok
 }
 
@@ -1458,7 +1473,11 @@ func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
 //
 // throttle > 0 时跳过「刚铸过票不到这么久」的账号（保温路径用；交付路径传 0，
 // 那边有人在等，节流会直接变成服务不可用）。
-func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Duration) (types.Account, types.Region, bool) {
+//
+// skip 非 nil 时按 (账号, 区域) 再筛一道，预铸用它排掉「这一轮已经试过」和「预测落点
+// 已经有活票」的组合。交付路径传 nil：那边有人在等票，少一个候选就可能直接变成 503。
+func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Duration,
+	skip func(accountID int64, regionKey string) bool) (types.Account, types.Region, bool) {
 	now := s.now()
 	s.mu.Lock()
 	lastUsed := make(map[int64]time.Time, len(s.lastMintedAt))
@@ -1501,9 +1520,13 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		for _, n := range perRegion {
 			total += n
 		}
-		pick, picked, ok := bestRegion(want, perRegion, limit, lifetime[a.ID])
+		var drop func(string) bool
+		if skip != nil {
+			drop = func(key string) bool { return skip(a.ID, key) }
+		}
+		pick, picked, ok := bestRegion(want, perRegion, limit, lifetime[a.ID], drop)
 		if !ok {
-			continue // 九个区域（或点名的那一个）本小时都打满了
+			continue // 九个区域（或点名的那一个）本小时都打满了、或者都被 skip 排掉了
 		}
 		cs = append(cs, cand{a: a, r: pick, sent: total, unseen: picked == 0, used: lastUsed[a.ID]})
 	}
@@ -1530,11 +1553,17 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 //
 // limit <= 0 当「不设限」：只有没接配置的裸 mint.Client 会这样，生产的
 // mint.perRegionHour 永远回正数。
-func bestRegion(want types.Exit, perRegion map[string]int, limit int, lifetime map[string]int) (types.Region, int, bool) {
+//
+// drop 非 nil 时再排掉它说不要的区域（预铸用，见 minterFor 的 skip）。
+func bestRegion(want types.Exit, perRegion map[string]int, limit int, lifetime map[string]int,
+	drop func(regionKey string) bool) (types.Region, int, bool) {
 	var best types.Region
 	bestCount, found := 0, false
 	for _, r := range candidateRegions(want) {
 		if limit > 0 && perRegion[r.Key] >= limit {
+			continue
+		}
+		if drop != nil && drop(r.Key) {
 			continue
 		}
 		n := lifetime[r.Key]

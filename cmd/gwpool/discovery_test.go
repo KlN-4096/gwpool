@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -29,6 +30,8 @@ func (stubMinter) Geo(context.Context, types.Exit, string) (types.Observed, erro
 }
 
 func (stubMinter) NewSID(bool) (string, error) { return "sid", nil }
+
+func (stubMinter) NewSeedSID() (string, error) { return "", errors.New("没配种子出口") }
 
 func (stubMinter) Rate(string) (map[string]int, int) { return map[string]int{}, 6 }
 

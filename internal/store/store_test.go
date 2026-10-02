@@ -929,15 +929,15 @@ func TestRegionMintLedgerPersists(t *testing.T) {
 	}
 	at := time.Now().UTC().Truncate(time.Second)
 	for i := 0; i < 3; i++ {
-		if err := s.NoteRegionMint(a.ID, "us-east", at); err != nil {
+		if err := s.NoteRegionMint(a.ID, "us-east", "", at); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := s.NoteRegionMint(a.ID, "oceania", at); err != nil {
+	if err := s.NoteRegionMint(a.ID, "oceania", "", at); err != nil {
 		t.Fatal(err)
 	}
 	// 反查不到区域的出口（手改 state.json 才有）不记：空 key 会和别的格子串在一起。
-	if err := s.NoteRegionMint(a.ID, "", at); err != nil {
+	if err := s.NoteRegionMint(a.ID, "", "", at); err != nil {
 		t.Fatal(err)
 	}
 	_ = s.Close()
@@ -974,7 +974,7 @@ func TestDeleteAccountDropsRegionMints(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	for _, id := range []int64{a.ID, b.ID} {
-		if err := s.NoteRegionMint(id, "us-east", now); err != nil {
+		if err := s.NoteRegionMint(id, "us-east", "", now); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -405,10 +405,34 @@ func TestSchedulingKnobsRejectNegatives(t *testing.T) {
 		`{"slot_cooldown_minutes":-1,` + okProxies + `}`,
 		`{"max_tries_per_deliver":-1,` + okProxies + `}`,
 		`{"spare_target":-1,` + okProxies + `}`,
+		`{"mint_concurrency":-1,` + okProxies + `}`,
 	} {
 		if _, err := Load(writeCfg(t, body)); err == nil {
 			t.Errorf("该被拒: %s", body)
 		}
+	}
+}
+
+// 预铸并发封顶在区域数：同一个区域一次只许一发裸铸在打（sched.claimRegion），
+// 填得更大的那几个 worker 只会卡在抢区域上空转。缺键时要回 1（串行，老行为）。
+func TestMintConcurrencyBounds(t *testing.T) {
+	body := fmt.Sprintf(`{"mint_concurrency":%d,`, len(types.Regions)+1) + okProxies + `}`
+	if _, err := Load(writeCfg(t, body)); err == nil {
+		t.Errorf("超过区域数的 mint_concurrency 该被拒")
+	}
+	cfg, err := Load(writeCfg(t, `{`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.MintWorkers(); got != 1 {
+		t.Fatalf("缺键时该是串行 1，拿到 %d", got)
+	}
+	// 显式 0 也走默认：0 个 worker 等于保温彻底不铸票，那不是任何人想要的配置。
+	if cfg, err = Load(writeCfg(t, `{"mint_concurrency":0,`+okProxies+`}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.MintWorkers(); got != 1 {
+		t.Fatalf("显式 0 该回落到 1，拿到 %d", got)
 	}
 }
 

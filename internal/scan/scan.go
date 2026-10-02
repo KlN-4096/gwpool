@@ -199,7 +199,7 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 	}
 	// 记进 (账号 × 区域) 台账：挑下一个铸票者时「这个号哪个区域还没走过」全靠它，
 	// 而没走过的区域才可能有没见过的落点。
-	if err := s.Store.NoteRegionMint(acct.ID, r.Key, now); err != nil {
+	if err := s.Store.NoteRegionMint(acct.ID, r.Key, res.Gateway, now); err != nil {
 		return Landing{}, fmt.Errorf("记区域台账: %w", err)
 	}
 	// 这一发本身就是这个账号对这个网关的一次接触，满血窗口已经开始烧了，记上。

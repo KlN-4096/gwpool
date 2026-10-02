@@ -45,6 +45,12 @@ const (
 	KindNovproxy ProxyKind = "novproxy"
 	// KindWebshare 机房代理，每连接换 IP：<user>-<CC>-rotate
 	KindWebshare ProxyKind = "webshare"
+	// KindSeed 是我们自己的普通机房代理，用户名里不带任何定向段，原样送出去。
+	//
+	// 它**选不了地理**，所以只做一件事：带着某个大区的种子 `__cflb` 去摸这个账号
+	// 在那个大区的网关（2026-10-03 实测，见 docs 和 mint.Client.NewSeedSID）。
+	// 不参与住宅轮转——`Sticky()` 返回 false 把它挡在 StickyProxies 外面。
+	KindSeed ProxyKind = "seed"
 )
 
 // Proxy 是一个出口代理供应商。
@@ -195,6 +201,27 @@ type Config struct {
 	// 代价同样具体：预铸出来没人取、65 分钟后自然过期的那几张就是纯浪费的请求和槽位。
 	// 想把上游请求压到最低就调 0。
 	SpareTarget int `json:"spare_target"`
+
+	// MintConcurrency 是预铸同时派几个**不同账号**去铸票，0 时按 Defaults（1 = 串行）。
+	//
+	// 并发是**跨账号**的：同一个号仍然串行（store.LockAccount，SPEC 红线 2），同一个区域
+	// 也仍然一次只许一发裸铸在打（sched.claimRegion）⇒ 实际并发物理封顶在九个区域。
+	// 调大它买的是「一轮就把缺口补完」，代价是上游请求更密，而打得密本身就是封号特征
+	// （见 sched.Options.RenewGap）。
+	MintConcurrency int `json:"mint_concurrency"`
+}
+
+// defaultMintConcurrency 是 mint_concurrency 缺键时的取值。写成常量是因为 Defaults
+// 和 MintWorkers 都要用它：分开写的话老配置文件（没这个键）走的是 MintWorkers 那一份，
+// 两边分叉没人会发现。
+const defaultMintConcurrency = 1
+
+// MintWorkers 是当前生效的预铸并发数。
+func (c Config) MintWorkers() int {
+	if c.MintConcurrency > 0 {
+		return c.MintConcurrency
+	}
+	return defaultMintConcurrency
 }
 
 // SlotCooldown 是当前生效的槽位冷却时长。
@@ -243,6 +270,7 @@ func Defaults() Config {
 		SlotCooldownMinutes:   int(types.SlotCooldown / time.Minute),
 		MaxTriesPerDeliver:    2,
 		SpareTarget:           types.SpareTarget,
+		MintConcurrency:       defaultMintConcurrency,
 		// 这两个开关默认关，理由在字段注释里：两个都是「花一个满血窗口换一个读数」。
 		VerifyFullAtDeliver: false,
 		RenewPairs:          false,
@@ -269,6 +297,18 @@ func (c Config) StickyProxies() []Proxy {
 		}
 	}
 	return out
+}
+
+// SeedProxy 返回启用着的那条普通机房代理（没有则 ok=false）。
+//
+// 只取第一条：它不做地理定向，多配几条也没有轮转的意义，谁在第一位就用谁。
+func (c Config) SeedProxy() (Proxy, bool) {
+	for _, p := range c.Proxies {
+		if p.Enabled && p.Kind == KindSeed {
+			return p, true
+		}
+	}
+	return Proxy{}, false
 }
 
 // EnabledProxies 返回启用着的全部供应商。
@@ -324,6 +364,15 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.MaxTriesPerDeliver < 0 {
 		return Config{}, fmt.Errorf("max_tries_per_deliver 不能为负（0 = 用默认值）")
+	}
+	if cfg.MintConcurrency < 0 {
+		return Config{}, fmt.Errorf("mint_concurrency 不能为负（0 = 用默认值 %d = 串行）", defaultMintConcurrency)
+	}
+	// 九个区域是物理上限：同一个区域一次只许一发裸铸在打（sched.claimRegion），
+	// 填得更大只会让多出来的 worker 全卡在抢区域上空转。
+	if n := len(types.Regions); cfg.MintConcurrency > n {
+		return Config{}, fmt.Errorf("mint_concurrency 最多 %d：同一个区域一次只许一发裸铸在打，"+
+			"九个区域就是并发的物理上限", n)
 	}
 	if cfg.MaxTriesPerDeliver == 0 {
 		cfg.MaxTriesPerDeliver = Defaults().MaxTriesPerDeliver
@@ -404,9 +453,9 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("proxies[%d] 缺 name", i)
 		case seen[p.Name]:
 			return Config{}, fmt.Errorf("proxies 里 name %q 重复", p.Name)
-		case p.Kind != KindNovproxy && p.Kind != KindWebshare:
-			return Config{}, fmt.Errorf("proxies[%s] 的 kind %q 不认，只有 %q 和 %q",
-				p.Name, p.Kind, KindNovproxy, KindWebshare)
+		case p.Kind != KindNovproxy && p.Kind != KindWebshare && p.Kind != KindSeed:
+			return Config{}, fmt.Errorf("proxies[%s] 的 kind %q 不认，只有 %q、%q 和 %q",
+				p.Name, p.Kind, KindNovproxy, KindWebshare, KindSeed)
 		case p.Host == "" || p.User == "" || p.Pass == "":
 			return Config{}, fmt.Errorf("proxies[%s] 的 host/user/pass 都必填", p.Name)
 		}

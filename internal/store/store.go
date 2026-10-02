@@ -993,12 +993,16 @@ func (s *Store) RegionMints() map[string]types.RegionMint {
 	return out
 }
 
-// NoteRegionMint 记一次**成功**的铸票：计数 +1，记下时刻。
+// NoteRegionMint 记一次**成功**的铸票：计数 +1，记下时刻和落点。
 //
 // 只记成功的，见 types.RegionMint 的注释。regionKey 为空（出口反查不到区域，
 // 只可能来自手改的 state.json）时什么都不做：那一格画不到九宫格上去，
 // 记了也只是让 state.json 长出一行谁都不读的垃圾。
-func (s *Store) NoteRegionMint(accountID int64, regionKey string, at time.Time) error {
+//
+// gateway 为空就**保留**上一次的落点，不清掉：读不出落点的那种成功（送进去的 pair
+// 被上游接受、没回新 cookie）并不意味着这个组合的落点变了，而清掉会让预铸把这个
+// 组合重新当成「没铸过」、再去白打一发。
+func (s *Store) NoteRegionMint(accountID int64, regionKey, gateway string, at time.Time) error {
 	if regionKey == "" {
 		return nil
 	}
@@ -1010,6 +1014,9 @@ func (s *Store) NoteRegionMint(accountID int64, regionKey string, at time.Time) 
 	m.AccountID, m.RegionKey = accountID, regionKey
 	m.Count++
 	m.LastAt = at
+	if gateway != "" {
+		m.Gateway = gateway
+	}
 	s.st.Mints[k] = m
 	if err := s.save(); err != nil {
 		if had {

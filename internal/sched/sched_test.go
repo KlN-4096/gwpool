@@ -180,7 +180,7 @@ func (f *fakeStore) RegionMints() map[string]types.RegionMint {
 	return out
 }
 
-func (f *fakeStore) NoteRegionMint(accountID int64, regionKey string, at time.Time) error {
+func (f *fakeStore) NoteRegionMint(accountID int64, regionKey, gateway string, at time.Time) error {
 	if regionKey == "" {
 		return nil // 照 store 的语义：画不到九宫格上的格子不记
 	}
@@ -191,6 +191,9 @@ func (f *fakeStore) NoteRegionMint(accountID int64, regionKey string, at time.Ti
 	m.AccountID, m.RegionKey = accountID, regionKey
 	m.Count++
 	m.LastAt = at
+	if gateway != "" {
+		m.Gateway = gateway // 照 store 的语义：读不出落点时保留上一次的，不清掉
+	}
 	f.mints[k] = m
 	return nil
 }
@@ -282,11 +285,14 @@ func (f *fakeStore) AppendSample(sm types.Sample) error {
 const cookiePrefix = "__cflb=cf; __oailb="
 
 type fakeMinter struct {
-	mu    sync.Mutex
-	clk   *clock
-	land  map[string]string // exitKey → 落点网关
-	full  map[string]bool   // 网关 → state-echo 判满血
-	delay time.Duration
+	mu   sync.Mutex
+	clk  *clock
+	land map[string]string // exitKey → 落点网关
+	// landByAcct 是 (账号 × 大区) → 落点网关，key = comboKey(id, exitKey)。
+	// 比 land 优先：真实机制里网关 = f(账号, 大区)，同一个出口不同账号落不同网关。
+	landByAcct map[string]string
+	full       map[string]bool // 网关 → state-echo 判满血
+	delay      time.Duration
 
 	noNewPair bool // 模拟「上游接受了送进去的 pair，不下发新 cookie」
 	// drift 是「预期落点 → 实际落点」：出口只能把落点倾向到某个网关，定不住。
@@ -305,7 +311,12 @@ type fakeMinter struct {
 	// 零值 = 上游没给（429 的账号级退避该回落到默认时长）。
 	mintRetryAfter time.Duration
 
-	sidErr    error
+	sidErr error
+	// seedSIDErr 非 nil 时「没配种子出口」，预铸该回落到住宅（NewSID）。
+	seedSIDErr error
+	// seedSent 记每一发带种子铸票送进去的 cookie，key = sid。
+	// 用它证明「有活种子票时走的是种子出口、而且把那张票送出去了」。
+	seedSent  map[string]string
 	sidSeq    int
 	mints     []types.Sample // 只借这个结构记 (account, gateway) 调用流水
 	echoes    int
@@ -397,8 +408,24 @@ func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid,
 	}
 	m.mu.Lock()
 	gw := m.land[exitKey(e)]
-	if sentPair != "" {
-		gw = gwOf(sentPair) // 带 pair 就留在那个网关上
+	// 落点先看 (账号 × 大区)：这是真实机制（同账号同出口连铸 5 发落点逐字相同，
+	// 同出口不同账号落不同网关）。没铺这一格的用例退回只按出口算，行为不变。
+	if byAcct := m.landByAcct[comboKey(id, exitKey(e))]; byAcct != "" {
+		gw = byAcct
+	}
+	seeded := strings.HasPrefix(sid, "seed")
+	switch {
+	case seeded:
+		// 带**种子**票铸票：`__cflb` 只钉大区，具体网关仍由 (账号 × 大区) 决定，
+		// 所以落点**不是**送进去那张票的网关。这一格就是整条种子路的全部要害——
+		// 写成 gwOf(sentPair) 的话这个 fake 会把「摸到自己的新网关」变成
+		// 「原地留在别人的网关上」，整类 bug 在套子里不可达。
+		if m.seedSent == nil {
+			m.seedSent = map[string]string{}
+		}
+		m.seedSent[sid] = sentPair
+	case sentPair != "":
+		gw = gwOf(sentPair) // 续期：带着自己那张 pair 回同一个网关
 	}
 	// 漂移：出口只能把落点「倾向」到某个网关，定不住。没有这个旋钮的话这个 fake
 	// 结构性地永不漂移（两条路都写死「落点 = 预期落点」），于是整类漂移 bug
@@ -496,6 +523,18 @@ func (m *fakeMinter) NewSID(sticky bool) (string, error) {
 	return fmt.Sprintf("sid%05d", m.sidSeq), nil
 }
 
+// NewSeedSID 照真实 mint 的语义：绑在普通机房出口上的 sid，没配那条出口就报错。
+// sid 前缀和 NewSID 分开，用例据此断言这一发走的是哪条出口。
+func (m *fakeMinter) NewSeedSID() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.seedSIDErr != nil {
+		return "", m.seedSIDErr
+	}
+	m.sidSeq++
+	return fmt.Sprintf("seed%05d", m.sidSeq), nil
+}
+
 func (m *fakeMinter) Geo(ctx context.Context, e types.Exit, sid string) (types.Observed, error) {
 	return types.Observed{IP: "203.0.113.1", Country: e.Region, City: e.City}, nil
 }
@@ -513,6 +552,18 @@ func (m *fakeMinter) Rate(acct string) (map[string]int, int) {
 		out[k] = v
 	}
 	return out, m.rateLimit
+}
+
+// seedShots 是每一发**带种子铸票**送进去的 cookie，key = sid。
+// 空 map = 这一轮一发都没走种子出口。
+func (m *fakeMinter) seedShots() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]string, len(m.seedSent))
+	for k, v := range m.seedSent {
+		out[k] = v
+	}
+	return out
 }
 
 func (m *fakeMinter) mintedGateways() []string {
@@ -1128,7 +1179,7 @@ func TestNoDeadlockBetweenAccounts(t *testing.T) {
 	// 道理，换成区域再说一遍。铸票者是交叉的（1 号的是 2、2 号的是 1，各自只剩对方可选），
 	// 给 2 号的 us-east 记一笔 ⇒ 它改挑 us-west(→unified-2)，1 号仍挑 us-east(→unified-1)，
 	// 正好各自落在**对方**烧过的那个上，两路都能走完 finish，ABBA 才真的有得可死。
-	if err := st.NoteRegionMint(2, "us-east", now); err != nil {
+	if err := st.NoteRegionMint(2, "us-east", "", now); err != nil {
 		t.Fatal(err)
 	}
 	// 确定性屏障：两个 goroutine 都拿到**第一把**锁之后才放行，
@@ -1315,7 +1366,7 @@ func anonRig(t *testing.T, n, accts, min int) (*Scheduler, *fakeStore, *clock, *
 		addAccount(st, id, fmt.Sprintf("acct-%d", i+1))
 		// 对外开放门槛数的是**铸过票**的账号（provenAccounts，防伪造 JWT 顶开），
 		// 所以这里得给每个号记一发成功铸票，不然 Public() 永远算 0 个、测不出开放。
-		if err := st.NoteRegionMint(id, "us-east", clk.now()); err != nil {
+		if err := st.NoteRegionMint(id, "us-east", "", clk.now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1594,7 +1645,7 @@ func TestMinterPicksByRegionLedger(t *testing.T) {
 	// 规则 3（区域级）：同一个号里，优先它**终身没铸过**的格子——那是唯一可能出新落点的
 	// 地方。给所有号的 us-east 记上终身铸票，清单第一格就该让位给 us-west。
 	for _, id := range []int64{1, 2, 3} {
-		if err := st.NoteRegionMint(id, "us-east", clk.now()); err != nil {
+		if err := st.NoteRegionMint(id, "us-east", "", clk.now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1606,7 +1657,7 @@ func TestMinterPicksByRegionLedger(t *testing.T) {
 	// 哪怕它刚被用过（「歇得最久」排在后面）。
 	for _, id := range []int64{1, 2} {
 		for _, r := range types.Regions {
-			if err := st.NoteRegionMint(id, r.Key, clk.now()); err != nil {
+			if err := st.NoteRegionMint(id, r.Key, "", clk.now()); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1663,12 +1714,12 @@ func TestMinterForTargetedExitUsesThatRegion(t *testing.T) {
 	mn.rateUsed = map[string]int{"east-asia": 6}
 
 	jp := types.Exit{Region: "JP"} // = east-asia，配额打满了
-	if a, _, ok := s.minterFor(jp, 0, 0); ok {
+	if a, _, ok := s.minterFor(jp, 0, 0, nil); ok {
 		t.Fatalf("east-asia 配额满了还派了账号 %d", a.ID)
 	}
 	// 别的区域照旧：定向到 AU 就该放行，而且返回的区域是**那个出口自己**。
 	au := types.Exit{Region: "AU"}
-	_, r, ok := s.minterFor(au, 0, 0)
+	_, r, ok := s.minterFor(au, 0, 0, nil)
 	if !ok || r.Exit != au || r.Key != "oceania" {
 		t.Fatalf("定向到 AU 没放行或区域对不上: ok=%v r=%+v", ok, r)
 	}
@@ -2460,14 +2511,130 @@ func TestRenewPairsSwitchRestoresRenewal(t *testing.T) {
 	}
 }
 
-// D 条：连续两发裸铸都落回已有落点就收手——请求和槽位都花了，覆盖面没涨。
-func TestPremintStopsAfterTwoWastedShots(t *testing.T) {
+// 种子票：这个大区手上有活 __cflb 时，预铸走我们自己的普通机房出口、把那张票送出去，
+// 而落点是**执行这一发的号自己**在那个大区的网关，不是种子那张票的网关。
+//
+// 这一条是整条种子路的要害。2026-10-03 实测：3 个 free 号带同一张 east-asia 票从同一个
+// 机房出口打，分别落 unified-88 / 94 / 75（裸打基线 146 / 120 / 128）⇒ __cflb 只钉大区。
+// 实现里摘 __oailb 的动作在 mint.Mint（见 TestSeedBoundSIDSendsOnlyTheCflb），
+// sched 这一层送的是完整那张票。
+func TestPremintUsesASeedTicketWhenTheRegionHasOne(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
-	// 九个区域全都落到同一个网关，而它已经有一张活票 ⇒ 每一发都是白烧。
+	us := types.Regions[0]
+	// 两个号在 us-east 都落 unified-9（池子还没见过它）。
+	mn.landByAcct = map[string]string{
+		comboKey(1, exitKey(us.Exit)): "unified-9",
+		comboKey(2, exitKey(us.Exit)): "unified-9",
+	}
+	// us-east 手上有一张活票 ⇒ 它的 __cflb 就是这个大区的种子。
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{us.Exit}}
+	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
+		RegionKey: us.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
+		CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	// 目标 2、已有 1 张活票 ⇒ 缺口 1 发。
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 2 })})
+	s.markDemand()
+
+	s.warmOnce(context.Background())
+	if got := mn.mintedGateways(); len(got) != 1 || got[0] != "unified-9" {
+		t.Fatalf("该落到这个号自己在 us-east 的网关 unified-9，实际 %v", got)
+	}
+	sent := mn.seedShots()
+	if len(sent) != 1 {
+		t.Fatalf("该走种子出口打一发，实际走了 %d 发", len(sent))
+	}
+	for sid, cookie := range sent {
+		if !strings.HasPrefix(sid, "seed") {
+			t.Fatalf("sid %q 不是种子出口的", sid)
+		}
+		if cookie != cookiePrefix+"unified-1" {
+			t.Fatalf("送出去的不是 us-east 那张种子票：%q", cookie)
+		}
+	}
+}
+
+// 这个大区没有活票就没有种子，照旧走住宅出口 —— 别把别的大区的票当种子送出去。
+func TestPremintFallsBackToResidentialWhenTheRegionHasNoSeed(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	us, oc := types.Regions[0], types.Regions[6]
+	mn.landByAcct = map[string]string{
+		comboKey(1, exitKey(us.Exit)): "unified-9",
+		comboKey(2, exitKey(us.Exit)): "unified-9",
+	}
+	// 唯一那张活票在 oceania，而预铸挑中的是 us-east（终身计数全 0 ⇒ 取第一个大区）。
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{oc.Exit}}
+	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
+		RegionKey: oc.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
+		CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 2 })})
+	s.markDemand()
+
+	s.warmOnce(context.Background())
+	if got := mn.mintedGateways(); len(got) != 1 || got[0] != "unified-9" {
+		t.Fatalf("该照旧裸铸到 unified-9，实际 %v", got)
+	}
+	if sent := mn.seedShots(); len(sent) != 0 {
+		t.Fatalf("us-east 没有种子票，不该走种子出口，实际 %v", sent)
+	}
+}
+
+// 种子票的 __cflb 快到点了就不能用：路由要活过这一次往返。
+func TestSeedPairIgnoresTicketsWhoseCflbIsAboutToDie(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	us := types.Regions[0]
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{us.Exit}}
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now})
+
+	base := types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
+		RegionKey: us.Key, ExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	for _, tc := range []struct {
+		name string
+		cflb time.Duration
+		want bool
+	}{
+		{"还剩很久", types.PairLifetime, true},
+		{"刚好够一次往返", seedCflbFloor + time.Second, true},
+		{"只剩一点点", seedCflbFloor - time.Second, false},
+		{"已经死了", -time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := base
+			p.CflbExpiresAt = clk.now().Add(tc.cflb)
+			st.pairs["unified-1"] = p
+			if _, ok := s.seedPairFor(us.Key); ok != tc.want {
+				t.Fatalf("cflb 还剩 %s，能当种子=%v，想要 %v", tc.cflb, ok, tc.want)
+			}
+		})
+	}
+}
+
+// D 条：台账是空的时候预铸也得有封顶 —— 失手预算 = 缺口，总发数封顶 2n。
+//
+// 这是替掉旧「连续两发白烧就收手」的那条。旧规则数的是「随机撞上已有落点」，
+// 新规则数的是「预测错」；而台账空的时候一个组合都预测不出来，于是候选集
+// （账号数 × 9）会全部被当成值得一试 —— 没有这个预算就是一轮打上千发。
+func TestPremintCapsWastedShotsAtTheGap(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	// 九个区域全都落到同一个网关，而它已经有一张活票 ⇒ 每一发都是失手。
 	for _, r := range types.Regions {
 		mn.land[exitKey(r.Exit)] = "unified-1"
 	}
@@ -2475,14 +2642,96 @@ func TestPremintStopsAfterTwoWastedShots(t *testing.T) {
 		ReachableExits: []types.Exit{{Region: "US"}}}
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
 		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
-	// 富余目标拉到 9，缺口远大于 2 ⇒「只打两发」只可能来自浪费预算。
+	// 富余目标 3 ⇒ 缺口 = 3 - 1 = 2（unified-1 那张活票算一格）⇒ 失手预算 2。
+	// 候选组合有 2 × 9 = 18 个，所以「只打 2 发」只可能来自这个预算。
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 3 })})
+	s.markDemand()
+
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n != 2 {
+		t.Fatalf("裸铸打了 %d 发，失手预算是缺口 2 发就该收手（候选组合 18 个）", n)
+	}
+}
+
+// 台账知道这个组合上次落在哪、而那个落点还有活票 ⇒ 一发都不该打。
+//
+// 这是新规则真正省下来的那部分：旧版要**打完**才知道白打了。
+func TestPremintSkipsCombosWhosePredictedGatewayStillHasAPair(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	for _, r := range types.Regions {
+		mn.land[exitKey(r.Exit)] = "unified-1"
+	}
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{{Region: "US"}}}
+	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
+		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	// 台账：两个号的九个大区全都落过 unified-1 ⇒ 全部可预测、全部该跳过。
+	for _, id := range []int64{1, 2} {
+		for _, r := range types.Regions {
+			if err := st.NoteRegionMint(id, r.Key, "unified-1", clk.now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 9 })})
 	s.markDemand()
 
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != 2 {
-		t.Fatalf("裸铸打了 %d 发，连续两发白烧就该收手", n)
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("预测落点全都还有活票，一发都不该打，实际打了 %d 发", n)
+	}
+}
+
+// 台账说这个组合的落点已经没票了 ⇒ 正是该补的那一格，而且不算失手。
+func TestPremintRefillsCombosWhosePairExpired(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	// 1 号在 us-east 落 unified-7，2 号在 us-east 落 unified-8（网关 = f(账号, 大区)）。
+	mn.landByAcct = map[string]string{
+		comboKey(1, exitKey(types.Regions[0].Exit)): "unified-7",
+		comboKey(2, exitKey(types.Regions[0].Exit)): "unified-8",
+	}
+	for _, r := range types.Regions {
+		mn.land[exitKey(r.Exit)] = "unified-1" // 其余大区都落回已有活票那个
+	}
+	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
+		ReachableExits: []types.Exit{{Region: "US"}}}
+	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
+		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	// unified-7 / unified-8 在表上但**票已经过期**（没写 pairs）⇒ 这两格该补。
+	for _, g := range []string{"unified-7", "unified-8"} {
+		st.gws[g] = types.Gateway{Name: g, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: "US"}}}
+	}
+	for _, id := range []int64{1, 2} {
+		for _, r := range types.Regions {
+			gw := "unified-1"
+			if r.Key == types.Regions[0].Key {
+				gw = map[int64]string{1: "unified-7", 2: "unified-8"}[id]
+			}
+			if err := st.NoteRegionMint(id, r.Key, gw, clk.now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 9 })})
+	s.markDemand()
+
+	s.warmOnce(context.Background())
+	got := mn.mintedGateways()
+	sort.Strings(got)
+	want := []string{"unified-7", "unified-8"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("该只补过期那两格 %v，实际打了 %v", want, got)
 	}
 }
 

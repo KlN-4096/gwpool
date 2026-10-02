@@ -143,7 +143,7 @@ func TestUpstream429SkipsHeldAccountWhenPickingMinter(t *testing.T) {
 	}
 
 	// exclude = 0（谁都不排除）⇒ 两个号都是候选，但 1 号被按住了。
-	got, _, ok := s.minterFor(types.Exit{}, 0, 0)
+	got, _, ok := s.minterFor(types.Exit{}, 0, 0, nil)
 	if !ok {
 		t.Fatal("还有一个号没被按住，该挑得出人")
 	}
@@ -155,7 +155,7 @@ func TestUpstream429SkipsHeldAccountWhenPickingMinter(t *testing.T) {
 	if err := mintProbe(t, s, st.accounts[1], "s1"); err == nil {
 		t.Fatal("上游 429 该是失败")
 	}
-	if _, _, ok := s.minterFor(types.Exit{}, 0, 0); ok {
+	if _, _, ok := s.minterFor(types.Exit{}, 0, 0, nil); ok {
 		t.Error("全员被按住就该挑不出人")
 	}
 }

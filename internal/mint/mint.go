@@ -234,6 +234,39 @@ func (c *Client) NewSID(sticky bool) (string, error) {
 	return sid, nil
 }
 
+// NewSeedSID 开一个绑在普通机房代理（config.KindSeed）上的 sid，给「带种子 cflb 铸票」用。
+//
+// 为什么能复用整条铸票路径：do 里那句 resolve(sid, true) 是**绑定优先**的——
+// 已经绑过的 sid 直接返回它绑的那条，不再过 Sticky 闸。所以这里先把绑定种下，
+// 后面 Geo / Mint 全部自然走这条出口，mintOnce 一行都不用改。
+//
+// 没配这条代理就回 ErrNoProxy，调用方据此回落到住宅出口。
+func (c *Client) NewSeedSID() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, p := range c.Proxies {
+		if p.Enabled && p.Kind == config.KindSeed {
+			sid := randSID()
+			c.bindLocked(sid, i, time.Now())
+			return sid, nil
+		}
+	}
+	return "", fmt.Errorf("%w（没有启用着的 kind=%q 出口）", ErrNoProxy, config.KindSeed)
+}
+
+// seedBound 报这个 sid 是不是绑在种子出口上。
+//
+// 直接查绑定表、**不走 resolve**：resolve 对没绑过的 sid 会顺手挑一条绑上，而这里
+// 只是问一句「要不要摘 __oailb」，不该有副作用——那会让一个还没出手的 sid 被钉在
+// 轮询游标当时指着的那条出口上。下标越界的判法照抄 resolve 里那一句（配置热加过
+// 代理时旧绑定可能指向已经不存在的下标）。
+func (c *Client) seedBound(sid string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, ok := c.sids[sid]
+	return ok && b.idx < len(c.Proxies) && c.Proxies[b.idx].Kind == config.KindSeed
+}
+
 // Sticky 说明这个 sid 绑定的出口能不能钉住同一个 IP。
 // 不能钉住时就不该把 Geo 的结果当成铸票那一发的地理（每连接换 IP）。
 func (c *Client) Sticky(sid string) bool {
@@ -302,7 +335,14 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 	if err := c.spend(cr.AccountID, e); err != nil {
 		return types.MintResult{}, err
 	}
-	body, header := buildWire(c.fingerprint(), c.model(), cr, sentPair, "")
+	// 种子出口上**必须**只送 `__cflb`，见 CflbOnly。钉在这里而不是交给调用方：
+	// 违反它不报错，只会静默白打一发（两件齐送上游一个 cookie 都不回 ⇒ 落点读不出
+	// ⇒ 这条路唯一想要的那个读数没了），这种错误没人会发现。
+	cookie := sentPair
+	if c.seedBound(sid) {
+		cookie = CflbOnly(sentPair)
+	}
+	body, header := buildWire(c.fingerprint(), c.model(), cr, cookie, "")
 	req, err := c.newRequest(ctx, http.MethodPost, c.upstream(), body, header)
 	if err != nil {
 		return types.MintResult{}, err
@@ -340,10 +380,13 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		res.CflbExpires = cookieDeadline(fresh[cookieCflb], at)
 		// 上游常只补发变动的那一项。只拿新的那半会丢掉钉路由的 __cflb，
 		// 所以在送进去的 pair 上**覆盖**，而不是替换。
-		res.NewPair = mergePair(sentPair, fresh)
+		//
+		// 覆盖在 cookie 上而不是 sentPair 上：种子那条路已经把 __oailb 摘掉了，
+		// 而摘掉的那张**指向别人的网关**，合回来就是给这张新票贴一个错的落点。
+		res.NewPair = mergePair(cookie, fresh)
 		return res, nil
 	}
-	if sentPair != "" {
+	if cookie != "" {
 		// 「没下发新 cookie」对应两件**相反**的事，判据是送进去那张的 __cflb 还活着没：
 		//
 		//   活着 ⇒ 上游接受了它、路由没变 ⇒ 落点就是旧名字（SPEC 第 2 节）
@@ -357,9 +400,13 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		// **判据必须「可证」**：要求死期晚于**响应时刻**。响应时刻之后才死 ⇒ 整个
 		// 往返期间它都活着。读不出死期（零值）一律按死了算——猜错的代价不对称。
 		if sentCflbExp.After(at) {
-			res.Gateway = pairGateway(sentPair)
+			res.Gateway = pairGateway(cookie)
 			if res.Gateway == "" {
-				return res, fmt.Errorf("送进去的 pair 里读不出网关")
+				// 种子那条路会落到这儿：只送了 `__cflb`，旧名字根本不在 cookie 里，
+				// 而旧名字本来也是**别人的**网关、不能当自己的落点。上游接受了种子、
+				// 路由钉在那个大区了，但落到哪个网关读不出来 ⇒ 这一发对「摸落点」零产出。
+				// 必须报 ErrNoLanding，不能静默当成功（那会把一张没有落点的票写进账本）。
+				return res, fmt.Errorf("%w（cookie 里没有能读出落点的 __oailb）", ErrNoLanding)
 			}
 			return res, nil
 		}
@@ -681,6 +728,13 @@ func proxyClient(p config.Proxy, user string, timeout time.Duration, fp config.F
 //	novproxy: <user>-region-<CC>[-city-<City>]-sid-<SID>-t-<N>   同 sid 在 N 分钟内固定出口 IP
 //	webshare: <user>-<CC>-<数字会话号>                            同号固定出口 IP，粘多久在面板里设
 func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, error) {
+	// 种子出口的用户名**原样是 p.User**，一个外来字节都不进去，所以它不过 validateExit：
+	// 那个闸是「Exit 的内容要拼进 SOCKS5 用户名」这件事的边界，而这条路上 Exit 只用来
+	// 分速率闸的桶和记 RegionKey。放在闸前面而不是 switch 里的一个 case，是为了让这件事
+	// 在代码上就是显然的：种子出口和 Exit 无关，别让下一个人以为它也要国家合法。
+	if p.Kind == config.KindSeed {
+		return p.User, nil
+	}
 	if err := validateExit(e); err != nil {
 		return "", err
 	}
@@ -841,6 +895,24 @@ func mergePair(sentPair string, fresh map[string]*http.Cookie) string {
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+
+// CflbOnly 把一张完整 pair 砍成只剩 `__cflb`，没有 `__cflb` 就回空串。
+//
+// 这是「带种子票铸票」的出站形态，而且**必须**摘掉 `__oailb`：
+//   - 两件齐送时上游一个 cookie 都不回（2026-10-02 实测），落点读不出来 ⇒ 这一发
+//     等于白打，因为我们要的正是「这个号在那个大区落到哪」这个读数
+//   - 只送 `__cflb` 时上游必回新 `__oailb` ⇒ 落点现场可读（2026-10-03，3/3）
+//
+// 大区跟着 `__cflb` 走，而具体网关是 (账号 × 大区) 决定的：三个 free 号带同一张
+// east-asia 票从同一个机房出口打，分别落到 unified-88 / 94 / 75，裸打基线是
+// 146 / 120 / 128。所以这张票是**路由种子**，不是「别人的网关」。
+func CflbOnly(pair string) string {
+	v := parsePair(pair)[cookieCflb]
+	if v == "" {
+		return ""
+	}
+	return cookieCflb + "=" + v
 }
 
 func parsePair(pair string) map[string]string {

@@ -672,7 +672,7 @@ func TestPublicReadsLiveConfig(t *testing.T) {
 	// 门槛数的是**铸过票**的账号（provenAccounts，见 types.AccountsForContinuous），
 	// 不是货架上的活 pair 数，也不是光上传没铸过的号。给每个号记一发成功铸票让它算数。
 	for _, a := range st.Accounts() {
-		if err := st.NoteRegionMint(a.ID, "us-east", clk.now()); err != nil {
+		if err := st.NoteRegionMint(a.ID, "us-east", "", clk.now()); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -120,6 +120,36 @@ func TestAdminAddProxyProbeFails(t *testing.T) {
 	}
 }
 
+// 种子出口这一类能从页面上加，但只许留一条：SeedProxy 只取第一条启用着的，
+// 加第二条是静默无效的，必须当场说出来。
+func TestAdminAddSeedProxyOnlyOnce(t *testing.T) {
+	h, srv, _, calls := proxyRig(t)
+
+	f := addForm("bv-seed")
+	f.Set("kind", "seed")
+	f.Set("host", "127.0.0.1:35444")
+	if loc := postForm(h, "/admin/proxies", f).Header().Get("Location"); !strings.Contains(loc, "proxy_note=") {
+		t.Fatalf("第一条种子出口该能加，跳到了 %q", loc)
+	}
+	if len(calls.added) != 1 || calls.added[0].Kind != config.KindSeed {
+		t.Fatalf("没把种子出口加进运行中的清单：%+v", calls.added)
+	}
+	// 热重载之后 SeedProxy 要能找到它 —— 这才是预铸真正读的那条路。
+	if p, ok := srv.opt.Live.Get().SeedProxy(); !ok || p.Name != "bv-seed" {
+		t.Fatalf("热重载后 SeedProxy 没找到它：%+v ok=%v", p, ok)
+	}
+
+	f2 := addForm("bv-seed-2")
+	f2.Set("kind", "seed")
+	f2.Set("host", "127.0.0.1:35445")
+	if loc := postForm(h, "/admin/proxies", f2).Header().Get("Location"); !strings.Contains(loc, "proxy_err=") {
+		t.Fatalf("第二条种子出口该被拒，跳到了 %q", loc)
+	}
+	if len(calls.added) != 1 {
+		t.Fatalf("第二条被拒了却还是加进了运行中的清单：%+v", calls.added)
+	}
+}
+
 // 表单是系统边界：不合法的连试都不试。
 func TestAdminAddProxyValidates(t *testing.T) {
 	h, _, path, calls := proxyRig(t)

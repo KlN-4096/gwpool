@@ -76,8 +76,8 @@
         <div class="fields">
           <label>名称 <span class="hint">日志和这张表里认它用，不超过 32 个字，不能和已有的重名</span>
             <input name="name" required maxlength="32" autocomplete="off" spellcheck="false"></label>
-          <label>类型 <span class="hint">决定用户名怎么拼，只支持这两家</span>
-            <select name="kind"><option value="novproxy">novproxy（住宅）</option><option value="webshare">webshare（机房）</option></select></label>
+          <label>类型 <span class="hint">决定用户名怎么拼；seed 是我们自己的普通代理，只能留一条</span>
+            <select name="kind"><option value="novproxy">novproxy（住宅）</option><option value="webshare">webshare（机房）</option><option value="seed">seed（自己的，带种子票摸同大区新网关）</option></select></label>
           <label>地址 <span class="hint">主机:端口，不带 socks5://</span>
             <input name="host" required autocomplete="off" spellcheck="false" placeholder="us.novproxy.io:1000"></label>
           <label>用户名 <span class="hint">面板上的原始用户名，地区和会话号由池子自己拼</span>
@@ -91,6 +91,7 @@
     </div>
     {{end}}
     <p class="foot">请求失败的代理会被暂时跳过，到期后自动恢复；停用的代理不再分给新会话，已经在用它的会话用完为止。粘性会话指同一会话固定使用同一个出口 IP（novproxy、webshare 都支持）；绑定会话是最近绑到它上面、还在粘性时限内的会话数，停用后它降到 0 就说明在用的都用完了。</p>
+    <p class="foot"><b>seed</b> 那一类不参与地区轮转，也不粘性，只做一件事：某个大区手上还有一张活路由票时，带着它的 <code>__cflb</code> 去摸<b>本池账号自己</b>在那个大区的网关 —— 大区跟着票走，具体网关由账号决定，所以不必在当地有住宅出口。没有活票的大区照旧走住宅。它停用了只是回到全住宅，池子照常工作。</p>
   </div>
 </section>
 
