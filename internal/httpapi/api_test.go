@@ -2328,8 +2328,15 @@ func TestPoolRegionCells(t *testing.T) {
 	for _, c := range cells {
 		byKey[c.Key] = c
 	}
-	if len(cells) != len(types.Regions)+1 {
-		t.Fatalf("画了 %d 格，该是九格加一个未归类", len(cells))
+	if len(cells) != len(types.Regions)+2 {
+		t.Fatalf("画了 %d 格，该是「全部」加九格加一个未归类", len(cells))
+	}
+	// 「全部」排在最前面：它是默认态，也是从某一格退出来的那条路。
+	if all := cells[0]; !all.All || all.Total != len(rows) || all.Ready != 2 {
+		t.Fatalf("「全部」那一格的读数不对：%+v", all)
+	}
+	if len(cells[0].Gateways) != 0 {
+		t.Fatal("「全部」那一格不该列网关名：几十个名字堆在一格里什么也读不出来")
 	}
 	if eu := byKey["europe"]; eu.Total != 2 || eu.Ready != 1 {
 		t.Fatalf("欧洲那一格的读数不对：%+v", eu)
@@ -2363,6 +2370,57 @@ func TestPoolRegionCells(t *testing.T) {
 		if c.Key == "europe" && (c.Ready != 0 || !strings.Contains(c.Note, "都没有可交付")) {
 			t.Fatalf("没有活票的区域不该报可交付：%+v", c)
 		}
+	}
+}
+
+// 点一格只看那个区域：筛选走查询串、服务端过滤，关掉 JS 也能用。
+// 顶上那几个 KPI 和页签计数**不跟着缩水**——筛着欧洲时写「已知网关 2」是在说池子只剩两个。
+func TestPoolPageRegionFilter(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	st.gws["unified-73"] = types.Gateway{Name: "unified-73", ReachableExits: []types.Exit{{Region: "JP"}}}
+	st.gws["unified-900"] = types.Gateway{Name: "unified-900", ReachableExits: []types.Exit{{Region: "US", City: "Dallas"}}}
+
+	// 没带参数 ⇒ 整张表，「全部」那一格选中。
+	all := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	for _, name := range []string{"unified-142", "unified-73", "unified-900"} {
+		if !strings.Contains(all, name) {
+			t.Fatalf("默认该列出全部网关，少了 %s", name)
+		}
+	}
+
+	// 只看东亚：rig 的 unified-142 出口是 IT（欧洲），不该出现。
+	ea := do(h, httptest.NewRequest("GET", "/?region=east-asia", nil)).Body.String()
+	if !strings.Contains(ea, "unified-73") {
+		t.Fatal("筛东亚把东亚的网关也筛掉了")
+	}
+	if strings.Contains(ea, `<td class="mono">unified-142</td>`) {
+		t.Fatal("筛东亚时表里还列着欧洲的网关")
+	}
+	if !strings.Contains(ea, "显示全部") {
+		t.Fatal("筛选时没给退出去的路")
+	}
+	// 九宫格自己报的是整池读数，不跟着筛选缩水——不然点进去就看不到别的区域有多少了。
+	if !strings.Contains(ea, "unified-142") {
+		t.Fatal("筛选把九宫格里别的区域也清空了")
+	}
+
+	// 未归类单独一格：它的值不能是空串，空串就是「全部」。
+	other := do(h, httptest.NewRequest("GET", "/?region="+poolRegionQuery, nil)).Body.String()
+	if !strings.Contains(other, `<td class="mono">unified-900</td>`) ||
+		strings.Contains(other, `<td class="mono">unified-73</td>`) {
+		t.Fatal("未归类那一格没筛对")
+	}
+
+	// 认不出的值当「全部」，不报错：把拼错的链接变成错误页比直接给整张表更糟。
+	bad := do(h, httptest.NewRequest("GET", "/?region=%E4%B8%8D%E5%AD%98%E5%9C%A8", nil))
+	if bad.Code != http.StatusOK || !strings.Contains(bad.Body.String(), `<td class="mono">unified-73</td>`) {
+		t.Fatalf("认不出的区域值该当全部，得到 %d", bad.Code)
+	}
+
+	// 有网关但一个都不在该区域 ⇒ 空表要说清是哪一格空，而不是「尚未发现网关」。
+	empty := do(h, httptest.NewRequest("GET", "/?region=oceania", nil)).Body.String()
+	if !strings.Contains(empty, "大洋洲还没有已知网关") {
+		t.Fatal("空区域的空表文案不对")
 	}
 }
 

@@ -50,11 +50,12 @@
 
 <section id="tab-gateways">
   <div class="card">
-    <header class="card-head"><div><h2>各区域的落点</h2><p>九个出口区域各自能摸到哪些网关。一个网关能从多个区域连通时，它在那几格里都出现。</p></div></header>
+    <header class="card-head"><div><h2>各区域的落点</h2><p>九个出口区域各自能摸到哪些网关。一个网关能从多个区域连通时，它在那几格里都出现。<strong>点一格只看那个区域</strong>。</p></div></header>
     <div class="card-body">
       <div class="regions wide">
       {{range .Regions}}
-        <div class="region{{if .Ready}} on{{end}}" title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}">
+        <a class="region{{if .Ready}} on{{end}}{{if .Active}} sel{{end}}" href="{{.Href}}"
+           title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}{{if .Active}}　（正在只看这一格）{{end}}">
           <b>{{.Label}}</b>
           <span>{{if .Total}}{{.Ready}} / {{.Total}} 可交付{{else}}未发现网关{{end}}</span>
           {{if .Gateways}}<span class="gws">
@@ -63,19 +64,22 @@
             {{- else}}<code class="dup" title="此刻没有可交付的路由 Cookie">{{.Name}}</code>{{end}}
             {{- end}}
           </span>{{end}}
-        </div>
+        </a>
       {{end}}
       </div>
-      <p class="foot">绿色表示这个区域此刻至少有一个网关可交付；灰色表示已知的网关都没有可用的路由 Cookie，或者还没在这个区域发现过网关。网关名里颜色较淡的那些是此刻不可交付的。</p>
+      <p class="foot">绿色表示这个区域此刻至少有一个网关可交付；灰色表示已知的网关都没有可用的路由 Cookie，或者还没在这个区域发现过网关。网关名里颜色较淡的那些是此刻不可交付的。点任意一格把下面那张表收窄到该区域，点「全部」回到整池。</p>
     </div>
   </div>
   <div class="card">
-    {{if .Gateways}}
+    {{if .FilterLabel}}
+    <p class="foot filter-note">下面这张表只列<strong>{{.FilterLabel}}</strong>的网关（共 {{len .Shown}} 个）。<a href="/#tab-gateways">显示全部 {{len .Gateways}} 个 →</a></p>
+    {{end}}
+    {{if .Shown}}
     <div class="table-wrap"><table class="tiles pool" data-grid data-natsort data-facet-first data-size="240"
         data-facets="ready:可交付:ok|idle:暂不可交付" data-placeholder="搜索网关名称">
       <thead><tr><th>网关</th><th>状态</th><th>剩余有效期</th><th class="num">空闲槽位</th><th class="num">可达出口</th></tr></thead>
       <tbody>
-      {{range .Gateways}}
+      {{range .Shown}}
         <tr class="{{if .PairReady}}ready{{end}}" data-facet="{{if .PairReady}}ready{{else}}idle{{end}}"
             title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　空闲槽位 {{.RestedSlots}}　可达出口 {{.Exits}}　区域 {{if .Regions}}{{range $i, $r := .Regions}}{{if $i}} / {{end}}{{$r}}{{end}}{{else}}未归类{{end}}">
           <td class="mono">{{.Name}}</td>
@@ -94,7 +98,7 @@
       <span><b>出口</b>能连通这个网关的出口地区数</span>
     </div>
     {{else}}
-    <p class="empty">尚未发现网关。账号接入后会自动探测。</p>
+    <p class="empty">{{if .FilterLabel}}{{.FilterLabel}}还没有已知网关。{{else}}尚未发现网关。账号接入后会自动探测。{{end}}</p>
     {{end}}
   </div>
 </section>

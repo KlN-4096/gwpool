@@ -241,6 +241,11 @@ table.tiles tr.nomatch td { position: static; width: auto; height: auto; clip-pa
 .region.on { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .region.on b { color: var(--ok); }
 .region.on b::after { content: " ✓"; }
+/* 号池页的格子是链接：点一格把下面那张表收窄到那个区域。 */
+a.region { text-decoration: none; }
+a.region:hover { border-color: var(--line-2); }
+a.region.on:hover { border-color: var(--ok-dot); }
+.region.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* 表单与按钮 */
 form { display: grid; gap: 1rem; margin: 0; }

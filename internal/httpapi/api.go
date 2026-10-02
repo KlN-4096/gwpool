@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -607,7 +608,11 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			v.ReadyCount++
 		}
 	}
+	// 格子先算（它们报的是**整池**的读数，筛选时不许跟着缩水），再按查询串筛表。
 	v.Regions = poolRegionCells(v.Gateways, gws)
+	want := sanitizeLabel(r.URL.Query().Get("region"), "")
+	v.Shown, v.FilterLabel = filterPoolGateways(v.Gateways, v.Regions, want)
+	markPoolRegionLinks(v.Regions, want)
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
@@ -642,6 +647,7 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 			}
 			seen[k] = true
 			byRegion[k] = append(byRegion[k], item)
+			rows[i].regionKeys = append(rows[i].regionKeys, k)
 			if k != "" {
 				rows[i].Regions = append(rows[i].Regions, regionLabel(k))
 			}
@@ -649,9 +655,27 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 		// 一个出口都没记过的网关也要有地方落，否则它在这一页上凭空消失。
 		if len(gws[rows[i].Name].ReachableExits) == 0 {
 			byRegion[""] = append(byRegion[""], item)
+			rows[i].regionKeys = append(rows[i].regionKeys, "")
 		}
 	}
-	out := make([]poolRegionCell, 0, len(types.Regions)+1)
+	out := make([]poolRegionCell, 0, len(types.Regions)+2)
+	// 「全部」排在最前面：它是默认态，也是从某一格退出来的那条路。
+	all := poolRegionCell{Label: "全部", All: true, Total: len(rows)}
+	for _, r := range rows {
+		if r.PairReady {
+			all.Ready++
+		}
+	}
+	switch {
+	case all.Total == 0:
+		all.Note = "还没发现过网关"
+	case all.Ready == 0:
+		all.Note = fmt.Sprintf("已知 %d 个网关，此刻一个都交付不了", all.Total)
+	default:
+		all.Note = fmt.Sprintf("已知 %d 个网关，其中 %d 个此刻可交付", all.Total, all.Ready)
+	}
+	out = append(out, all)
+
 	keys := make([]string, 0, len(types.Regions)+1)
 	for _, r := range types.Regions {
 		keys = append(keys, r.Key)
@@ -687,6 +711,69 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 		out = append(out, c)
 	}
 	return out
+}
+
+// markPoolRegionLinks 给每一格配上「点它去哪儿」和「现在选的是不是它」。
+//
+// 链接都带 #tab-gateways：这一页是分页签的，不带锚点的话点一下会弹回第一个页签，
+// 而人正看着的就是网关那一页。
+func markPoolRegionLinks(cells []poolRegionCell, want string) {
+	hit := false
+	for i := range cells {
+		c := &cells[i]
+		switch {
+		case c.All:
+			c.Href = "/#tab-gateways"
+		case c.Key == "":
+			c.Href = "/?region=" + poolRegionQuery + "#tab-gateways"
+		default:
+			c.Href = "/?region=" + url.QueryEscape(c.Key) + "#tab-gateways"
+		}
+		if !c.All && (c.Key == want || (c.Key == "" && want == poolRegionQuery)) {
+			c.Active, hit = true, true
+		}
+	}
+	// 没选中任何一格（没带参数，或带了个认不出来的）⇒ 高亮「全部」，和表里列的内容一致。
+	if !hit && len(cells) > 0 && cells[0].All {
+		cells[0].Active = true
+	}
+}
+
+// poolRegionQuery 是「未归类」那一格在查询串里的值。
+//
+// 不能用空串：空串就是「全部」（没带参数、或带了个空的），两者混在一起的话点「未归类」
+// 会跳回全部，而那一格恰恰是最需要单独看的（那些网关的出口反查不到区域）。
+const poolRegionQuery = "other"
+
+// filterPoolGateways 按查询串挑出表里要列的行，并回一句「正在只看谁」。
+//
+// 认不出的值一律当「全部」，不报错：这个参数只影响看到哪几行，而把一个拼错的链接变成
+// 一张错误页，比直接给他整张表更糟。
+func filterPoolGateways(rows []gatewayRow, cells []poolRegionCell, want string) ([]gatewayRow, string) {
+	if want == "" {
+		return rows, ""
+	}
+	key := want
+	if want == poolRegionQuery {
+		key = ""
+	}
+	var label string
+	for _, c := range cells {
+		if !c.All && c.Key == key {
+			label = c.Label
+			break
+		}
+	}
+	if label == "" {
+		return rows, ""
+	}
+	out := rows[:0:0]
+	for _, r := range rows {
+		if slices.Contains(r.regionKeys, key) {
+			out = append(out, r)
+		}
+	}
+	return out, label
 }
 
 // publicBaseURL 是对外根地址。接了配置文件就现读（管理页改完立刻生效），

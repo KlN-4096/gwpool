@@ -40,10 +40,19 @@ type poolView struct {
 	OpenAccounts  int
 	Threshold     int
 
+	// Gateways 是**全部**已知网关：上面那几个 KPI 和页签计数都数它，筛选时不能跟着缩水
+	// （筛着欧洲时顶上写「已知网关 2」是在说池子只剩两个）。表里实际列出来的是 Shown。
 	Gateways []gatewayRow
+	// Shown 是表里列出来的那几行：没筛选时等于 Gateways，筛了就是那个区域的。
+	Shown []gatewayRow
+	// FilterLabel 非空 = 正在只看某一格，页面上要如实说、并给一条退出去的路。
+	FilterLabel string
 	// Regions 把已知网关按**出口区域**摊开：这张表要回答的是「哪个区域的落点还不够」，
 	// 一条 57 行的平表答不了。一个网关能从好几个区域连通时，它在那几格里都出现——
 	// 那是事实，不是重复计数（格子里数的是「这个区域能摸到几个落点」）。
+	//
+	// 每一格都是个链接（筛选走查询串、服务端过滤）：**不写 JS**，关掉 JS 也能用，
+	// 而且表格那套 data-grid 的搜索/分面/计数全都照常工作——它只是拿到了更少的行。
 	Regions []poolRegionCell
 	// ReadyCount 在服务端算好。原来这张卡片靠 JS 数表格行，关掉 JS 就只剩「—」。
 	ReadyCount  int
@@ -68,9 +77,11 @@ type gatewayRow struct {
 	PairReady   bool   // 池里有剩余 ≥ DeliverFloor 的 pair
 	PairLeft    string // 人读的剩余时间；**不含 cookie 本体**
 	RestedSlots int
-	// Regions 是这个网关能从哪几个区域连通（人读的区域名），给表里那一列用。
+	// Regions 是这个网关能从哪几个区域连通（人读的区域名），给行的悬停用。
 	// 空 = 它的出口一个都反查不到区域（见 types.RegionKeyOf 的精确匹配）。
 	Regions []string
+	// regionKeys 是上面那几个区域的 key（含未归类的空串），只给筛选用，模板不读。
+	regionKeys []string
 }
 
 // poolRegionCell 是号池页九宫格的一格：这个区域已知哪些网关、其中几个此刻可交付。
@@ -78,11 +89,15 @@ type gatewayRow struct {
 // 末尾可能多出一格「未归类」：出口反查不到区域的网关要有地方落，否则九格加起来
 // 对不上页面自己写的网关总数，而那种对不上没人查得出来。
 type poolRegionCell struct {
+	poolRegionFilter
 	Key   string
 	Label string
 	Total int
 	Ready int
 	Note  string
+	// All = 这是「全部」那一格（退出筛选用）。它不列网关名：几十个名字堆在一格里
+	// 什么也读不出来，那正是下面那张表的活。
+	All bool
 	// Gateways 按名字排，可交付的在前——这一格最常被问的是「现在这儿能不能拿到票」。
 	Gateways []poolRegionGateway
 }
@@ -90,6 +105,15 @@ type poolRegionCell struct {
 type poolRegionGateway struct {
 	Name  string
 	Ready bool
+}
+
+// poolRegionFilter 是九宫格每一格的点击目标。
+//
+// Href 在服务端拼好：模板不注册函数（见本文件顶上的注释），把 url.Values 的拼接
+// 散进模板就得给它加一个转义规则，而那正是最容易写漏的地方。
+type poolRegionFilter struct {
+	Active bool
+	Href   string
 }
 
 // ---------- 上传者页 ----------
