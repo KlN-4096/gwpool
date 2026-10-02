@@ -247,7 +247,7 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 // 锁序恒为 r.mu → s.mu，反向不存在：r.mu 只有本文件这几个方法碰，而 minterFor 自己
 // 那把 s.mu 在候选循环**之前**就放掉了（skip 不在它里面跑）。
 func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
-	live, landed := s.liveGateways(), s.lastLandings()
+	live, landed, seedless := s.liveGateways(), s.lastLandings(), s.seedlessRegions()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.halt {
@@ -268,10 +268,7 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 		// 丢了种子票的大区优先补：它一掉，那个大区的所有账号都回落到住宅出口，
 		// 而**一张**票就能把整个大区的便宜路径恢复（种子不绑账号，见 seedPairFor）。
 		// 所以它的收益高于普通的「去摸一个新落点」—— 后者只多一个槽位。
-		prefer: func(key string) bool {
-			_, ok := s.seedPairFor(key)
-			return !ok
-		},
+		prefer: func(key string) bool { return seedless[key] },
 	}
 	for try := 0; try < premintPickTries; try++ {
 		// 本小时打得最少的号优先、丢了种子的大区优先、它终身没走过的区域优先；
@@ -383,6 +380,20 @@ func (s *Scheduler) lastLandings() map[string]string {
 //
 // 刻意不用 store.MintKey：那个键的格式归 store 所有（见 Store.RegionMints 的注释），
 // 这里只是进程内的一轮临时记账，不该跟着它走。
+// seedlessRegions 列出手上没有活种子票的大区。**一轮挑选只算一次**：bestRegion 会对
+// 每个 (账号 × 大区) 都问一次 prefer，而 seedPairFor 一次要扫全部网关的 pair ⇒ 写成
+// 闭包里现算就是「账号数 × 9 遍全表扫描」（113 个号时十万次 store.Pair），
+// 而且整段在 r.mu 里。提出来是 9 遍。
+func (s *Scheduler) seedlessRegions() map[string]bool {
+	out := make(map[string]bool, len(types.Regions))
+	for _, r := range types.Regions {
+		if _, ok := s.seedPairFor(r.Key); !ok {
+			out[r.Key] = true
+		}
+	}
+	return out
+}
+
 func comboKey(accountID int64, regionKey string) string {
 	return strconv.FormatInt(accountID, 10) + "|" + regionKey
 }

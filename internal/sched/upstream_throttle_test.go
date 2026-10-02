@@ -42,6 +42,32 @@ func mintProbe(t *testing.T, s *Scheduler, a types.Account, sid string) error {
 	return err
 }
 
+// 上游只补发 __oailb 时，pair 的寿命必须留在**旧 __cflb** 的死期上。
+//
+// 判据本身是 types.MintResult.RouteDeadline 的第二级（单元覆盖在
+// types_test.TestRouteDeadlineTakesTheShorterCookie）；这条盯的是 mintOnce 真的把现持
+// 那张的 CflbExpiresAt 传了进去。传 time.Time{} 的话寿命按 __oailb 虚报（多算 300 秒，
+// 没有 CflbExpires 时更多）⇒ 一张**路由已死**的票被当活票交付出去，
+// 而 __cflb 才是钉路由的那个。原来由 protocol_test.TestRenewKeepsOldCflbDeadline 盯着，
+// 那条随池子侧续期（renewStalePairs）一起删了，判据没删，所以挪到这儿。
+func TestMintKeepsOldCflbDeadlineWhenUpstreamOnlyReissuesOailb(t *testing.T) {
+	s, st, mn, clk := throttleFixture(t)
+	dead := clk.now().Add(400 * time.Second)
+	putPair(st, "unified-1", cookiePrefix+"unified-1", dead)
+	mn.onlyOailb = true
+
+	cur, _ := st.Pair("unified-1")
+	if _, err := s.mintOnce(context.Background(), st.accounts[0], types.Regions[0].Exit,
+		"sid1", cur, "unified-1", ""); err != nil {
+		t.Fatalf("定向铸票失败: %v", err)
+	}
+	p, _ := st.Pair("unified-1")
+	if !p.CflbExpiresAt.Equal(dead) || !p.ExpiresAt.Equal(dead) {
+		t.Fatalf("寿命被放大了：ExpiresAt=%v CflbExpiresAt=%v，两个都该留在旧 __cflb 的 %v",
+			p.ExpiresAt, p.CflbExpiresAt, dead)
+	}
+}
+
 func TestUpstream429HoldsWholeAccount(t *testing.T) {
 	s, st, mn, clk := throttleFixture(t)
 	acct := st.accounts[0]
