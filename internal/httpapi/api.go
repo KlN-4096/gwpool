@@ -142,6 +142,11 @@ type Options struct {
 	// ProxyStates 报各出口供应商的状态，给管理页看。nil = 管理页不显示这一节。
 	// 用函数而不是接口：只有一个实现（mint.Client），为它造个接口是白开销。
 	ProxyStates func() []mint.ProxyState
+	// AddProxy / SetProxyEnabled 在运行中往末尾加出口、改启用标志；ProbeProxy 是加之前那一发试通。
+	// 这三个和 ProxyStates 有一个是 nil，管理页的出口代理就只能看（测试和没接出口的实例）。
+	AddProxy        func(config.Proxy) error
+	SetProxyEnabled func(name string, on bool) error
+	ProbeProxy      func(ctx context.Context, p config.Proxy) (types.Observed, error)
 
 	// Refresh 换票。nil = 用 oauth.Refresh 直连上游。
 	// 存在的唯一理由是测试：测试绝不打真实上游（SPEC 红线 8），而换票是
@@ -264,6 +269,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
 	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
+	mux.Handle("POST /admin/proxies", s.sameOrigin(http.HandlerFunc(s.handleAdminAddProxy)))
+	mux.Handle("POST /admin/proxies/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminProxyEnabled)))
 	mux.HandleFunc("GET /admin/accounts", s.handleAdminAccounts)
 	mux.HandleFunc("GET /admin/", s.handleAdmin)
 	return noStore(mux)
@@ -1818,14 +1825,8 @@ func (s *Server) adminAccountForm(w http.ResponseWriter, r *http.Request) (int64
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "账号 ID 不是正整数"})
 		return 0, nil, false
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
-	if err != nil {
-		http.Error(w, "请求体太大", http.StatusRequestEntityTooLarge)
-		return 0, nil, false
-	}
-	form, err := parseForm(body)
-	if err != nil {
-		http.Error(w, "表单解不开", http.StatusBadRequest)
+	form, ok := readAdminForm(w, r)
+	if !ok {
 		return 0, nil, false
 	}
 	for _, a := range s.st.Accounts() {
@@ -1862,6 +1863,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	v.Config = buildConfigView(s.opt.Live,
 		r.URL.Query().Get("cfg_note"), r.URL.Query().Get("cfg_err"))
 	v.Rescan = sanitizeLabel(r.URL.Query().Get("rescan"), "")
+	v.ProxyNote, v.ProxyErr = r.URL.Query().Get("proxy_note"), r.URL.Query().Get("proxy_err")
+	v.ProxyEditable = s.canEditProxies()
 	v.Fails = s.fails.failRows(0, failLogKeep, true)
 
 	if s.opt.ProxyStates != nil {

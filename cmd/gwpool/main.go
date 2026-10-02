@@ -36,6 +36,25 @@ func main() {
 	}
 }
 
+// newMinter 按配置搭铸票客户端。
+//
+// 出口代理传**全集**：不是只传粘性的——Client.NewSID(true) 自己会挑粘性出口，而只传
+// 粘性的会让 webshare 那批接入点永远走不到（unified-121 / 71 只有它能摸到，那正是它
+// 存在的理由）；也不是只传启用的——停用的不交进去，重启后管理页上就没有它，再也点不回
+// 「启用」。挑出口时 resolve 自己会跳过停用的。
+func newMinter(cfg config.Config, live *config.Live, log *slog.Logger) *mint.Client {
+	return &mint.Client{
+		Proxies:     cfg.Proxies,
+		StickyMin:   cfg.StickyMinutes,
+		Fingerprint: cfg.Fingerprint,
+		Model:       cfg.Model,
+
+		UpstreamPerRegionHour: cfg.UpstreamPerRegionHour,
+		Live:                  live,
+		Log:                   log, // 只用来记出口熔断的开合
+	}
+}
+
 func run(path string, log *slog.Logger) error {
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -47,23 +66,11 @@ func run(path string, log *slog.Logger) error {
 	}
 	defer st.Close()
 
-	// 传**全集**，不是只传粘性的：Client.NewSID(true) 自己会挑粘性出口，
-	// 而只传粘性的会让 webshare 那批接入点永远走不到——unified-121 / 71 只有它能摸到，
-	// 那正是它存在的理由。
 	// 配置的活引用：管理页改旋钮、或者有人直接编辑文件，都当场生效，不用重启。
 	// 重启会丢掉进程里的速率窗口、铸票计数、需求时间戳——而调度正依据那些。
 	live := config.NewLive(path, cfg)
 
-	minter := &mint.Client{
-		Proxies:     cfg.EnabledProxies(),
-		StickyMin:   cfg.StickyMinutes,
-		Fingerprint: cfg.Fingerprint,
-		Model:       cfg.Model,
-
-		UpstreamPerRegionHour: cfg.UpstreamPerRegionHour,
-		Live:                  live,
-		Log:                   log, // 只用来记出口熔断的开合
-	}
+	minter := newMinter(cfg, live, log)
 	pool := sched.New(st, minter, sched.Options{
 		Mode: cfg.Mode,
 		// 验满血、续期、槽位冷却、对外开放门槛这几个旋钮由调度**现读** live，
@@ -82,7 +89,11 @@ func run(path string, log *slog.Logger) error {
 		PublicBaseURL: cfg.PublicBaseURL,
 		Live:          live,
 		ProxyStates:   minter.ProxyStates,
-		Log:           log,
+		// 管理页加出口、停用出口：运行中只往末尾加、只改启用标志，sid 绑的下标不会挪。
+		AddProxy:        minter.AddProxy,
+		SetProxyEnabled: minter.SetProxyEnabled,
+		ProbeProxy:      minter.ProbeProxy,
+		Log:             log,
 	})
 	if err != nil {
 		return err

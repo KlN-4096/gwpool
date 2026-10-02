@@ -535,7 +535,11 @@ func Patch(path string, changes map[string]any) error {
 		raw[k] = b
 	}
 	// 派生字段不该留在文件里：它是 Models[0] 的镜像，下次 Load 会把它当成「又排一次」。
-	delete(raw, "model")
+	// **只在这次改了 models 时删**：只改 proxies 的补丁（管理页加代理、停用代理）删了它，
+	// 只写了老式单值 model 的配置就会悄悄回落到默认模型。
+	if _, ok := changes["models"]; ok {
+		delete(raw, "model")
+	}
 
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {

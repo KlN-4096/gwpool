@@ -34,11 +34,18 @@
 
 <section id="tab-proxies">
   <div class="card">
-    <header class="card-head"><div><h2>出口代理</h2><p>在 <code>config.json</code> 的 <code>proxies</code> 中配置，修改后需要重启服务才能生效。</p></div></header>
+    <header class="card-head"><div><h2>出口代理</h2>
+      {{if .ProxyEditable}}<p>可以在下面直接添加，试通了才保存，<strong>立即生效、不用重启</strong>。已有的只能停用或启用；删除和修改要改 <code>config.json</code> 再重启——会话按代理在清单里的位置绑定出口，删掉一条会让正在用的会话串到别的出口。</p>
+      {{else}}<p>在 <code>config.json</code> 的 <code>proxies</code> 中配置，修改后需要重启服务才能生效。</p>{{end}}</div></header>
+    {{if or .ProxyNote .ProxyErr}}
+    <div class="card-body">
+      {{if .ProxyErr}}<p class="err" role="alert">{{.ProxyErr}}</p>{{else}}<div class="note info"><p>{{.ProxyNote}}</p></div>{{end}}
+    </div>
+    {{end}}
     {{if .Proxies}}
     <div class="table-wrap"><table id="t-proxies" data-grid data-facets="ok:正常:ok|skip:暂停中:warn|off:已停用" data-placeholder="搜索名称或地址">
       <thead><tr><th>名称</th><th>类型</th><th>地址</th><th>用户名</th><th>状态</th><th>粘性会话</th>
-        <th class="num">连续失败</th><th>暂停剩余</th><th class="num">绑定会话</th></tr></thead>
+        <th class="num">连续失败</th><th>暂停剩余</th><th class="num">绑定会话</th>{{if .ProxyEditable}}<th data-nosort></th>{{end}}</tr></thead>
       <tbody>
       {{range .Proxies}}
         <tr data-facet="{{if not .Enabled}}off{{else if .SkipLeft}}skip{{else}}ok{{end}}">
@@ -51,6 +58,10 @@
           <td class="num {{if .Fails}}bad{{end}}">{{.Fails}}</td>
           <td>{{if .SkipLeft}}<span class="badge warn">{{.SkipLeft}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
           <td class="num">{{.BoundSIDs}}</td>
+          {{- if $.ProxyEditable}}
+          <td><form method="post" action="/admin/proxies/enabled"><input type="hidden" name="name" value="{{.Name}}"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
+            <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form></td>
+          {{- end}}
         </tr>
       {{end}}
       </tbody>
@@ -58,7 +69,28 @@
     {{else}}
     <p class="empty">没有配出口代理，或者服务端没把状态接进来。</p>
     {{end}}
-    <p class="foot">请求失败的代理会被暂时跳过，到期后自动恢复。粘性会话指同一会话固定使用同一个出口 IP，目前只有 novproxy 类型支持；绑定会话是当前固定在该代理上的会话数。</p>
+    {{if .ProxyEditable}}
+    <div class="card-body">
+      <h3>添加出口代理</h3>
+      <form method="post" action="/admin/proxies" onsubmit="this.querySelector('button[type=submit]').disabled = true">
+        <div class="fields">
+          <label>名称 <span class="hint">日志和这张表里认它用，不超过 32 个字，不能和已有的重名</span>
+            <input name="name" required maxlength="32" autocomplete="off" spellcheck="false"></label>
+          <label>类型 <span class="hint">决定用户名怎么拼，只支持这两家</span>
+            <select name="kind"><option value="novproxy">novproxy（住宅）</option><option value="webshare">webshare（机房）</option></select></label>
+          <label>地址 <span class="hint">主机:端口，不带 socks5://</span>
+            <input name="host" required autocomplete="off" spellcheck="false" placeholder="us.novproxy.io:1000"></label>
+          <label>用户名 <span class="hint">面板上的原始用户名，地区和会话号由池子自己拼</span>
+            <input name="user" required autocomplete="off" spellcheck="false"></label>
+          <label>密码 <span class="hint">只写进配置文件，页面上不会再显示</span>
+            <input name="pass" type="password" required autocomplete="new-password"></label>
+        </div>
+        <div class="actions"><button type="submit" class="primary">试通并添加</button></div>
+      </form>
+      <p class="foot">提交后先经这条代理查一次出口 IP（ipinfo，不碰 OpenAI、不花额度），最多等 25 秒；不通就不保存，原因会显示在上面。</p>
+    </div>
+    {{end}}
+    <p class="foot">请求失败的代理会被暂时跳过，到期后自动恢复；停用的代理不再分给新会话，已经在用它的会话用完为止。粘性会话指同一会话固定使用同一个出口 IP（novproxy、webshare 都支持）；绑定会话是最近绑到它上面、还在粘性时限内的会话数，停用后它降到 0 就说明在用的都用完了。</p>
   </div>
 </section>
 

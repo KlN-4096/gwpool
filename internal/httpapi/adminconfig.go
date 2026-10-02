@@ -109,6 +109,8 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		s.adminConfigDone(w, r, "", err.Error())
 		return
 	}
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	if err := config.Patch(live.Path(), changes); err != nil {
 		s.opt.Log.Warn("保存配置失败", "err", err)
 		s.adminConfigDone(w, r, "", err.Error())

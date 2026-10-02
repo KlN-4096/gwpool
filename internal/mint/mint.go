@@ -79,7 +79,8 @@ func (e *RateLimited) Unwrap() error { return types.ErrRateLimited }
 
 // Client 实现 types.Minter。
 type Client struct {
-	// Proxies 是出口供应商清单，下标即 sid 前两位编的那个下标，**顺序不要在运行中变**。
+	// Proxies 是出口供应商清单（含停用的），sid 绑的就是它的下标，**顺序不要在运行中变**。
+	// 构造之后只许经 AddProxy / SetProxyEnabled 改（见 proxyadmin.go），别直接动。
 	Proxies     []config.Proxy
 	StickyMin   int                // novproxy 的 -t-，0 时按 5 分钟
 	Fingerprint config.Fingerprint // 空时按 sub2api 形状
@@ -100,8 +101,9 @@ type Client struct {
 	// Live 非 nil 时，模型和速率上限每次**现读**它，于是改配置不用重启。
 	// 为空就用上面那两个字段（测试走这条路，不必搭一份配置）。
 	//
-	// 代理清单刻意**不**走它：Proxies 的下标编进了 sid，运行中换顺序会让已经发出去的
-	// sid 指向另一条出口，铸票和 state-echo 就配不成同一个 IP 了。改代理要重启。
+	// 代理清单刻意**不**走它：sid 绑的是 Proxies 的下标，整份换掉会让已经发出去的
+	// sid 指向另一条出口，铸票和 state-echo 就配不成同一个 IP 了。管理页只能往末尾加、
+	// 改启用标志（AddProxy / SetProxyEnabled）；删和改别的字段要改文件再重启。
 	Live *config.Live
 
 	// Log 非 nil 时记熔断的开合。**只记这一件事**：别的失败都原路返回给调用方，
@@ -267,8 +269,11 @@ func (c *Client) resolve(sid string, sticky bool) (config.Proxy, error) {
 		c.bindLocked(sid, idx, now)
 		return p, nil
 	}
-	return config.Proxy{}, fmt.Errorf("%w（sticky=%v，共 %d 条）", ErrNoProxy, sticky, n)
+	return config.Proxy{}, fmt.Errorf("%w（sticky=%v，共 %d 条，含停用的）", ErrNoProxy, sticky, n)
 }
+
+// bindTTL 是一条 sid 绑定有意义的时长：粘性窗口一过出口 IP 本来就会变。
+func (c *Client) bindTTL() time.Duration { return 2 * time.Duration(c.stickyMin()) * time.Minute }
 
 // bindLocked 记下绑定，顺手清掉过期的。
 // 绑定只需要活过粘性窗口：窗口一过出口 IP 本来就会变，留着也没用。
@@ -277,7 +282,7 @@ func (c *Client) bindLocked(sid string, idx int, now time.Time) {
 		c.sids = map[string]sidBind{}
 	}
 	if len(c.sids) >= 2000 {
-		ttl := 2 * time.Duration(c.stickyMin()) * time.Minute
+		ttl := c.bindTTL()
 		for k, v := range c.sids {
 			if now.Sub(v.at) > ttl {
 				delete(c.sids, k)
@@ -429,13 +434,9 @@ func (c *Client) Geo(ctx context.Context, e types.Exit, sid string) (types.Obser
 }
 
 func (c *Client) geoOnce(ctx context.Context, e types.Exit, sid string) (types.Observed, error) {
-	url := c.GeoURL
-	if url == "" {
-		url = defaultGeoURL
-	}
 	ctx, cancel := context.WithTimeout(ctx, geoTimeout)
 	defer cancel()
-	req, err := c.newRequest(ctx, http.MethodGet, url, nil, nil)
+	req, err := c.geoRequest(ctx)
 	if err != nil {
 		return types.Observed{}, err
 	}
@@ -443,6 +444,20 @@ func (c *Client) geoOnce(ctx context.Context, e types.Exit, sid string) (types.O
 	if err != nil {
 		return types.Observed{}, err
 	}
+	return readGeo(resp)
+}
+
+// geoRequest 是查出口地理的那一发 GET：打的是 ipinfo，不是上游。
+func (c *Client) geoRequest(ctx context.Context) (*http.Request, error) {
+	url := c.GeoURL
+	if url == "" {
+		url = defaultGeoURL
+	}
+	return c.newRequest(ctx, http.MethodGet, url, nil, nil)
+}
+
+// readGeo 读 ipinfo 的回答，读完关掉响应体。
+func readGeo(resp *http.Response) (types.Observed, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return types.Observed{}, fmt.Errorf("查 geo 返回 HTTP %d", resp.StatusCode)
@@ -680,8 +695,8 @@ func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, erro
 				b.WriteString(e.City)
 			}
 		}
-		// 整串 sid 都进去（含前两位的代理下标）：它只影响「哪些请求共享同一个出口 IP」，
-		// 而同下标就是同供应商，语义正好。
+		// 整串 sid 都进去：它只影响「哪些请求共享同一个出口 IP」，而同一个 sid
+		// 永远绑在同一条供应商上（见 resolve），语义正好。
 		fmt.Fprintf(&b, "-sid-%s-t-%d", sid, mins)
 		return b.String(), nil
 	case config.KindWebshare:
@@ -894,16 +909,21 @@ type ProxyState struct {
 	Sticky    bool
 	Fails     int       // 连续失败次数，到 3 熔断
 	SkipUntil time.Time // 零值 = 没被熔断
-	BoundSIDs int       // 当前钉在这条出口上的 sid 数
+	BoundSIDs int       // 粘性时限内钉在这条出口上的 sid 数（停用后降到 0 = 在用的都用完了）
 }
 
-// ProxyStates 报各出口的状态。顺序同 Proxies，即 sid 前两位编的那个下标。
+// ProxyStates 报各出口的状态。顺序同 Proxies，即 sid 绑定的那个下标。
 func (c *Client) ProxyStates() []ProxyState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// 只数还在粘性时限内的绑定：过期的绑定要攒满 2000 条才清，全数进去的话，
+	// 一条停用的出口要挂好几个小时才降到 0，看不出在用的会话用完没有。
+	now, ttl := time.Now(), c.bindTTL()
 	bound := map[int]int{}
 	for _, b := range c.sids {
-		bound[b.idx]++
+		if now.Sub(b.at) <= ttl {
+			bound[b.idx]++
+		}
 	}
 	out := make([]ProxyState, 0, len(c.Proxies))
 	for i, p := range c.Proxies {

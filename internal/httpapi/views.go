@@ -323,6 +323,10 @@ type adminView struct {
 	// Rescan 是刚点过「找新网关」按钮之后的回话："queued" = 真排进去了，
 	// 其余非空串是没派出去的原因。空 = 这一次打开不是从那个按钮跳回来的。
 	Rescan string
+	// ProxyEditable：接了配置文件和出口代理，出口代理那一节才有「添加」表单和停用按钮。
+	ProxyEditable bool
+	// ProxyNote / ProxyErr 是刚加完、刚停用完代理跳回来时的回话。
+	ProxyNote, ProxyErr string
 }
 
 // ownerRow 是一个上传者。**Token 在这一页是故意给的**：迁移出来那个 owner 的令牌
