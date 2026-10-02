@@ -137,33 +137,9 @@
 <section id="tab-submit">
   <div class="grid-2">
     <div class="card">
-      <header class="card-head"><div><h2>上传账号</h2><p>提交后立即创建，并跳转到该账号的页面。</p></div></header>
+      <header class="card-head"><div><h2>上传账号</h2><p>可一次贴多份。全部成功就跳到账号总览页；有失败的会留在这里，逐条列出原因。</p></div></header>
       <div class="card-body">
-        <form id="upload" method="post" action="/upload">
-          <label>备注名称 <span class="hint">选填，最多 64 字，便于识别</span>
-            <input name="label" maxlength="64" autocomplete="off"></label>
-          <label>账号凭据 <span class="hint">可粘贴 auth.json 全文、包含 access_token / refresh_token / account_id 的 JSON，或单个 token</span>
-            <textarea name="creds" required spellcheck="false" placeholder="在此粘贴 JSON 或 token"></textarea></label>
-          <fieldset>
-            <legend>凭据类型 <span class="hint">仅在粘贴单个 token 时生效；粘贴 JSON 时自动识别</span></legend>
-            <div class="choices">
-              <label class="choice"><input type="radio" name="kind" value="auto" checked>
-                <span>自动识别<small>三段式 JWT 按 access_token 处理，其余按 refresh_token 处理</small></span></label>
-              <label class="choice"><input type="radio" name="kind" value="access">
-                <span>access_token<small>直接使用；过期后需要重新上传</small></span></label>
-              <label class="choice"><input type="radio" name="kind" value="refresh">
-                <span>refresh_token<small>先换取 access_token，之后自动续期</small></span></label>
-            </div>
-          </fieldset>
-          <label>挂到已有账号页 <span class="hint">选填。粘总览页令牌，这份凭据就挂在同一页下；留空则新建一个</span>
-            <input name="owner_token" autocomplete="off" spellcheck="false"></label>
-          <p class="err" id="upload-err" role="alert" hidden></p>
-          <div class="actions">
-            <button type="submit" class="primary">提交并创建账号</button>
-            <button type="button" id="pick" hidden data-js>从文件读取…</button>
-            <input type="file" id="creds-file" accept=".json,application/json" hidden>
-          </div>
-        </form>
+        {{template "upload" .Upload}}
       </div>
     </div>
     <div class="card">
@@ -172,7 +148,8 @@
         <ul class="checklist">
           <li>会用这个账号发探测请求（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），<strong>消耗 0 token</strong>，用于发现网关和维护路由 Cookie。</li>
           <li>只给 refresh_token 时先换 access_token；没给 account_id 时从 token 里读。</li>
-          <li>提交后跳转到账号页。接入 key 和停用开关都在那里，保存好地址。</li>
+          <li>同一批上传的都挂在同一个账号总览页下；接入 key 和停用开关在各账号页，保存好地址。</li>
+          <li>不填备注就用 token 里的邮箱当名字。同一个号再传一次是更新凭据，不会多建一行。</li>
           <li>可随时在账号页停用，停用后不再用它发请求。</li>
         </ul>
       </div>

@@ -33,6 +33,7 @@ const (
 type Claims struct {
 	AccountID string
 	Plan      string // free / plus / pro / ...
+	Email     string // 上传时没填备注就拿它当名字
 	Expires   time.Time
 }
 
@@ -55,11 +56,20 @@ func Parse(accessToken string) (Claims, error) {
 			AccountID string `json:"chatgpt_account_id"`
 			Plan      string `json:"chatgpt_plan_type"`
 		} `json:"https://api.openai.com/auth"`
+		Profile json.RawMessage `json:"https://api.openai.com/profile"`
 	}
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return Claims{}, errors.New("access_token 的 payload 不是 JSON")
 	}
 	out := Claims{AccountID: c.Auth.AccountID, Plan: c.Auth.Plan}
+	// 邮箱只拿来起名字：profile 长得不对就当没有，别让整张票因此读不出来
+	// （读不出来的票，后台续票会跳过它）。
+	var prof struct {
+		Email string `json:"email"`
+	}
+	if json.Unmarshal(c.Profile, &prof) == nil {
+		out.Email = prof.Email
+	}
 	if c.Exp > 0 {
 		out.Expires = time.Unix(c.Exp, 0)
 	}

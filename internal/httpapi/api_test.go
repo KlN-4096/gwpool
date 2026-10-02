@@ -276,6 +276,16 @@ func (f *fakeStore) SetAccountEnabled(id int64, enabled bool) error {
 	return fmt.Errorf("账号 %d 不存在", id)
 }
 
+func (f *fakeStore) SetAccountVia(id, via int64) error {
+	for i := range f.accounts {
+		if f.accounts[i].ID == id {
+			f.accounts[i].Via = via
+			return nil
+		}
+	}
+	return fmt.Errorf("账号 %d 不存在", id)
+}
+
 func (f *fakeStore) DeleteAccount(id int64) error {
 	for i := range f.accounts {
 		if f.accounts[i].ID == id {
@@ -441,6 +451,29 @@ func TestConsumerKeyDerivation(t *testing.T) {
 	}
 }
 
+// 匿名占位行没凭据、没归属，管理页上原来只剩一串上游 ID，看不出是谁在用（用户问过
+// 「匿名 e44acf05… 是什么」）。拿谁的 key 替它取票、取了多少、最近一次，都得摆出来。
+func TestAdminShowsWhoFetchesForAnonymousRows(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModePool)
+	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 acct-outside",
+		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-outside"}, Enabled: true, ViewToken: "vt-9"})
+	st.slots = map[string]types.Slot{"9|unified-7": {AccountID: 9, Gateway: "unified-7",
+		LastDeliver: time.Date(2026, 10, 2, 12, 37, 36, 0, time.UTC)}}
+	ka := srv.ConsumerKeyFor(st.accounts[0])
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-outside", nil), ka)); w.Code != 200 {
+		t.Fatalf("替外部账号取票失败 %d: %s", w.Code, w.Body.String())
+	}
+	if got := st.accounts[2].Via; got != 1 {
+		t.Fatalf("没记下是账号 1 的 key 在替它取: Via=%d", got)
+	}
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	for _, want := range []string{"经 #1 pro1 的接入 key 取票", "取过 1 个网关的票，最近一次 2026-10-02 12:37:36 UTC"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("管理页的外部账号行缺了 %q", want)
+		}
+	}
+}
+
 // 调度正确性：A 的 key 取到的必须是 A 的槽位，不是 B 的。
 func TestCookieIsPerAccount(t *testing.T) {
 	srv, h, p, st, _ := rig(t, types.ModePool)
@@ -567,8 +600,9 @@ func TestUpload(t *testing.T) {
 	if len(a.ViewToken) < 20 {
 		t.Fatalf("view_token 太短或没生成: %q", a.ViewToken)
 	}
-	if loc := w.Header().Get("Location"); loc != "/a/"+a.ViewToken {
-		t.Fatalf("没跳到查看页: %q", loc)
+	// 传完回账号总览页（不是这个号自己的 /a/ 页）。
+	if loc := w.Header().Get("Location"); len(st.addedOwners) != 1 || loc != "/u/"+st.addedOwners[0].Token {
+		t.Fatalf("没跳到账号总览页: %q", loc)
 	}
 	// plan 取 **token 里** 的（这张票写的是 pro），不取表单手填的那个 plus：
 	// 手填的只是标签，票里的是事实，而「这票其实是 free」正是会让整次扫描全军覆没的事。
@@ -1810,6 +1844,143 @@ func TestUploadDerivesAccountIDFromToken(t *testing.T) {
 	}
 }
 
+// 批量上传靠这两件事才看得懂结果：没填备注时用票里的邮箱当名字（account_id 那串谁也认不出），
+// 回执说清是「新建」还是「更新」（同一个号贴两遍不该多出一行）。走真 store，和页面脚本
+// 发的一样：表单 + Accept: json，第二发带着第一发种下的身份 cookie。
+func TestUploadNamesByEmailAndReportsUpdate(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	srv, err := New(&fakePool{mode: types.ModePool}, st, &fakeScanner{},
+		Options{ConsumerKey: "ckey", AdminKey: "akey", Model: "gpt-6-luna"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+	tokenWithEmail := func(acct, email string) string {
+		payload, _ := json.Marshal(map[string]any{
+			"exp":                            time.Now().Add(time.Hour).Unix(),
+			"https://api.openai.com/auth":    map[string]string{"chatgpt_account_id": acct, "chatgpt_plan_type": "free"},
+			"https://api.openai.com/profile": map[string]string{"email": email},
+		})
+		enc := base64.RawURLEncoding.EncodeToString
+		return enc([]byte(`{"alg":"RS256"}`)) + "." + enc(payload) + "." + enc([]byte("sig"))
+	}
+	upload := func(creds, label string, cookies []*http.Cookie) (*httptest.ResponseRecorder, map[string]string) {
+		t.Helper()
+		form := url.Values{"creds": {creds}, "label": {label}, "kind": {"auto"}}
+		r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.Header.Set("Accept", "application/json")
+		for _, c := range cookies {
+			r.AddCookie(c)
+		}
+		w := do(h, r)
+		if w.Code != 200 {
+			t.Fatalf("上传失败 %d: %s", w.Code, w.Body.String())
+		}
+		var resp map[string]string
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("回执不是 JSON: %v", err)
+		}
+		return w, resp
+	}
+
+	w, first := upload(tokenWithEmail("acct-mail", "someone@example.com"), "", nil)
+	if first["label"] != "someone@example.com" || first["status"] != "created" || first["plan"] != "free" {
+		t.Fatalf("第一发回执不对: %v", first)
+	}
+	_, again := upload(tokenWithEmail("acct-mail", "someone@example.com"), "", w.Result().Cookies())
+	if again["status"] != "updated" || again["view_token"] != first["view_token"] {
+		t.Fatalf("同一个号再传一次应该是更新同一行: %v", again)
+	}
+	_, named := upload(tokenWithEmail("acct-named", "x@example.com"), "我起的名字", w.Result().Cookies())
+	if named["label"] != "我起的名字" || named["owner_url"] != first["owner_url"] {
+		t.Fatalf("填了备注就用备注、并挂在同一个总览页下: %v", named)
+	}
+	if n := len(st.Accounts()); n != 2 {
+		t.Fatalf("账号数 %d，同一个号传两遍不该多出一行", n)
+	}
+	// 批量重传（不带备注）拿新票刷旧号：人家起过的名字不能被冲成邮箱。
+	_, kept := upload(tokenWithEmail("acct-named", "x@example.com"), "", w.Result().Cookies())
+	if kept["status"] != "updated" || kept["label"] != "我起的名字" {
+		t.Fatalf("不带备注重传把原备注冲掉了: %v", kept)
+	}
+	// 票里没邮箱就回落到 account_id；邮箱来自不验签的票，控制字符得滤掉。
+	_, bare := upload(fakeToken("acct-no-mail", "pro", time.Now().Add(time.Hour)), "", w.Result().Cookies())
+	_, dirty := upload(tokenWithEmail("acct-dirty", "a\x1b[31m\nb@x.io"), "", w.Result().Cookies())
+	_, blank := upload(tokenWithEmail("acct-blank-mail", " \x00 "), "", w.Result().Cookies())
+	if bare["label"] != "acct-no-mail" || dirty["label"] != "a[31mb@x.io" || blank["label"] != "acct-blank-mail" {
+		t.Fatalf("备注兜底不对: 无邮箱=%q 脏邮箱=%q 洗完是空的=%q", bare["label"], dirty["label"], blank["label"])
+	}
+}
+
+// 在别人的 /u/ 页上传（隐藏字段 page_owner 带着那一页的令牌）：凭据挂过去，但**不写**
+// 浏览器的身份——有身份的不能被换掉，没身份的也不能被种上：令牌是链接带进来的，不是
+// 这个人自己选的，种上的话之后他在首页传的全挂到别人名下（审查 2026-10-02 两轮）。
+// 只有首页手填的 owner_token 是「挂上并记住」。
+func TestUploadOnAnotherOwnersPageKeepsIdentity(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	post := func(acct, field, cookie string) *httptest.ResponseRecorder {
+		form := url.Values{field: {ownerTok1},
+			"creds": {`{"access_token":"` + fakeToken(acct, "pro", time.Now().Add(time.Hour)) + `"}`}}
+		r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if cookie != "" {
+			r = ownerCookieOf(r, cookie)
+		}
+		w := do(h, r)
+		if w.Code != http.StatusSeeOther {
+			t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+		}
+		return w
+	}
+	identity := func(w *httptest.ResponseRecorder) string {
+		for _, c := range w.Result().Cookies() {
+			if c.Name == ownerCookie {
+				return c.Value
+			}
+		}
+		return ""
+	}
+	if w := post("acct-for-owner1", "page_owner", ownerTok2); identity(w) != "" {
+		t.Fatalf("在 owner 1 的页面上传把 owner 2 的身份换掉了: %q", identity(w))
+	}
+	if got := st.added[0].OwnerID; got != 1 {
+		t.Fatalf("凭据没挂到那一页的 owner 下: OwnerID=%d", got)
+	}
+	if w := post("acct-for-owner1-b", "page_owner", ""); identity(w) != "" {
+		t.Fatalf("没身份的浏览器在别人页面上传被种上了那个身份: %q", identity(w))
+	}
+	if w := post("acct-for-owner1-c", "owner_token", ""); identity(w) != ownerTok1 {
+		t.Fatalf("首页手填令牌该挂上并记住: %q", identity(w))
+	}
+}
+
+// 记住了身份的浏览器不该再被要求手填总览令牌（用户嫌每次都要粘）：首页表单直接带上那个
+// 身份，没身份的才给输入框。/u 页同理，令牌就是这一页的。
+func TestUploadFormCarriesKnownOwner(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	anon := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	if !strings.Contains(anon, `<input name="owner_token"`) {
+		t.Fatal("没身份的首页缺了「挂到已有账号页」输入框")
+	}
+	known := do(h, ownerCookieOf(httptest.NewRequest("GET", "/", nil), ownerTok1)).Body.String()
+	if strings.Contains(known, `<input name="owner_token"`) {
+		t.Fatal("记住了身份的首页还在让人手填令牌")
+	}
+	// 身份只给链接、不进表单：写进表单的话，在别的标签页登出后这个旧页还会把凭据挂回去。
+	if strings.Contains(known, `name="owner_token"`) || !strings.Contains(known, `<a href="/u/`+ownerTok1+`">你的账号总览页</a>`) {
+		t.Fatal("首页的上传表单应该只给总览页链接，不带令牌字段")
+	}
+	page := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String()
+	if !strings.Contains(page, `name="page_owner" value="`+ownerTok1+`"`) {
+		t.Fatal("/u 页的上传表单没带这一页的令牌")
+	}
+}
+
 // 只贴 refresh_token：当场换一张 access_token 再建号。
 // 换不出来就别建——建了也是个废号，要等第一次扫描白打一轮才发现。
 func TestUploadAcceptsRefreshTokenOnly(t *testing.T) {
@@ -1899,6 +2070,62 @@ func TestUploadRejectsExpiredWithoutRefresh(t *testing.T) {
 	}
 }
 
+// 线上的 refresh_token 长这样：`rt.<一段>.<一段>`（2026-10-02 查了池子里全部 26 张，无一例外），
+// 恰好也是点分三段。按「三段就是 JWT」去猜，自动识别会把它当 access_token 拆，当场报
+// payload 解不开——用户实际踩到。判 access_token 得看它真能当 JWT 读出声明。
+func TestUploadAutoDetectsDottedRefreshToken(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModeSingle)
+	var asked []string
+	srv.opt.Refresh = func(_ context.Context, rt string) (string, string, error) {
+		asked = append(asked, rt)
+		return fakeToken("acct-dotted-rt", "plus", time.Now().Add(time.Hour)), "", nil
+	}
+	rt := "rt." + strings.Repeat("A1b2", 20) + "." + strings.Repeat("c3D4", 20)
+	form := url.Values{"kind": {"auto"}, "creds": {rt}}
+	r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if w := do(h, r); w.Code != http.StatusSeeOther {
+		t.Fatalf("rt. 开头的 refresh_token 被拒 %d: %s", w.Code, w.Body.String())
+	}
+	if len(asked) != 1 || asked[0] != rt {
+		t.Fatalf("没拿它去换票：换了 %d 次", len(asked))
+	}
+	if got := st.added[0].Creds.AccountID; got != "acct-dotted-rt" {
+		t.Fatalf("换回来的票没落对: %q", got)
+	}
+
+	// 反过来：一张折坏的 JWT 照旧按 access_token 报错，不能被当成 refresh_token 送去换票
+	// ——那样报出来的是一句不着边的「换票失败」。
+	form = url.Values{"kind": {"auto"}, "creds": {"eyJhbGciOiJSUzI1NiJ9.!!!broken!!!.c2ln"}}
+	r = httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := do(h, r)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "access_token") || len(asked) != 1 {
+		t.Fatalf("坏 JWT 该报 access_token 的错且不去换票：%d %s（换了 %d 次）", w.Code, w.Body.String(), len(asked))
+	}
+
+	// 两种前缀都不像（比如终端折行切下来的半截 JWT）：让人手动选，别拿去上游换票。
+	form = url.Values{"kind": {"auto"}, "creds": {"In0.c2lnbmF0dXJlLXRhaWwtb2YtYS1qd3Q"}}
+	r = httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w = do(h, r)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "手动选") || len(asked) != 1 {
+		t.Fatalf("认不出的 token 该让人手动选、不去换票：%d %s（换了 %d 次）", w.Code, w.Body.String(), len(asked))
+	}
+}
+
+// 「anon:」是匿名占位行的命名空间。票不验签，自造一张 account_id 填 anon:foo 的票上传，
+// 就能认领那一行占位行、拿到它的 key（审查 2026-10-02 第二轮），所以上传口就得拒。
+func TestUploadRejectsAnonNamespaceAccountID(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	form := url.Values{"creds": {`{"access_token":"` + fakeToken(types.AnonPrefix+"foo", "pro", time.Now().Add(time.Hour)) + `"}`}}
+	r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if w := do(h, r); w.Code != http.StatusBadRequest || len(st.added) != 0 {
+		t.Fatalf("anon: 开头的 account_id 该被拒：%d %s（建了 %d 行）", w.Code, w.Body.String(), len(st.added))
+	}
+}
+
 // 表单里只贴一个裸 token（不交整份 auth.json）也要收。
 func TestUploadAcceptsBareToken(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModeSingle)
@@ -1935,7 +2162,7 @@ func TestUploadAcceptsBareToken(t *testing.T) {
 	}
 
 	// auto + 不是 JWT ⇒ 当 refresh_token，去换票
-	if w := post("auto", "rt-"+strings.Repeat("x", 40)); w.Code != http.StatusSeeOther {
+	if w := post("auto", "rt."+strings.Repeat("x", 20)+"."+strings.Repeat("y", 20)); w.Code != http.StatusSeeOther {
 		t.Fatalf("裸 refresh_token 被拒 %d: %s", w.Code, w.Body.String())
 	}
 	if got := st.added[1].Creds.AccountID; got != "acct-bare-rt" {
@@ -2483,6 +2710,10 @@ func TestAdminAccountsPage(t *testing.T) {
 	// 这一页不是某个人的总览：别把「本页地址/令牌」那套上传者文案摆上来。
 	if strings.Contains(body, "换设备时在首页粘这个令牌") || strings.Contains(body, ownerTok1) {
 		t.Fatal("/admin/accounts 混进了上传者总览令牌")
+	}
+	// 上传表单只属于某个人的 /u/ 页：管理员这页传上去该挂给谁，答不出来。
+	if strings.Contains(body, `id="upload"`) {
+		t.Fatal("/admin/accounts 混进了上传表单")
 	}
 	// 凭据一个字都不许出现（和其他页面同一条哨兵）。
 	if strings.Contains(body, secretToken) {

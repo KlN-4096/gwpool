@@ -45,14 +45,27 @@
   {{end}}
 </div>
 
+{{if not .Admin}}
+<nav class="tabs" data-tabs hidden data-js>
+  <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
+  <a href="#import">添加账号</a>
+</nav>
+{{end}}
+
+<section id="tab-accounts">
 {{if .Accounts}}
+<div class="fold-bar" hidden data-js>
+  <button type="button" class="sm" data-fold="close">全部折叠</button>
+  <button type="button" class="sm" data-fold="open">全部展开</button>
+</div>
 {{range .Accounts}}
-<div class="card">
-  <header class="card-head">
-    <div><h2>{{.Label}}</h2>
-      <p>{{if .Plan}}套餐 {{.Plan}} · {{end}}添加于 {{.Since}} UTC · 累计 <strong>{{.Requests}} 次请求</strong>（消耗 <strong>0 token</strong>）· 发现 <strong>{{.NewGateways}} 个新网关</strong></p></div>
+<details class="card acct" data-acct="{{.ID}}" open>
+  {{/* summary 里只放标题和行内元素（规范只许这些），所以元信息是 span 不是 p */}}
+  <summary class="card-head acct-head">
+    <h2>{{.Label}}</h2>
+    <span class="meta">{{if .Plan}}套餐 {{.Plan}} · {{end}}添加于 {{.Since}} UTC · 累计 <strong>{{.Requests}} 次请求</strong>（消耗 <strong>0 token</strong>）· 发现 <strong>{{.NewGateways}} 个新网关</strong></span>
     {{if .Enabled}}<span class="badge ok">已启用</span>{{else}}<span class="badge bad">已停用</span>{{end}}
-  </header>
+  </summary>
   <div class="card-body">
     {{if not .Enabled}}
     <p class="err">已停用：不再用它发请求，接入 key 失效。</p>
@@ -85,20 +98,22 @@
     {{end}}
   </div>
   <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明、停用开关在那边）</p>
-</div>
+</details>
 {{end}}
 {{else}}
-<div class="card"><p class="empty">{{if .Admin}}池内暂无账号。{{else}}你名下还没有凭据。回<a href="/">首页</a>上传一份。{{end}}</p></div>
+<div class="card"><p class="empty">{{if .Admin}}池内暂无账号。{{else}}你名下还没有凭据，到<a href="#import">添加账号</a>里上传。{{end}}</p></div>
 {{end}}
+</section>
 
 {{if not .Admin}}
+<section id="tab-import">
 <div class="card">
-  <header class="card-head"><div><h2>再挂一份凭据</h2></div></header>
+  <header class="card-head"><div><h2>添加账号</h2><p>可一次贴多份，不填备注就用 token 里的邮箱。</p></div></header>
   <div class="card-body">
-    <p>回<a href="/">首页</a>上传，新凭据自动挂到这一页。</p>
-    <p class="muted">换浏览器时，在上传表单的「挂到已有账号页」里粘上面的令牌。</p>
+    {{template "upload" .Upload}}
     <p class="foot">探测请求固定为 <code>ping</code>（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），带 <code>store=false</code>，不在账号里留对话记录。</p>
   </div>
 </div>
+</section>
 {{end}}
 {{end}}

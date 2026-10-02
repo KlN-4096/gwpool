@@ -614,6 +614,29 @@ func (s *Store) AddOwner(label string) (types.Owner, error) {
 	return o, nil
 }
 
+// SetAccountVia 只改 Via 一个字段（见 types.Account.Via）。没变就不写盘：同一个调用方
+// 每两三分钟就来取一次票。
+func (s *Store) SetAccountVia(id, via int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.st.Accounts {
+		if s.st.Accounts[i].ID != id {
+			continue
+		}
+		old := s.st.Accounts[i].Via
+		if old == via {
+			return nil
+		}
+		s.st.Accounts[i].Via = via
+		if err := s.save(); err != nil {
+			s.st.Accounts[i].Via = old // 没落盘就别留在内存里
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("账号 %d 不存在", id)
+}
+
 // SetAccountEnabled 只翻 Enabled 这一个字段。
 //
 // 刻意不是 PutAccount(a types.Account)：整行覆盖的入口意味着调用方手里得先有一份

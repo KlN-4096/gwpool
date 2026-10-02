@@ -297,6 +297,28 @@ a.btn:hover { background: var(--accent-2); border-color: var(--accent-2); text-d
 button:disabled { opacity: .55; cursor: default; }
 button[type=submit]:disabled { cursor: progress; }
 .err { margin: 0; padding: .55rem .8rem; border-radius: 8px; background: var(--bad-soft); color: var(--bad); white-space: pre-wrap; font-size: 13px; }
+details.card > summary { cursor: pointer; list-style: none; }
+summary.acct-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .15rem 1rem; align-items: center; }
+summary.acct-head h2, summary.acct-head .meta { grid-column: 1; min-width: 0; }
+summary.acct-head .meta { color: var(--muted); font-size: 12.5px; }
+summary.acct-head .badge { grid-column: 2; grid-row: 1 / span 2; }
+details.card > summary::-webkit-details-marker { display: none; }
+details.card > summary:hover { background: var(--sunken); }
+details.card > summary h2::before { content: ""; flex: none; width: .45rem; height: .45rem; margin: 0 .15rem .2rem 0;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); transition: transform .15s; }
+details.card:not([open]) { margin-bottom: .5rem; }
+details.card:not([open]) > summary { border-bottom: 0; padding-top: .6rem; padding-bottom: .6rem; }
+details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margin-bottom: 0; }
+.fold-bar { display: flex; justify-content: flex-end; gap: .5rem; margin: 0 0 .75rem; }
+.results { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; font-size: 13px; }
+.results li { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .6rem; margin: 0; padding: .45rem .7rem; border-radius: 8px; background: var(--sunken); }
+.results li b { white-space: nowrap; color: var(--ok); }
+.results li span { min-width: 0; overflow-wrap: anywhere; color: var(--fg-2); }
+.results li a { margin-left: auto; white-space: nowrap; }
+.results li.bad { background: var(--bad-soft); }
+.results li.bad b, .results li.bad span { color: var(--bad); }
+.results li.more { background: none; padding: .2rem 0 0; }
+.results li.more a { margin-left: 0; }
 .checklist { list-style: none; padding: 0 !important; display: grid; gap: .65rem; }
 .checklist li { position: relative; padding-left: 1.4rem; margin: 0 !important; }
 .checklist li::before { content: ""; position: absolute; left: .2rem; top: .55em; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); opacity: .7; }
@@ -333,6 +355,7 @@ button[type=submit]:disabled { cursor: progress; }
   <span class="crumb">{{.Title}}</span>
   {{if eq .Mode "pool"}}<span class="mode" title="任一账号取得的路由 Cookie 可分发给其他账号使用">池模式</span>
   {{- else}}<span class="mode" title="每个账号只使用自己取得的路由 Cookie">单账号模式</span>{{end}}
+  <button type="button" class="sm" id="reload" hidden data-js title="重新加载本页，看最新状态">↻ 刷新</button>
 </div></header>
 <main class="wrap">{{template "content" .}}</main>
 <footer class="wrap foot-note">gwpool 只分发路由 Cookie（<code>__cflb</code> / <code>__oailb</code>），业务请求不经过本服务。</footer>
@@ -340,6 +363,28 @@ button[type=submit]:disabled { cursor: progress; }
 (function () {
   'use strict';
   for (const el of document.querySelectorAll('[data-js]')) el.hidden = false;
+  // 页面都是服务端现算的，刷新 = 重新加载（保留当前页签和滚动位置）
+  document.getElementById('reload').addEventListener('click', function () { location.reload(); });
+
+  // 账号卡片折叠：记在 localStorage，刷新不丢。按账号 ID 记（池内唯一），/u/ 和全部账号页共用一份。
+  const cards = document.querySelectorAll('details[data-acct]');
+  if (cards.length) {
+    const FOLD_KEY = 'gwpool.folded';
+    let folded;
+    try { folded = new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]')); } catch (e) { folded = new Set(); }
+    for (const d of cards) {
+      if (folded.has(d.dataset.acct)) d.open = false;
+      d.addEventListener('toggle', function () {
+        if (d.open) folded.delete(d.dataset.acct); else folded.add(d.dataset.acct);
+        try { localStorage.setItem(FOLD_KEY, JSON.stringify(Array.from(folded))); } catch (e) { /* 隐私模式存不了就只管这一次 */ }
+      });
+    }
+    for (const b of document.querySelectorAll('[data-fold]')) {
+      b.addEventListener('click', function () {
+        for (const d of cards) d.open = b.dataset.fold === 'open';
+      });
+    }
+  }
 
   function make(tag, cls, text) {
     const e = document.createElement(tag);
@@ -565,50 +610,203 @@ button[type=submit]:disabled { cursor: progress; }
   if (form) {
     const btn = form.querySelector('button[type=submit]');
     const err = document.getElementById('upload-err');
+    const out = document.getElementById('upload-results');
     const file = document.getElementById('creds-file');
-    document.getElementById('pick').addEventListener('click', function () { file.click(); });
-    file.addEventListener('change', async function () {
-      const f = file.files[0];
-      file.value = '';
-      if (!f) return;
-      if (f.size > 65536) {
-        err.textContent = '文件过大（' + Math.round(f.size / 1024) + ' KB），上限为 64 KB。';
-        err.hidden = false;
-        return;
+    const box = form.elements.creds;
+    const idle = btn.textContent;
+    const MAX_ITEMS = 100;
+    // 一段文本拆成若干份凭据。auth.json 是多行的，不能按行切：花括号配平把每个 JSON 对象
+    // 整个抠出来（跳过字符串里的括号），对象之外的按空白、逗号、方括号、引号切成单个 token。
+    // 没配平的半截对象原样交上去，让服务端报「不是合法 JSON」。
+    function split(text) {
+      const items = [];
+      let rest = '', depth = 0, start = 0, str = false, esc = false;
+      // 逐个 push 不用展开：一个大文本文件切出十几万段时，push(...arr) 会爆调用栈
+      const flush = function () { for (const t of rest.split(/[\s,[\]"']+/)) if (t) items.push(t); rest = ''; };
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (!depth) {
+          if (c === '{') { flush(); depth = 1; start = i; } else rest += c;
+        } else if (str) {
+          if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') str = false;
+        } else if (c === '"') str = true;
+        else if (c === '{') depth++;
+        else if (c === '}' && !--depth) items.push(text.slice(start, i + 1));
       }
-      form.elements.creds.value = (await f.text()).trim();
+      if (depth) items.push(text.slice(start)); else flush();
+      return items;
+    }
+    function count() {
+      const n = split(box.value).length;
+      btn.textContent = n > 1 ? idle + ' ' + n + ' 份' : idle;
+    }
+    async function addFiles(files) {
+      if (box.readOnly) return; // 正在上传：结束时框会被改写成「失败的那几份」，这时塞进来的会丢
       err.hidden = true;
+      for (const f of files) {
+        if (f.size > 1 << 20) {
+          err.textContent = f.name + ' 太大（' + Math.round(f.size / 1024) + ' KB），单个文件上限 1 MB。';
+          err.hidden = false;
+          continue;
+        }
+        box.value = (box.value.trim() + '\n' + (await f.text()).trim()).trim();
+      }
+      count();
+    }
+    box.addEventListener('input', count);
+    const pick = document.getElementById('pick');
+    pick.addEventListener('click', function () { file.click(); });
+    file.addEventListener('change', async function () {
+      await addFiles(file.files);
+      file.value = '';
     });
+    // 文件拖到框上：读出来追加进框里，和「选择文件」同一条路。拖的是文字就交给浏览器。
+    box.addEventListener('dragover', function (e) {
+      if (e.dataTransfer.types.includes('Files')) e.preventDefault();
+    });
+    box.addEventListener('drop', function (e) {
+      if (!e.dataTransfer.files.length) return;
+      e.preventDefault(); // 上传中也要拦：不拦的话浏览器会直接打开那个文件、把这一页换掉
+      addFiles(e.dataTransfer.files);
+    });
+    function row(cls, head, text, href, link) {
+      const li = document.createElement('li');
+      li.className = cls;
+      if (head) {
+        const b = document.createElement('b');
+        b.textContent = head;
+        li.append(b);
+      }
+      if (text) {
+        const span = document.createElement('span');
+        span.textContent = text;
+        li.append(span);
+      }
+      if (href) {
+        const a = document.createElement('a');
+        a.href = href;
+        a.textContent = link;
+        li.append(a);
+      }
+      out.append(li);
+      out.hidden = false;
+    }
     form.addEventListener('submit', async function (e) {
       e.preventDefault();
       // 防止重复点击创建出多个账号
       if (btn.disabled) return;
-      const label = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = '正在提交…';
-      err.hidden = true;
-      try {
-        const r = await fetch(form.action, { method: 'POST', headers: { Accept: 'application/json' },
-                                            body: new URLSearchParams(new FormData(form)) });
-        if (r.ok) {
-          const url = (await r.json()).url;
-          form.reset();
-          location.assign(url);
-          return;
-        }
-        err.textContent = (await r.text()).trim() || ('HTTP ' + r.status);
-      } catch (e2) {
-        err.textContent = '网络错误，提交未完成，请稍后重试。';
+      const items = split(box.value);
+      if (!items.length) return;
+      // 有上限：拖错一个大文本文件会切出成千上万段，每段都是一发 POST（像 refresh_token 的还会被拿去换票）
+      if (items.length > MAX_ITEMS) {
+        err.textContent = '识别出 ' + items.length + ' 份，一次最多 ' + MAX_ITEMS + ' 份，请分几批上传。';
+        err.hidden = false;
+        return;
       }
-      err.hidden = false;
+      const body = new FormData(form);
+      if (items.length > 1) body.delete('label'); // 备注只给单份；多份各自用 token 里的邮箱
+      btn.disabled = true;
+      pick.disabled = true; // 上传中选进来的文件没处放（框是只读的），干脆别让选
+      box.readOnly = true;
+      err.hidden = true;
+      out.hidden = true;
+      out.replaceChildren();
+      const failed = [];
+      let owner = '';
+      // 逐份串行：并发的话，没带身份来的头几份会各建一个总览页（身份 cookie 是第一份回来才种上的），
+      // 也别一下子把上游换票打满。
+      for (let i = 0; i < items.length; i++) {
+        btn.textContent = items.length > 1 ? '正在上传 ' + (i + 1) + ' / ' + items.length + '…' : '正在提交…';
+        body.set('creds', items[i]);
+        let msg;
+        try {
+          const r = await fetch(form.action, { method: 'POST', headers: { Accept: 'application/json' },
+                                              body: new URLSearchParams(body) });
+          if (r.ok) {
+            const j = await r.json();
+            owner = j.owner_url || owner;
+            // 后面几份明说挂到同一页，不全指望第一份种下的身份 cookie（浏览器拦了 cookie 就会各建一页）
+            if (j.owner_token && !form.elements.page_owner) body.set('owner_token', j.owner_token);
+            row('ok', j.status === 'updated' ? '✓ 已更新' : '✓ 新建', j.label + (j.plan ? ' · ' + j.plan : ''), j.url, '账号页 →');
+            continue;
+          }
+          msg = (await r.text()).trim() || ('HTTP ' + r.status);
+        } catch (e2) {
+          msg = '网络错误，没有提交成功，请稍后重试。';
+        }
+        failed.push(items[i]);
+        if (items.length === 1) {
+          err.textContent = msg;
+          err.hidden = false;
+        } else {
+          row('bad', '✗ 第 ' + (i + 1) + ' 份', msg);
+        }
+      }
+      // 全部成功就回账号总览页看全貌（不是钻进某一个号的 /a/）；就在那一页的话，
+      // 重新加载并切到「账号」页签——只改 hash 不会重新加载，新账号看不见。
+      function goOwner() {
+        if (owner !== location.pathname) return location.assign(owner);
+        history.replaceState(null, '', '#accounts');
+        location.reload();
+      }
+      if (owner && !failed.length) {
+        form.reset();
+        goOwner();
+        return;
+      }
+      // 有失败的就留在这儿：失败的留在框里，改好再点一次；成功的拿掉，免得重传。
+      box.value = failed.join('\n\n');
+      box.readOnly = false;
+      pick.disabled = false;
       btn.disabled = false;
-      btn.textContent = label;
+      count();
+      if (owner) {
+        row('more', '', '', owner + '#accounts', owner === location.pathname ? '刷新查看新账号' : '打开账号总览页 →');
+        out.lastChild.querySelector('a').addEventListener('click', function (e2) {
+          e2.preventDefault();
+          goOwner();
+        });
+      }
     });
   }
 })();
 </script>
 </body>
 </html>
+{{- end}}
+
+{{/* 上传表单。参数是 uploadForm（见 views.go）：/u/ 页给自己的令牌（走隐藏字段），首页
+     认出身份时只给链接、认不出才给输入框。两页共用一份，免得改一处漏一处。 */}}
+{{define "upload" -}}
+<form id="upload" method="post" action="/upload">
+  <label>账号凭据 <span class="hint">可一次贴多份：auth.json 全文（几个连着贴也行）、含 access_token / refresh_token 的 JSON，或单个 token（每行一个）；文件可以直接拖进来</span>
+    <textarea name="creds" required spellcheck="false" placeholder="在此粘贴 JSON 或 token"></textarea></label>
+  <label>备注名称 <span class="hint">选填，只有一份时生效；不填就用 token 里的邮箱</span>
+    <input name="label" maxlength="64" autocomplete="off"></label>
+  <fieldset>
+    <legend>凭据类型 <span class="hint">只对单独贴的 token 生效；JSON 自动识别</span></legend>
+    <div class="choices">
+      <label class="choice"><input type="radio" name="kind" value="auto" checked>
+        <span>自动识别<small>eyJ 开头的按 access_token 处理，rt. 开头的按 refresh_token 处理；都不是就手动选</small></span></label>
+      <label class="choice"><input type="radio" name="kind" value="access">
+        <span>access_token<small>直接使用；过期后需要重新上传</small></span></label>
+      <label class="choice"><input type="radio" name="kind" value="refresh">
+        <span>refresh_token<small>先换取 access_token，之后自动续期</small></span></label>
+    </div>
+  </fieldset>
+  {{if .PageToken}}<input type="hidden" name="page_owner" value="{{.PageToken}}">
+  <p class="note info">在这里上传的凭据都挂到本页。</p>
+  {{else if .KnownOwner}}<p class="note info">上传的凭据自动挂到<a href="/u/{{.KnownOwner}}">你的账号总览页</a>（这台设备记住了你的身份），不用再填令牌。要挂到别人的账号页，去那一页的「添加账号」。</p>
+  {{else}}<label>挂到已有账号页 <span class="hint">选填。粘总览页令牌，这批凭据就挂在同一页下；留空则新建一个。只用填一次：传成功后这台设备会记住，之后自动挂上</span>
+    <input name="owner_token" autocomplete="off" spellcheck="false"></label>{{end}}
+  <p class="err" id="upload-err" role="alert" hidden></p>
+  <div class="actions">
+    <button type="submit" class="primary">上传</button>
+    <button type="button" id="pick" hidden data-js>选择文件…</button>
+    <input type="file" id="creds-file" accept=".json,.txt,application/json,text/plain" multiple hidden>
+  </div>
+  <ol class="results" id="upload-results" aria-live="polite" hidden></ol>
+</form>
 {{- end}}
 
 {{/* 九宫格。参数是 regionGrid，/u/、/a/、/admin/accounts 共用这一份——

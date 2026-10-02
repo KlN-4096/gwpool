@@ -95,6 +95,8 @@ type Store interface {
 	RegionMints() map[string]types.RegionMint
 	// SetAccountEnabled 只翻一个 bool。给上传者自己停用/启用用。
 	SetAccountEnabled(id int64, enabled bool) error
+	// SetAccountVia 记匿名占位行最近是拿谁的 key 取的票（管理页靠它认人）。
+	SetAccountVia(id, via int64) error
 	// PutPair 覆盖一个网关的 pair。只有 /pair/renew 用它（消费端自己续出来的那张
 	// 交回来），所以这一层写盘只会改 Cookie 和两个死期，不碰 MintedBy。
 	PutPair(p types.Pair) error
@@ -624,6 +626,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	if o, ok := s.ownerFromCookie(r); ok {
 		v.OwnerToken = o.Token
 	}
+	v.Upload.KnownOwner = v.OwnerToken
 	v.EnterErr = r.URL.Query().Get("enter") == "bad"
 	s.render(w, s.tplPool, v)
 }
@@ -884,25 +887,25 @@ func (f authUpload) pick() (access, refresh, account string) {
 // ——2026-10-01 就这么进来一张标着 pro1 实际是另一个 free 账号的票，两个字段自洽、
 // 上游照收，然后二十个区域全回 400。填了就必须和票里一致。
 //
-// 返回的第二个值是 token 自己写的 plan（free/plus/pro/…），空表示票里没这个声明。
-func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, string, error) {
+// 返回的第二个值是票里的声明（plan、邮箱……），空字段表示票里没写。
+func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, oauth.Claims, error) {
 	var f authUpload
 	if err := json.Unmarshal(raw, &f); err != nil {
-		return types.Creds{}, "", errors.New("不是合法 JSON")
+		return types.Creds{}, oauth.Claims{}, errors.New("不是合法 JSON")
 	}
 	access, refresh, account := f.pick()
 	if access == "" && refresh == "" {
-		return types.Creds{}, "", errors.New("access_token 和 refresh_token 至少要有一个")
+		return types.Creds{}, oauth.Claims{}, errors.New("access_token 和 refresh_token 至少要有一个")
 	}
 	if refresh != "" && (len(refresh) < 20 || hasBlank(refresh)) {
-		return types.Creds{}, "", errors.New("refresh_token 形状不对")
+		return types.Creds{}, oauth.Claims{}, errors.New("refresh_token 形状不对")
 	}
 	// 只给了 refresh_token：当场换一张。换不出来就别建号——建了也是个废号，
 	// 第一次扫描才发现，白打一轮。
 	if access == "" {
 		got, newRefresh, err := s.refresh(ctx, refresh)
 		if err != nil {
-			return types.Creds{}, "", fmt.Errorf("用 refresh_token 换 access_token 失败：%w", err)
+			return types.Creds{}, oauth.Claims{}, fmt.Errorf("用 refresh_token 换 access_token 失败：%w", err)
 		}
 		access = got
 		if newRefresh != "" {
@@ -910,44 +913,46 @@ func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, strin
 		}
 	}
 	if len(access) < 20 || hasBlank(access) {
-		return types.Creds{}, "", errors.New("access_token 形状不对")
+		return types.Creds{}, oauth.Claims{}, errors.New("access_token 形状不对")
 	}
-	if len(account) > 128 || hasBlank(account) {
-		return types.Creds{}, "", errors.New("account_id 形状不对")
-	}
-
 	cl, err := oauth.Parse(access)
 	if err != nil {
-		return types.Creds{}, "", err
+		return types.Creds{}, oauth.Claims{}, err
 	}
 	switch {
 	case account == "" && cl.AccountID == "":
-		return types.Creds{}, "", errors.New("票里没有 chatgpt_account_id，得自己贴一个 account_id")
+		return types.Creds{}, oauth.Claims{}, errors.New("票里没有 chatgpt_account_id，得自己贴一个 account_id")
 	case account == "":
 		account = cl.AccountID
 	case cl.AccountID != "" && cl.AccountID != account:
-		return types.Creds{}, "", fmt.Errorf(
+		return types.Creds{}, oauth.Claims{}, fmt.Errorf(
 			"account_id 和 access_token 里写的不是同一个账号（票里是 %s）——八成是两处凭据贴串了",
 			cl.AccountID)
 	}
+	// 放在这儿而不是读票之前：票里读出来的那个同样是外面送进来的（票不验签）。
+	// 「anon:」开头的是匿名占位行的命名空间（types.AnonPrefix），真账号是 UUID 不会这样；
+	// 放进来就能认领一行占位行、拿到它的 key，再把那个外部号的槽位历史还原掉。
+	if len(account) > 128 || hasBlank(account) || strings.HasPrefix(account, types.AnonPrefix) {
+		return types.Creds{}, oauth.Claims{}, errors.New("account_id 形状不对")
+	}
 	if !cl.Expires.IsZero() && time.Now().After(cl.Expires) {
 		if refresh == "" {
-			return types.Creds{}, "", errors.New("access_token 已经过期了，换一张新的（或者贴 refresh_token）")
+			return types.Creds{}, oauth.Claims{}, errors.New("access_token 已经过期了，换一张新的（或者贴 refresh_token）")
 		}
 		// 有 refresh 就自己续，不必让人回去重新导出。
 		got, newRefresh, rerr := s.refresh(ctx, refresh)
 		if rerr != nil {
-			return types.Creds{}, "", fmt.Errorf("access_token 过期且换票失败：%w", rerr)
+			return types.Creds{}, oauth.Claims{}, fmt.Errorf("access_token 过期且换票失败：%w", rerr)
 		}
 		access = got
 		if newRefresh != "" {
 			refresh = newRefresh
 		}
 		if cl, err = oauth.Parse(access); err != nil {
-			return types.Creds{}, "", err
+			return types.Creds{}, oauth.Claims{}, err
 		}
 	}
-	return types.Creds{AccessToken: access, AccountID: account, RefreshToken: refresh}, cl.Plan, nil
+	return types.Creds{AccessToken: access, AccountID: account, RefreshToken: refresh}, cl, nil
 }
 
 // wrapBareToken 把「光一个 token」包成 parseCreds 认的 JSON。
@@ -955,15 +960,18 @@ func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, strin
 // 不是所有人都愿意把整份 auth.json 交出来（里面还有 id_token 和别的东西），
 // 所以单贴一个 token 也要收。已经是 JSON 的原样放过。
 //
-// kind 来自上传页的单选：auto 时按形状猜——access_token 是 JWT（三段、点分隔），
-// refresh_token 不是，这个区分是可靠的，不用猜第二次。
-func wrapBareToken(raw []byte, kind string) []byte {
+// kind 来自上传页的单选。auto 只认两种前缀：`eyJ`（JWT 头 `{"` 的 base64）是
+// access_token，`rt.` 是 refresh_token（2026-10-02 查了池子里全部 26 张，无一例外）。
+// **不能数段数**：`rt.<…>.<…>` 也是点分三段，按段数猜会把它当 access_token 拆。
+// 两种都不像就报错让人手动选，**不**默认当 refresh_token：终端折行切开的半截 JWT
+// 会被送去上游换票，报一句不着边的「换票失败」。
+func wrapBareToken(raw []byte, kind string) ([]byte, error) {
 	if len(raw) == 0 || raw[0] == '{' {
-		return raw
+		return raw, nil
 	}
 	tok, err := json.Marshal(string(raw))
 	if err != nil { // 只会在非法 UTF-8 时发生，交给 parseCreds 去报「不是合法 JSON」
-		return raw
+		return raw, nil
 	}
 	field := "refresh_token"
 	switch kind {
@@ -971,11 +979,15 @@ func wrapBareToken(raw []byte, kind string) []byte {
 		field = "access_token"
 	case "refresh":
 	default: // auto
-		if len(strings.Split(string(raw), ".")) == 3 {
+		switch {
+		case bytes.HasPrefix(raw, []byte("eyJ")):
 			field = "access_token"
+		case bytes.HasPrefix(raw, []byte("rt.")):
+		default:
+			return nil, errors.New("自动识别认不出这个 token（access_token 是 eyJ 开头，refresh_token 是 rt. 开头），在「凭据类型」里手动选一下")
 		}
 	}
-	return []byte(`{"` + field + `":` + string(tok) + `}`)
+	return []byte(`{"` + field + `":` + string(tok) + `}`), nil
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -989,7 +1001,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	wantJSON := strings.Contains(r.Header.Get("Content-Type"), "json")
 	// 身份默认取 cookie；表单里贴了 owner 令牌就按贴的那个办（「我已经有账号页了，
 	// 把这份凭据挂上去」——那是显式意图，压过浏览器里碰巧存着的那个）。
-	owner, hasOwner := s.ownerFromCookie(r)
+	cur, hadCur := s.ownerFromCookie(r)
+	owner, hasOwner := cur, hadCur
+	fromPage := false // 归属来自 /u/ 页的隐藏字段（见下面 page_owner）
 	if !wantJSON {
 		// 表单来的：凭据在 creds 字段里。
 		form, ferr := parseForm(raw)
@@ -1004,8 +1018,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		if v := form.Get("plan"); v != "" {
 			plan = v
 		}
-		if v := strings.TrimSpace(form.Get("owner_token")); v != "" {
-			o, ok := s.st.OwnerByToken(v)
+		// page_owner 是 /u/ 页表单的隐藏字段：令牌跟着链接走、不是这个人自己选的，所以
+		// 只决定挂到哪一页，**不写身份 cookie**——否则别人发来一个 /u/ 链接、新人在那儿
+		// 传一份，浏览器就记成了别人，之后在首页传的全挂过去（审查 2026-10-02 第二轮）。
+		// owner_token 是首页那个手填的输入框：人自己贴的，挂上并记住。
+		tok := strings.TrimSpace(form.Get("owner_token"))
+		if v := strings.TrimSpace(form.Get("page_owner")); v != "" {
+			tok, fromPage = v, true
+		}
+		if tok != "" {
+			o, ok := s.st.OwnerByToken(tok)
 			if !ok {
 				// 和 /enter 同一个口径：不说「这个令牌不存在」。
 				http.Error(w, "认不出这个账号总览令牌，留空就新建一个", http.StatusBadRequest)
@@ -1013,17 +1035,32 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			}
 			owner, hasOwner = o, true
 		}
-		raw = wrapBareToken(raw, form.Get("kind"))
+		var werr error
+		if raw, werr = wrapBareToken(raw, form.Get("kind")); werr != nil {
+			http.Error(w, "凭据有问题："+werr.Error(), http.StatusBadRequest)
+			return
+		}
 	}
-	creds, tokenPlan, err := s.parseCreds(r.Context(), raw)
+	creds, claims, err := s.parseCreds(r.Context(), raw)
 	if err != nil {
 		http.Error(w, "凭据有问题："+err.Error(), http.StatusBadRequest)
 		return
 	}
 	// token 自己写的 plan 压过表单里手填的那个：手填的只是个标签，票里的是事实，
 	// 而「这票是 free」正是会让整次扫描全军覆没的那件事，得在页面上看得见。
-	if tokenPlan != "" {
-		plan = tokenPlan
+	if claims.Plan != "" {
+		plan = claims.Plan
+	}
+	// 回执里报「新建」还是「更新」：批量导入时同一个号贴两遍、或拿新票来刷旧号，
+	// 得让人看得出没多建一行。占位行（没凭据）升级成托管行算新建。
+	ex, exists := s.accountByUpstream(creds.AccountID)
+	existed := exists && ex.Creds.AccessToken != ""
+	// 更新已有行时没填备注就传空，存储层会留着原来的：批量上传一定不带备注，拿新票刷
+	// 旧号不该把人家起过的名字冲成邮箱。新建才用默认值。
+	lbl := sanitizeLabel(label, "")
+	if lbl == "" && !existed {
+		// 没填备注就用票里的邮箱：一次传好几份时没法逐个起名，而 account_id 那串谁也认不出。
+		lbl = sanitizeLabel(claims.Email, creds.AccountID)
 	}
 
 	// 上传即 both：产品规则是「池子的目的是共享 pair，上传了凭据的就可以请求到 pair」。
@@ -1035,7 +1072,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 建出来的只是一个谁都不用的空 owner 行。
 	createdOwner := false // 这一发新建了 owner ⇒ AddAccount 失败时要把它清掉
 	if !hasOwner {
-		if ex, exists := s.accountByUpstream(creds.AccountID); !exists || ex.OwnerID == 0 {
+		if !exists || ex.OwnerID == 0 {
 			o, oerr := s.st.AddOwner("上传者")
 			if oerr != nil {
 				s.opt.Log.Error("建上传者失败", "err", oerr)
@@ -1050,7 +1087,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		ownerID = owner.ID
 	}
 	a, err := s.st.AddAccount(types.Account{
-		Label:     sanitizeLabel(label, creds.AccountID),
+		Label:     lbl,
 		PlanType:  sanitizeLabel(plan, "unknown"),
 		Creds:     creds,
 		Enabled:   true,
@@ -1075,8 +1112,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 更不去查那个 owner 的令牌（那一页上有对方每个账号的 consumer key）。
 	mine := hasOwner && a.OwnerID == ownerID
 	if mine {
-		// 顺手刷有效期，也覆盖「表单贴了令牌但浏览器里存着另一个」那种情形。
-		s.setOwnerCookie(w, r, owner.Token)
+		// 浏览器原来没身份、或者就是这个人，才写（顺手刷有效期）。**不拿表单里的令牌去
+		// 顶掉另一个身份**：/u/ 页的上传表单把那一页的令牌放在隐藏字段里，令牌跟着链接走
+		// ——A 把自己的页面链接发给带着身份的 V，V 在那儿传一份，从前这里就把 V 的身份
+		// 换成了 A，之后 V 在首页传的全挂到 A 名下（审查 2026-10-02）。换身份只走 /enter。
+		if !fromPage && (!hadCur || cur.ID == owner.ID) {
+			s.setOwnerCookie(w, r, owner.Token)
+		}
 	} else {
 		s.opt.Log.Info("上传的凭据已挂在别的上传者名下，归属不动",
 			"account", a.ID, "owner", a.OwnerID, "asked_by", ownerID)
@@ -1103,7 +1145,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if wantJSON || strings.Contains(r.Header.Get("Accept"), "json") {
+		status := "created"
+		if existed {
+			status = "updated"
+		}
 		writeJSON(w, http.StatusOK, map[string]string{
+			"status":       status,
+			"label":        a.Label,
+			"plan":         a.PlanType,
 			"view_token":   a.ViewToken,
 			"url":          "/a/" + a.ViewToken,
 			"consumer_key": s.ConsumerKeyFor(a),
@@ -1113,7 +1162,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	http.Redirect(w, r, "/a/"+a.ViewToken, http.StatusSeeOther)
+	// 传完回账号总览页，不钻进某一个号：一次常常传好几份，要看的是全貌（用户 2026-10-02 要的）。
+	http.Redirect(w, r, "/u/"+owner.Token, http.StatusSeeOther)
 }
 
 // ---------- 上传者信任视图 ----------
@@ -1238,6 +1288,7 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 		Effort:    probeEffort,
 		BaseURL:   s.publicBaseURL(),
 		CanLogout: had && cur.ID == o.ID,
+		Upload:    uploadForm{PageToken: tok},
 	}
 	v.Accounts = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
 	for _, row := range v.Accounts {
@@ -1438,6 +1489,10 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	//
 	// 代价说在明处：池子**验不了**那张票——state-echo 要用那个账号的凭据打一发，池子
 	// 手上只有上传者的。所以走和匿名同一条路，回去的 verified_full 是 false。
+	if len(ref) > 128 { // 和匿名分支同一个上限：占位行按它建，标识会落盘、上管理页
+		s.badRequest(w, http.StatusBadRequest, "account 参数太长")
+		return
+	}
 	if ref != "" && !accountRefMatches(acct, ref) {
 		// 记账归上传者（他的页面该看见这一行），**调度归占位行**：轮询要按那个号的
 		// 冷却判，发现扫描要排除的也是那个号——而池内行里只有上传者。
@@ -1446,7 +1501,11 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 		// 手上没有那个号的凭据（验不了、也不替它铸），不该连带吃匿名的开放门槛。
 		s.serveCookie(w, r, acct.ID, s.rowFor(types.AnonPrefix+ref), req, wait,
 			func(rq sched.Request) (types.Delivery, error) {
-				return s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
+				d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
+				if err == nil {
+					s.noteVia(ref, acct.ID)
+				}
+				return d, err
 			})
 		return
 	}
@@ -1482,8 +1541,23 @@ func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sche
 	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait,
 		func(rq sched.Request) (types.Delivery, error) {
 			// authed=false：真匿名，门槛照常卡他（那是给上传者留的余量）。
-			return s.pool.DeliverAnonymous(r.Context(), ref, rq, false)
+			d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, false)
+			if err == nil {
+				s.noteVia(ref, 0) // 这一次没带 key
+			}
+			return d, err
 		})
+}
+
+// noteVia 记下匿名占位行最近一次**取到票**是拿谁的 key（0 = 没带 key）。只记成功的：
+// 失败的尝试谁都能发（门槛关着时不带 key 的扫描器），不该把记录冲掉。占位行是取票时
+// 才建的，所以在取票之后记；「这是谁在用」只有 /cookie 这里知道。没变就不写盘。
+func (s *Server) noteVia(ref string, via int64) {
+	if id := s.rowFor(types.AnonPrefix + ref); id != 0 {
+		if err := s.st.SetAccountVia(id, via); err != nil {
+			s.opt.Log.Error("记匿名行的来源失败", "account", id, "err", err)
+		}
+	}
 }
 
 // deliveryResponse 在 types.Delivery 之外多说两句话。
@@ -1725,16 +1799,41 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		found[g.FirstSeenBy]++
 	}
 	ownerAccounts := map[int64]int{}
-	for _, a := range s.st.Accounts() {
+	accounts := s.st.Accounts()
+	labels := map[int64]string{}
+	for _, a := range accounts {
+		labels[a.ID] = a.Label
+	}
+	delivered, lastDeliver := map[int64]int{}, map[int64]time.Time{}
+	for _, sl := range s.st.Slots() {
+		if sl.LastDeliver.IsZero() {
+			continue
+		}
+		delivered[sl.AccountID]++
+		if sl.LastDeliver.After(lastDeliver[sl.AccountID]) {
+			lastDeliver[sl.AccountID] = sl.LastDeliver
+		}
+	}
+	for _, a := range accounts {
 		ownerAccounts[a.OwnerID]++
-		v.Accounts = append(v.Accounts, accountRow{
+		row := accountRow{
 			ID: a.ID, Label: a.Label, Plan: a.PlanType,
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
 			Requests: reqs[a.ID], Found: found[a.ID],
 			ViewToken: a.ViewToken, Since: a.CreatedAt.Format(time.DateTime),
 			HasCreds: a.Creds.AccessToken != "", Upstream: a.Creds.AccountID,
-			OwnerID: a.OwnerID,
-		})
+			OwnerID: a.OwnerID, Delivered: delivered[a.ID],
+		}
+		if a.Via != 0 {
+			row.Via = fmt.Sprintf("#%d %s", a.Via, labels[a.Via])
+			if _, ok := labels[a.Via]; !ok {
+				row.Via = fmt.Sprintf("#%d（已删除）", a.Via)
+			}
+		}
+		if t := lastDeliver[a.ID]; !t.IsZero() {
+			row.LastDeliver = t.UTC().Format(time.DateTime)
+		}
+		v.Accounts = append(v.Accounts, row)
 	}
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
 
@@ -1872,14 +1971,17 @@ func validName(s string) bool {
 // sanitizeLabel 把上传者自填的标签压成一行短文本。模板会做 HTML 转义，
 // 这里只管别让控制字符和超长串进账本。
 func sanitizeLabel(v, fallback string) string {
-	v = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, strings.TrimSpace(v))
-	if v == "" {
-		v = fallback
+	clean := func(s string) string {
+		return strings.TrimSpace(strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}, s))
+	}
+	// 兜底值也要过一遍：它可能来自票里的声明（邮箱），而票不验签。
+	if v = clean(v); v == "" {
+		v = clean(fallback)
 	}
 	// 按**字符**截，不按字节：`v[:64]` 会把一个汉字劈成半个，落盘就是坏字节。
 	// 前端那个 maxlength 数的是 UTF-16 码元，和这里不是同一个口径（emoji 会被它

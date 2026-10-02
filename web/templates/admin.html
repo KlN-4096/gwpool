@@ -87,7 +87,7 @@
 
 <section id="tab-accounts">
   <div class="card">
-    <header class="card-head"><div><h2>账号</h2><p>没有凭据的账号（例如不带 key 调用时自动登记的调用方）只接收分发，不参与探测。</p></div>
+    <header class="card-head"><div><h2>账号</h2><p>没有凭据的是「外部账号」：有人拿某个账号的接入 key 替自己别的 Codex 号取票（或对外开放时不带 key 来取），池子按那个号的上游 ID 自动登记一行，记它烧过哪些网关。它只接收分发、不参与探测；删掉的话下次取票会重建，而且烧过的网关记录跟着丢。</p></div>
       <a class="btn" href="/admin/accounts">查看全部账号 →</a></header>
     {{if .Accounts}}
     <div class="table-wrap"><table id="t-accounts" data-grid data-facets="on:启用:ok|off:已停用:bad|ext:无凭据" data-placeholder="搜索名称、套餐或上游账号 ID">
@@ -97,13 +97,18 @@
       {{range .Accounts}}
         <tr data-facet="{{if not .Enabled}}off{{else if not .HasCreds}}ext{{else}}on{{end}}">
           <td class="num">{{.ID}}</td>
-          <td class="text">{{.Label}}{{if not .Enabled}} <span class="badge bad">已停用</span>{{if .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}{{end}}</td>
+          <td class="text">{{if .HasCreds}}{{.Label}}{{else}}外部账号
+            <div class="sub">{{if .Via}}经 {{.Via}} 的接入 key 取票{{else}}不带 key 取票，或还没记录到来源{{end}} ·
+              {{if .LastDeliver}}取过 {{.Delivered}} 个网关的票，最近一次 {{.LastDeliver}} UTC{{else}}还没取到过票{{end}}</div>{{end}}
+            {{- if not .Enabled}} <span class="badge bad">已停用</span>{{if .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}{{end}}</td>
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else}}{{.Plan}}{{end}}</td>
           <td>{{if .HasCreds}}<span class="badge ok">有</span>{{else}}<span class="badge">无</span>{{end}}</td>
           <td class="mono text">{{.Upstream}}</td>
           <td class="num">{{if .OwnerID}}{{.OwnerID}}{{else}}<span class="muted" title="匿名占位行，不是谁托管的">—</span>{{end}}</td>
-          <td class="num">{{.Requests}}</td>
+          {{if .HasCreds}}<td class="num">{{.Requests}}</td>
           <td class="num">{{.Found}}</td>
+          {{- else}}<td class="num"><span class="muted" title="外部账号不探测">—</span></td>
+          <td class="num"><span class="muted" title="外部账号不探测">—</span></td>{{end}}
           <td class="mono">{{.Since}}</td>
           <td>{{if .ViewToken}}<a href="/a/{{.ViewToken}}">打开</a>{{else}}<span class="muted">—</span>{{end}}</td>
           <td><form method="post" action="/admin/accounts/{{.ID}}/delete"

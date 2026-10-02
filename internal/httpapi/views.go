@@ -27,8 +27,21 @@ type gateView struct {
 
 // ---------- 公开页 ----------
 
+// uploadForm 是上传表单（layout.html 里的 "upload"）的参数。两个都空 ⇒ 给「挂到已有
+// 账号页」输入框。
+//
+// PageToken：/u/ 页自己的令牌，进隐藏字段 ⇒ 在这一页传的都挂到这一页。
+// KnownOwner：首页认出了浏览器的身份，**只用来给个链接、不进表单**——服务端本来就按
+// cookie 挂；写进表单的话，在别的标签页登出之后，这个旧标签页还会把凭据挂回去
+// （审查 2026-10-02）。
+type uploadForm struct {
+	PageToken  string
+	KnownOwner string
+}
+
 type poolView struct {
 	base
+	Upload uploadForm
 	// 对外开放状态是承诺，得让人看得见。
 	//
 	// OpenAccounts/Threshold 数的是**托管账号数**，不是活 pair 数——按需铸票的池子
@@ -152,6 +165,7 @@ type accountView struct {
 
 type ownerView struct {
 	base
+	Upload uploadForm
 	// Token 是这一页自己的地址令牌，用来拼页内链接。
 	Token string
 	Label string
@@ -322,6 +336,11 @@ type accountRow struct {
 	Since          string
 	HasCreds       bool   // 只说有没有，不说是什么
 	Upstream       string // 上游账号标识，匿名消费者按它认账号
+	// 下面三个只给没凭据的行（匿名占位行）：它不探测，「请求数」「发现网关」恒为 0，
+	// 有用的是谁在替它取票、取了多少、最近一次在什么时候。
+	Via         string // 「#20 free-kl1」；空 = 不带 key 取的或没记录到
+	Delivered   int    // 取过票的网关数（槽位台账里 LastDeliver 非零的）
+	LastDeliver string // 最近一次取票（UTC）；空 = 一张都没取到过
 }
 
 // proxyRow 是一条出口供应商。**没有密码字段**，用户名只给前 4 个字符：
