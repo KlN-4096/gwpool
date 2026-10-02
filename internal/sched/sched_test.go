@@ -322,6 +322,29 @@ func newMinter(clk *clock) *fakeMinter {
 	return &fakeMinter{clk: clk, land: map[string]string{}, full: map[string]bool{}, inflight: map[int64]int{}}
 }
 
+// seedGateway 给网关铺一条出口、并让假 Minter 从那条出口落到它，返回那条出口。
+//
+// **出口必须取自 types.Regions**：按区域现铸（sched.mintByRegion）从那张表出发，
+// 而以前各处自己拼的假区域码（"1"/"2"/"3"、"R4"）在 land 里查不到 ⇒ 现铸恒「没拿到落点」，
+// 一切走回落铸票的用例都测不出真东西。idx 对区域数取模，所以网关再多也不会越界。
+func seedGateway(st *fakeStore, mn *fakeMinter, gw string, idx int, firstSeenBy int64) types.Exit {
+	e := types.Regions[idx%len(types.Regions)].Exit
+	st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: firstSeenBy, ReachableExits: []types.Exit{e}}
+	mn.land[exitKey(e)] = gw
+	return e
+}
+
+// landBare 让**任何区域**出发的裸铸都落到 gw。
+//
+// 走回落铸票（sched.mintByRegion）的用例该用这个来钉落点，别靠 seedGateway 的 idx 顺序：
+// 区域由铸票者的终身台账挑（bestRegion），空台账时才恰好是 types.Regions[0]，
+// 台账上有一笔就换一个区域 —— 靠顺序钉落点的用例会在无关改动下莫名变红。
+func landBare(mn *fakeMinter, gw string) {
+	for _, r := range types.Regions {
+		mn.land[exitKey(r.Exit)] = gw
+	}
+}
+
 func gwOf(cookie string) string {
 	i := strings.Index(cookie, "__oailb=")
 	if i < 0 {
@@ -508,10 +531,8 @@ func rig(t *testing.T, mode types.Mode) (*Scheduler, *fakeStore, *fakeMinter, *c
 		ID: 1, Label: "pro1", Enabled: true,
 		Creds: types.Creds{AccessToken: "secret", AccountID: "acct-1"},
 	}}
-	for _, gw := range []string{"unified-1", "unified-2", "unified-3"} {
-		region := strings.ToUpper(strings.TrimPrefix(gw, "unified-"))
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+	for i, gw := range []string{"unified-1", "unified-2", "unified-3"} {
+		seedGateway(st, mn, gw, i, 1)
 		mn.full[gw] = true
 	}
 	// 这组用例测的是**两个开关都打开**那条路：交付前验满血、保温走续期。
@@ -803,7 +824,7 @@ func TestPoolModeConsumerMintsOwnTicket(t *testing.T) {
 			Creds: types.Creds{AccessToken: "c", AccountID: "acct-2"}},
 	}
 	st.gws["unified-9"] = types.Gateway{Name: "unified-9", FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: "ES"}}}
-	mn.land["ES"] = "unified-9"
+	landBare(mn, "unified-9") // 池子里只有这一个网关，裸铸从哪个区域出发都该落到它
 	mn.full["unified-9"] = true
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(verifyOn)})
@@ -875,9 +896,9 @@ func driftRig(t *testing.T, from, to string) (*Scheduler, *fakeStore, *fakeMinte
 	st := newStore(clk)
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
-	region := strings.ToUpper(strings.TrimPrefix(from, "unified-"))
-	st.gws[from] = types.Gateway{Name: from, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
-	mn.land[region] = from
+	seedGateway(st, mn, from, 0, 1)
+	// 裸铸也要落到 from（再被 drift 弹到 to）：回落铸票从区域出发，不冲着某个网关去。
+	landBare(mn, from)
 	mn.drift = map[string]string{from: to} // 想去 from，实到 to
 	mn.full[from], mn.full[to] = true, true
 	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
@@ -957,12 +978,13 @@ func TestDeliverIsPerAccount(t *testing.T) {
 		{ID: 2, Label: "B", Enabled: true,
 			Creds: types.Creds{AccessToken: "b", AccountID: "acct-2"}},
 	}
-	for _, gw := range []string{"unified-1", "unified-2"} {
-		region := strings.ToUpper(strings.TrimPrefix(gw, "unified-"))
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+	for i, gw := range []string{"unified-1", "unified-2"} {
+		seedGateway(st, mn, gw, i, 1)
 		mn.full[gw] = true
 	}
+	// 两个网关都铺上活票：这一条测的是**挑选**按 (账号 × 网关) 走，不是铸票。
+	// 不铺票会掉进回落铸票，而那条路的落点由区域定、根本不看候选集，测的就不是这件事了。
+	seedPairs(st, clk)
 	// A 刚烧过 1，B 刚烧过 2 ⇒ 两个人该拿到相反的网关。
 	now := clk.now()
 	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
@@ -1084,9 +1106,7 @@ func TestNoDeadlockBetweenAccounts(t *testing.T) {
 	// 两个网关各有一张快过期的 pair，分别由对方铸的 ⇒ minterFor 会交叉选人：
 	// A 的铸票者是 2、B 的铸票者是 1。
 	for i, gw := range []string{"unified-1", "unified-2"} {
-		region := strings.ToUpper(strings.TrimPrefix(gw, "unified-"))
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: int64(i + 1), ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+		seedGateway(st, mn, gw, i, int64(i+1))
 		mn.full[gw] = true
 		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
 			ExpiresAt: clk.now().Add(time.Minute), MintedBy: int64(2 - i)}
@@ -1097,6 +1117,14 @@ func TestNoDeadlockBetweenAccounts(t *testing.T) {
 	now := clk.now()
 	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
 	st.slots[slotKey(2, "unified-2")] = types.Slot{AccountID: 2, Gateway: "unified-2", LastTouch: now}
+	// 票全低于交付门槛 ⇒ 两路都走回落铸票，而那条路按**区域**单飞：撞上同一个区域的那一路
+	// 会被当场挡回去，于是它根本走不到账号锁、屏障等不满 —— 和上面「挑到不同网关」同一个
+	// 道理，换成区域再说一遍。铸票者是交叉的（1 号的是 2、2 号的是 1，各自只剩对方可选），
+	// 给 2 号的 us-east 记一笔 ⇒ 它改挑 us-west(→unified-2)，1 号仍挑 us-east(→unified-1)，
+	// 正好各自落在**对方**烧过的那个上，两路都能走完 finish，ABBA 才真的有得可死。
+	if err := st.NoteRegionMint(2, "us-east", now); err != nil {
+		t.Fatal(err)
+	}
 	// 确定性屏障：两个 goroutine 都拿到**第一把**锁之后才放行，
 	// 嵌套持锁的实现到这一步必然互等。靠 sleep 撞时序是撞不出来的。
 	barrier := make(chan struct{})
@@ -1266,12 +1294,25 @@ func TestPoolModeNeedsTwoAccounts(t *testing.T) {
 // ---------- 票充足时自动公开 ----------
 
 // anonRig 搭一个有 n 张活 pair 的池子，门槛 min。
-func anonRig(t *testing.T, n, min int) (*Scheduler, *fakeStore, *clock, *bytes.Buffer) {
+// anonRig 搭一个匿名交付的台子：n 个有活 pair 的网关、accts 个托管账号、门槛 min。
+//
+// **accts 和 min 是独立的两个数**：门槛数的是托管账号数，不是货架上的活 pair 数
+// （见 types.AccountsForContinuous），所以「够不够格开放」只由 accts vs min 决定，
+// 跟 n 无关。合成一个参数的话就测不出「票多但号少 ⇒ 仍然不开放」。
+func anonRig(t *testing.T, n, accts, min int) (*Scheduler, *fakeStore, *clock, *bytes.Buffer) {
 	t.Helper()
 	clk := newClock()
 	st := newStore(clk)
 	mn := newMinter(clk)
-	addAccount(st, 1, "acct-1")
+	for i := 0; i < accts; i++ {
+		id := int64(i + 1)
+		addAccount(st, id, fmt.Sprintf("acct-%d", i+1))
+		// 对外开放门槛数的是**铸过票**的账号（provenAccounts，防伪造 JWT 顶开），
+		// 所以这里得给每个号记一发成功铸票，不然 Public() 永远算 0 个、测不出开放。
+		if err := st.NoteRegionMint(id, "us-east", clk.now()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for i := 0; i < n; i++ {
 		gw := fmt.Sprintf("unified-%d", i+1)
 		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: "US"}}}
@@ -1285,7 +1326,7 @@ func anonRig(t *testing.T, n, min int) (*Scheduler, *fakeStore, *clock, *bytes.B
 		Live: liveCfg(func(c *config.Config) {
 			c.VerifyFullAtDeliver = true
 			c.PublicWhenSurplus.Enabled = true
-			c.PublicWhenSurplus.MinFreeGateways = min
+			c.PublicWhenSurplus.MinAccounts = min
 		}),
 		Log: slog.New(slog.NewTextHandler(&buf, nil))})
 	return s, st, clk, &buf
@@ -1293,8 +1334,8 @@ func anonRig(t *testing.T, n, min int) (*Scheduler, *fakeStore, *clock, *bytes.B
 
 // 空闲数达标就放行，并留下那行给运营方看的读数。
 func TestAnonymousAllowedWhenSurplus(t *testing.T) {
-	s, st, clk, buf := anonRig(t, 6, 6)
-	if ps := s.Public(); !ps.Open || ps.Free != 6 {
+	s, st, clk, buf := anonRig(t, 6, 6, 6)
+	if ps := s.Public(); !ps.Open || ps.Accounts != 6 {
 		t.Fatalf("应开放: %+v", ps)
 	}
 	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{}, false)
@@ -1336,7 +1377,7 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 
 // 空闲数不达标就拒，哪怕还剩好几张——上传者永远优先。
 func TestAnonymousRefusedBelowThreshold(t *testing.T) {
-	s, _, _, _ := anonRig(t, 5, 6)
+	s, _, _, _ := anonRig(t, 5, 1, 6)
 	if ps := s.Public(); ps.Open {
 		t.Fatalf("不该开放: %+v", ps)
 	}
@@ -1344,7 +1385,7 @@ func TestAnonymousRefusedBelowThreshold(t *testing.T) {
 		t.Fatalf("err=%v，应为 ErrPublicClosed", err)
 	}
 	// 开关没开时，再富裕也不开放。改的是**活配置**：Public() 现读它。
-	off, _, _, _ := anonRig(t, 9, 1)
+	off, _, _, _ := anonRig(t, 9, 1, 1)
 	offCfg := off.opt.Live.Get()
 	offCfg.PublicWhenSurplus.Enabled = false
 	off.opt.Live = config.NewLive("", offCfg)
@@ -1356,10 +1397,18 @@ func TestAnonymousRefusedBelowThreshold(t *testing.T) {
 	}
 }
 
-// 匿名只认「有活 pair」这一条，而门槛是它唯一的让路机制：
-// 租约互斥按实测删掉之后（见 types.Pair），供给紧张时挡住匿名的就只剩 MinFreeGateways。
-func TestAnonymousRespectsFreeThreshold(t *testing.T) {
-	s, st, clk, _ := anonRig(t, 6, 1)
+// mintedOf 从调度器身上取回那个假 Minter 的铸票记录。
+// 比给 anonRig 再加一个返回值省事，而且想数铸票次数的只有这一处。
+func mintedOf(s *Scheduler) []string { return s.mint.(*fakeMinter).mintedGateways() }
+
+// 匿名只发**现成且够新鲜**的票，而且货架空了也绝不替它现铸。
+//
+// 这条以前断言「票全过期 ⇒ ErrPublicClosed」。门槛改成按托管账号数算之后那个前提没了
+// （见 types.AccountsForContinuous）：库存不再是开放判据，所以票发完露出来的是
+// 「没有可交付的槽位」而不是「不对外开放」。**真正要钉死的不变量是「不替匿名铸票」**
+// ——铸票要烧某个上传者的满血窗口，为匿名花这个钱是这条路最容易悄悄退化掉的地方。
+func TestAnonymousGetsOnlyFreshStockAndNeverMints(t *testing.T) {
+	s, st, clk, _ := anonRig(t, 6, 1, 1)
 	// 让 5 张票剩余跌破 DeliverFloor，只剩 unified-6 还够交付。
 	for i := 1; i <= 5; i++ {
 		gw := fmt.Sprintf("unified-%d", i)
@@ -1377,12 +1426,26 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 	if d.Gateway != "unified-6" {
 		t.Fatalf("匿名拿到了票不够新鲜的 %s", d.Gateway)
 	}
-	// 最后一张也跌破门槛 ⇒ 空闲数 0 < 门槛 1 ⇒ 直接拒，哪怕池子里还有行。
+	minted := len(mintedOf(s))
+	// 最后一张也跌破 DeliverFloor ⇒ 货架空了。
 	p := st.pairs["unified-6"]
 	p.ExpiresAt = clk.now().Add(types.DeliverFloor - time.Minute)
 	st.pairs["unified-6"] = p
-	if _, err := s.DeliverAnonymous(context.Background(), "y", Request{}, false); !errors.Is(err, ErrPublicClosed) {
-		t.Fatalf("err=%v，空闲跌破门槛时应 ErrPublicClosed", err)
+	_, err = s.DeliverAnonymous(context.Background(), "y", Request{}, false)
+	if err == nil {
+		t.Fatal("货架空了还交付成功了")
+	}
+	// 开放门槛仍然达标（1 个号 ≥ 门槛 1），所以这里**不该**是 public_closed：
+	// 拒绝的理由是没有现成票，不是「不对外开放」，两者要让调用方分得开。
+	if errors.Is(err, ErrPublicClosed) {
+		t.Fatalf("库存空了却报成不对外开放: %v", err)
+	}
+	if !errors.Is(err, ErrNoFullSlot) {
+		t.Fatalf("err=%v，应为 ErrNoFullSlot", err)
+	}
+	// 最要紧的一条：一发都没替匿名铸。
+	if now := len(mintedOf(s)); now != minted {
+		t.Fatalf("替匿名铸了 %d 发票（烧的是上传者的窗口）", now-minted)
 	}
 }
 
@@ -1391,7 +1454,7 @@ func TestAnonymousRespectsFreeThreshold(t *testing.T) {
 // **刻意不要求换一张**：匿名和上传者拿到同一个网关是允许的（一张 pair 可以同时给几个号
 // 用，见 types.Pair 的 2026-10-01 实测）。这里要守的是「上传者不会因为匿名先到而拿不到」。
 func TestUploaderStillServedAfterAnonymous(t *testing.T) {
-	s, st, _, _ := anonRig(t, 6, 1)
+	s, st, _, _ := anonRig(t, 6, 1, 1)
 	addAccount(st, 2, "acct-2")
 	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
@@ -1407,7 +1470,7 @@ func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 
 // 匿名报一个上传者的上游 ID，不能污染那个上传者的账本。
 func TestAnonymousCannotPolluteUploaderLedger(t *testing.T) {
-	s, st, _, _ := anonRig(t, 6, 1)
+	s, st, _, _ := anonRig(t, 6, 1, 1)
 	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", Request{}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -1434,8 +1497,8 @@ func TestNoStickyExitFails(t *testing.T) {
 
 // 普通路径发歇得最久的那张，不管他手上正拿着谁。
 func TestNormalPathPicksLongestRested(t *testing.T) {
-	s, st, _, clk := rig(t, types.ModeSingle)
-	seedHeldGateway(st, clk)
+	s, st, mn, clk := rig(t, types.ModeSingle)
+	seedHeldGateway(st, mn, clk)
 	if d := mustDeliver(t, s, 1, ""); d.Gateway != "unified-2" {
 		t.Fatalf("普通路径给了 %s，应是歇得最久的 unified-2", d.Gateway)
 	}
@@ -1445,7 +1508,7 @@ func TestNormalPathPicksLongestRested(t *testing.T) {
 // 「手上那张」靠槽位 LastTouch 认（租约字段已按 2026-10-01 的实测删掉，见 types.Pair）。
 func TestForceSkipsHeldGateway(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedHeldGateway(st, clk)
+	seedHeldGateway(st, mn, clk)
 
 	// 点名他正拿着的那个 + force ⇒ 没得换，只能 503。这一条只有 holding() 真生效才过。
 	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1", Force: true}); !errors.Is(err, ErrNoFullSlot) {
@@ -1467,9 +1530,13 @@ func TestForceSkipsHeldGateway(t *testing.T) {
 }
 
 // seedHeldGateway 让 1 号手上正拿着 unified-1（刚碰过），unified-2 则歇了三小时。
-func seedHeldGateway(st *fakeStore, clk *clock) {
+func seedHeldGateway(st *fakeStore, mn *fakeMinter, clk *clock) {
 	now := clk.now()
 	delete(st.gws, "unified-3")
+	// unified-2 没票 ⇒ 这两个用例都要走回落铸票，而回落是从区域出发、不冲着
+	// 「歇得最久的那个候选」去的 ⇒ 落点得显式钉在 unified-2 上。
+	// 用例仍然在验「别把他手上的 unified-1 发回去」。
+	landBare(mn, "unified-2")
 	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
 	st.slots[slotKey(1, "unified-2")] = types.Slot{AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-3 * time.Hour)}
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
@@ -1490,7 +1557,7 @@ func TestForceWithNothingElseFails(t *testing.T) {
 
 // 匿名那条路也认 force。
 func TestForceForAnonymous(t *testing.T) {
-	s, _, _, _ := anonRig(t, 6, 1)
+	s, _, _, _ := anonRig(t, 6, 1, 1)
 	first, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false)
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
@@ -1710,11 +1777,7 @@ func TestDeliverStopsAfterMaxTries(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	// 六个网关，全都验不出满血（rig 自带三个，这里补到六个）。
 	for i := 4; i <= 6; i++ {
-		gw := fmt.Sprintf("unified-%d", i)
-		region := fmt.Sprintf("R%d", i)
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1,
-			ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+		seedGateway(st, mn, fmt.Sprintf("unified-%d", i), i-1, 1)
 	}
 	for gw := range st.gws {
 		mn.full[gw] = false
@@ -2068,7 +2131,7 @@ func TestWindowElapsedPutsSlotInCooldown(t *testing.T) {
 // 冷却对匿名/跨账号的占位行一视同仁：他们的交付也写 LastDeliver，
 // 「这个上游账号在这个网关上烧过了」和他有没有上传凭据无关。
 func TestCooldownAppliesToAnonymousToo(t *testing.T) {
-	s, _, clk, _ := anonRig(t, 1, 1)
+	s, _, clk, _ := anonRig(t, 1, 1, 1)
 	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -2145,10 +2208,8 @@ func TestFreshMintSuccessCostsOneRequest(t *testing.T) {
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
-	for _, gw := range []string{"unified-1", "unified-2", "unified-3"} {
-		region := strings.ToUpper(strings.TrimPrefix(gw, "unified-"))
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+	for i, gw := range []string{"unified-1", "unified-2", "unified-3"} {
+		seedGateway(st, mn, gw, i, 1)
 	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	s.opt.MaxTriesPerDeliver = 5
@@ -2198,12 +2259,19 @@ func TestStalePairDoesNotCountAsLive(t *testing.T) {
 	}
 }
 
-// ---------- 同一个网关一次只许有一发在铸（B 条） ----------
+// ---------- 一个区域一次只许有一发裸铸（B 条） ----------
 
-// 两路交付同时发现同一个网关没票：第二个必须等第一个铸完直接用，不许各铸一发。
+// 两路交付同时撞上冷池子：只许打出去**一发**，另一路当场被挡回去。
 //
-// 账号锁拦不住这件事：minterFor 会给两个消费者挑**不同**的铸票者，于是两发都放出去了
-// ——而一张 pair 本来就能同时服务多个消费者，第二发纯属白烧一个槽位加一发请求。
+// 原来这一条写的是「按网关拦，第二路等第一路铸完直接用那张票」。按需铸票（mintByRegion）
+// 之后没有网关可拦了——出手前根本不知道会落到哪 ⇒ 退化成按区域单飞。
+// 而且只能是「占不住就走」，不能排队：两路的铸票者不是同一个号，排队等于让后一路在走到
+// **账号锁**之前就停住，前一路正等着账号锁 ⇒ 真死锁（TestNoDeadlockBetweenAccounts
+// 的屏障就是钉这件事，2026-10-02 拿全局锁实测 3 秒超时）。
+//
+// 要守的不变量没变：**不许为同一件事烧两个铸票者槽位**。槽位是池子最紧的资源，
+// 而被挡回去的那一路重试时第一路的票已经在池里了，一发上游都不用打——下面最后一段
+// 就是在证这件事。
 //
 // 三个号、消费者是 2 和 3：铸票者必然是账号 1（minterFor 只排掉消费者自己，剩下按 ID）。
 // 铸票者不能是其中一个消费者，否则等到票的那个人该被拒——那是另一条规则，由
@@ -2218,10 +2286,10 @@ func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
 	addAccount(st, 3, "acct-3")
-	// 只有一个网关、一张票都没有 ⇒ 两个人必然挑到同一个。
+	// 只有一个网关、一张票都没有 ⇒ 两个人必然撞上同一个区域。
 	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
 		ReachableExits: []types.Exit{{Region: "US"}}}
-	mn.land["US"] = "unified-1"
+	landBare(mn, "unified-1")
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 
 	var wg sync.WaitGroup
@@ -2235,16 +2303,40 @@ func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	// 一发、而且只一发：这是这条用例的全部重点。
+	if n := len(mn.mintedGateways()); n != 1 {
+		t.Fatalf("两路裸铸打了 %d 发上游，单飞没拦住（烧的是两个铸票者槽位）", n)
+	}
+	// 一个成、一个被挡。谁成谁被挡是调度顺序的事，不钉。
+	won, lost, blocked := 0, 0, int64(0)
 	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("第 %d 路交付失败: %v", i+1, err)
+		switch {
+		case err == nil:
+			won++
+			if out[i].Gateway != "unified-1" {
+				t.Fatalf("第 %d 路落点不对: %+v", i+1, out[i])
+			}
+		case errors.Is(err, ErrNoLivePair):
+			// 归成「等得起」那一格：调用方该重试，而不是当成永久 503
+			lost, blocked = lost+1, int64(i+2)
+		default:
+			t.Fatalf("第 %d 路的错不该是这个: %v", i+1, err)
 		}
 	}
-	if out[0].Cookie != out[1].Cookie {
-		t.Fatalf("两路拿到了不同的票：%q / %q", out[0].Cookie, out[1].Cookie)
+	if won != 1 || lost != 1 {
+		t.Fatalf("成 %d 路、被挡 %d 路，应各一路", won, lost)
+	}
+	// 被挡那一路重试：池子里已经有票了 ⇒ 拿到同一张，而且**一发上游都不用打**。
+	// 这是「挡回去」能成立的全部前提，不验这一条就等于把 503 当成了功能。
+	retry, err := s.Deliver(context.Background(), blocked, Request{})
+	if err != nil {
+		t.Fatalf("被挡的 %d 号重试该直接捡到池里那张票: %v", blocked, err)
+	}
+	if retry.Gateway != "unified-1" {
+		t.Fatalf("重试拿到 %s，池里只有 unified-1 那张", retry.Gateway)
 	}
 	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("同一个网关铸了 %d 发，网关锁没拦住", n)
+		t.Fatalf("重试又打了上游，共 %d 发", n)
 	}
 }
 

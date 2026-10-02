@@ -75,6 +75,47 @@ func TestLoadRejectsBadInput(t *testing.T) {
 	}
 }
 
+// public_base_url 是页面上那个「填进 sub2api 的根地址」。
+//
+// 校验在配置边界上做而不是在页面上提醒：人最容易填的恰恰是自己那个
+// /a/<令牌> 地址（这个配置项就是为那个坑加的），而拼出来的
+// "/a/<令牌>/cookie" 只会回 404。空是合法的「没配」—— 页面照实说「问管理员要」，
+// 绝不拿 Host 头猜一个（那个头是调用方可控的输入）。
+func TestPublicBaseURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                             "",
+		"https://pool.example.com":     "https://pool.example.com",
+		"https://pool.example.com/":    "https://pool.example.com",
+		"  http://127.0.0.1:8099  ":    "http://127.0.0.1:8099",
+		"https://pool.example.com:443": "https://pool.example.com:443",
+	} {
+		cfg, err := Load(writeCfg(t, `{`+okProxies+`,"public_base_url":`+jsonStr(in)+`}`))
+		if err != nil {
+			t.Fatalf("%q 被拒了: %v", in, err)
+		}
+		if cfg.PublicBaseURL != want {
+			t.Errorf("%q 规范化成 %q，应为 %q", in, cfg.PublicBaseURL, want)
+		}
+	}
+	for _, bad := range []string{
+		"pool.example.com",                    // 没协议：拼出来是相对路径
+		"ftp://pool.example.com",              // 不是 http(s)
+		"https://",                            // 没主机名
+		"https://pool.example.com/a/deadbeef", // 正是那个坑：个人页地址
+		"https://pool.example.com/?x=1",
+		"https://u:p@pool.example.com", // 凭据不该进页面
+	} {
+		if cfg, err := Load(writeCfg(t, `{`+okProxies+`,"public_base_url":`+jsonStr(bad)+`}`)); err == nil {
+			t.Errorf("%q 该被拒，却过成了 %q", bad, cfg.PublicBaseURL)
+		}
+	}
+}
+
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
 func TestProxySelection(t *testing.T) {
 	cfg, err := Load(writeCfg(t, `{"proxies":[
 		{"name":"nov","kind":"novproxy","host":"h","user":"u","pass":"p","enabled":true},
@@ -276,32 +317,60 @@ func TestSlotCooldownFromMinutes(t *testing.T) {
 	}
 }
 
-// min_free_gateways 的默认值要跟着**配置里的**冷却算，而不是那个 4 小时的常量：
-// 冷却调成 30 分钟时「一个账号不停转」只要 12 个网关，留着 96 会让公开池难开一个量级。
-func TestMinFreeGatewaysDefaultFollowsCooldown(t *testing.T) {
+// min_accounts 的默认值要跟着**配置里的**冷却算，而不是那个 4 小时的常量：
+// 冷却调成 30 分钟时连续供上只要 3 个账号，留着按 4 小时算出来的 12 会让公开池难开好几倍。
+func TestMinAccountsDefaultFollowsCooldown(t *testing.T) {
 	cfg, err := Load(writeCfg(t, `{"slot_cooldown_minutes":30,`+okProxies+`}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := types.GatewaysForContinuous(30 * time.Minute); cfg.PublicWhenSurplus.MinFreeGateways != want {
-		t.Fatalf("门槛 %d，按 30 分钟冷却该是 %d", cfg.PublicWhenSurplus.MinFreeGateways, want)
+	if want := types.AccountsForContinuous(30 * time.Minute); cfg.PublicWhenSurplus.MinAccounts != want {
+		t.Fatalf("门槛 %d，按 30 分钟冷却该是 %d", cfg.PublicWhenSurplus.MinAccounts, want)
 	}
 	// 没动冷却时还是那个常量算出来的数：这条改动不许顺手改掉默认部署的门槛。
 	cfg, err = Load(writeCfg(t, `{`+okProxies+`}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := types.GatewaysForContinuous(types.SlotCooldown); cfg.PublicWhenSurplus.MinFreeGateways != want {
-		t.Fatalf("默认门槛变成了 %d，应为 %d", cfg.PublicWhenSurplus.MinFreeGateways, want)
+	if want := types.AccountsForContinuous(types.SlotCooldown); cfg.PublicWhenSurplus.MinAccounts != want {
+		t.Fatalf("默认门槛变成了 %d，应为 %d", cfg.PublicWhenSurplus.MinAccounts, want)
 	}
 	// 显式写了就照显式的办——那是运营决策，不许被派生值盖掉。
 	cfg, err = Load(writeCfg(t, `{"slot_cooldown_minutes":30,
-		"public_when_surplus":{"enabled":true,"min_free_gateways":3},`+okProxies+`}`))
+		"public_when_surplus":{"enabled":true,"min_accounts":3},`+okProxies+`}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PublicWhenSurplus.MinFreeGateways != 3 {
-		t.Fatalf("显式门槛被盖成了 %d", cfg.PublicWhenSurplus.MinFreeGateways)
+	if cfg.PublicWhenSurplus.MinAccounts != 3 {
+		t.Fatalf("显式门槛被盖成了 %d", cfg.PublicWhenSurplus.MinAccounts)
+	}
+	// 写 0 = 和没写一样走推导，**绝不能**落成「门槛 0」或者报错。
+	//
+	// 管理表单上那一格留空时 atoiField 回的是下限，而同一张表单上另外几格的提示都写着
+	// 「0 = 用默认值」⇒ 运营清空它是最自然的「让它用默认」动作。下限若是 1，门槛就变成
+	// 「有一个号铸过票就对全互联网开放」——这是整张表上唯一一个**往开那边**失败的格子。
+	cfg, err = Load(writeCfg(t, `{"slot_cooldown_minutes":30,
+		"public_when_surplus":{"enabled":true,"min_accounts":0},`+okProxies+`}`))
+	if err != nil {
+		t.Fatalf("写 0 应该走推导，却报错了: %v", err)
+	}
+	if want := types.AccountsForContinuous(30 * time.Minute); cfg.PublicWhenSurplus.MinAccounts != want {
+		t.Fatalf("写 0 之后门槛 %d，该按冷却推导成 %d", cfg.PublicWhenSurplus.MinAccounts, want)
+	}
+
+	// 旧键名要**明着拒**，不能跟着 encoding/json 静默忽略。
+	//
+	// 这个键嵌在 public_when_surplus 里，所以它同时钉住「改名闸认得嵌套键」——
+	// 只扫顶层的话这道闸对它等于不存在。而它正是最不能静默的那种：旧值数的是
+	// 空闲网关（96），新值数的是托管账号（12），照搬过去差两个量级。
+	_, err = Load(writeCfg(t, `{"slot_cooldown_minutes":30,
+		"public_when_surplus":{"enabled":true,"min_free_gateways":96},`+okProxies+`}`))
+	if err == nil {
+		t.Fatal("旧键 min_free_gateways 被静默吃掉了，运维会以为自己设的门槛还生效")
+	}
+	// 报错里必须给出新键名，否则看到报错也不知道改成什么。
+	if !strings.Contains(err.Error(), "min_accounts") {
+		t.Fatalf("报错没告诉人改成哪个键: %v", err)
 	}
 }
 

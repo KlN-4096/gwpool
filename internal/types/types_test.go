@@ -71,6 +71,37 @@ func TestGatewaysForContinuousFollowsCooldown(t *testing.T) {
 	}
 }
 
+// 对外开放门槛按**账号数**算：⌈所需网关数 ÷ 区域数⌉ + 1 的重叠余量。
+func TestAccountsForContinuousFollowsCooldown(t *testing.T) {
+	// 默认 4h：⌈96/9⌉ = 11，+1 = 12。这个数是用户定的，改了要先问。
+	if got, want := AccountsForContinuous(SlotCooldown), 12; got != want {
+		t.Fatalf("4 小时冷却算出 %d 个账号，应是 %d", got, want)
+	}
+	// 冷却测准成 30 分钟就该大幅降门槛：⌈12/9⌉ = 2，+1 = 3。
+	if got, want := AccountsForContinuous(30*time.Minute), 3; got != want {
+		t.Fatalf("30 分钟冷却算出 %d 个账号，应是 %d", got, want)
+	}
+	// 0 和负数退回默认冷却，别算出 0（那等于对外完全敞开）。
+	if got := AccountsForContinuous(0); got != AccountsForContinuous(SlotCooldown) {
+		t.Fatalf("0 没退回默认冷却: %d", got)
+	}
+	// 那个 +1 是重叠余量（一个区域在不同账号上常落回同一个网关），不是凑整。
+	// 刚好整除时也必须留着，否则门槛退回成偏乐观的那个值。
+	exact := time.Duration(len(Regions)) * DeliverTTL // ⌈9/9⌉ = 1，+1 = 2
+	if got, want := AccountsForContinuous(exact), 2; got != want {
+		t.Fatalf("刚好整除时算出 %d，重叠余量被吃掉了（应是 %d）", got, want)
+	}
+	// 门槛必须随冷却单调不减：测准的冷却越长，要的账号越多。
+	prev := 0
+	for _, d := range []time.Duration{time.Minute, 30 * time.Minute, time.Hour, 4 * time.Hour, 12 * time.Hour} {
+		got := AccountsForContinuous(d)
+		if got < prev {
+			t.Fatalf("冷却 %v 算出 %d，比更短的冷却还少（上一个 %d）", d, got, prev)
+		}
+		prev = got
+	}
+}
+
 // cookie_version 是调用方拿来回头指名一张票的身份（exclude_versions、/release）：
 // 必须确定、定长、不泄露 cookie 本体，而且**不存状态** ⇒ 重启后仍是同一个值。
 func TestCookieVersion(t *testing.T) {

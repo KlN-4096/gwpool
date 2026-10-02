@@ -7,6 +7,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -99,6 +100,18 @@ type Config struct {
 	// SiteKey 给页面加一道访问码：想分享给谁就把码给谁。空 = 不设门禁。
 	SiteKey Secret `json:"site_key"`
 
+	// PublicBaseURL 是这个服务对外的根地址（"https://pool.example.com"），
+	// 页面上拿它告诉人「填进 sub2api 的是这个，不是你的个人页地址」。
+	//
+	// **只能配置，不许从请求头推。** Host / X-Forwarded-Host 是调用方可控的输入，
+	// 照它拼出来的地址会把这几个页面变成一台反射式的钓鱼地址分发器：攻击者带一个
+	// 自己的 Host 来访问，受害者在页面上读到的「接口地址」就指向攻击者的域名。
+	// 空就如实说「问管理员要」——猜一个比不说更糟。
+	//
+	// Load 会把它规范化成 scheme+主机名（去掉末尾斜杠、拒掉带路径的）：
+	// 页面上要拼 "<base>/cookie"，多一个斜杠就是个 404。
+	PublicBaseURL string `json:"public_base_url"`
+
 	Proxies     []Proxy     `json:"proxies"`
 	Fingerprint Fingerprint `json:"fingerprint"`
 
@@ -187,13 +200,18 @@ func (c Config) SlotCooldown() time.Duration {
 	return types.SlotCooldown
 }
 
-// PublicWhenSurplus：票富裕时自动对没上传凭据的人开放 /cookie，供给回落自动关上。
+// PublicWhenSurplus：池子够格时自动对没上传凭据的人开放 /cookie，不够格自动关上。
 //
-// 空闲网关 = 有活 pair（剩余 ≥ types.DeliverFloor）且当前没被租走的网关。
-// 门槛是**给上传者留的余量**：跌破它的那一刻就拒匿名，哪怕还剩一张。
+// 门槛按**托管账号数**算，不按「此刻有几张活 pair」——理由见
+// types.AccountsForContinuous（按需铸票的池子不囤票，按活 pair 数判等于永远关着）。
+// 0 时按 types.AccountsForContinuous 推导，推导依据是配置里那个冷却。
+//
+// 旧字段 min_free_gateways 已经没了：Load 不是严格模式（json.Unmarshal），
+// 旧配置里残留的那个键会被**静默忽略**然后落到推导值上。线上那份要手工改键名，
+// 不然页面上的门槛数会跟你记的不一样。
 type PublicWhenSurplus struct {
-	Enabled         bool `json:"enabled"`
-	MinFreeGateways int  `json:"min_free_gateways"`
+	Enabled     bool `json:"enabled"`
+	MinAccounts int  `json:"min_accounts"`
 }
 
 // Defaults 是未配置字段的取值。
@@ -210,11 +228,10 @@ func Defaults() Config {
 		// pro1 清单里的头一个。换账号多半要改，所以 Load 里会校验它非空。
 		Models: []string{"gpt-6-luna"},
 		// 默认不对外开放：开放是运营决策，不该由默认值替人做主。
-		// 门槛取「一个账号能不停转」所需的网关数（冷却 ÷ 单张可用时长），
-		// 不是随手填一个小数字让它看起来开着。
+		// 门槛取「连续供上需要多少个托管账号」，不是随手填一个小数字让它看起来开着。
 		// 冷却改过的话这个默认值会在 Load 里按**配置里那个冷却**重算。
 		PublicWhenSurplus: PublicWhenSurplus{
-			MinFreeGateways: types.GatewaysForContinuous(types.SlotCooldown)},
+			MinAccounts: types.AccountsForContinuous(types.SlotCooldown)},
 		// 九个区域各 6 发 = 原先按账号算的 54 发/小时，拆开之后一个区域的重试
 		// 吃不掉别的区域的预算。
 		UpstreamPerRegionHour: 6,
@@ -288,6 +305,9 @@ func Load(path string) (Config, error) {
 	if cfg.StickyMinutes <= 0 {
 		return Config{}, fmt.Errorf("sticky_minutes 必须为正")
 	}
+	if cfg.PublicBaseURL, err = normalizeBaseURL(cfg.PublicBaseURL); err != nil {
+		return Config{}, err
+	}
 	// 负数会让速率闸变成「一发都不许打」，而那看起来和「上游全挂了」一模一样。
 	// 0 是合法的「用默认值」。
 	if cfg.UpstreamPerRegionHour < 0 {
@@ -319,9 +339,17 @@ func Load(path string) (Config, error) {
 	// 这个文件是手改的（部署时直接编辑 config.json）：运维把 upstream_per_hour 从 54
 	// 调到 108 以为放宽了配额，实际一直按每区 6 发跑，而「配额没生效」的现象和
 	// 「上游在限流」长得一模一样，查起来要先怀疑一圈上游。启动即拒，一眼就知道改哪。
-	for old, now := range renamedKeys {
-		if _, ok := raw[old]; ok {
-			return Config{}, fmt.Errorf("配置键 %s 已经改名为 %s（语义也变了：现在是**每个区域**每小时的发数，九个区域各一份），请手动改掉", old, now)
+	// 键名带点号的是嵌套键——**必须认它**：公开门槛那个键就嵌在 public_when_surplus 里，
+	// 只扫顶层的话这道闸对它等于不存在，而它恰好是「旧值照搬过去会错两个量级」的那种。
+	for _, k := range renamedKeys {
+		var present bool
+		if obj, key, nested := strings.Cut(k.old, "."); nested {
+			present = hasNestedKey(raw, obj, key)
+		} else {
+			_, present = raw[k.old]
+		}
+		if present {
+			return Config{}, fmt.Errorf("配置键 %s 已经改名为 %s（%s），请手动改掉", k.old, k.now, k.why)
 		}
 	}
 
@@ -349,15 +377,20 @@ func Load(path string) (Config, error) {
 		}
 	}
 	cfg.Model = cfg.Models[0] // 派生镜像，见字段注释
-	// min_free_gateways 没显式写时按**配置里的**冷却算，不按那个常量：冷却调成 30 分钟
-	// 时「一个账号不停转」只要 12 个网关，留着按 4 小时算出来的 96 会让公开池难开
-	// 一个量级（而那个函数自己的注释就说冷却是参数不是常量）。
-	if !hasNestedKey(raw, "public_when_surplus", "min_free_gateways") {
-		cfg.PublicWhenSurplus.MinFreeGateways = types.GatewaysForContinuous(cfg.SlotCooldown())
+	// min_accounts 没显式写时按**配置里的**冷却算，不按那个常量：冷却调成 30 分钟时
+	// 连续供上只要 3 个账号，留着按 4 小时算出来的 12 会让公开池难开好几倍
+	// （而那个函数自己的注释就说冷却是参数不是常量）。
+	//
+	// 0（和没写一样走推导）而不是报错：同一张管理表单上 upstream_per_region_hour、
+	// slot_cooldown_minutes、max_tries_per_deliver 的提示都是「0 = 用默认值」，而那一格
+	// 留空时 atoiField 回的就是下限 ⇒ 这一格必须也认 0，否则「留空 = 用默认值」这个
+	// 全表一致的直觉在**唯一一个往开那边失败的格子**上不成立。
+	if n := cfg.PublicWhenSurplus.MinAccounts; n <= 0 || !hasNestedKey(raw, "public_when_surplus", "min_accounts") {
+		cfg.PublicWhenSurplus.MinAccounts = types.AccountsForContinuous(cfg.SlotCooldown())
 	}
-	if cfg.PublicWhenSurplus.Enabled && cfg.PublicWhenSurplus.MinFreeGateways <= 0 {
-		return Config{}, fmt.Errorf("public_when_surplus.min_free_gateways 必须为正，" +
-			"否则一张空闲票都没有也会放匿名进来")
+	if cfg.PublicWhenSurplus.Enabled && cfg.PublicWhenSurplus.MinAccounts <= 0 {
+		return Config{}, fmt.Errorf("public_when_surplus.min_accounts 必须为正，" +
+			"否则一个托管账号都没有也会放匿名进来")
 	}
 	seen := map[string]bool{}
 	for i, p := range cfg.Proxies {
@@ -387,8 +420,43 @@ func Load(path string) (Config, error) {
 //
 // 只收**语义也变了**的那种。单纯挪位置的不用进来——静默忽略一个没人读的键无害，
 // 而静默忽略一个「我以为我改了配额」的键会让人去怀疑上游。
-var renamedKeys = map[string]string{
-	"upstream_per_hour": "upstream_per_region_hour",
+// 键名用点号表示嵌套（"public_when_surplus.min_accounts"）。why 要写清**语义**
+// 怎么变了——只说「改名了」的话，运维会直接把值照搬到新键上，而值的含义已经不同。
+var renamedKeys = []renamedKey{
+	{old: "upstream_per_hour", now: "upstream_per_region_hour",
+		why: "语义也变了：现在是**每个区域**每小时的发数，九个区域各一份"},
+	{old: "public_when_surplus.min_free_gateways", now: "public_when_surplus.min_accounts",
+		why: "语义也变了：数的是**托管账号数**不是空闲网关数（见 types.AccountsForContinuous）。" +
+			"按 4 小时冷却推导出来是 12，别把原来那个 96 照搬过去"},
+}
+
+type renamedKey struct{ old, now, why string }
+
+// normalizeBaseURL 校验并规范化 public_base_url：空串照过，非空必须是
+// scheme + 主机名，回出来一律没有末尾斜杠。
+//
+// 为什么拒带路径的：页面上拼的是 "<base>/cookie"，而人很自然会把自己那个
+// /a/<令牌> 地址填进来（这就是这个配置项要解决的那个坑），拼出来是
+// "/a/<令牌>/cookie" ⇒ 404。在配置边界上拒掉，比在每个页面上提醒管用。
+func normalizeBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("public_base_url 解不开: %w", err)
+	}
+	switch {
+	case u.Scheme != "http" && u.Scheme != "https":
+		return "", fmt.Errorf("public_base_url 要以 http:// 或 https:// 开头，给的是 %q", raw)
+	case u.Host == "":
+		return "", fmt.Errorf("public_base_url 缺主机名: %q", raw)
+	case u.Path != "" && u.Path != "/", u.RawQuery != "", u.Fragment != "", u.User != nil:
+		return "", fmt.Errorf("public_base_url 只要根地址（如 https://pool.example.com），"+
+			"不要路径、查询串或凭据，给的是 %q", raw)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // isModelName 卡住能进 JSON 请求体和日志的模型名。上游的拼法只用这几类字符

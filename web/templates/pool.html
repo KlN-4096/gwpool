@@ -9,8 +9,37 @@
   <div class="kpi ok"><b>{{.ReadyCount}}</b><span>可交付网关</span>{{if .Gateways}}<div class="meter" style="--v: {{.ReadyCount}}; --max: {{len .Gateways}}"><i></i></div>{{end}}</div>
   <div class="kpi"><b>{{.Accounts}}</b><span>托管账号</span></div>
   {{if .PublicEnabled}}
-  <div class="kpi {{if .PublicOpen}}ok{{else}}off{{end}}"><b>{{if .PublicOpen}}开放中{{else}}已关闭{{end}}</b><span>对外开放</span><small>空闲网关 {{.FreeGateways}} 个 / 开放门槛 {{.Threshold}} 个</small></div>
+  <div class="kpi {{if .PublicOpen}}ok{{else}}off{{end}}"><b>{{if .PublicOpen}}开放中{{else}}已关闭{{end}}</b><span>对外开放</span><small>可用 {{.OpenAccounts}} / 门槛 {{.Threshold}}</small></div>
   {{end}}
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <header class="card-head"><div><h2>我的账号后台</h2><p>自己托管的凭据、各自的接入 key 与探测情况。</p></div></header>
+    <div class="card-body">
+      {{if .OwnerToken}}
+      <div class="actions"><a class="btn" href="/u/{{.OwnerToken}}">进入我的账号后台 →</a></div>
+      {{else}}
+      <form method="post" action="/enter">
+        <label>账号总览令牌 <span class="hint">上传后给你的那一串；单个账号的页面令牌也能用</span>
+          <input name="token" autocomplete="off" spellcheck="false" required placeholder="粘贴令牌"></label>
+        {{if .EnterErr}}<p class="err" role="alert">认不出这个令牌。</p>{{end}}
+        <div class="actions"><button type="submit" class="primary">进入</button></div>
+      </form>
+      {{end}}
+    </div>
+  </div>
+  <div class="card">
+    <header class="card-head"><div><h2>接口地址</h2><p>填进 sub2api 的<strong>根地址</strong>。</p></div></header>
+    <div class="card-body">
+      {{if .BaseURL}}
+      <div class="copy"><pre class="mono" id="base-url">{{.BaseURL}}</pre><button type="button" data-copy="#base-url" hidden data-js>复制</button></div>
+      {{else}}
+      <p class="muted">未配置对外地址，找管理员要。</p>
+      {{end}}
+      <p class="foot"><strong>填根地址，不是个人页地址。</strong>填 <code>/a/&lt;令牌&gt;</code> 或 <code>/u/&lt;令牌&gt;</code> 的话，请求会变成 <code>/a/&lt;令牌&gt;/cookie</code>，返回 404。</p>
+    </div>
+  </div>
 </div>
 
 <nav class="tabs" data-tabs hidden data-js>
@@ -39,13 +68,13 @@
       </tbody>
     </table></div>
     <div class="legend">
-      <span><i class="sw ok"></i>可交付：路由 Cookie 剩余有效期充足，可立即分发</span>
-      <span><i class="sw"></i>暂不可交付：尚无路由 Cookie，或剩余有效期不足</span>
-      <span><b>槽位</b>可用于该网关的账号数（距上次使用已超过 {{.RestedLabel}}，且不在退避期）</span>
-      <span><b>出口</b>能连通该网关的出口地区数</span>
+      <span><i class="sw ok"></i>可交付：路由 Cookie 剩余有效期充足</span>
+      <span><i class="sw"></i>暂不可交付：没有路由 Cookie，或剩余不足</span>
+      <span><b>槽位</b>还能用这个网关的账号数（距上次<strong>取走票</strong>超过 {{.RestedLabel}}，且不在退避期）。这是<strong>接触记录</strong>不是锁——路由 Cookie 不互斥，一张可以同时发给好几个账号，所以 0 是「每个账号最近都取过它」，不是「被谁占着」</span>
+      <span><b>出口</b>能连通这个网关的出口地区数</span>
     </div>
     {{else}}
-    <p class="empty">尚未发现网关。账号接入后，系统会自动探测并在此列出。</p>
+    <p class="empty">尚未发现网关。账号接入后会自动探测。</p>
     {{end}}
   </div>
 </section>
@@ -56,30 +85,32 @@
       <header class="card-head"><div><h2>调用流程</h2><p>适用于已上传账号的调用方。</p></div></header>
       <div class="card-body">
         <h3>1. 获取接入 key</h3>
-        <p>在「上传账号」中提交账号凭据。提交成功后会进入该账号的专属页面，页面中提供接入 key。</p>
+        <p>在「上传账号」提交凭据，成功后跳转到该账号的页面，接入 key 在那里。</p>
         <h3>2. 请求路由 Cookie</h3>
         <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
-        <p>返回 JSON，其中 <code>cookie</code> 字段即路由 Cookie。可选参数：<code>gateway=&lt;网关名&gt;</code> 指定网关；<code>force=1</code> 更换为其他网关。</p>
+        <p>返回 JSON，<code>cookie</code> 字段即路由 Cookie。可选参数：<code>gateway=&lt;网关名&gt;</code> 指定网关；<code>force=1</code> 换一个网关。</p>
         <h3>3. 携带 Cookie 请求上游</h3>
-        <p>将 <code>cookie</code> 字段原样放入上游请求的 <code>Cookie</code> 请求头，并在 <code>valid_for_s</code> 秒内使用，到期后重新获取。</p>
-        <p class="foot">完整的返回字段与状态码说明，见账号专属页面的「接入说明」。</p>
+        <p>把 <code>cookie</code> 字段原样放进上游请求的 <code>Cookie</code> 头，在 <code>valid_for_s</code> 秒内用完，到期重新取。</p>
+        <p class="foot">完整字段与状态码见账号页的「接入说明」。</p>
       </div>
     </div>
     {{if .PublicEnabled}}
     <div class="card">
-      <header class="card-head"><div><h2>对外开放</h2><p>空闲网关充足时，未上传账号的调用方也可直接获取路由 Cookie。</p></div>
+      <header class="card-head"><div><h2>对外开放</h2><p>可用账号够多时，未上传账号的调用方也可直接获取路由 Cookie。<strong>可用</strong>指启用着、凭据还在、<strong>且至少成功铸过一次票</strong>的托管账号——停用的、匿名占位行、以及刚传上来还没铸出过票的都不算，所以这个数可能小于上面那张「托管账号」。</p></div>
         {{if .PublicOpen}}<span class="badge ok">开放中</span>{{else}}<span class="badge">已关闭</span>{{end}}</header>
       <div class="card-body">
         {{if .PublicOpen}}
-        <p>当前空闲网关 <strong>{{.FreeGateways}}</strong> 个，已达到开放门槛（{{.Threshold}} 个），可以不带 key 直接调用：</p>
+        <p>当前可用账号 <strong>{{.OpenAccounts}}</strong> 个，已达门槛（{{.Threshold}} 个），可以不带 key 直接调用：</p>
         <pre class="mono">curl '<span class="origin">https://&lt;站点地址&gt;</span>/cookie?account=&lt;你的 account_id&gt;'</pre>
         <ul>
-          <li><code>account</code> 为必填参数，用于区分调用方，建议填写你的上游账号 ID。</li>
-          <li>此方式不经过可用性校验，返回的 <code>verified_full</code> 固定为 <code>false</code>。</li>
-          <li>空闲网关少于 {{.Threshold}} 个时自动关闭，此时请求返回 503。</li>
+          <li><code>account</code> 必填，用于区分调用方，填你的上游账号 ID。</li>
+          <li>不做可用性校验，<code>verified_full</code> 固定为 <code>false</code>。</li>
+          <li>只发现成的票，不为你现铸；没有现成票时同样 503。</li>
+          <li>可用账号少于 {{.Threshold}} 个时自动关闭，请求返回 503。</li>
         </ul>
         {{else}}
-        <p>当前空闲网关 <strong>{{.FreeGateways}}</strong> 个，未达到开放门槛（{{.Threshold}} 个），暂不接受不带 key 的调用。空闲网关回升到门槛后会自动开放。</p>
+        <p>当前可用账号 <strong>{{.OpenAccounts}}</strong> 个，未达门槛（{{.Threshold}} 个），暂不接受不带 key 的调用。</p>
+        <p class="foot">门槛数的是账号，不是现成的票：一个账号最多摸到 9 个落点，连续供上需要约 {{.Threshold}}×9 个，所以它量的是「池子够不够格」。按现成票数判的话，按需铸票的池子永远开不了。</p>
         {{end}}
       </div>
     </div>
@@ -90,10 +121,10 @@
 <section id="tab-submit">
   <div class="grid-2">
     <div class="card">
-      <header class="card-head"><div><h2>上传账号</h2><p>提交后立即创建账号，并跳转到该账号的专属页面。</p></div></header>
+      <header class="card-head"><div><h2>上传账号</h2><p>提交后立即创建，并跳转到该账号的页面。</p></div></header>
       <div class="card-body">
         <form id="upload" method="post" action="/upload">
-          <label>备注名称 <span class="hint">选填，最多 64 个字符，便于在列表中识别</span>
+          <label>备注名称 <span class="hint">选填，最多 64 字，便于识别</span>
             <input name="label" maxlength="64" autocomplete="off"></label>
           <label>账号凭据 <span class="hint">可粘贴 auth.json 全文、包含 access_token / refresh_token / account_id 的 JSON，或单个 token</span>
             <textarea name="creds" required spellcheck="false" placeholder="在此粘贴 JSON 或 token"></textarea></label>
@@ -108,6 +139,8 @@
                 <span>refresh_token<small>先换取 access_token，之后自动续期</small></span></label>
             </div>
           </fieldset>
+          <label>挂到已有账号页 <span class="hint">选填。粘总览页令牌，这份凭据就挂在同一页下；留空则新建一个</span>
+            <input name="owner_token" autocomplete="off" spellcheck="false"></label>
           <p class="err" id="upload-err" role="alert" hidden></p>
           <div class="actions">
             <button type="submit" class="primary">提交并创建账号</button>
@@ -121,10 +154,10 @@
       <header class="card-head"><div><h2>提交须知</h2></div></header>
       <div class="card-body">
         <ul class="checklist">
-          <li>系统会定期使用该账号发送探测请求（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），<strong>消耗 0 token</strong>，用于发现网关和维护路由 Cookie。</li>
-          <li>只提供 refresh_token 时，系统会先换取 access_token；未提供 account_id 时，从 token 中自动读取。</li>
-          <li>提交成功后会跳转到账号专属页面。该页面是查看接入 key、停用账号的入口，请保存好页面地址。</li>
-          <li>可以随时在专属页面停用账号，停用后系统不再使用该账号发送请求。</li>
+          <li>会用这个账号发探测请求（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），<strong>消耗 0 token</strong>，用于发现网关和维护路由 Cookie。</li>
+          <li>只给 refresh_token 时先换 access_token；没给 account_id 时从 token 里读。</li>
+          <li>提交后跳转到账号页。接入 key 和停用开关都在那里，保存好地址。</li>
+          <li>可随时在账号页停用，停用后不再用它发请求。</li>
         </ul>
       </div>
     </div>

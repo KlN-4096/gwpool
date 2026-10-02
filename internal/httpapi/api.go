@@ -75,6 +75,23 @@ type Store interface {
 	Accounts() []types.Account
 	AccountByViewToken(tok string) (types.Account, bool)
 	AddAccount(a types.Account) (types.Account, error)
+
+	// owner 层。/u/{token} 的鉴权就是 OwnerByToken，和 /a/{token} 同一个套路。
+	OwnerByToken(tok string) (types.Owner, bool)
+	AccountsByOwner(ownerID int64) []types.Account
+	// AddOwner 建一个上传者。归属在**这一层**定好再传给 AddAccount：让存储层
+	// 兜底铸一个的话，回来那个 OwnerID 分不清是「刚为我铸的」还是「去重命中了
+	// 别人的账号」，而那两件事的处置完全相反。
+	AddOwner(label string) (types.Owner, error)
+	// PruneEmptyOwners 丢掉名下零账号的 owner。上传新建了 owner 但 AddAccount 失败时
+	// （撞上限、并发竞争）清掉那个孤儿，否则 owner 表会被反复上传刷到无上限。
+	PruneEmptyOwners() (int, error)
+	// Owners 只给管理页：迁移出来那个 owner 的 token 不显示的话，现有账号的
+	// 总览页谁都进不去。
+	Owners() []types.Owner
+
+	// RegionMints 是 (账号 × 区域) 的终身铸票台账，/u/ 的九宫格按它画。
+	RegionMints() map[string]types.RegionMint
 	// SetAccountEnabled 只翻一个 bool。给上传者自己停用/启用用。
 	SetAccountEnabled(id int64, enabled bool) error
 	// PutPair 覆盖一个网关的 pair。只有 /pair/renew 用它（消费端自己续出来的那张
@@ -99,8 +116,13 @@ type Scanner interface {
 	// 所以派**别人**去，铸出来的 pair 是账号无关的路由，要票的人拿到时仍然是对那个
 	// 网关的首次接触——这才有满血窗口。
 	//
-	// 实现方负责挑人（按 (账号 × 区域) 台账）和限流；没人可派就什么都不做。
-	EnqueueDiscovery(exclude int64)
+	// 实现方负责挑人（按 (账号 × 区域) 台账）和限流。
+	//
+	// 返回空串 = 真的排进去了；非空 = 没派出去，内容是给人看的原因。管理页那个
+	// 「手动踢一次」的按钮据此如实回话：挑不出人（单账号冷池子）、九个区域本小时
+	// 都打满、挑中的号还在 30 分钟发现冷却里——这三种从前都回「已排队」，
+	// 只有服务端日志说了实话，而这个按钮恰恰是冷启动时唯一的出路。
+	EnqueueDiscovery(exclude int64) string
 }
 
 // Options 是服务端参数。两个 key 为空时对应路由**全拒**，不是全放。
@@ -130,6 +152,10 @@ type Options struct {
 	// 上传者视图要向托管者如实交代用了他的凭据打什么，所以不能写死。
 	Model string
 
+	// PublicBaseURL 是启动时那份 config.PublicBaseURL，给没接 Live 的实例（测试）用。
+	// 接了 Live 的现读它（管理页改完立刻生效），见 Server.publicBaseURL。
+	PublicBaseURL string
+
 	Log *slog.Logger
 }
 
@@ -149,7 +175,7 @@ type Server struct {
 	// 最近的交付失败，给页面回答「为什么客户端报 502」。
 	fails failLog
 
-	tplPool, tplAccount, tplAdmin, tplGate *template.Template
+	tplPool, tplAccount, tplOwner, tplAdmin, tplGate *template.Template
 }
 
 // probeEffort 必须跟 mint 包实际发出去的 payload 一致（SPEC 第 2 节）：
@@ -159,17 +185,21 @@ type Server struct {
 const probeEffort = "low"
 
 // probeModel 是页面上要向托管者交代的模型名。
+//
+// 先读热配置：管理页那个按钮写着「保存并立即生效」，铸票确实立刻换模型
+// （mint 走 Live.Get().DefaultModel()），而 Options.Model 是启动快照 ⇒ 只读它的话，
+// 改完模型到下次重启之间，首页和 /a/、/u/ 三处都在向托管者交代一个**已经不用了**的
+// 模型名。上传者页是信任凭证，上面那句注释「模型不是常量，否则页面上那句交代就是假的」
+// 要靠这一步才成立。写法与 publicBaseURL 一致（Live 为 nil 时 Get 回零值配置）。
 func (s *Server) probeModel() string {
+	if v := s.opt.Live.Get().DefaultModel(); v != "" {
+		return v
+	}
 	if s.opt.Model != "" {
 		return s.opt.Model
 	}
 	return "(未配置)"
 }
-
-// restedThreshold 只是公开页上「歇着的槽位」这个人眼读数的门槛。
-// (账号 × 网关) 的真实冷却时长至今没测准（≥4 h 只是没验过的估算），
-// 所以这个数不参与任何调度决策，纯展示。
-const restedThreshold = time.Hour
 
 func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if opt.Log == nil {
@@ -182,6 +212,9 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 		return nil, err
 	}
 	if s.tplAccount, err = parse("account.html"); err != nil {
+		return nil, err
+	}
+	if s.tplOwner, err = parse("owner.html"); err != nil {
 		return nil, err
 	}
 	if s.tplAdmin, err = parse("admin.html"); err != nil {
@@ -202,19 +235,29 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// 门禁只罩**给人看的那几个页面**。/cookie 是机器面、自带 key，
 	// 罩上去等于把 sub2api 一起关在门外；/admin/ 有自己的 admin key。
+	// 给人看的页面罩门禁；**改状态的 POST 还要再罩一层 sameOrigin**（CSRF，见那个函数
+	// 的注释）。机器端点（/cookie、/release、/pair/renew、/gateways）不罩 sameOrigin：
+	// 它们按定义就是别的服务从服务端调的，没有浏览器、也没有可被利用的环境凭证。
 	mux.Handle("GET /{$}", s.gate(http.HandlerFunc(s.handlePool)))
-	mux.Handle("POST /upload", s.gate(http.HandlerFunc(s.handleUpload)))
+	mux.Handle("POST /upload", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUpload))))
 	mux.Handle("GET /a/{token}", s.gate(http.HandlerFunc(s.handleAccount)))
-	mux.Handle("POST /a/{token}/enabled", s.gate(http.HandlerFunc(s.handleAccountEnabled)))
+	mux.Handle("POST /a/{token}/enabled", s.gate(s.sameOrigin(http.HandlerFunc(s.handleAccountEnabled))))
+	// owner 总览页和「贴令牌进来」的入口也是给人看的，和上面几个一起罩门禁。
+	mux.Handle("GET /u/{token}", s.gate(http.HandlerFunc(s.handleOwner)))
+	mux.Handle("POST /enter", s.gate(s.sameOrigin(http.HandlerFunc(s.handleEnter))))
+	mux.Handle("POST /logout", s.gate(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
 	mux.HandleFunc("GET /cookie", s.handleCookie)
 	// /release 和 /cookie 同一把钥匙、同一套 account 语义（见 handleRelease）。
 	mux.HandleFunc("POST /release", s.handleRelease)
 	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
 	mux.HandleFunc("POST /pair/renew", s.handleRenew)
 	mux.HandleFunc("GET /gateways", s.handleGateways)
-	mux.HandleFunc("POST /admin/rescan", s.handleAdminRescan)
-	mux.HandleFunc("POST /admin/accounts/{id}/delete", s.handleAdminDeleteAccount)
-	mux.HandleFunc("POST /admin/config", s.handleAdminConfig)
+	// 管理面的 POST 也要罩 sameOrigin：authAdmin 走 HTTP Basic，而浏览器一旦缓存了
+	// 这个 realm 的凭据，**跨站请求照样会自动带上**——和 cookie 一样是「环境凭证」。
+	// 不罩的话一个第三方页面就能让管理员的浏览器替他删号或改配置。
+	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
+	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
+	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
 	mux.HandleFunc("GET /admin/", s.handleAdmin)
 	return noStore(mux)
 }
@@ -261,6 +304,99 @@ func (s *Server) gate(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// sameOrigin 挡住跨站发起的改状态请求（CSRF）。
+//
+// **这条闸不能用「POST 比 GET 安全」来替代**——第三方页面放一个自动提交的表单就能发出
+// 任意 POST。SameSite=Lax 也替代不了它：Lax 只约束 cookie 的**发送**，不约束响应里
+// Set-Cookie 的**写入**，所以一个跨站 POST /enter 照样能把受害者的身份 cookie 换成
+// 攻击者的令牌，之后他上传的凭据和接入 key 全落到攻击者的 /u/ 页下，全程不用猜任何令牌。
+//
+// 站点码开着时这条路恰好被堵住（门禁 cookie 是 Lax，跨站 POST 不带它 ⇒ 403），
+// 但那是**巧合不是设计**：site_key 是可以留空的（设计上就支持全公开），
+// 一个配置开关之外就是凭据窃取。所以显式挡。
+//
+// 判据按「浏览器一定会说实话」的两个头来，不引第三方库、不发 CSRF 令牌：
+//   - Sec-Fetch-Site：现代浏览器必带。same-origin/none（地址栏直接访问）放行，
+//     cross-site/same-site 拒。
+//   - 没有这个头说明不是现代浏览器 ⇒ 退回看 Origin。浏览器对跨源 POST 一定带 Origin，
+//     带了就必须和本站对得上。两个都没有的是 curl/脚本，它们不是 CSRF 的载体
+//     （攻击者没法让受害者的 curl 带上受害者的 cookie），放行——/upload 本来就支持脚本调用。
+func (s *Server) sameOrigin(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !sameOriginRequest(r) {
+			s.opt.Log.Warn("拒掉跨站请求", "path", r.URL.Path,
+				"sec_fetch_site", r.Header.Get("Sec-Fetch-Site"), "has_origin", r.Header.Get("Origin") != "")
+			http.Error(w, "跨站请求被拒绝：请从本站页面上操作", http.StatusForbidden)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "same-origin", "none":
+		return true
+	case "":
+		// 老浏览器或非浏览器客户端，往下看 Origin。
+	default:
+		return false // cross-site / same-site
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	// r.Host 在反代后面是对外那个主机名（Caddy 原样透传），和 Origin 同口径。
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// ownerCookie 记住「这个浏览器是哪个上传者」。
+//
+// 和门禁 cookie 刻意分开：门禁是「这个站给不给你看」，这个是「你是谁」。
+// 一台共用的浏览器上两件事的取舍不一样，混成一个就没法只清掉身份。
+const ownerCookie = "gwp_owner"
+
+// ownerCookieDays 比门禁那个 30 天长得多：这是一个人回到自己账号页的唯一一条路，
+// 而令牌本体只在上传那一次（以及管理页上）露过面。过期等于把人锁在外面。
+const ownerCookieDays = 365
+
+// setOwnerCookie 下发身份 cookie。属性照门禁那个来（HttpOnly + Lax + 反代感知的
+// Secure）：HttpOnly 挡住页面上任何脚本读它，Lax 挡住跨站请求带上它。
+func (s *Server) setOwnerCookie(w http.ResponseWriter, r *http.Request, tok string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     ownerCookie,
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   forwardedHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   ownerCookieDays * 24 * 3600,
+	})
+}
+
+// clearOwnerCookie 清掉身份 cookie（MaxAge<0 让浏览器立刻删）。共用机器上前一个人
+// 留下的一年期 cookie 会让下一个人的上传默默挂到他名下，总得有个「这不是我」的出口。
+func (s *Server) clearOwnerCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name: ownerCookie, Value: "", Path: "/",
+		HttpOnly: true, Secure: forwardedHTTPS(r), SameSite: http.SameSiteLaxMode,
+		MaxAge: -1,
+	})
+}
+
+// ownerFromCookie 认出带着身份 cookie 来的上传者。认不出就当没带。
+func (s *Server) ownerFromCookie(r *http.Request) (types.Owner, bool) {
+	c, err := r.Cookie(ownerCookie)
+	if err != nil {
+		return types.Owner{}, false
+	}
+	return s.st.OwnerByToken(c.Value)
 }
 
 // forwardedHTTPS 判断对外那一跳是不是 https。进程只监听回环、由 Caddy 反代，
@@ -369,6 +505,23 @@ func (s *Server) findAccount(ref string) (types.Account, bool) {
 	return types.Account{}, false
 }
 
+// accountByUpstream 按**上游账号标识精确匹配**，不收池内 ID 那种写法。
+//
+// 和 findAccount 分开是因为它要和 store.AddAccount 的去重判据逐字一致：那边只比
+// Creds.AccountID。顺手接受池内 ID 的话，一个长得像数字的上游标识就会让这边以为
+// 「已经有行了」而那边照样新建。
+func (s *Server) accountByUpstream(id string) (types.Account, bool) {
+	if id == "" {
+		return types.Account{}, false
+	}
+	for _, a := range s.st.Accounts() {
+		if a.Creds.AccountID == id {
+			return a, true
+		}
+	}
+	return types.Account{}, false
+}
+
 func (s *Server) authAdmin(w http.ResponseWriter, r *http.Request) bool {
 	got := bearer(r)
 	if got == "" {
@@ -412,6 +565,15 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 「空闲槽位」这一格**必须和调度那把尺子是同一把**。从前它是写死的 1 小时常量 + 按
+	// LastTouch 算，而真实闸是 slot_cooldown_minutes（默认 240）+ 按 LastDeliver 算
+	// （sched.notCooling / coolingByDeliver）。字段和时长同时错 ⇒ 两个方向都说谎：
+	//   - 两小时前取过票的槽位 → 页面显示「空闲槽位 1」，而接下来两小时每次取票都 503
+	//     （2026-10-02 本地实测：首页 1，/cookie 回 all_cooling retry_after 7190）；
+	//   - 只被一次失败续期 touch 过的槽位 → 页面显示 0，而它其实照常能发
+	//     （notCooling 刻意不拿 LastTouch 当冷却起点，见 sched.go 那段注释）。
+	// 图例那句「还能用这个网关的账号数」是对使用者的承诺，不是内部读数，不能"纯展示"。
+	cooldown := s.slotCooldown()
 	v := poolView{base: base{Title: "池子", Mode: s.pool.Mode()}}
 	for name, g := range gws {
 		row := gatewayRow{Name: name, Exits: len(g.ReachableExits), PairLeft: "—"}
@@ -428,7 +590,10 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			sl, seen := slots[a.ID][name]
-			if seen && (now.Before(sl.BackoffUntil) || now.Sub(sl.LastTouch) < restedThreshold) {
+			// 判据和 sched 的冷却闸对齐：LastDeliver（真的有人在这个网关上取走过票）
+			// 而不是 LastTouch（它连失败的续期都记）。
+			if seen && (now.Before(sl.BackoffUntil) ||
+				(!sl.LastDeliver.IsZero() && now.Sub(sl.LastDeliver) < cooldown)) {
 				continue
 			}
 			row.RestedSlots++
@@ -443,11 +608,68 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
-	v.FreeGateways, v.Threshold = ps.Free, ps.Threshold
+	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
 	v.Accounts = len(hosted)
-	v.RestedLabel = shortDur(restedThreshold)
+	v.RestedLabel = shortDur(cooldown)
 	v.Model, v.Effort = s.probeModel(), probeEffort
+	v.BaseURL = s.publicBaseURL()
+	// 带着身份 cookie 来的人直接给按钮；没带的只给一个贴令牌的小表单。
+	if o, ok := s.ownerFromCookie(r); ok {
+		v.OwnerToken = o.Token
+	}
+	v.EnterErr = r.URL.Query().Get("enter") == "bad"
 	s.render(w, s.tplPool, v)
+}
+
+// publicBaseURL 是对外根地址。接了配置文件就现读（管理页改完立刻生效），
+// 否则用启动时传进来的那个（测试走这条路）。Live 为 nil 时 Get 回零值配置。
+//
+// **绝不看 Host / X-Forwarded-Host**：见 config.Config.PublicBaseURL。
+func (s *Server) publicBaseURL() string {
+	if v := s.opt.Live.Get().PublicBaseURL; v != "" {
+		return v
+	}
+	return s.opt.PublicBaseURL
+}
+
+// handleEnter 收人贴进来的令牌，认出来就把他送到对应的页面。
+//
+// owner 令牌和 view_token 都收：人手上可能只剩其中一个，而让他自己分辨「我这串是
+// 哪种」毫无意义——两种都是 32 个十六进制字符，长得一模一样。
+//
+// **认不出来时不区分「不存在」和「格式不对」**：区分出来就等于给人一个枚举令牌的
+// 工具（猜对格式回一种话、猜错回另一种，一次尝试就有了反馈）。统一回那一句。
+func (s *Server) handleEnter(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
+	if err != nil {
+		http.Error(w, "请求体太大", http.StatusRequestEntityTooLarge)
+		return
+	}
+	form, err := parseForm(body)
+	if err != nil {
+		http.Error(w, "表单解不开", http.StatusBadRequest)
+		return
+	}
+	tok := strings.TrimSpace(form.Get("token"))
+	if o, ok := s.st.OwnerByToken(tok); ok {
+		// 顺手记住他：下次进首页就是一个按钮，不用再贴一遍。
+		s.setOwnerCookie(w, r, o.Token)
+		http.Redirect(w, r, "/u/"+url.PathEscape(o.Token), http.StatusSeeOther)
+		return
+	}
+	if a, ok := s.st.AccountByViewToken(tok); ok {
+		http.Redirect(w, r, "/a/"+url.PathEscape(a.ViewToken), http.StatusSeeOther)
+		return
+	}
+	// 令牌一个字都不回显（它会躺在 URL、历史和日志里），只回一个标记。
+	http.Redirect(w, r, "/?enter=bad", http.StatusSeeOther)
+}
+
+// handleLogout 清掉身份 cookie。POST（表单按钮），不是 GET——GET 能被别人的页面
+// 用 <img> 之类静默触发，而登出别人的身份也是一种骚扰。清完回首页。
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearOwnerCookie(w, r)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // ---------- 上传 ----------
@@ -610,6 +832,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	label, plan := r.URL.Query().Get("label"), r.URL.Query().Get("plan")
 	raw := bytes.TrimSpace(body)
 	wantJSON := strings.Contains(r.Header.Get("Content-Type"), "json")
+	// 身份默认取 cookie；表单里贴了 owner 令牌就按贴的那个办（「我已经有账号页了，
+	// 把这份凭据挂上去」——那是显式意图，压过浏览器里碰巧存着的那个）。
+	owner, hasOwner := s.ownerFromCookie(r)
 	if !wantJSON {
 		// 表单来的：凭据在 creds 字段里。
 		form, ferr := parseForm(raw)
@@ -623,6 +848,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		if v := form.Get("plan"); v != "" {
 			plan = v
+		}
+		if v := strings.TrimSpace(form.Get("owner_token")); v != "" {
+			o, ok := s.st.OwnerByToken(v)
+			if !ok {
+				// 和 /enter 同一个口径：不说「这个令牌不存在」。
+				http.Error(w, "认不出这个账号总览令牌，留空就新建一个", http.StatusBadRequest)
+				return
+			}
+			owner, hasOwner = o, true
 		}
 		raw = wrapBareToken(raw, form.Get("kind"))
 	}
@@ -640,27 +874,87 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 上传即 both：产品规则是「池子的目的是共享 pair，上传了凭据的就可以请求到 pair」。
 	// 没有角色之分，也就没有「谁能取 pair」这个问题。
 	// view_token 留空，由存储层生成（它负责保证不重样），这边只负责交到上传者手里。
+	//
+	// 没带身份来的要现建一个 owner —— 除非这份凭据在池子里**已经有行而且那行已经
+	// 属于别人**：存储层不会改归属（见 store.AddAccount），这次上传拿不到归属，
+	// 建出来的只是一个谁都不用的空 owner 行。
+	createdOwner := false // 这一发新建了 owner ⇒ AddAccount 失败时要把它清掉
+	if !hasOwner {
+		if ex, exists := s.accountByUpstream(creds.AccountID); !exists || ex.OwnerID == 0 {
+			o, oerr := s.st.AddOwner("上传者")
+			if oerr != nil {
+				s.opt.Log.Error("建上传者失败", "err", oerr)
+				http.Error(w, "存储失败", http.StatusInternalServerError)
+				return
+			}
+			owner, hasOwner, createdOwner = o, true, true
+		}
+	}
+	ownerID := int64(0)
+	if hasOwner {
+		ownerID = owner.ID
+	}
 	a, err := s.st.AddAccount(types.Account{
 		Label:     sanitizeLabel(label, creds.AccountID),
 		PlanType:  sanitizeLabel(plan, "unknown"),
 		Creds:     creds,
 		Enabled:   true,
 		CreatedAt: time.Now().UTC(),
+		OwnerID:   ownerID,
 	})
 	if err != nil {
+		// 这一发要是刚为它新建了一个 owner（没带身份来的那条路），AddAccount 又失败了
+		// （撞上限、并发竞争），那个 owner 就成了孤儿。立刻清掉，别让它在账本上堆积
+		// ——拿站点码反复贴新 account_id 本来能把 owner 表刷到无上限。
+		if createdOwner {
+			if _, perr := s.st.PruneEmptyOwners(); perr != nil {
+				s.opt.Log.Error("清理孤儿 owner 失败", "err", perr)
+			}
+		}
 		s.opt.Log.Error("建账号失败", "err", err)
 		http.Error(w, "存储失败", http.StatusInternalServerError)
 		return
+	}
+	// a.OwnerID 是**最终**归属：去重命中一个已经属于别人的账号时存储层刻意不改归属，
+	// 所以它可能不是我们传进去的那个。对不上就什么都不做——不换 cookie、不回链接、
+	// 更不去查那个 owner 的令牌（那一页上有对方每个账号的 consumer key）。
+	mine := hasOwner && a.OwnerID == ownerID
+	if mine {
+		// 顺手刷有效期，也覆盖「表单贴了令牌但浏览器里存着另一个」那种情形。
+		s.setOwnerCookie(w, r, owner.Token)
+	} else {
+		s.opt.Log.Info("上传的凭据已挂在别的上传者名下，归属不动",
+			"account", a.ID, "owner", a.OwnerID, "asked_by", ownerID)
 	}
 	// **不排首扫**：新账号进来时没有任何需求，那九发上游纯属白花，而且会把它在
 	// 九个落点上的首次接触全烧掉。等有人要票时按需去找落点（见 Scanner 的注释）。
 	s.opt.Log.Info("收到新账号", "account", a.ID, "label", a.Label)
 
+	// 归属没落到他头上 ⇒ **一把钥匙都不给**，连 view_token 和 303 的落点都不给。
+	//
+	// 这条路是真能被人走的：oauth.Parse 不验签（它自己的注释写着），所以知道别人
+	// 上游 account_id 的人可以自制一张 JWT 打上来，让去重命中那一行。归属确实没被改，
+	// 但从前这里照样把**那一行的** view_token 和 consumer key 原样回出去，表单路径还
+	// 303 到 /a/<别人的 view_token>——拿到前者能开对方账号页、能 POST 停掉他的号，
+	// 拿到后者能直接替他取票。等于归属守住了，钥匙从旁边递了出去。
+	if !mine {
+		// **409 而不是 200**：这不是一次成功的上传，而前端恰好把「200 就一定有 url」当成了
+		// 契约（layout.html 里 `if (r.ok) location.assign((await r.json()).url)`）。回 200 +
+		// 没有 url 的 JSON ⇒ `location.assign(undefined)` ⇒ 浏览器跳到 /undefined 的裸 404，
+		// 下面这句话一个人都看不到。而走到这条路最常见的不是攻击，是「换了浏览器、总览令牌
+		// 丢了，把同一份 auth.json 再贴一次想找回链接」。
+		// 两条路都回同一个状态码和同一句话，钥匙照旧一把都不给（见上面那段注释）。
+		http.Error(w, "这份凭据已经登记过了，页面地址请找它的上传者要。", http.StatusConflict)
+		return
+	}
 	if wantJSON || strings.Contains(r.Header.Get("Accept"), "json") {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"view_token":   a.ViewToken,
 			"url":          "/a/" + a.ViewToken,
 			"consumer_key": s.ConsumerKeyFor(a),
+			// 换设备时靠这个令牌回来，所以要给得出来。
+			"owner_token": owner.Token,
+			"owner_url":   "/u/" + owner.Token,
 		})
 		return
 	}
@@ -695,12 +989,17 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		Since:          a.CreatedAt.Format(time.DateTime),
 		Model:          s.probeModel(), Effort: probeEffort,
 		ConsumerKey: s.ConsumerKeyFor(a),
+		BaseURL:     s.publicBaseURL(),
 	}
-	for _, g := range s.st.Gateways() {
-		if g.FirstSeenBy == a.ID {
-			v.NewGateways++
-		}
+	// owner 令牌**只在浏览器已经带着它**时才回显。这一页的地址是转发得出去的
+	// （页面上写着「不要分享」，人还是会分享），而 owner 令牌能打开这个人**所有**
+	// 账号的页面、连带那几把 consumer key ⇒ 印在 HTML 里就是一次权限升级。
+	// 拿 cookie 当判据的话，转发出去的链接在别人浏览器里什么都多不出来。
+	// 令牌丢了的人去找管理员（管理页上列着）。
+	if o, ok := s.ownerFromCookie(r); ok && o.ID == a.OwnerID {
+		v.OwnerToken = o.Token
 	}
+	v.NewGateways = s.foundBy(a.ID)
 	for _, sm := range samples {
 		if sm.AccountID != a.ID {
 			continue
@@ -720,6 +1019,127 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.Rows = v.Rows[:500]
 	}
 	s.render(w, s.tplAccount, v)
+}
+
+// foundBy 数这个账号为池子发现了几个新网关。
+func (s *Server) foundBy(accountID int64) int {
+	n := 0
+	for _, g := range s.st.Gateways() {
+		if g.FirstSeenBy == accountID {
+			n++
+		}
+	}
+	return n
+}
+
+// ---------- 上传者总览（一个人的多账号页） ----------
+
+// handleOwner 出 GET /u/{owner_token}：这个人名下每一份凭据各一张卡。
+//
+// 鉴权就是令牌本身，和 /a/{view_token} 同一个套路（store.OwnerByToken 挡掉空串）。
+// **只读 AccountsByOwner 那一份名单**，绝不遍历全表再筛——筛漏一条就是把别人的
+// consumer key 印在这一页上。
+func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
+	tok := r.PathValue("token")
+	o, ok := s.st.OwnerByToken(tok)
+	if !ok {
+		// 和 /a/ 一个口径：不区分「没有这个令牌」和「格式不对」。
+		http.Error(w, "没有这个总览链接", http.StatusNotFound)
+		return
+	}
+	samples, err := s.samples()
+	if err != nil {
+		s.opt.Log.Error("读样本失败", "err", err)
+		http.Error(w, "读账本失败", http.StatusInternalServerError)
+		return
+	}
+	// 请求数按账号先汇总一遍：账号可能有好几个，每个都扫一遍全量样本是 O(n×m)。
+	reqs := map[int64]int{}
+	for _, sm := range samples {
+		reqs[sm.AccountID]++
+	}
+	mints := s.st.RegionMints()
+
+	// **这一页一个字的身份 cookie 都不写。** 曾经写过，条件是「还没有身份时才记」，
+	// 图的是「来都来了，下次进首页就是一个按钮」。那是一个身份固定漏洞：
+	//
+	//	攻击者把自己的 /u/<他的令牌> 发给一个新人（「这是我的后台，你也传一份」）
+	//	⇒ 新人浏览器里没有 gwp_owner ⇒ 服务端给他种上**攻击者的**令牌
+	//	⇒ 新人回首页上传，handleUpload 读到这个 cookie ⇒ 凭据以攻击者的 OwnerID 落库
+	//	⇒ 攻击者的总览页上出现受害者的 consumer key 和 view_token（后者还能停对方的号），
+	//	  而受害者自己连一个 owner 都没有，看不出任何异常。
+	//
+	// SameSite=Lax 挡不住：顶层 GET 导航照样带 cookie，响应里的 Set-Cookie 也照收。
+	// 「只在没有身份时写」挡住的是**换掉**已有身份，挡不住**凭空建立**一个身份，
+	// 而后者才是这条路上真正发生的事。
+	//
+	// 身份只在用户**自己动手**的两条 POST 上写：/enter（他贴了令牌）和 /upload
+	// （他交了凭据）。一个点链接就能到达的 GET 不该改变「你是谁」。
+
+	// 登出按钮只在「访客的身份 cookie 正好就是这个 owner」时给：这一页靠令牌认人，
+	// 谁拿到链接都看得到，但登出清的是浏览器里那个 cookie——cookie 指向别人（或没有）时
+	// 给按钮只会误导。
+	cur, had := s.ownerFromCookie(r)
+	v := ownerView{
+		base:      base{Title: "我的账号", Mode: s.pool.Mode()},
+		Token:     tok,
+		Label:     o.Label,
+		Since:     o.CreatedAt.Format(time.DateTime),
+		Model:     s.probeModel(),
+		Effort:    probeEffort,
+		BaseURL:   s.publicBaseURL(),
+		CanLogout: had && cur.ID == o.ID,
+	}
+	for _, a := range s.st.AccountsByOwner(o.ID) {
+		row := ownerAccountRow{
+			ID: a.ID, Label: a.Label, Plan: a.PlanType,
+			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
+			Since:       a.CreatedAt.Format(time.DateTime),
+			ViewToken:   a.ViewToken,
+			ConsumerKey: s.ConsumerKeyFor(a),
+			Requests:    reqs[a.ID],
+			NewGateways: s.foundBy(a.ID),
+			Regions:     regionCells(a.ID, mints),
+			// Detail 不给上传者：里面是出口名、上游状态码这类内部读数（照 handleAccount）。
+			Fails: s.fails.failRows(a.ID, 20, false),
+		}
+		v.Accounts = append(v.Accounts, row)
+		v.Requests += row.Requests
+		v.NewGateways += row.NewGateways
+	}
+	// 稳定顺序：加入先后就是人心里的顺序，而 map 遍历不是。
+	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
+	s.render(w, s.tplOwner, v)
+}
+
+// regionCells 画一个账号的九宫格：types.Regions 那九个区域，终身铸过票的算绿。
+//
+// 按 (账号, 区域) 两个**字段**查台账，不去拼 store 那个 "<id>|<区域>" 键：键格式是
+// 存储层的事，抄一份迟早对不上（handlePool 对槽位表也是这么做的）。
+//
+// 顺带兜住一件事：台账里可能有 RegionKeyOf 反查回空串的行（手改的 state.json），
+// 而这里是**照 types.Regions 画格子、再回头查台账**，所以那种行天然画不出第十个格子。
+func regionCells(accountID int64, mints map[string]types.RegionMint) []regionCell {
+	byRegion := map[string]types.RegionMint{}
+	for _, m := range mints {
+		if m.AccountID == accountID && m.RegionKey != "" {
+			byRegion[m.RegionKey] = m
+		}
+	}
+	out := make([]regionCell, 0, len(types.Regions))
+	for _, r := range types.Regions {
+		// 措辞统一成对外那套「探测」，别和格子正文的「已探测 N 次」打架（N11）。
+		c := regionCell{Key: r.Key, Label: regionLabel(r.Key), Note: "未探测"}
+		if m, ok := byRegion[r.Key]; ok && m.Count > 0 {
+			c.Minted, c.Count = true, m.Count
+			c.Note = fmt.Sprintf("已探测 %d 次", m.Count)
+			if !m.LastAt.IsZero() {
+				c.Note += "，最近 " + m.LastAt.UTC().Format(time.DateTime) + " UTC"
+			}
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // ---------- /cookie ----------
@@ -786,7 +1206,8 @@ func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sche
 		return
 	}
 	if !ps.Open {
-		s.publicClosed(w, fmt.Sprintf("池子暂不对外开放：空闲 %d 个网关，门槛 %d", ps.Free, ps.Threshold))
+		s.publicClosed(w, fmt.Sprintf("池子暂不对外开放：托管账号 %d 个，门槛 %d 个",
+			ps.Accounts, ps.Threshold))
 		return
 	}
 	// 必须报上他**自己的**上游账号标识：槽位是 (账号 × 网关)，不知道是谁就没法
@@ -955,7 +1376,24 @@ func (s *Server) handleAdminRescan(w http.ResponseWriter, r *http.Request) {
 		}
 		forWhom = a.ID
 	}
-	s.scan.EnqueueDiscovery(forWhom)
+	// 如实回话。「踢了但其实没派出去」的三种情形（挑不出人、配额打满、还在发现冷却里）
+	// 从前都回 queued:true，只有服务端日志说了实话——而这个按钮正是单账号冷池子唯一的
+	// 出路，看不出踢没踢动的话，运维只能一直点。
+	why := s.scan.EnqueueDiscovery(forWhom)
+	// 表单提交 ⇒ 303 回管理页，结论挂在查询串上（与删账号那个按钮同口径）。
+	if !strings.Contains(r.Header.Get("Accept"), "json") {
+		to := "/admin/?rescan=queued"
+		if why != "" {
+			to = "/admin/?rescan=" + url.QueryEscape(why)
+		}
+		http.Redirect(w, r, to, http.StatusSeeOther)
+		return
+	}
+	if why != "" {
+		writeJSON(w, http.StatusOK,
+			map[string]any{"account": forWhom, "queued": false, "reason": why})
+		return
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"account": forWhom, "queued": true})
 }
 
@@ -1000,6 +1438,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode()}}
 	v.Config = buildConfigView(s.opt.Live,
 		r.URL.Query().Get("cfg_note"), r.URL.Query().Get("cfg_err"))
+	v.Rescan = sanitizeLabel(r.URL.Query().Get("rescan"), "")
 	v.Fails = s.fails.failRows(0, failLogKeep, true)
 
 	if s.opt.ProxyStates != nil {
@@ -1023,16 +1462,28 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	for _, g := range s.st.Gateways() {
 		found[g.FirstSeenBy]++
 	}
+	ownerAccounts := map[int64]int{}
 	for _, a := range s.st.Accounts() {
+		ownerAccounts[a.OwnerID]++
 		v.Accounts = append(v.Accounts, accountRow{
 			ID: a.ID, Label: a.Label, Plan: a.PlanType,
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
 			Requests: reqs[a.ID], Found: found[a.ID],
 			ViewToken: a.ViewToken, Since: a.CreatedAt.Format(time.DateTime),
 			HasCreds: a.Creds.AccessToken != "", Upstream: a.Creds.AccountID,
+			OwnerID: a.OwnerID,
 		})
 	}
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
+
+	// owner 的令牌必须在**这一页**看得见：迁移出来那个 owner 的令牌没人见过，
+	// 不显示就等于现有那几个账号的总览页谁都进不去。而 /a/ 那一页刻意**不**印它
+	// （见 handleAccount），所以这里是唯一的找回入口。
+	for _, o := range s.st.Owners() {
+		v.Owners = append(v.Owners, ownerRow{ID: o.ID, Label: o.Label, Token: o.Token,
+			Accounts: ownerAccounts[o.ID], Since: o.CreatedAt.Format(time.DateTime)})
+	}
+	sort.Slice(v.Owners, func(i, j int) bool { return v.Owners[i].ID < v.Owners[j].ID })
 
 	// pair 只报剩余时间和铸它的账号，cookie 本体一个字都不往页面上放。
 	for name, p := range s.st.Pairs() {

@@ -51,8 +51,17 @@ func (l *failLog) add(f deliverFail) {
 	}
 }
 
-// recent 回最近 n 条，新的在前。accountID 非 0 时只给那个账号的。
-func (l *failLog) recent(accountID int64, n int) []deliverFail {
+// notAFailure 报告这一行其实是一次**成功**：续期收下了新 cookie、归还了槽位。
+//
+// 它们和失败共用一个环（「续期在不在生效」和取票失败是同一个问题的两面），但上传者
+// 那一页只留 20 条、标题写的是「最近的取票失败」、表头写的是「错误码」——而按冻结口径
+// **每取一张票就续一次**，于是那 20 条会被一行行 `renew / 续到还剩 3023 秒` 占满：
+// 既看不懂（这明明是成功），又把真正的失败挤出了窗口。管理页 200 条不过滤。
+func (f deliverFail) notAFailure() bool { return f.Code == "renew" || f.Code == "release" }
+
+// recent 回最近 n 条，新的在前。accountID 非 0 时只给那个账号的；
+// failsOnly 时跳过续期/归还这类成功行（见 notAFailure）。
+func (l *failLog) recent(accountID int64, n int, failsOnly bool) []deliverFail {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]deliverFail, 0, n)
@@ -60,19 +69,28 @@ func (l *failLog) recent(accountID int64, n int) []deliverFail {
 		if accountID != 0 && l.rows[i].AccountID != accountID {
 			continue
 		}
+		if failsOnly && l.rows[i].notAFailure() {
+			continue
+		}
 		out = append(out, l.rows[i])
 	}
 	return out
 }
 
-// failRows 把它摊成页面上的行。Detail 只给管理页：里面是出口名、上游状态码这类内部读数。
-func (l *failLog) failRows(accountID int64, n int, withDetail bool) []failRow {
-	fs := l.recent(accountID, n)
+// failRows 把它摊成页面上的行。
+//
+// admin 把「这是管理页吗」这一个判断管到底，两件事都跟着它走：
+//   - Detail 只给管理页（里面是出口名、上游状态码这类内部读数）；
+//   - 续期/归还那些成功行也只给管理页（见 notAFailure）。
+//
+// 两件事同一个分界，所以同一个参数，不另加一个布尔。
+func (l *failLog) failRows(accountID int64, n int, admin bool) []failRow {
+	fs := l.recent(accountID, n, !admin)
 	out := make([]failRow, 0, len(fs))
 	for _, f := range fs {
 		r := failRow{At: f.At.UTC().Format("01-02 15:04:05"), AccountID: f.AccountID,
 			Gateway: f.Gateway, Code: f.Code, Reason: f.Reason}
-		if withDetail {
+		if admin {
 			r.Detail = f.Detail
 		}
 		out = append(out, r)

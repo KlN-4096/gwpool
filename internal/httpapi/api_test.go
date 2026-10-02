@@ -17,11 +17,16 @@ import (
 
 	"gwpool/internal/mint"
 	"gwpool/internal/sched"
+	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
 
 const (
 	secretToken = "sk-must-never-appear-in-any-page"
+	// 两个 owner 的令牌。够长够像真的（真的是 32 个十六进制字符），
+	// 而且互为「另一个人的」，用来钉死 /u/ 的鉴权边界。
+	ownerTok1 = "0wn3r1aaaaaaaaaaaaaaaaaaaaaaaaaa"
+	ownerTok2 = "0wn3r2bbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
 // fakeToken 拼一张形状对的 Codex access_token：三段、payload 里有声明、不验签。
@@ -122,12 +127,17 @@ func (p *fakePool) PairTarget() int { return p.target }
 
 type fakeStore struct {
 	accounts []types.Account
+	owners   []types.Owner
+	mints    map[string]types.RegionMint
 	gws      map[string]types.Gateway
 	pairs    map[string]types.Pair
 	slots    map[string]types.Slot
 	samples  []types.Sample
 	added    []types.Account
 	deleted  []int64
+	// addedOwners 留住每一次 AddOwner：「贴了一份已经属于别人的凭据」那条路上**不许**
+	// 凭空长出一个空 owner，而响应里看不出来。
+	addedOwners []types.Owner
 	// puts 留住每一次 PairPut：「受理但不落盘」那条路唯一的判据就是这里**没有**
 	// 多出一行，光看响应（两边都是 200）区分不出来。
 	puts   []types.Pair
@@ -149,8 +159,100 @@ func (f *fakeStore) AccountByViewToken(tok string) (types.Account, bool) {
 	return types.Account{}, false
 }
 
-// 照真实 store 的行为：分配 ID，并在 ViewToken 为空时兜底生成一个。
+func (f *fakeStore) Owners() []types.Owner { return f.owners }
+
+func (f *fakeStore) OwnerByToken(tok string) (types.Owner, bool) {
+	for _, o := range f.owners {
+		if tok != "" && o.Token == tok {
+			return o, true
+		}
+	}
+	return types.Owner{}, false
+}
+
+// AccountsByOwner 照真实 store：ownerID 为 0 时回 nil，不是「所有没归属的行」
+// （0 是匿名占位行的常态值）。
+func (f *fakeStore) AccountsByOwner(ownerID int64) []types.Account {
+	if ownerID == 0 {
+		return nil
+	}
+	var out []types.Account
+	for _, a := range f.accounts {
+		if a.OwnerID == ownerID {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func (f *fakeStore) AddOwner(label string) (types.Owner, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return types.Owner{}, err
+	}
+	o := types.Owner{ID: int64(len(f.owners) + 1), Token: base64.RawURLEncoding.EncodeToString(b),
+		Label: label, CreatedAt: time.Now().UTC()}
+	f.owners = append(f.owners, o)
+	f.addedOwners = append(f.addedOwners, o)
+	return o, nil
+}
+
+func (f *fakeStore) RegionMints() map[string]types.RegionMint { return f.mints }
+
+// PruneEmptyOwners 丢掉名下零账号的 owner，照真 store 的行为。
+func (f *fakeStore) PruneEmptyOwners() (int, error) {
+	used := map[int64]bool{}
+	for _, a := range f.accounts {
+		if a.OwnerID != 0 {
+			used[a.OwnerID] = true
+		}
+	}
+	kept := f.owners[:0:0]
+	for _, o := range f.owners {
+		if used[o.ID] {
+			kept = append(kept, o)
+		}
+	}
+	n := len(f.owners) - len(kept)
+	f.owners = kept
+	return n, nil
+}
+
+// 照真实 store 的行为（store.AddAccount 的镜像，改那边这里要一起改）：分配 ID、
+// ViewToken 为空时兜底生成，去重命中时**属于别人的原样返回一个字段都不碰**。
+// 这条镜像是 httpapi 侧「不碰别人的 owner / 不交出别人的钥匙」全部断言的前提；
+// 两份实现一旦漂移，那些断言会继续绿在一个生产里不存在的行为上（这就是审查里的
+// S6）。所以 TestUploadWiredToRealStore 用真 store 又跑了一遍最关键的那条，兜住漂移。
 func (f *fakeStore) AddAccount(a types.Account) (types.Account, error) {
+	if up := a.Creds.AccountID; up != "" {
+		for i, x := range f.accounts {
+			if x.Creds.AccountID != up {
+				continue
+			}
+			// 已经属于别人 ⇒ 原样返回，一个字段都不碰（见 store.AddAccount 的长注释）。
+			if x.OwnerID != 0 && x.OwnerID != a.OwnerID {
+				return x, nil
+			}
+			x.Creds.AccessToken = a.Creds.AccessToken
+			if a.Creds.RefreshToken != "" {
+				x.Creds.RefreshToken = a.Creds.RefreshToken
+			}
+			if a.PlanType != "" {
+				x.PlanType = a.PlanType
+			}
+			if a.Label != "" {
+				x.Label = a.Label
+			}
+			x.Enabled = true
+			x.DisabledReason = ""
+			if x.OwnerID == 0 {
+				x.OwnerID = a.OwnerID
+			}
+			f.accounts[i] = x
+			f.added = append(f.added, x)
+			return x, nil
+		}
+	}
 	a.ID = int64(len(f.accounts) + 1)
 	if a.ViewToken == "" {
 		b := make([]byte, 16)
@@ -199,10 +301,13 @@ func (f *fakeStore) PutPair(p types.Pair) error {
 
 type fakeScanner struct {
 	discovery []int64
+	// refuse 非空时模拟「没派出去」：挑不出人、配额打满、还在发现冷却里。
+	refuse string
 }
 
-func (s *fakeScanner) EnqueueDiscovery(exclude int64) {
+func (s *fakeScanner) EnqueueDiscovery(exclude int64) string {
 	s.discovery = append(s.discovery, exclude)
+	return s.refuse
 }
 
 func rig(t *testing.T, mode types.Mode) (*Server, http.Handler, *fakePool, *fakeStore, *fakeScanner) {
@@ -212,14 +317,31 @@ func rig(t *testing.T, mode types.Mode) (*Server, http.Handler, *fakePool, *fake
 		accounts: []types.Account{
 			{
 				ID: 1, Label: "pro1", PlanType: "pro", Enabled: true,
-				ViewToken: "vt-1", CreatedAt: now.Add(-time.Hour),
-				Creds: types.Creds{AccessToken: secretToken, AccountID: "acct-upstream"},
+				ViewToken: "vt-1", CreatedAt: now.Add(-time.Hour), OwnerID: 1,
+				// refresh_token 也塞 secretToken 前缀：泄漏断言用 Contains 查它，
+				// 顺手覆盖「refresh_token 不许出现在任何页面上」（审查 N8，原先只有
+				// access_token 这一个哨兵，refresh 漏了也测不出来）。
+				Creds: types.Creds{AccessToken: secretToken, RefreshToken: secretToken + "-rt", AccountID: "acct-upstream"},
 			},
 			{
 				ID: 2, Label: "朋友的号", PlanType: "plus", Enabled: true,
-				ViewToken: "vt-2", CreatedAt: now.Add(-time.Minute),
-				Creds: types.Creds{AccessToken: secretToken + "-b", AccountID: "acct-b"},
+				ViewToken: "vt-2", CreatedAt: now.Add(-time.Minute), OwnerID: 2,
+				Creds: types.Creds{AccessToken: secretToken + "-b", RefreshToken: secretToken + "-b-rt", AccountID: "acct-b"},
 			},
+		},
+		// 两个账号刻意挂在**两个不同的** owner 下：/u/ 这一页最要紧的保证是
+		// 「A 的令牌看不见 B 的任何东西」，同一个 owner 下测不出来。
+		owners: []types.Owner{
+			{ID: 1, Token: ownerTok1, Label: "我", CreatedAt: now.Add(-time.Hour)},
+			{ID: 2, Token: ownerTok2, Label: "朋友", CreatedAt: now.Add(-time.Minute)},
+		},
+		mints: map[string]types.RegionMint{
+			"1|europe": {AccountID: 1, RegionKey: "europe", Count: 3, LastAt: now.Add(-30 * time.Minute)},
+			// 台账里可能有「出口反查不到区域」的行（只会来自手改的 state.json）。
+			// 九宫格照 types.Regions 画，所以这种行画不出第十个格子。
+			"1|": {AccountID: 1, RegionKey: "", Count: 9, LastAt: now},
+			// 2 号的格子不许串到 1 号头上。
+			"2|oceania": {AccountID: 2, RegionKey: "oceania", Count: 1, LastAt: now},
 		},
 		gws: map[string]types.Gateway{"unified-142": {
 			Name: "unified-142", FirstSeenBy: 1, FirstSeenAt: now.Add(-time.Hour),
@@ -542,6 +664,538 @@ func TestAccountView(t *testing.T) {
 	}
 }
 
+// ---------- owner 层 ----------
+
+// ownerCookieOf 给请求带上身份 cookie。
+func ownerCookieOf(r *http.Request, tok string) *http.Request {
+	r.AddCookie(&http.Cookie{Name: ownerCookie, Value: tok})
+	return r
+}
+
+// /u/{token} 的鉴权边界：令牌认得出就给**它名下那几个**账号，认不出一律 404，
+// 而且 A 的令牌一个字都看不到 B 的东西（那一页上有每个账号的接入 key）。
+func TestOwnerPageIsScopedToItsOwnAccounts(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModePool)
+	k1, k2 := srv.ConsumerKeyFor(st.accounts[0]), srv.ConsumerKeyFor(st.accounts[1])
+
+	// 认不出的令牌：不存在的、空的、别人的 view_token、乱填的，全是 404/非 200。
+	for _, bad := range []string{"/u/nope", "/u/vt-1", "/u/", "/u"} {
+		if w := do(h, httptest.NewRequest("GET", bad, nil)); w.Code == 200 {
+			t.Fatalf("%s 居然进去了", bad)
+		}
+	}
+
+	w := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil))
+	if w.Code != 200 {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"pro1", k1, "/a/vt-1", "1 次请求", "0</b><span>消耗 token"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("自己的总览页缺了 %q", want)
+		}
+	}
+	// **别人的东西一个字都不许有。** 这是这一页唯一要紧的保证。
+	for _, leak := range []string{"朋友的号", k2, "vt-2", ownerTok2, secretToken} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("owner 1 的总览页漏了 owner 2 的 %q", leak)
+		}
+	}
+
+	// 反空测：换成 owner 2 的令牌，那几样东西本来是出得来的。
+	other := do(h, httptest.NewRequest("GET", "/u/"+ownerTok2, nil)).Body.String()
+	for _, want := range []string{"朋友的号", k2, "/a/vt-2"} {
+		if !strings.Contains(other, want) {
+			t.Fatalf("owner 2 的总览页缺了 %q，上面那组断言什么都没测到", want)
+		}
+	}
+	if strings.Contains(other, "pro1") || strings.Contains(other, k1) {
+		t.Fatal("owner 2 的页面上出现了 owner 1 的账号")
+	}
+}
+
+// 九宫格恒为 types.Regions 那九个：铸过的绿、没铸过的灰，而台账里「出口反查不到
+// 区域」那种行（RegionKeyOf 回空串）**不许**画成第十个格子。
+// 另外：纯靠颜色对色盲不友好，所以格子里必须有文字。
+func TestOwnerPageDrawsNineRegionCells(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	body := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String()
+
+	// 九个格子，一个不多一个不少（owner 1 名下只有一个账号）。
+	// 带引号精确数，别把外面那个 class="regions" 容器也数进来。
+	n := strings.Count(body, `class="region"`) + strings.Count(body, `class="region on"`)
+	if n != len(types.Regions) {
+		t.Fatalf("画了 %d 个格子，该是 %d 个：台账里那条空 RegionKey 画成了第十个？", n, len(types.Regions))
+	}
+	// europe 铸过 3 次 ⇒ 绿 + 文字 + 带时间的 title；别的区域是灰的。
+	if !strings.Contains(body, `class="region on"`) || !strings.Contains(body, "已探测 3 次") {
+		t.Fatalf("europe 该标成铸过 3 次：\n%s", body)
+	}
+	if !strings.Contains(body, "已探测 3 次，最近 ") {
+		t.Fatal("格子的 title 里没有「最近一次什么时候」")
+	}
+	if !strings.Contains(body, "未探测") {
+		t.Fatal("没铸过的区域该有文字说明，不能只靠颜色")
+	}
+	// 2 号的那一格（oceania）不许串到 1 号的页面上。
+	if strings.Count(body, `class="region on"`) != 1 {
+		t.Fatal("绿格子不止一个：别人的台账串过来了")
+	}
+}
+
+// GET /u/ **一个字的身份 cookie 都不写**（审查 B1：身份固定漏洞）。
+//
+// 从前这一页会「顺手记住没有身份的访客」。那条路能被滥用：攻击者把自己的 /u/ 链接
+// 发给新人，新人一点就被种上攻击者的身份，下一次上传把凭据连同接入 key 挂到攻击者
+// 名下——而受害者只是点了个链接，自己连一个 owner 都没有，看不出异常。SameSite=Lax
+// 挡不住顶层 GET 导航。所以身份只在用户自己动手的 POST（/enter、/upload）上写。
+func TestOwnerPageNeverWritesIdentityOnGET(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	ownerCookieIn := func(w *httptest.ResponseRecorder) string {
+		for _, c := range w.Result().Cookies() {
+			if c.Name == ownerCookie {
+				return c.Value
+			}
+		}
+		return ""
+	}
+
+	// 没有身份点开自己的页：页照给，但不许种 cookie（这正是被滥用的那一支）。
+	w := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil))
+	if w.Code != 200 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	if got := ownerCookieIn(w); got != "" {
+		t.Fatalf("GET /u/ 给无身份访客种了身份 cookie（B1 身份固定）: %q", got)
+	}
+	// 已经是自己点开自己：也不写（没必要，刷新有效期的便利不值这个攻击面）。
+	if got := ownerCookieIn(do(h, ownerCookieOf(
+		httptest.NewRequest("GET", "/u/"+ownerTok1, nil), ownerTok1))); got != "" {
+		t.Fatalf("自己的页面也不该在 GET 上碰 cookie: %q", got)
+	}
+	// 带着自己的身份点开**别人**分享的链接：那一页照给（令牌就是凭证），身份不动。
+	w = do(h, ownerCookieOf(httptest.NewRequest("GET", "/u/"+ownerTok2, nil), ownerTok1))
+	if w.Code != 200 {
+		t.Fatalf("状态 %d", w.Code)
+	}
+	if got := ownerCookieIn(w); got != "" {
+		t.Fatalf("身份被别人的链接换掉了: %q", got)
+	}
+}
+
+// 没带身份来的上传：现铸一个 owner，下发 HttpOnly cookie，并把 /u/ 链接交出去
+// （否则他下次换设备就再也回不来了）。
+// 跨站发起的改状态 POST 一律拒。
+//
+// 这条挡的是**身份固定**：第三方页面自动提交 POST /enter 就能把受害者的身份 cookie 换成
+// 攻击者的令牌，之后受害者上传的凭据和接入 key 全落到攻击者的 /u/ 页下，不用猜任何令牌。
+// 「POST 比 GET 安全」是错的（表单能自动提交），SameSite=Lax 也救不了（它只约束 cookie
+// 的发送，不约束响应里 Set-Cookie 的写入）。站点码开着时恰好挡得住，但 site_key 可以留空。
+func TestCrossSitePostsAreRejected(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+
+	body := func() *strings.Reader { return strings.NewReader("token=whatever") }
+	post := func(path string, set func(*http.Request)) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", path, body())
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		set(r)
+		return do(h, r)
+	}
+
+	for _, path := range []string{"/enter", "/logout", "/upload", "/admin/rescan", "/admin/config"} {
+		// 现代浏览器：Sec-Fetch-Site 说了实话。
+		w := post(path, func(r *http.Request) { r.Header.Set("Sec-Fetch-Site", "cross-site") })
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s 跨站 POST 没被拒: %d", path, w.Code)
+		}
+		if len(w.Result().Cookies()) != 0 {
+			t.Fatalf("%s 被拒了还下发了 cookie", path)
+		}
+		// 老浏览器：没有 Sec-Fetch-Site，但跨源 POST 一定带 Origin。
+		w = post(path, func(r *http.Request) { r.Header.Set("Origin", "https://evil.example") })
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s 异源 Origin 没被拒: %d", path, w.Code)
+		}
+	}
+
+	// 本站页面上操作照常放行（这里只看没被 403 掐掉，后续鉴权/参数错误不归这条闸管）。
+	if w := post("/enter", func(r *http.Request) {
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+	}); w.Code == http.StatusForbidden {
+		t.Fatal("本站的 POST 被当成跨站拒了")
+	}
+	// 脚本/curl 两个头都没有：它们不是 CSRF 的载体，放行——/upload 本来就支持脚本调用。
+	if w := post("/enter", func(*http.Request) {}); w.Code == http.StatusForbidden {
+		t.Fatal("没有浏览器头的调用被拒了，脚本上传这条路会断")
+	}
+}
+
+func TestUploadMintsOwnerAndHandsBackTheLink(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	r := httptest.NewRequest("POST", "/upload?label=x",
+		strings.NewReader(`{"access_token":"`+fakeToken("acct-fresh", "pro", time.Now().Add(time.Hour))+`"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := do(h, r)
+	if w.Code != 200 {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	if len(st.addedOwners) != 1 {
+		t.Fatalf("没为这份新凭据建 owner: %+v", st.addedOwners)
+	}
+	o := st.addedOwners[0]
+	if got := st.added[0].OwnerID; got != o.ID {
+		t.Fatalf("账号没挂到刚建的 owner 下: OwnerID=%d owner=%d", got, o.ID)
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["owner_token"] != o.Token || resp["owner_url"] != "/u/"+o.Token {
+		t.Fatalf("回执里没给总览链接: %v", resp)
+	}
+	var tok string
+	for _, c := range w.Result().Cookies() {
+		if c.Name == ownerCookie {
+			tok = c.Value
+			if !c.HttpOnly {
+				t.Error("身份 cookie 没设 HttpOnly")
+			}
+			if c.SameSite != http.SameSiteLaxMode {
+				t.Errorf("身份 cookie 的 SameSite 是 %v", c.SameSite)
+			}
+		}
+	}
+	if tok != o.Token {
+		t.Fatalf("没下发身份 cookie（下次进首页就只能再贴一遍令牌）: %q", tok)
+	}
+	// 拿着 cookie 真的进得去那一页。
+	if w2 := do(h, httptest.NewRequest("GET", "/u/"+tok, nil)); w2.Code != 200 {
+		t.Fatalf("刚建的总览页进不去: %d", w2.Code)
+	}
+}
+
+// 带着身份来的上传（cookie 或表单里贴令牌）挂到那个 owner 名下，不另建一个。
+func TestUploadAttachesToExistingOwner(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		with func(*http.Request) *http.Request
+	}{
+		{"cookie", func(r *http.Request) *http.Request { return ownerCookieOf(r, ownerTok1) }},
+		{"表单贴令牌", func(r *http.Request) *http.Request { return r }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, h, _, st, _ := rig(t, types.ModePool)
+			form := url.Values{
+				"creds": {`{"access_token":"` + fakeToken("acct-second", "pro", time.Now().Add(time.Hour)) + `"}`},
+			}
+			if c.name == "表单贴令牌" {
+				form.Set("owner_token", ownerTok1)
+			}
+			r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if w := do(h, c.with(r)); w.Code != http.StatusSeeOther {
+				t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+			}
+			if len(st.addedOwners) != 0 {
+				t.Fatalf("已经有身份了还另建了 owner: %+v", st.addedOwners)
+			}
+			if got := st.added[0].OwnerID; got != 1 {
+				t.Fatalf("没挂到 owner 1 下: OwnerID=%d", got)
+			}
+			// 总览页上要看得见这一份新凭据。
+			if body := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String(); !strings.Contains(body, "acct-second") {
+				t.Fatal("新挂的凭据没出现在总览页上")
+			}
+		})
+	}
+}
+
+// 认不出的 owner_token 要拒掉，**不能静默当成「没带」**去新建一个 owner：
+// 那样人贴错一个字就会凭空多出一页，而他以为挂上去了。
+func TestUploadRejectsUnknownOwnerToken(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	form := url.Values{
+		"owner_token": {"0wn3rXcccccccccccccccccccccccccc"},
+		"creds":       {`{"access_token":"` + fakeToken("acct-x", "pro", time.Now().Add(time.Hour)) + `"}`},
+	}
+	r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if w := do(h, r); w.Code != 400 {
+		t.Fatalf("乱填总览令牌拿到 %d", w.Code)
+	}
+	if len(st.added) != 0 || len(st.addedOwners) != 0 {
+		t.Fatalf("拒掉了却还是建了东西: accounts=%d owners=%d", len(st.added), len(st.addedOwners))
+	}
+}
+
+// **抢账号**：拿一份公开流传的凭据重新上传，不许把别人的账号搬到自己名下
+// （那一页上有对方每个账号的接入 key）。而且不许在账本上留一个空 owner。
+func TestUploadDoesNotStealAnotherOwnersAccount(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModePool)
+	k2 := srv.ConsumerKeyFor(st.accounts[1])
+	// acct-b 是 owner 2 的账号。带着 owner 1 的身份重新上传它的凭据。
+	form := url.Values{
+		"creds": {`{"access_token":"` + fakeToken("acct-b", "plus", time.Now().Add(time.Hour)) + `"}`},
+	}
+	r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := do(h, ownerCookieOf(r, ownerTok1))
+	// 归属属于别人 ⇒ 既不改归属，也不交出任何钥匙：回 409，不 303 到 /a/<别人的票>。
+	if w.Code != http.StatusConflict {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	if got := st.accounts[1].OwnerID; got != 2 {
+		t.Fatalf("归属被抢走了: acct-b 现在挂在 owner %d 下", got)
+	}
+	// **回执本身**不许带对方的 view_token / 接入 key / 总览令牌（审查 B2/S6：
+	// 从前这里只查状态码不查 body，而 vt-2 和接入 key 就在 body 里）。
+	body := w.Body.String()
+	for _, leak := range []string{k2, "vt-2", ownerTok2, "/a/vt-2"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("回执里漏了别人的钥匙: %q", leak)
+		}
+	}
+	// Location 也不许指向对方的账号页。
+	if loc := w.Header().Get("Location"); strings.Contains(loc, "vt-2") {
+		t.Fatalf("303 到了别人的账号页: %q", loc)
+	}
+	// 伪造票不许覆盖对方存着的凭据 / 改掉它的备注 / 解开它的停用。
+	if got := st.accounts[1].Label; got == "acct-b" {
+		t.Fatalf("对方账号的 Label 被伪造票改成了上游 ID: %q", got)
+	}
+	// owner 1 的总览页上照旧没有它。
+	mine := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String()
+	for _, leak := range []string{"朋友的号", k2, "vt-2"} {
+		if strings.Contains(mine, leak) {
+			t.Fatalf("抢到自己页面上了: %q", leak)
+		}
+	}
+	// 不许顺手下发 owner 2 的身份 cookie。
+	for _, ck := range w.Result().Cookies() {
+		if ck.Name == ownerCookie && ck.Value == ownerTok2 {
+			t.Fatal("下发了别人的身份 cookie")
+		}
+	}
+	// 没拿到归属的那次上传不该在账本上留一个空 owner（否则这条路可以被反复刷）。
+	if len(st.addedOwners) != 0 {
+		t.Fatalf("白建了 %d 个空 owner", len(st.addedOwners))
+	}
+}
+
+// 用**真** store 把「抢账号」这条最关键的路再跑一遍（审查 S6）。
+//
+// httpapi 侧那些不泄漏断言平时跑在 fakeStore 上，而 fake 的去重分支是 store.AddAccount
+// 的手抄本——两份一旦漂移，fake 可能照旧全绿在一个生产里不存在的行为上。这条绕开
+// fake，直接验真实存储层接出来的 handler 不交出别人的钥匙、不改别人的归属、不被伪造票
+// 覆盖凭据。
+func TestUploadWiredToRealStore(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// samples.jsonl 是常开的追加句柄：Windows 上不关它，t.TempDir 的清理会删不掉目录
+	// 而整条用例判失败（Linux 上删得掉，所以只在这台机器上露出来）。
+	t.Cleanup(func() { _ = st.Close() })
+	oA, err := st.AddOwner("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oB, err := st.AddOwner("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim, err := st.AddAccount(types.Account{
+		Label: "受害者", PlanType: "plus", Enabled: true, OwnerID: oB.ID,
+		Creds: types.Creds{AccessToken: "victim-at", RefreshToken: "victim-rt", AccountID: "acct-victim"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(&fakePool{mode: types.ModePool}, st, &fakeScanner{},
+		Options{ConsumerKey: "ckey", AdminKey: "akey", Model: "gpt-6-luna"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+	vk := srv.ConsumerKeyFor(victim)
+
+	// 攻击者带着 A 的身份，用一张自制的、account_id 填受害者的 JWT 上传（oauth 不验签）。
+	form := url.Values{"creds": {`{"access_token":"` +
+		fakeToken("acct-victim", "plus", time.Now().Add(time.Hour)) + `"}`}}
+	r := httptest.NewRequest("POST", "/upload", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := do(h, ownerCookieOf(r, oA.Token))
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, leak := range []string{vk, victim.ViewToken, oB.Token, "/a/" + victim.ViewToken, "victim-at", "victim-rt"} {
+		if leak != "" && strings.Contains(body, leak) {
+			t.Fatalf("回执漏了受害者的钥匙/凭据: %q", leak)
+		}
+	}
+	got, _ := st.Account(victim.ID)
+	if got.OwnerID != oB.ID {
+		t.Fatalf("归属被抢到 A 下了: owner=%d", got.OwnerID)
+	}
+	if got.Creds.AccessToken != "victim-at" || got.Label != "受害者" {
+		t.Fatalf("受害者的凭据/备注被伪造票覆盖了: token 前缀被换=%v label=%q",
+			got.Creds.AccessToken != "victim-at", got.Label)
+	}
+}
+
+// 没有身份、而且这份凭据已经属于别人：同样不许建空 owner、不许泄露那个人的令牌。
+func TestUploadOfOwnedCredentialWithoutIdentity(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	r := httptest.NewRequest("POST", "/upload",
+		strings.NewReader(`{"access_token":"`+fakeToken("acct-b", "plus", time.Now().Add(time.Hour))+`"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := do(h, r)
+	// **409，不是 200。** 这不是一次成功的上传，而上传表单的 JS 把「200 就一定有 url」
+	// 当成了契约（layout.html：`if (r.ok) location.assign((await r.json()).url)`）⇒
+	// 回 200 + 没有 url 的 JSON 会让浏览器跳到 /undefined 的裸 404，下面那句话一个人都看不到。
+	// 走到这条路最常见的不是攻击，是「换了浏览器、令牌丢了，把同一份凭据再贴一次想找回链接」。
+	if w.Code != 409 {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "找它的上传者要") {
+		t.Fatalf("没告诉他该去找谁: %s", w.Body.String())
+	}
+	if st.accounts[1].OwnerID != 2 {
+		t.Fatalf("归属被动了: %d", st.accounts[1].OwnerID)
+	}
+	if len(st.addedOwners) != 0 {
+		t.Fatalf("白建了 %d 个空 owner", len(st.addedOwners))
+	}
+	if strings.Contains(w.Body.String(), ownerTok2) {
+		t.Fatal("回执里带了别人的总览令牌")
+	}
+	for _, ck := range w.Result().Cookies() {
+		if ck.Name == ownerCookie {
+			t.Fatalf("凭空下发了身份 cookie: %q", ck.Value)
+		}
+	}
+}
+
+// 首页那个入口：owner 令牌进总览页、view_token 进那个账号的页面，
+// 认不出来时**不区分**「不存在」和「格式不对」（区分了就是个枚举令牌的工具）。
+func TestEnterAcceptsBothTokenKinds(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	post := func(tok string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/enter",
+			strings.NewReader(url.Values{"token": {tok}}.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return do(h, r)
+	}
+
+	w := post(ownerTok1)
+	if w.Code != 303 || w.Header().Get("Location") != "/u/"+ownerTok1 {
+		t.Fatalf("owner 令牌没进总览页: %d %q", w.Code, w.Header().Get("Location"))
+	}
+	// 顺手记住他：下次进首页就是一个按钮。
+	var got string
+	for _, c := range w.Result().Cookies() {
+		if c.Name == ownerCookie {
+			got = c.Value
+		}
+	}
+	if got != ownerTok1 {
+		t.Fatalf("没记住身份: %q", got)
+	}
+
+	if w := post("vt-2"); w.Code != 303 || w.Header().Get("Location") != "/a/vt-2" {
+		t.Fatalf("view_token 没进账号页: %d %q", w.Code, w.Header().Get("Location"))
+	}
+
+	// 认不出的几种：回话必须**完全一样**，否则一次尝试就有了反馈。
+	var answers []string
+	for _, bad := range []string{"", "   ", "not-a-token", strings.Repeat("f", 32), "0wn3r1aaaaaaaaaaaaaaaaaaaaaaaaa"} {
+		w := post(bad)
+		answers = append(answers, fmt.Sprintf("%d|%s", w.Code, w.Header().Get("Location")))
+		if strings.Contains(w.Header().Get("Location"), bad) && bad != "" {
+			t.Fatalf("把令牌回显进了重定向地址: %q", w.Header().Get("Location"))
+		}
+	}
+	for i, a := range answers {
+		if a != answers[0] {
+			t.Fatalf("第 %d 种认不出的令牌回了不一样的话: %q vs %q", i, a, answers[0])
+		}
+	}
+	if !strings.Contains(answers[0], "enter=bad") {
+		t.Fatalf("认不出时没回首页报错: %q", answers[0])
+	}
+	// 首页要把那句话显示出来。
+	if body := do(h, httptest.NewRequest("GET", "/?enter=bad", nil)).Body.String(); !strings.Contains(body, "认不出这个令牌") {
+		t.Fatal("首页没显示「认不出」那句话")
+	}
+}
+
+// 首页的「进入我的账号后台」：带 cookie 给按钮，不带给表单。
+func TestPoolPageOwnerEntry(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+
+	bare := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	if !strings.Contains(bare, `action="/enter"`) {
+		t.Fatal("没带身份时该给一个贴令牌的表单")
+	}
+	if strings.Contains(bare, ownerTok1) || strings.Contains(bare, ownerTok2) {
+		t.Fatal("首页对谁都印出了 owner 令牌")
+	}
+
+	withCookie := do(h, ownerCookieOf(httptest.NewRequest("GET", "/", nil), ownerTok1)).Body.String()
+	if !strings.Contains(withCookie, `href="/u/`+ownerTok1+`"`) {
+		t.Fatal("带身份 cookie 时该直接给进入总览页的按钮")
+	}
+	if strings.Contains(withCookie, ownerTok2) {
+		t.Fatal("首页上出现了别人的令牌")
+	}
+	// 坏 cookie 当没带（不能把它当令牌直接拼进链接）。
+	bad := do(h, ownerCookieOf(httptest.NewRequest("GET", "/", nil), "garbage")).Body.String()
+	if strings.Contains(bad, "/u/garbage") {
+		t.Fatal("坏 cookie 被原样拼进了链接")
+	}
+	if !strings.Contains(bad, `action="/enter"`) {
+		t.Fatal("坏 cookie 该退回表单")
+	}
+}
+
+// /a/ 那一页**只在浏览器自己带着 owner cookie 时**才回显总览令牌：
+// 这一页的地址是转发得出去的，而那个令牌能打开这个人全部账号的页面和接入 key。
+func TestAccountPageShowsOwnerTokenOnlyWithCookie(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+
+	if body := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(); strings.Contains(body, ownerTok1) {
+		t.Fatal("裸看账号页就拿到了总览令牌（转发这一页等于交出全部账号）")
+	}
+	// 带着自己的 cookie：给链接。
+	body := do(h, ownerCookieOf(httptest.NewRequest("GET", "/a/vt-1", nil), ownerTok1)).Body.String()
+	if !strings.Contains(body, `href="/u/`+ownerTok1+`"`) {
+		t.Fatal("带着自己的身份 cookie 时该给「返回我的账号总览」")
+	}
+	// 带着**别人**的 cookie 看这一页：什么都不该多出来。
+	other := do(h, ownerCookieOf(httptest.NewRequest("GET", "/a/vt-1", nil), ownerTok2)).Body.String()
+	for _, leak := range []string{ownerTok1, ownerTok2} {
+		if strings.Contains(other, leak) {
+			t.Fatalf("拿别人的 cookie 看这一页漏了 %q", leak)
+		}
+	}
+}
+
+// 管理页要把 owner 的令牌列出来：迁移出来那个 owner 的令牌没人见过，
+// 不显示就等于现有账号的总览页谁都进不去。这也是丢了令牌唯一的找回入口。
+func TestAdminShowsOwnerTokens(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	r := httptest.NewRequest("GET", "/admin/", nil)
+	r.SetBasicAuth("admin", "akey")
+	body := do(h, r).Body.String()
+	for _, want := range []string{"上传者", ownerTok1, ownerTok2, "/u/" + ownerTok1} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("管理页缺了 %q", want)
+		}
+	}
+}
+
 // 管理页：Basic 或 Bearer 都能进，内容不含凭据、cookie 本体和各账号的 key。
 func TestAdminView(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModePool)
@@ -616,14 +1270,14 @@ func TestAnonymousCookie(t *testing.T) {
 	}
 
 	// 开了但供给不够 ⇒ 503，并告诉他差多少。
-	p.public = sched.PublicState{Enabled: true, Open: false, Free: 2, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 2, Threshold: 6}
 	w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-x", nil))
 	if w.Code != 503 || !strings.Contains(w.Body.String(), "门槛 6") {
 		t.Fatalf("供给不够时应 503 且说明门槛: %d %s", w.Code, w.Body.String())
 	}
 
 	// 开放了但不报 account ⇒ 400：不知道是谁就避不开他烧过的网关。
-	p.public = sched.PublicState{Enabled: true, Open: true, Free: 7, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 7, Threshold: 6}
 	if w := do(h, httptest.NewRequest("GET", "/cookie", nil)); w.Code != 400 {
 		t.Fatalf("匿名没带 account 居然 %d", w.Code)
 	}
@@ -649,14 +1303,14 @@ func TestAnonymousCookie(t *testing.T) {
 // 公开页要如实报开放状态——这是对外承诺。
 func TestPublicPageShowsOpenState(t *testing.T) {
 	_, h, p, _, _ := rig(t, types.ModePool)
-	p.public = sched.PublicState{Enabled: true, Open: true, Free: 7, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 7, Threshold: 6}
 	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
 	for _, want := range []string{"开放中", "7", "6", "account="} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("公开页没报开放状态，缺 %q", want)
 		}
 	}
-	p.public = sched.PublicState{Enabled: true, Open: false, Free: 1, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
 	if body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String(); !strings.Contains(body, "已关闭") {
 		t.Fatal("关闭状态没显示")
 	}
@@ -704,7 +1358,7 @@ func TestForceAndAdvisoryTTL(t *testing.T) {
 	}
 
 	// 匿名那条路也要带上。
-	p.public = sched.PublicState{Enabled: true, Open: true, Free: 9, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 9, Threshold: 6}
 	do(h, httptest.NewRequest("GET", "/cookie?account=acct-x&force=1", nil))
 	if len(p.anon) != 1 || !strings.Contains(p.anon[0], "force=true") {
 		t.Fatalf("匿名 force 没传下去: %v", p.anon)
@@ -718,7 +1372,7 @@ func TestForceAndAdvisoryTTL(t *testing.T) {
 // 带出来。这道口子只能在 httpapi 守：出去的只能是本包自己的视图结构体。
 func TestNoEndpointLeaksCredentials(t *testing.T) {
 	srv, h, p, st, _ := rig(t, types.ModePool)
-	p.public = sched.PublicState{Enabled: true, Open: true, Free: 9, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 9, Threshold: 6}
 	ka := srv.ConsumerKeyFor(st.accounts[0])
 	admin := func(r *http.Request) *http.Request { return authed(r, "akey") }
 	self := func(r *http.Request) *http.Request { return authed(r, ka) }
@@ -736,6 +1390,9 @@ func TestNoEndpointLeaksCredentials(t *testing.T) {
 		{"公开页", httptest.NewRequest("GET", "/", nil)},
 		{"上传回执", upload()},
 		{"上传者页", httptest.NewRequest("GET", "/a/vt-1", nil)},
+		// 总览页一页上摆着这个人全部凭据的读数，是最容易把 token 带出来的那一页。
+		{"总览页", httptest.NewRequest("GET", "/u/"+ownerTok1, nil)},
+		{"总览页（另一个人）", httptest.NewRequest("GET", "/u/"+ownerTok2, nil)},
 		{"cookie", self(httptest.NewRequest("GET", "/cookie", nil))},
 		{"cookie 管理员", admin(httptest.NewRequest("GET", "/cookie?account=2", nil))},
 		{"cookie 匿名", httptest.NewRequest("GET", "/cookie?account=acct-anon", nil)},
@@ -817,6 +1474,12 @@ func TestAccountDisableNeedsItsOwnViewToken(t *testing.T) {
 // account 可选，语义是「替谁找」⇒ 它自己**不会**被派出去。
 func TestAdminRescanIsAManualDiscoveryKick(t *testing.T) {
 	_, h, _, st, sc := rig(t, types.ModePool)
+	// 脚本路径（带 Accept: json）拿 JSON；不带的是管理页那个表单按钮，拿 303。
+	kick := func(q string) *httptest.ResponseRecorder {
+		r := authed(httptest.NewRequest("POST", "/admin/rescan"+q, nil), "akey")
+		r.Header.Set("Accept", "application/json")
+		return do(h, r)
+	}
 	// 无 key：不许排队。
 	if w := do(h, httptest.NewRequest("POST", "/admin/rescan?account=1", nil)); w.Code != 401 {
 		t.Fatalf("没带 admin key 居然 %d", w.Code)
@@ -825,14 +1488,14 @@ func TestAdminRescanIsAManualDiscoveryKick(t *testing.T) {
 		t.Fatalf("没鉴权就排进队列了: %v", sc.discovery)
 	}
 	// 不点名账号也行：那就是「随便派一个有空区域的号」，exclude=0。
-	if w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan", nil), "akey")); w.Code != 202 {
+	if w := kick(""); w.Code != 202 {
 		t.Fatalf("不点名账号拿到 %d", w.Code)
 	}
 	if len(sc.discovery) != 1 || sc.discovery[0] != 0 {
 		t.Fatalf("不点名时 exclude 应为 0: %v", sc.discovery)
 	}
 	// 点名了就把他排除在外——找到的落点必须对他还是首次接触。
-	w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan?account=1", nil), "akey"))
+	w := kick("?account=1")
 	if w.Code != 202 {
 		t.Fatalf("正常踢一发拿到 %d: %s", w.Code, w.Body.String())
 	}
@@ -840,11 +1503,57 @@ func TestAdminRescanIsAManualDiscoveryKick(t *testing.T) {
 		t.Fatalf("点名的账号没被当成 exclude 传下去: %v", sc.discovery)
 	}
 	// 账号不存在就别排：猜一个等于替别人烧一个槽位。
-	if w := do(h, authed(httptest.NewRequest("POST", "/admin/rescan?account=9999", nil), "akey")); w.Code != 404 {
+	if w := kick("?account=9999"); w.Code != 404 {
 		t.Fatalf("不存在的账号拿到 %d", w.Code)
 	}
 	if len(sc.discovery) != 2 {
 		t.Fatalf("账号不存在还是排了队: %v", sc.discovery)
+	}
+}
+
+// 「踢了但其实没派出去」要如实说，不能照回 queued:true。
+//
+// 挑不出人（单账号冷池子）、九个区域本小时打满、挑中的号还在 30 分钟发现冷却里 ——
+// 这三种从前都回 202 + queued:true，只有服务端日志说了实话。而这个按钮恰恰是冷启动时
+// 唯一的出路，看不出踢没踢动的话运维只能一直点，每点一次还可能真花掉一发上游。
+func TestAdminRescanTellsYouWhenItDidNotQueue(t *testing.T) {
+	_, h, _, _, sc := rig(t, types.ModePool)
+	sc.refuse = "挑不出可以派去找新网关的账号"
+
+	r := authed(httptest.NewRequest("POST", "/admin/rescan", nil), "akey")
+	r.Header.Set("Accept", "application/json")
+	w := do(h, r)
+	if w.Code != 200 {
+		t.Fatalf("没派出去却回了 %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"queued":true`) {
+		t.Fatalf("没派出去还说排进去了: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), sc.refuse) {
+		t.Fatalf("没说原因: %s", w.Body.String())
+	}
+
+	// 管理页那个表单按钮：303 回管理页，原因挂在查询串上，页面要显示出来。
+	sc.refuse = "挑中的号还在 30m0s 的发现冷却里，等它出来再踢"
+	w = do(h, authed(httptest.NewRequest("POST", "/admin/rescan", nil), "akey"))
+	if w.Code != 303 {
+		t.Fatalf("表单提交拿到 %d", w.Code)
+	}
+	to := w.Header().Get("Location")
+	if !strings.HasPrefix(to, "/admin/?rescan=") {
+		t.Fatalf("没把结论带回管理页: %q", to)
+	}
+	body := do(h, authed(httptest.NewRequest("GET", to, nil), "akey")).Body.String()
+	if !strings.Contains(body, "发现冷却里") {
+		t.Fatalf("管理页没显示没派出去的原因：\n%s", body)
+	}
+
+	// 真排进去了也要有回话，否则点了之后页面一点变化都没有。
+	sc.refuse = ""
+	w = do(h, authed(httptest.NewRequest("POST", "/admin/rescan", nil), "akey"))
+	body = do(h, authed(httptest.NewRequest("GET", w.Header().Get("Location"), nil), "akey")).Body.String()
+	if !strings.Contains(body, "已排进发现队列") {
+		t.Fatalf("排进去了却没回话：\n%s", body)
 	}
 }
 
@@ -870,13 +1579,16 @@ func TestGateBlocksHumanPages(t *testing.T) {
 	}{
 		{"公开页", httptest.NewRequest("GET", "/", nil)},
 		{"上传者页", httptest.NewRequest("GET", "/a/vt-1", nil)},
+		{"总览页", httptest.NewRequest("GET", "/u/"+ownerTok1, nil)},
+		{"贴令牌进入", httptest.NewRequest("POST", "/enter", strings.NewReader("token="+ownerTok1))},
 		{"上传", httptest.NewRequest("POST", "/upload", strings.NewReader("creds=x"))},
 	} {
 		w := do(h, c.req)
 		if w.Code != 403 {
 			t.Fatalf("%s 没被门禁拦住：%d", c.name, w.Code)
 		}
-		if body := w.Body.String(); strings.Contains(body, "已知网关") || strings.Contains(body, "vt-1") {
+		if body := w.Body.String(); strings.Contains(body, "已知网关") ||
+			strings.Contains(body, "vt-1") || strings.Contains(body, "pro1") {
 			t.Fatalf("%s 的门禁页漏出了内容：\n%s", c.name, body)
 		}
 	}
@@ -960,10 +1672,62 @@ func TestPublicPageCountsOnlyHostedAccounts(t *testing.T) {
 	if !strings.Contains(body, "<b>2</b><span>托管账号") {
 		t.Fatalf("2 个真上传者 + 3 个匿名占位，托管账号没报 2：\n%s", body)
 	}
-	// 占位行铸不了票，也不该算成这个网关「歇着的槽位」：两个托管号都歇够了
-	// restedThreshold，该是 2，把占位行算进来就是 5。
+	// 占位行铸不了票，也不该算成这个网关「歇着的槽位」：两个托管号都没被交付过票，
+	// 该是 2，把占位行算进来就是 5。
 	if !strings.Contains(body, `<td class="num">2</td>`) {
 		t.Fatalf("歇着的槽位没报 2，占位行被算进去了：\n%s", body)
+	}
+}
+
+// 「空闲槽位」必须和真正发票那把尺子一致：slot_cooldown_minutes（可配）+ LastDeliver，
+// 而不是写死的 1 小时 + LastTouch。
+//
+// 两把尺子的话两个方向都会说谎：两小时前取过票的槽位在页面上显示「可用」，而接下来两小时
+// 每次取票都 503（2026-10-02 本地实测：首页 1，/cookie 回 all_cooling retry_after 7190）；
+// 反过来，只被一次失败续期 touch 过的槽位显示 0，其实照常能发——notCooling 刻意不拿
+// LastTouch 当冷却起点。图例那句「还能用这个网关的账号数」是对使用者的承诺，不是内部读数。
+func TestPublicPageRestedSlotsUseTheSameRulerAsDelivery(t *testing.T) {
+	now := time.Now()
+	// rig 有两个托管号。每个用例只给**一个**号铺槽位，另一个号没有槽位行 ⇒ 恒为「可用」，
+	// 于是两把尺子算出来的总数一定不同，不会像「两边都算 1」那样互相遮住。
+	cases := []struct {
+		name string
+		slot types.Slot
+		want int // 新尺子（slot_cooldown + LastDeliver）下的空闲槽位数
+	}{
+		{
+			// 两小时前取走过票 ⇒ 4 小时冷却下不可用。旧尺子（1 小时 + LastTouch）会算成
+			// 可用，而取票实际 503（2026-10-02 本地实测：首页 1，/cookie 回 all_cooling）。
+			name: "取过票的还在冷却里",
+			slot: types.Slot{AccountID: 1, Gateway: "unified-142",
+				LastDeliver: now.Add(-2 * time.Hour), LastTouch: now.Add(-2 * time.Hour)},
+			want: 1,
+		},
+		{
+			// 只被一次失败的续期碰过：LastTouch 很新、LastDeliver 为零 ⇒ 照常能发。
+			// 旧尺子会算成不可用 —— notCooling 刻意不拿 LastTouch 当冷却起点。
+			name: "只被 touch 过的照样能发",
+			slot: types.Slot{AccountID: 1, Gateway: "unified-142", LastTouch: now.Add(-time.Minute)},
+			want: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, h, _, st, _ := rig(t, types.ModePool)
+			st.slots = map[string]types.Slot{"1|unified-142": tc.slot}
+
+			body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+			if want := fmt.Sprintf("空闲槽位 %d　", tc.want); !strings.Contains(body, want) {
+				t.Fatalf("没报 %q：\n%s", want, body)
+			}
+		})
+	}
+
+	// 图例上那个门槛也要跟着冷却走，不能是写死的「1.0 小时」。
+	_, h, _, _, _ := rig(t, types.ModePool)
+	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	if want := shortDur(types.SlotCooldown); !strings.Contains(body, want) {
+		t.Fatalf("图例门槛不是 %s：\n%s", want, body)
 	}
 }
 
@@ -1137,8 +1901,18 @@ func TestUploadRejectsExpiredWithoutRefresh(t *testing.T) {
 // 表单里只贴一个裸 token（不交整份 auth.json）也要收。
 func TestUploadAcceptsBareToken(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModeSingle)
-	fresh := fakeToken("acct-bare-rt", "pro", time.Now().Add(time.Hour))
-	srv.opt.Refresh = func(context.Context, string) (string, string, error) { return fresh, "", nil }
+	// 每次换票返回**不同** account_id：refresh 路径（post2、post3）要是都落到同一个
+	// account_id，第二发就会撞上「这份凭据已属于别人」的归属守卫（每发无身份上传各建
+	// 一个 owner），而这条测的是 kind 解析不是归属。首发按 acct-bare-rt 断言。
+	rtN := 0
+	srv.opt.Refresh = func(context.Context, string) (string, string, error) {
+		rtN++
+		acct := "acct-bare-rt"
+		if rtN > 1 {
+			acct = fmt.Sprintf("acct-bare-rt%d", rtN)
+		}
+		return fakeToken(acct, "pro", time.Now().Add(time.Hour)), "", nil
+	}
 
 	post := func(kind, creds string) *httptest.ResponseRecorder {
 		form := url.Values{"kind": {kind}, "creds": {creds}}
@@ -1167,11 +1941,14 @@ func TestUploadAcceptsBareToken(t *testing.T) {
 		t.Fatalf("没当成 refresh_token 去换票: acct=%q", got)
 	}
 
-	// 明确选了 refresh，哪怕贴的是 JWT 也按人说的算（他可能真有个 JWT 形状的 refresh）
-	if w := post("refresh", jwt); w.Code != http.StatusSeeOther {
+	// 明确选了 refresh，哪怕贴的是 JWT 也按人说的算（他可能真有个 JWT 形状的 refresh）。
+	// 用一个**不同 account_id** 的 JWT：复用前面那个会撞上「这份凭据已属于别人」的
+	// 归属守卫（每发无身份上传各建一个 owner），而这条测的是 kind 解析，不是归属。
+	jwt2 := fakeToken("acct-bare-at2", "plus", time.Now().Add(time.Hour))
+	if w := post("refresh", jwt2); w.Code != http.StatusSeeOther {
 		t.Fatalf("显式 refresh 被拒 %d: %s", w.Code, w.Body.String())
 	}
-	if st.added[2].Creds.RefreshToken != jwt {
+	if st.added[2].Creds.RefreshToken != jwt2 {
 		t.Fatal("显式选 refresh 却没当 refresh_token 用")
 	}
 }

@@ -256,7 +256,7 @@ func TestGatewaysReportsThresholds(t *testing.T) {
 // （这条路一发上游都没花，让它来得勤一点不花钱）。
 func TestPublicClosedCode(t *testing.T) {
 	_, h, p, _, _ := rig(t, types.ModePool)
-	p.public = sched.PublicState{Enabled: true, Open: false, Free: 1, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
 	w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("状态 %d", w.Code)
@@ -487,9 +487,14 @@ func TestReleaseRestoresAndIsLogged(t *testing.T) {
 	if len(p.released) != 1 || p.released[0] != "1|"+ver {
 		t.Fatalf("归还记到别人头上了: %+v", p.released)
 	}
-	mine := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String()
-	if !strings.Contains(mine, "归还了 1 个槽位") {
-		t.Fatal("页面上看不见这次归还")
+	// 归还是**成功**，所以它进管理页那张 200 条的表，不进上传者页那张 20 条的
+	// 「最近的取票失败」——按冻结口径每取一张票就续一次，混在一起会把真失败挤出窗口。
+	admin := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	if !strings.Contains(admin, "归还了 1 个槽位") {
+		t.Fatal("管理页上看不见这次归还")
+	}
+	if mine := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(); strings.Contains(mine, "归还了 1 个槽位") {
+		t.Fatal("归还跑进了上传者那张「取票失败」表")
 	}
 }
 
@@ -686,7 +691,7 @@ func TestCodesReachTheFailLog(t *testing.T) {
 		t.Fatalf("状态 %d", w.Code)
 	}
 	// public_closed：匿名撞上关着的公开池。
-	p.public = sched.PublicState{Enabled: true, Open: false, Free: 1, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
 	if w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil)); w.Code != 503 {
 		t.Fatalf("状态 %d", w.Code)
 	}
@@ -722,7 +727,7 @@ func TestCrossAccountIsNotGatedByPublicSwitch(t *testing.T) {
 	if w.Code != 401 { // 开关没开 ⇒ 没带 key 就是 key 不认
 		t.Fatalf("匿名状态 %d", w.Code)
 	}
-	p.public = sched.PublicState{Enabled: true, Open: false, Free: 1, Threshold: 6}
+	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
 	w = do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
 	if w.Code != 503 || decodeFail(t, w).Error.Code != codePublicClosed {
 		t.Fatalf("匿名该被门槛挡住: %d %s", w.Code, w.Body.String())
@@ -918,8 +923,12 @@ func TestRenewStoresTheNewCookie(t *testing.T) {
 	if p.calls != 0 || len(p.released) != 0 {
 		t.Fatalf("续期动了调度: calls=%d released=%+v", p.calls, p.released)
 	}
-	if !strings.Contains(do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(), "续到还剩") {
-		t.Fatal("页面上看不见这次续期")
+	// 续期也是成功：进管理页，不进上传者那张「取票失败」表（理由同 TestReleaseRestoresAndIsLogged）。
+	if !strings.Contains(do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String(), "续到还剩") {
+		t.Fatal("管理页上看不见这次续期")
+	}
+	if strings.Contains(do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(), "续到还剩") {
+		t.Fatal("续期跑进了上传者那张「取票失败」表")
 	}
 }
 
@@ -1584,7 +1593,7 @@ func TestFailDetailTruncatesByRune(t *testing.T) {
 	l := &failLog{}
 	// 开头故意放一个 ASCII：这样第 300 个**字节**正好落在一个汉字中间。
 	l.add(deliverFail{Detail: "x" + strings.Repeat("网关", failDetailMax)})
-	got := l.recent(0, 1)[0].Detail
+	got := l.recent(0, 1, false)[0].Detail
 	if !utf8.ValidString(got) {
 		t.Fatalf("截出了半个汉字: %q", got)
 	}

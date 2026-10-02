@@ -1,0 +1,107 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>我的账号<span class="badge">{{len .Accounts}} 份凭据</span></h1>
+  <p>创建于 {{.Since}} UTC。</p>
+</div>
+
+<div class="kpis">
+  <div class="kpi"><b>{{len .Accounts}}</b><span>托管凭据</span></div>
+  <div class="kpi"><b>{{.Requests}}</b><span>探测请求</span></div>
+  <div class="kpi ok"><b>0</b><span>消耗 token</span></div>
+  <div class="kpi"><b>{{.NewGateways}}</b><span>新发现网关</span></div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <header class="card-head"><div><h2>接口地址</h2><p>填进 sub2api 的<strong>根地址</strong>。</p></div></header>
+    <div class="card-body">
+      {{if .BaseURL}}
+      <div class="copy"><pre class="mono" id="base-url">{{.BaseURL}}</pre><button type="button" data-copy="#base-url" hidden data-js>复制</button></div>
+      {{else}}
+      <p class="muted">未配置对外地址，找管理员要。</p>
+      {{end}}
+      <div class="note warn">
+        <p><strong>填根地址，不是个人页地址。</strong>填 <code>/u/&lt;令牌&gt;</code> 或 <code>/a/&lt;令牌&gt;</code> 的话，请求会变成
+        <code>/u/&lt;令牌&gt;/cookie</code>，返回 404。</p>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <header class="card-head"><div><h2>本页地址</h2><p>进入这一页的唯一入口。</p></div></header>
+    <div class="card-body">
+      <div class="copy" hidden data-js><pre class="mono" id="page-url"></pre><button type="button" data-copy="#page-url">复制</button></div>
+      <p>换设备时在首页粘这个令牌：</p>
+      <div class="copy"><pre class="mono" id="owner-token">{{.Token}}</pre><button type="button" data-copy="#owner-token" hidden data-js>复制</button></div>
+      <p class="foot">地址和令牌即访问凭证，别分享。丢了只能找管理员查。</p>
+      {{if .CanLogout}}
+      <form method="post" action="/logout" class="logout">
+        <button type="submit">在这台设备上登出<span class="hint">共用电脑时，清掉浏览器记住的身份；不影响你的凭据</span></button>
+      </form>
+      {{end}}
+    </div>
+  </div>
+</div>
+
+{{if .Accounts}}
+{{range .Accounts}}
+<div class="card">
+  <header class="card-head">
+    <div><h2>{{.Label}}</h2>
+      <p>{{if .Plan}}套餐 {{.Plan}} · {{end}}添加于 {{.Since}} UTC · 累计 <strong>{{.Requests}} 次请求</strong>（消耗 <strong>0 token</strong>）· 发现 <strong>{{.NewGateways}} 个新网关</strong></p></div>
+    {{if .Enabled}}<span class="badge ok">已启用</span>{{else}}<span class="badge bad">已停用</span>{{end}}
+  </header>
+  <div class="card-body">
+    {{if not .Enabled}}
+    <p class="err">已停用：不再用它发请求，接入 key 失效。</p>
+    {{if .DisabledReason}}<p>停用原因：</p><pre class="mono">{{.DisabledReason}}</pre>{{end}}
+    {{end}}
+
+    <h3>接入 key</h3>
+    {{if .ConsumerKey}}
+    <div class="copy"><pre class="mono" id="key-{{.ID}}">{{.ConsumerKey}}</pre><button type="button" data-copy="#key-{{.ID}}" hidden data-js>复制</button></div>
+    {{else}}
+    <p class="muted">没有接入 key：服务未配置 consumer_key，或这个账号没有 access_token。</p>
+    {{end}}
+
+    <h3>各区域探测情况</h3>
+    <div class="regions">
+    {{range .Regions}}
+      <div class="region{{if .Minted}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
+        <b>{{.Label}}</b>
+        <span>{{if .Minted}}已探测 {{.Count}} 次{{else}}未探测{{end}}</span>
+      </div>
+    {{end}}
+    </div>
+    <p class="foot">绿＝这个账号在该区域取到过路由 Cookie（终身计数）；红＝还没取到过。悬停看最近一次时间。</p>
+
+    {{if .Fails}}
+    <h3>最近的取票失败</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>时间（UTC）</th><th>指定网关</th><th>错误码</th><th>原因</th></tr></thead>
+      <tbody>
+      {{range .Fails}}
+        <tr><td class="mono">{{.At}}</td>
+          <td class="mono">{{if .Gateway}}{{.Gateway}}{{else}}<span class="muted">未指定</span>{{end}}</td>
+          <td class="mono">{{if .Code}}{{.Code}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{.Reason}}</td></tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{end}}
+  </div>
+  <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明、停用开关在那边）</p>
+</div>
+{{end}}
+{{else}}
+<div class="card"><p class="empty">你名下还没有凭据。回<a href="/">首页</a>上传一份。</p></div>
+{{end}}
+
+<div class="card">
+  <header class="card-head"><div><h2>再挂一份凭据</h2></div></header>
+  <div class="card-body">
+    <p>回<a href="/">首页</a>上传，新凭据自动挂到这一页。</p>
+    <p class="muted">换浏览器时，在上传表单的「挂到已有账号页」里粘上面的令牌。</p>
+    <p class="foot">探测请求固定为 <code>ping</code>（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），带 <code>store=false</code>，不在账号里留对话记录。</p>
+  </div>
+</div>
+{{end}}

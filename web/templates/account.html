@@ -25,13 +25,13 @@
   </div>
   <div class="grid-2">
     <div class="card">
-      <header class="card-head"><div><h2>接入 key</h2><p>调用 <code>/cookie</code> 时放在 Authorization 请求头中，请勿泄露。</p></div></header>
+      <header class="card-head"><div><h2>接入 key</h2><p>调用 <code>/cookie</code> 时放在 Authorization 头里，别外泄。</p></div></header>
       <div class="card-body">
         {{if .ConsumerKey}}
         {{if not .Enabled}}<p class="err">账号已停用，该 key 暂时无法使用；重新启用后恢复。</p>{{end}}
         <div class="copy"><pre class="mono" id="key">{{.ConsumerKey}}</pre><button type="button" data-copy="#key" hidden data-js>复制</button></div>
         {{else}}
-        <p class="muted">当前不提供接入 key：服务未配置 consumer_key，或该账号缺少 access_token。</p>
+        <p class="muted">没有接入 key：服务未配置 consumer_key，或这个账号没有 access_token。</p>
         {{end}}
       </div>
     </div>
@@ -39,7 +39,13 @@
       <header class="card-head"><div><h2>本页地址</h2><p>查看账号状态{{if .ConsumerKey}}与接入 key{{end}}的唯一入口。</p></div></header>
       <div class="card-body">
         <div class="copy" hidden data-js><pre class="mono" id="page-url"></pre><button type="button" data-copy="#page-url">复制</button></div>
-        <p class="foot">地址本身即访问凭证，请收藏并妥善保管，不要分享给他人；遗失后需联系管理员查询。</p>
+        {{if .OwnerToken}}
+        <p><a href="/u/{{.OwnerToken}}">← 返回我的账号总览</a>（那一页列出你名下的全部凭据）</p>
+        <p>换设备时在首页粘这个总览令牌：</p>
+        <div class="copy"><pre class="mono" id="owner-token">{{.OwnerToken}}</pre><button type="button" data-copy="#owner-token" hidden data-js>复制</button></div>
+        <p class="hint">收藏它。总览令牌只在这个浏览器里认得出你的时候才显示，所以把这一页地址转发给别人不会连带交出它。</p>
+        {{end}}
+        <p class="foot">地址即访问凭证，别分享。丢了只能找管理员查。</p>
       </div>
     </div>
   </div>
@@ -51,8 +57,9 @@
     <header class="card-head"><div><h2>接口说明</h2><p>先通过 <code>/cookie</code> 获取路由 Cookie，再携带它向上游发起请求。</p></div></header>
     <div class="card-body">
       <div class="note warn">
-        <p><strong>接口位于站点根路径：</strong>base URL 是站点地址本身，不是本页地址。把 <code>/a/&lt;页面令牌&gt;</code> 当作 base URL 时，请求会变成 <code>/a/&lt;页面令牌&gt;/cookie</code> 并返回 404。</p>
-        <p class="mono">base URL = <span class="origin">https://&lt;站点地址&gt;</span></p>
+        <p><strong>接口位于站点根路径：</strong>base URL 是站点地址本身，不是本页地址。把 <code>/a/&lt;页面令牌&gt;</code> 当 base URL 的话，请求会变成 <code>/a/&lt;页面令牌&gt;/cookie</code>，返回 404。</p>
+        {{if .BaseURL}}<p class="mono">base URL = {{.BaseURL}}</p>
+        {{else}}<p class="mono">base URL = <span class="origin">https://&lt;站点地址&gt;</span><span class="hint">（未配置对外地址，找管理员核对）</span></p>{{end}}
       </div>
 
       <h3>1. 请求</h3>
@@ -61,7 +68,7 @@
         <thead><tr><th>参数</th><th>说明</th></tr></thead>
         <tbody>
           <tr><td class="mono">gateway</td><td>可选。指定网关名称，例如 <code>unified-142</code>；不指定时由系统选择。</td></tr>
-          <tr><td class="mono">force</td><td>可选。设为 <code>1</code> 时跳过你当前正在使用的网关，改为分配其他网关。</td></tr>
+          <tr><td class="mono">force</td><td>可选。设为 <code>1</code> 时跳过你正在用的网关，换一个。</td></tr>
         </tbody>
       </table></div>
 
@@ -80,25 +87,25 @@
           <tr><td class="mono">gateway</td><td>本次分配的网关。</td></tr>
           <tr><td class="mono">cookie</td><td>路由 Cookie，原样放入上游请求的 <code>Cookie</code> 请求头。</td></tr>
           <tr><td class="mono">expires_at</td><td>本次分配的到期时间（UTC）。</td></tr>
-          <tr><td class="mono">valid_for_s</td><td>本次分配的建议使用时长，单位为秒，到期后请重新获取。</td></tr>
+          <tr><td class="mono">valid_for_s</td><td>建议使用时长，单位秒，到期重新取。</td></tr>
           <tr><td class="mono">verified_full</td><td>分配前是否已对该网关完成可用性校验。</td></tr>
-          <tr><td class="mono">ttl_is_advisory</td><td>固定为 <code>true</code>，表示有效期只是建议值，实际以上游响应为准。</td></tr>
+          <tr><td class="mono">ttl_is_advisory</td><td>固定 <code>true</code>：有效期只是建议值，以上游响应为准。</td></tr>
         </tbody>
       </table></div>
 
       <h3>3. 携带 Cookie 请求上游</h3>
-      <p>将响应中的 <code>cookie</code> 字段作为请求头 <code>Cookie</code> 的值：</p>
+      <p>把响应里的 <code>cookie</code> 字段作为 <code>Cookie</code> 头的值：</p>
       <pre class="mono">POST https://chatgpt.com/backend-api/codex/responses
 Authorization: Bearer &lt;该账号自己的 Codex token&gt;
 chatgpt-account-id: &lt;该账号的 account_id&gt;
 Cookie: &lt;响应中的 cookie&gt;</pre>
-      <p class="foot"><strong>注意：</strong>请求上游时 Authorization 使用的是账号自己的 Codex token，不是本服务的接入 key。</p>
+      <p class="foot">请求上游时 Authorization 用的是账号自己的 Codex token，不是本服务的接入 key。</p>
 
       <h3>4. 何时重新获取</h3>
       <p>路由 Cookie 按「账号 × 网关」分配，出现以下情况时重新调用 <code>/cookie</code>：</p>
       <ul>
         <li>距上次获取已超过 <code>valid_for_s</code> 秒。</li>
-        <li>当前网关不可用、需要换一个网关时，加上 <code>force=1</code>：
+        <li>当前网关不可用、要换一个时，加 <code>force=1</code>：
           <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https://&lt;站点地址&gt;</span>/cookie?force=1'</pre></li>
         <li>需要固定使用某个网关时，传入 <code>gateway</code> 参数，例如 <code>/cookie?gateway=unified-142</code>。</li>
       </ul>
@@ -150,7 +157,7 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
           <tr><td class="mono">503</td><td>暂时没有可分配的路由 Cookie。</td><td>稍后重试；系统已自动安排为该账号探测新的网关。</td></tr>
         </tbody>
       </table></div>
-      <p class="foot"><strong>503 不代表服务故障：</strong>它表示当前可分配的网关已全部占用，稍后重试即可。</p>
+      <p class="foot"><strong>503 不是服务故障：</strong>可分配的网关都用掉了，稍后重试。</p>
     </div>
   </div>
 </section>
@@ -158,7 +165,7 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
 
 <section id="tab-records">
   <div class="card">
-    <header class="card-head"><div><h2>请求记录</h2><p>该账号发出的探测请求，按时间倒序排列。{{if .Truncated}}仅显示最近 {{len .Rows}} 条，另有 {{.Truncated}} 条更早的记录未显示。{{end}}</p></div></header>
+    <header class="card-head"><div><h2>请求记录</h2><p>按时间倒序。{{if .Truncated}}只显示最近 {{len .Rows}} 条，另有 {{.Truncated}} 条更早的。{{end}}</p></div></header>
     {{if .Rows}}
     <div class="table-wrap"><table data-grid data-facets="ok:成功:ok|err:失败:bad" data-placeholder="搜索时间、地区或网关">
       <thead><tr><th>时间（UTC）</th><th>出口位置</th><th>网关</th><th class="num">HTTP</th></tr></thead>
@@ -174,7 +181,7 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
       </tbody>
     </table></div>
     {{else}}
-    <p class="empty">暂无请求记录。账号接入后，系统会在后台自动发起探测。</p>
+    <p class="empty">暂无请求记录。</p>
     {{end}}
     <p class="foot">出口位置只显示国家和城市，不显示 IP 地址。</p>
   </div>
@@ -205,18 +212,18 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
     <header class="card-head"><div><h2>账号状态</h2></div>{{if .Enabled}}<span class="badge ok">已启用</span>{{else}}<span class="badge bad">已停用</span>{{end}}</header>
     <div class="card-body">
       {{if .Enabled}}
-      <p>账号处于启用状态：系统会使用它探测网关、维护路由 Cookie，接入 key 可以正常使用。</p>
-      <p class="muted">停用后，系统不再使用该账号发送请求，接入 key 同时失效；已有记录会保留，可以随时重新启用。</p>
+      <p>已启用：会用它探测网关、维护路由 Cookie，接入 key 可用。</p>
+      <p class="muted">停用后不再用它发请求，接入 key 同时失效；记录保留，可随时重新启用。</p>
       <form method="post" action="/a/{{.ViewToken}}/enabled">
         <input type="hidden" name="enabled" value="0">
         <div class="actions"><button type="submit" class="danger">停用账号</button></div>
       </form>
       {{else}}
-      <p>账号已<strong>停用</strong>：系统不会使用它发送请求，接入 key 暂时失效。</p>
+      <p>已<strong>停用</strong>：不再用它发请求，接入 key 失效。</p>
       {{if .DisabledReason}}
       <p>停用原因（系统自动记录）：</p>
       <pre class="mono">{{.DisabledReason}}</pre>
-      <p class="foot">如果原因是凭据失效，重新启用也无法恢复，请在首页重新上传有效的凭据。</p>
+      <p class="foot">凭据失效的话重新启用也救不回来，要在首页重新上传。</p>
       {{end}}
       <form method="post" action="/a/{{.ViewToken}}/enabled">
         <input type="hidden" name="enabled" value="1">

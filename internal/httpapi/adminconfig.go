@@ -23,7 +23,10 @@ type configView struct {
 	MaxTriesPerDeliver    int
 	SpareTarget           int
 	PublicEnabled         bool
-	MinFreeGateways       int
+	MinAccounts           int
+	// PublicBaseURL 是页面上要告诉人「填进 sub2api 的那个根地址」。
+	// 做成配置项而不是从 Host 头推：那个头是调用方可控的输入（见 config 里的注释）。
+	PublicBaseURL string
 
 	// Path 显示配置文件在哪，省得人找不到。
 	Path string
@@ -63,7 +66,8 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
 	v.SpareTarget = c.SpareTarget
 	v.PublicEnabled = c.PublicWhenSurplus.Enabled
-	v.MinFreeGateways = c.PublicWhenSurplus.MinFreeGateways
+	v.MinAccounts = c.PublicWhenSurplus.MinAccounts
+	v.PublicBaseURL = c.PublicBaseURL
 	v.Path = live.Path()
 
 	// 选中的排前面且保持配置里的顺序——第一个是默认模型，顺序有意义。
@@ -120,7 +124,7 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		"upstream_per_region_hour", c.UpstreamPerRegionHour,
 		"verify_full_at_deliver", c.VerifyFullAtDeliver, "renew_pairs", c.RenewPairs,
 		"slot_cooldown", c.SlotCooldown(),
-		"public", c.PublicWhenSurplus.Enabled, "min_free_gateways", c.PublicWhenSurplus.MinFreeGateways)
+		"public", c.PublicWhenSurplus.Enabled, "min_accounts", c.PublicWhenSurplus.MinAccounts)
 	s.adminConfigDone(w, r, "已保存并立即生效", "")
 }
 
@@ -144,7 +148,11 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	minFree, err := atoiField(r, "min_free_gateways", 1, 100000)
+	// 下限 0 而不是 1：atoiField 对空值回下限，而这一格留空是运营最自然的「让它用默认值」
+	// 动作（同一张表单上另外几格的提示就是「0 = 用默认值」，填 0 在原来的下限 1 下反而报错）。
+	// 回 1 的话门槛变成「有一个号铸过票就对全互联网开放」——空值失败的方向朝着开那一边。
+	// 0 在 config.Patch 里被 Load 当成「没写」⇒ 回去走 AccountsForContinuous 推导。
+	minAccounts, err := atoiField(r, "min_accounts", 0, 100000)
 	if err != nil {
 		return nil, err
 	}
@@ -166,10 +174,13 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 
 	pub := cur.PublicWhenSurplus
 	pub.Enabled = truthy(r.FormValue("public_enabled"))
-	pub.MinFreeGateways = minFree
+	pub.MinAccounts = minAccounts
 
 	return map[string]any{
-		"models":                   models,
+		"models": models,
+		// 形状校验交给 config.Patch 里那遍 Load（normalizeBaseURL）——校验规则只该有
+		// 一份，在这儿重复一遍迟早两边不一致。空串是合法的「没配」。
+		"public_base_url":          strings.TrimSpace(r.FormValue("public_base_url")),
 		"upstream_per_region_hour": perRegionHour,
 		// 两个开关默认关，理由见 config.Config 上的字段注释（都是「花一个满血窗口
 		// 换一个读数」）。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，

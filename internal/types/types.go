@@ -197,6 +197,19 @@ type Minter interface {
 	Geo(ctx context.Context, e Exit, sid string) (Observed, error)
 }
 
+// Owner 是一个上传者。一个人可能先后交上来好几份凭据，owner 把它们归到一页
+// （GET /u/{token}）上——没有它，每份凭据只剩一个孤零零的 /a/ 链接，丢一个少一个。
+//
+// 和 Account.ViewToken 的分工：view_token 认**一个账号**，owner token 认**一个人**。
+// 两个都是 128 bit 的 URL 令牌，所以也都是「谁拿到谁就是他」。刻意不做邮箱密码登录：
+// 这个服务没有会话层，为一个只读页面引进一套身份系统是本末倒置。
+type Owner struct {
+	ID        int64
+	Token     string
+	Label     string
+	CreatedAt time.Time
+}
+
 // Account 是一个托管账号。
 type Account struct {
 	ID        int64
@@ -206,6 +219,15 @@ type Account struct {
 	ViewToken string
 	Enabled   bool
 	CreatedAt time.Time
+	// OwnerID 是这份凭据挂在哪个 Owner 名下。
+	//
+	// 0 = 没有归属。两种情形：匿名占位行（没凭据、不是谁托管的）**永远**是 0；
+	// 托管行的 0 只会出现在加这个字段之前写下的老 state.json 里，由 store.Open
+	// 的一次性迁移收口。
+	//
+	// **归属一旦定下就不改。** 改归属的入口等于「谁手上有一份公开流传的凭据，
+	// 就能把别人的账号搬到自己页面下」，而那一页上有对方每个账号的 consumer key。
+	OwnerID int64
 	// DisabledReason 是自动停用的原因（上游那段话）。手动停用和启用时都清空。
 	// 没有它的话页面上只有一个「已停用」，没人知道为什么，只会被重新打开再废一轮。
 	DisabledReason string
@@ -519,6 +541,36 @@ func GatewaysForContinuous(cooldown time.Duration) int {
 		n++
 	}
 	return n
+}
+
+// AccountsForContinuous 是对外开放的门槛：要托管多少个账号才够连续供上。
+//
+//	一个账号最多能摸到 len(Regions) 个落点 ⇒ 账号数 = 所需网关数 ÷ 区域数，再 +1。
+//
+// **为什么门槛按账号数算，而不按「此刻有几张活 pair」。** 改成按需铸票之后池子
+// 根本不囤票（线上长期就是个位数），而所需网关数是 96 这个量级 ⇒ 按活 pair 数判
+// 等于把对外开放结构性焊死，永远不可能成立。账号数量的是**池子够不够格**
+// （能摸到多少落点），活 pair 数量的是**货架上还剩几张**；门槛问的是前者。
+// 后者不用在这儿判：没有现成票的匿名请求本来就会 503（DeliverAnonymous 刻意不现铸）。
+//
+// **那个 +1 是重叠余量，不是凑整，别删。** len(Regions) 是上限不是保证：不同账号
+// 从同一个区域经常落到同一个网关（老的九区域首扫就是因此才有「连续三个区域没新
+// 落点就停」那条规则，UpsertGateway 也要回 isNew）。所以 ⌈96/9⌉=11 个账号实际拿到的
+// **不同**网关会少于 99，这道门槛本来就偏乐观，+1 只是把它往回拉一点。
+// 真想要诚实版就改成数 len(Gateways()) ≥ GatewaysForContinuous——那是实测的同一件事。
+//
+// 冷却是参数：它是实测还没定下来的那个数（见 SlotCooldown），测准了门槛要跟着动。
+// 4h ⇒ ⌈96/9⌉+1 = 12 个账号；真要是 30 分钟 ⇒ ⌈12/9⌉+1 = 3 个。
+func AccountsForContinuous(cooldown time.Duration) int {
+	gws, regions := GatewaysForContinuous(cooldown), len(Regions)
+	if regions <= 0 {
+		return gws + 1 // 区域表被清空了：退化成「一个账号一个落点」
+	}
+	n := gws / regions
+	if gws%regions != 0 {
+		n++
+	}
+	return n + 1
 }
 
 // Mode 是运行模式。见 SPEC.md 第 7 节。

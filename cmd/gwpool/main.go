@@ -78,9 +78,11 @@ func run(path string, log *slog.Logger) error {
 		AdminKey:    cfg.AdminKey.Reveal(),
 		SiteKey:     cfg.SiteKey.Reveal(),
 		Model:       cfg.Model,
-		Live:        live,
-		ProxyStates: minter.ProxyStates,
-		Log:         log,
+		// 接了 Live 之后页面现读它，这个只是启动时那一份兜底（见 Server.publicBaseURL）。
+		PublicBaseURL: cfg.PublicBaseURL,
+		Live:          live,
+		ProxyStates:   minter.ProxyStates,
+		Log:           log,
 	})
 	if err != nil {
 		return err
@@ -110,7 +112,7 @@ func run(path string, log *slog.Logger) error {
 		"model", cfg.Model,
 		"accounts", len(st.Accounts()), "gateways", len(st.Gateways()),
 		"public_when_surplus", cfg.PublicWhenSurplus.Enabled,
-		"min_free_gateways", cfg.PublicWhenSurplus.MinFreeGateways)
+		"min_accounts", cfg.PublicWhenSurplus.MinAccounts)
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
@@ -170,7 +172,8 @@ func newDiscoveryQueue(sc *scan.Scanner, pool *sched.Scheduler, log *slog.Logger
 }
 
 // EnqueueDiscovery 见 httpapi.Scanner 的注释：派**别人**去找新网关。绝不阻塞。
-func (q *discoveryQueue) EnqueueDiscovery(exclude int64) {
+// 回空串 = 排进去了；非空 = 没派出去的原因（给管理页那个按钮如实回话用）。
+func (q *discoveryQueue) EnqueueDiscovery(exclude int64) string {
 	a, r, ok := q.pool.PickMinter(exclude)
 	if !ok {
 		// 池子里只有要票的这一个号，或者剩下的号九个区域本小时都打满了。
@@ -181,7 +184,7 @@ func (q *discoveryQueue) EnqueueDiscovery(exclude int64) {
 		// POST /admin/rescan。默认看不见这行的话，现象就只是「一直 503」。
 		q.log.Info("没有可派去找新网关的账号（池子自己走不出来，要再上传一个号或手动 /admin/rescan）",
 			"asked_by", exclude)
-		return
+		return "挑不出可以派去找新网关的账号：池子里只有要票的这一个号，或者剩下的号九个区域本小时都打满了"
 	}
 	// 冷却从**入队**算起，不是从开跑算起：队列堵着的时候按开跑计时会让同一个号
 	// 连排三次，等轮到它时三次都已经过了冷却。
@@ -193,15 +196,17 @@ func (q *discoveryQueue) EnqueueDiscovery(exclude int64) {
 	q.mu.Unlock()
 	if cooling {
 		q.log.Debug("挑中的号还在发现冷却里", "asked_by", exclude, "scanner", a.ID)
-		return
+		return fmt.Sprintf("挑中的号还在 %v 的发现冷却里，等它出来再踢", discoverCooldown)
 	}
 
 	q.log.Info("槽位烧完，派别的账号去找新网关",
 		"asked_by", exclude, "scanner", a.ID, "label", a.Label, "region", r.Key)
 	select {
 	case q.ch <- job{acct: a, r: r}:
+		return ""
 	default:
 		q.log.Warn("发现队列满，丢弃", "account", a.ID)
+		return "发现队列满了，这一发被丢弃"
 	}
 }
 

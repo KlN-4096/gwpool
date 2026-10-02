@@ -19,6 +19,10 @@ type base struct {
 type gateView struct {
 	base
 	Wrong bool // 带了码但不对；只影响文案，状态码恒为 403
+	// **刻意不带「输完码回原页」的目标路径**：那要把 r.URL 反射进门禁页正文，而
+	// /a/<view_token> 和 /u/<owner_token> 的路径本身就是访问凭证 —— 门禁页是未鉴权
+	// 的 403，不该有任何来自请求的内容（TestGateBlocksHumanPages 钉着这一点）。
+	// 代价是别人发来 /a/… 链接时，输完码落在首页，得自己回头再点一次。
 }
 
 // ---------- 公开页 ----------
@@ -26,9 +30,14 @@ type gateView struct {
 type poolView struct {
 	base
 	// 对外开放状态是承诺，得让人看得见。
+	//
+	// OpenAccounts/Threshold 数的是**托管账号数**，不是活 pair 数——按需铸票的池子
+	// 不囤票，按货架存量判等于永远关着（见 types.AccountsForContinuous）。
+	// 和下面那个 Accounts 是同一个数，分开两个字段是因为一个在讲「开放门槛」、
+	// 另一个在讲「池子规模」，哪天门槛改成别的判据时不该牵连那张概览卡片。
 	PublicEnabled bool
 	PublicOpen    bool
-	FreeGateways  int
+	OpenAccounts  int
 	Threshold     int
 
 	Gateways []gatewayRow
@@ -38,6 +47,15 @@ type poolView struct {
 	RestedLabel string
 	Model       string
 	Effort      string
+	// OwnerToken 非空 = 这个浏览器带着身份 cookie，直接给一个进总览页的按钮。
+	// 空则只给贴令牌的小表单。
+	OwnerToken string
+	// EnterErr 是上一次贴令牌没认出来。**只有一个 bool**：区分「不存在」和
+	// 「格式不对」等于给人一个枚举令牌的工具。
+	EnterErr bool
+	// BaseURL 是要填进 sub2api 的那个根地址（config.PublicBaseURL）。
+	// 空 = 没配，页面上如实说「问管理员要」，绝不拿请求头猜一个。
+	BaseURL string
 }
 
 type gatewayRow struct {
@@ -69,6 +87,86 @@ type accountView struct {
 	Truncated      int
 	// Fails 是最近几次没给出票的交付：客户端那头只看到一个 502/503。
 	Fails []failRow
+	// OwnerToken 只在**请求自己带着**这个账号 owner 的 cookie 时才填（见 handleAccount）：
+	// 这一页是转发得出去的，而这个令牌能打开这个人所有账号的页面。
+	OwnerToken string
+	// BaseURL 见 poolView.BaseURL。
+	BaseURL string
+}
+
+// ---------- 上传者总览页（/u/{token}） ----------
+
+type ownerView struct {
+	base
+	// Token 是这一页自己的地址令牌，用来拼页内链接。
+	Token string
+	Label string
+	Since string
+	// Requests / NewGateways 是名下所有账号的合计。
+	Requests    int
+	NewGateways int
+	Model       string
+	Effort      string
+	// BaseURL 见 poolView.BaseURL。
+	BaseURL string
+	// CanLogout：访客的身份 cookie 正好是这个 owner，给一个「登出」按钮。
+	CanLogout bool
+	Accounts  []ownerAccountRow
+}
+
+type ownerAccountRow struct {
+	ID      int64
+	Label   string
+	Plan    string
+	Enabled bool
+	// DisabledReason 是自动停用的原因（上游原话）。手动停用时为空。
+	DisabledReason string
+	Since          string
+	// ViewToken 用来拼进这个账号详情页的链接。同一个 owner 名下的账号，这一页
+	// 本来就都看得见，不是额外的泄漏面。
+	ViewToken   string
+	ConsumerKey string
+	Requests    int
+	NewGateways int
+	// Regions 恒为 types.Regions 那九个，顺序一致。
+	Regions []regionCell
+	Fails   []failRow
+}
+
+// regionCell 是九宫格的一格。
+//
+// Note 是给人读的那句（「铸过 3 次，最近 … UTC」）：纯靠红绿传达信息对色盲不友好，
+// 所以格子里必须有文字，而不只是 title 属性。
+type regionCell struct {
+	Key    string
+	Label  string
+	Minted bool
+	Count  int
+	Note   string
+}
+
+// regionLabels 把区域 key 翻成人话。
+//
+// 只放在视图层：types.Regions 是**扫描清单**（区域划分本身随 cohort 变，见那边的
+// 注释），给它挂一列中文名会让人以为那是数据模型的一部分。
+var regionLabels = map[string]string{
+	"us-east":       "美国东部",
+	"us-west":       "美国西部",
+	"south-america": "南美",
+	"west-europe":   "西欧",
+	"europe":        "欧洲",
+	"east-asia":     "东亚",
+	"oceania":       "大洋洲",
+	"south-asia":    "南亚",
+	"middle-east":   "中东",
+}
+
+// regionLabel 查不到就回 key 本身：往 types.Regions 里加一个区域不该让页面出现空格子。
+func regionLabel(key string) string {
+	if v, ok := regionLabels[key]; ok {
+		return v
+	}
+	return key
 }
 
 // failRow 是「为什么没给票」。Detail 只在管理页填。
@@ -97,6 +195,7 @@ type adminView struct {
 
 	base
 	Proxies      []proxyRow
+	Owners       []ownerRow
 	Accounts     []accountRow
 	Gateways     []adminGatewayRow
 	Pairs        []pairRow
@@ -104,6 +203,19 @@ type adminView struct {
 	Samples      []adminSampleRow
 	TotalSamples int
 	Fails        []failRow
+	// Rescan 是刚点过「找新网关」按钮之后的回话："queued" = 真排进去了，
+	// 其余非空串是没派出去的原因。空 = 这一次打开不是从那个按钮跳回来的。
+	Rescan string
+}
+
+// ownerRow 是一个上传者。**Token 在这一页是故意给的**：迁移出来那个 owner 的令牌
+// 没人见过，不显示就等于现有账号的总览页谁都进不去，而这一页已经要 admin key。
+type ownerRow struct {
+	ID       int64
+	Label    string
+	Token    string
+	Accounts int
+	Since    string
 }
 
 type accountRow struct {
@@ -111,6 +223,8 @@ type accountRow struct {
 	Label   string
 	Plan    string
 	Enabled bool
+	// OwnerID 是归属的上传者。0 = 匿名占位行（不是谁托管的）。
+	OwnerID int64
 	// DisabledReason 让管理员一眼看出是「上游否决」还是「上传者自己关的」。
 	DisabledReason string
 	Requests       int

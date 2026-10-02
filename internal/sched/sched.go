@@ -263,6 +263,10 @@ type Scheduler struct {
 	lastDeliver  time.Time
 	// gwLocks 是「同一个网关一次只许有一发在铸」，见 lockGateway。
 	gwLocks map[string]*sync.Mutex
+	// mintingRegions 是「同一个区域一次只许有一发裸铸在打」，见 claimRegion。
+	// 是个**标记**不是锁：裸铸出手前不知道落哪，拦不住只能按区域拦，
+	// 而按区域上真锁会让两路交付在走到账号锁之前就互等（见 claimRegion 的注释）。
+	mintingRegions map[string]bool
 }
 
 func New(st Store, m Minter, opt Options) *Scheduler {
@@ -539,7 +543,7 @@ func (s *Scheduler) noteTryFailure(ctx context.Context, consumer types.Account, 
 	// 账号的槽位挨个打进退避，故障恢复后它还要再瞎等一轮（2026-10-01 现网实测）。
 	// 这两种还**整池同病**：换个网关再试只是把同一句话重复 N 遍，白烧 N 发请求。
 	// 直接认 503，下一个人来的时候配额/出口可能已经回来了。
-	if errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit) {
+	if nothingWentOut(err) {
 		return false
 	}
 	if gateway == "" {
@@ -577,9 +581,12 @@ func (s *Scheduler) FreeGateways() int {
 
 // PublicState 是「此刻对外开不开放」的全部读数。公开页要显示它，这是对外承诺。
 type PublicState struct {
-	Enabled   bool // 开关本身开没开
-	Open      bool // 此刻放不放匿名进来
-	Free      int
+	Enabled bool // 开关本身开没开
+	Open    bool // 此刻放不放匿名进来
+	// Accounts 是此刻可用的托管账号数，Threshold 是够格所需的个数。
+	// **刻意不是活 pair 数**：见 types.AccountsForContinuous——按需铸票的池子不囤票，
+	// 按货架存量判等于把对外开放永远焊在关闭上。
+	Accounts  int
 	Threshold int
 }
 
@@ -588,11 +595,37 @@ type PublicState struct {
 // 开关和门槛**现读配置**，不读 New() 时的快照：管理页上那个按钮写着「保存并立即生效」，
 // 而把门槛调紧是运营方最可能的紧急动作——匿名这条路唯一的让路机制就是它
 // （pair 本身不互斥，见 types.Pair）。读快照的话日志说改了、页面说生效了，实际没变。
+//
+// 账号数用 provenAccounts()**不是 len(usable())**：/upload 不验签，贴几份自制 JWT 就能
+// 让 usable() 过线、把 /cookie 对全互联网免 key 打开（审查 S3）。真能贡献落点的账号
+// 必须至少成功铸过一次票，那是伪造不出来的。代价：冷池或没人用过的池子里，这个数要等
+// 账号被真正用起来才涨——但那正合理，一个还没铸出任何落点的池子本来就服务不了匿名。
 func (s *Scheduler) Public() PublicState {
 	c := s.cfg().PublicWhenSurplus
-	st := PublicState{Enabled: c.Enabled, Free: s.FreeGateways(), Threshold: c.MinFreeGateways}
-	st.Open = st.Enabled && st.Free >= st.Threshold
+	st := PublicState{Enabled: c.Enabled, Accounts: s.provenAccounts(), Threshold: c.MinAccounts}
+	st.Open = st.Enabled && st.Accounts >= st.Threshold
 	return st
+}
+
+// provenAccounts 数「可用且至少成功铸过一次票」的托管账号。
+//
+// RegionMints 只记成功的铸票（见 types.RegionMint），所以有记录 = 真的打通过上游一次，
+// 伪造的 access_token 打 /responses 会吃 400、永远攒不出记录。停用的、没凭据的、以及
+// 只上传没铸过的都不算——它们此刻贡献不了可交付的落点。
+func (s *Scheduler) provenAccounts() int {
+	proven := map[int64]bool{}
+	for _, m := range s.st.RegionMints() {
+		if m.Count > 0 {
+			proven[m.AccountID] = true
+		}
+	}
+	n := 0
+	for _, a := range s.usable() {
+		if proven[a.ID] {
+			n++
+		}
+	}
+	return n
 }
 
 // ErrPublicClosed：此刻不对匿名开放（开关没开，或空闲数不够门槛）。
@@ -608,8 +641,8 @@ var ErrPublicClosed = errors.New("池子此刻不对外开放")
 //  1. **不做 state-echo**——判据要用他自己的凭据打一发，池子没有 ⇒ VerifiedFull=false。
 //     满血窗口也从他自己第一次用起算：池子一次都没替他碰过这个网关。
 //  2. **不现铸**——铸票要烧某个上传者的窗口，不为匿名花这个钱，只发现成的。
-//  3. **严格低优先级**——空闲数跌破门槛就拒，哪怕还剩一张。门槛是给上传者留的余量，
-//     也是匿名这条路唯一的让路机制（pair 本身不互斥，见 types.Pair 的注释）。
+//  3. **严格低优先级**——托管账号数跌破门槛就拒，哪怕货架上还剩一张票。门槛是给
+//     上传者留的余量，也是匿名这条路唯一的让路机制（pair 本身不互斥，见 types.Pair）。
 //
 // authed = 调用方**鉴权过了**，只是替别的上游账号取票（一把上传者 key 替他自己手上
 // 好几个号用）。那种调用方走这个函数只因为前两条（池子没有那个号的凭据，验不了也
@@ -619,7 +652,8 @@ var ErrPublicClosed = errors.New("池子此刻不对外开放")
 func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req Request, authed bool) (types.Delivery, error) {
 	if !authed {
 		if ps := s.Public(); !ps.Open {
-			return types.Delivery{}, fmt.Errorf("%w（空闲 %d，门槛 %d）", ErrPublicClosed, ps.Free, ps.Threshold)
+			return types.Delivery{}, fmt.Errorf("%w（托管账号 %d，门槛 %d）",
+				ErrPublicClosed, ps.Accounts, ps.Threshold)
 		}
 	}
 	a, err := s.anonAccount(upstreamID)
@@ -767,91 +801,161 @@ func (s *Scheduler) tryGateway(ctx context.Context, consumer types.Account, gw t
 	return s.finish(ctx, consumer, gw.Name, exit, pair, minted{}, floor)
 }
 
-// deliverByFreshMint 是「一张活 pair 都没有」时的回落：**抽一次签**。
+// deliverByFreshMint 是「一张活 pair 都没有」时的回落：**只铸一发**。
 //
-// 出口只能把落点「倾向」到某个网关，定不住。既然是抽签，「先试网关 X 再试网关 Y」
-// 就是抽两次签、花两发请求烧两个铸票者槽位，而两次的分布一模一样。所以只铸一发，
-// 然后看抽到的那个网关上消费者出不出冷却：出了就交付，没出就老实 503，
-// 让发现路径（httpapi 在 ErrNoFullSlot 上挂的那一发）去找新落点。
+// 分两条路，差别在「出口怎么来」：
 //
-// 这也是为什么 MaxTriesPerDeliver 只管「有票的网关一个个试」那条路：
-// 让它乘在抽签上纯属多花请求。
+//   - 调用方点名了网关 ⇒ 定向铸（mintToward）：出口只能从那个网关的已知可达出口里挑，
+//     落点漂了算失败。他点名是因为**他**知道自己没烧过那个落点，给他换一个等于没听他说话。
+//   - 没点名（常态）⇒ 按区域铸（mintByRegion）：先定派谁去，再从那个号没走过的区域出发。
 //
-// strict = 调用方点名了网关：那就定向铸、落点漂了算失败。他点名是因为**他**知道自己
-// 没烧过那个落点，给他换一个等于没听他说话。
+// 两条都只铸一发：出口定不住落点，「先试网关 X 再试网关 Y」是抽两次签、花两发请求烧两个
+// 铸票者槽位。铸完看落点上消费者出不出冷却，出了就交付，没出就老实 503，让发现路径
+// （httpapi 在 ErrNoFullSlot 上挂的那一发）去找新落点。这也是为什么 MaxTriesPerDeliver
+// 只管「有票的网关一个个试」那条路。
 //
-// 第二个返回值是这一发**实际落在**哪个网关上（失败时尽力给出意图落点），
-// 调用方拿它记退避和交付——善后规则在 Deliver 那边，只有一份。
+// 第二个返回值是这一发**实际落在**哪个网关上（落点还不知道时是空串，noteTryFailure 认它
+// = 没有槽位可记），调用方拿它记退避和交付——善后规则在 Deliver 那边，只有一份。
 func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Account,
 	cands []string, cooldown time.Duration, req Request) (types.Delivery, string, error) {
 	sl, ok := s.st.LongestRestedSlot(consumer.ID, cands)
 	if !ok {
 		return types.Delivery{}, "", fmt.Errorf("%w（候选网关全在退避期）", ErrNoFullSlot)
 	}
-	gws := s.st.Gateways()
-	exit, ok := pickExit(gws[sl.Gateway])
-	if !ok {
-		return types.Delivery{}, sl.Gateway,
-			fmt.Errorf("网关 %s 没有已知可达出口，没法铸票", sl.Gateway)
-	}
 	floor := req.Floor()
 
 	// 冷却状态要在**铸票之前**定格：铸票那一发自己会 touch 消费者的槽位
-	// （单账号模式下铸票者就是他本人），拿铸完之后的账本去判「他出冷却了吗」，
+	// （铸票者就是他本人时），拿铸完之后的账本去判「他出冷却了吗」，
 	// 答案恒为否——自己把自己判死。
 	coolingBefore := s.coolingSet(consumer.ID, cooldown)
 
-	release := s.lockGateway(sl.Gateway)
+	if req.Gateway != "" {
+		return s.mintToward(ctx, consumer, sl.Gateway, coolingBefore, cooldown, req, floor)
+	}
+	return s.mintByRegion(ctx, consumer, coolingBefore, cooldown, req, floor)
+}
+
+// mintToward 是定向铸：出口从目标网关的 ReachableExits 里挑，落点漂了算失败。
+func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gateway string,
+	coolingBefore map[string]bool, cooldown time.Duration, req Request,
+	floor time.Duration) (types.Delivery, string, error) {
+	exit, ok := pickExit(s.st.Gateways()[gateway])
+	if !ok {
+		return types.Delivery{}, gateway,
+			fmt.Errorf("网关 %s 没有已知可达出口，没法铸票", gateway)
+	}
+	release := s.lockGateway(gateway)
 	// 别人可能刚为这个网关铸好了票——那就直接用，省下这一发。
-	if p, fresh := s.freshPair(sl.Gateway, floor); fresh {
+	if p, fresh := s.freshPair(gateway, floor); fresh {
 		release()
 		// 闸 2 在这一支要**现读**，不能用 coolingBefore：等这把锁花掉的 20~90 秒里
 		// 并没有「消费者自己铸票」这回事（那一发是别人打的），所以现读不会自己把自己
 		// 判死；而池子模式下 minterFor 常常就挑中另一个消费者，于是等到的那张票恰好
 		// 是**他自己**刚铸的 ⇒ 他对这个网关的满血窗口已经烧了几十秒，再按 now() 起算
 		// 窗口会多报最多 57 秒（和 B-2 同类错，从另一条路进来）。
-		if s.coolingSet(consumer.ID, cooldown)[sl.Gateway] {
-			return types.Delivery{}, sl.Gateway, fmt.Errorf(
-				"等锁期间这个账号刚碰过 %s，窗口已经在烧", sl.Gateway)
+		if s.coolingSet(consumer.ID, cooldown)[gateway] {
+			return types.Delivery{}, gateway, fmt.Errorf(
+				"等锁期间这个账号刚碰过 %s，窗口已经在烧", gateway)
 		}
-		d, err := s.finish(ctx, consumer, sl.Gateway, exit, p, minted{}, floor)
-		return d, sl.Gateway, err
+		d, err := s.finish(ctx, consumer, gateway, exit, p, minted{}, floor)
+		return d, gateway, err
 	}
-	want := ""
-	if req.Gateway != "" {
-		// 调用方点名了网关：定向铸、落点漂了算失败。他点名是因为**他**知道自己
-		// 没烧过那个落点，给他换一个等于没听他说话。
-		want = sl.Gateway
+	minter := consumer
+	if s.opt.Mode == types.ModePool {
+		// 补 pair 那一发交给别人打：它会烧掉铸票者在这个网关上的窗口，
+		// 烧消费者自己的就等于白跑一趟。出口已经由网关定死，所以只要人、不要它挑的区域。
+		// 交付路径不节流：有人在等着拿 pair。
+		if sc, _, ok := s.minterFor(exit, consumer.ID, 0); ok {
+			minter = sc
+		}
 	}
-	got, err := s.mintPair(ctx, consumer, sl.Gateway, exit, s.pairFor(sl.Gateway, floor), want, sl.Gateway)
-	if err != nil {
-		release()
-		return types.Delivery{}, sl.Gateway, err
-	}
+	got, err := s.mintPair(ctx, minter, consumer, exit, s.pairFor(gateway, floor), gateway, gateway)
 	release()
+	if err != nil {
+		return types.Delivery{}, gateway, err
+	}
+	return s.afterMint(ctx, consumer, got, "网关 "+gateway, coolingBefore, cooldown, req, floor)
+}
+
+// mintByRegion 是按区域铸：**先定派谁去，再从那个号终身没走过的区域出发**，落哪算哪。
+//
+// 为什么不像定向铸那样先挑一个网关再倒推出口：落点由出口所在国家决定，而「这个号没走过
+// 的区域」就约等于「它没烧过的网关」——那正是现铸要找的东西。倒推出口只会在这个号已经
+// 走熟的那几个区域里反复抽签（出口取自网关的 ReachableExits，而那张表本身就是走过的区域
+// 堆出来的），落点自然反复撞已经烧掉的网关，再被调用方的排除名单一一挡回来。
+// 2026-10-02 现网：连撞 8 次，13 发铸票只走了 3 个区域，而手上 19 个网关的出口横跨 8 个国家。
+//
+// 顺序也只能是先人后区域：区域要从**铸票者自己**的台账上挑，而定向铸那条路出口先定死，
+// 于是 minterFor 收到非零 want、candidateRegions 只剩那一格，台账彻底没机会参与决定。
+//
+// 不取网关铸票锁：那把锁拦的是「几路交付同时为**同一个网关**铸票」，而这条路一开始就不
+// 知道会落到哪，没有网关名可锁。退化成按区域单飞（claimRegion，占不住就走不排队），
+// 单账号并发 1 仍由 mintPair 里的 LockAccount 保证（SPEC 红线 2）。
+// 也不带 pair 进去（裸铸）：带一张活票会让上游接受它、把落点钉回那张票的网关，
+// 正好抵消掉按区域铸的全部意义。
+func (s *Scheduler) mintByRegion(ctx context.Context, consumer types.Account,
+	coolingBefore map[string]bool, cooldown time.Duration, req Request,
+	floor time.Duration) (types.Delivery, string, error) {
+	minter, region, ok := s.mintPlan(consumer)
+	if !ok {
+		// 空串而不是某个网关名：这一发根本没打出去，记在谁头上都是冤枉。
+		return types.Delivery{}, "",
+			fmt.Errorf("%w：能派的账号九个区域本小时都打满了", ErrMintFailed)
+	}
+	// 这个区域已经有一发在打 ⇒ 不排队、直接认「暂时没票」。两发裸铸烧的是**两个**
+	// 铸票者槽位去发现可能同一个落点，而槽位是池子最紧的资源。用 ErrNoLivePair 回：
+	// Deliver 把它归成「等得起」那一格，调用方重试那一次前一路的票大概率已经在池里了。
+	done, ok := s.claimRegion(region.Key)
+	if !ok {
+		return types.Delivery{}, "",
+			fmt.Errorf("%w（区域 %s 已经有一发裸铸在打，等它的结果）", ErrNoLivePair, region.Key)
+	}
+	defer done()
+
+	got, err := s.mintPair(ctx, minter, consumer, region.Exit, types.Pair{}, "", "")
+	if err != nil {
+		// 落点未知 ⇒ 没有单个网关可记，而 noteTryFailure 遇空名什么都不记 ⇒ 失败的裸铸
+		// 零代价，下一个人立刻从同一个出口再踩一遍。按出口所在国家**已知能到的全部网关**
+		// 各记一次，和 mintOnce 读不出落点时记触碰用的是同一把尺子（多记只是多歇会儿，
+		// 漏记会把烧过的当新鲜的发出去）。noteTryFailure 自己管调用方中断、速率闸、
+		// 出口全没了这几种豁免，所以这里不重复判。
+		for _, g := range s.gatewaysFrom(region.Exit) {
+			s.noteTryFailure(ctx, consumer, g, err)
+		}
+		return types.Delivery{}, "", err
+	}
+	return s.afterMint(ctx, consumer, got, "区域 "+region.Key, coolingBefore, cooldown, req, floor)
+}
+
+// afterMint 是两条现铸路共用的尾段：落点出来之后的三道闸，然后交付。
+//
+// aim 只进日志，用来事后分辨这一发是定向铸还是按区域铸。
+func (s *Scheduler) afterMint(ctx context.Context, consumer types.Account, got pairMint,
+	aim string, coolingBefore map[string]bool, cooldown time.Duration, req Request,
+	floor time.Duration) (types.Delivery, string, error) {
 	landed := got.pair.Gateway
 	if landed == "" {
-		return types.Delivery{}, sl.Gateway, errors.New("现铸没读出落点")
+		return types.Delivery{}, "", errors.New("现铸没读出落点")
 	}
-	// **漂移之后要再过一遍调用方的排除名单。** 候选集筛过了，但 want 为空时（没点名
-	// 网关，常态）铸票刻意不判漂移 ⇒ 这一发可以落到调用方**明确排除**的网关上。
-	// 而 exclude 编码的是「我自己烧过这个」——池子账本上没有记录，两条冷却闸都看不见。
-	// 换票（force + exclude_versions 把有票的网关全排掉）正好最常落到这一格，
-	// 于是客户端拿回一张自己刚烧过的落点，而验证默认关着 ⇒ 无从察觉。
+	// **落点出来之后要再过一遍调用方的排除名单。** 候选集筛过了，但按区域铸和不判漂移的
+	// 定向铸都可能落到调用方**明确排除**的网关上。而 exclude 编码的是「我自己烧过这个」
+	// ——池子账本上没有记录，两条冷却闸都看不见。换票（force + exclude_versions 把有票的
+	// 网关全排掉）正好最常落到这一格，于是客户端拿回一张自己刚烧过的落点，
+	// 而验证默认关着 ⇒ 无从察觉。
 	//
 	// 判据用 got.pair.Cookie 而不是回头读账本：res.NewPair 为空（上游接受了送进去那张、
 	// 不换 cookie）时两者会分叉。pair 照旧留在池里——白来的供给别扔，只是不发给他。
 	if req.Skips(landed, got.pair.Cookie) {
 		return types.Delivery{}, landed,
-			fmt.Errorf("%w（现铸漂到 %s，而调用方排除了它）", ErrNoLivePair, landed)
+			fmt.Errorf("%w（现铸落到 %s，而调用方排除了它）", ErrNoLivePair, landed)
 	}
 	// 闸 1（真的交付过票）要在铸完之后**重查一次**：铸票那几十秒里同一个账号的另一路
 	// 交付可能刚在 landed 上取走过一张票，而那件事快照看不见 ⇒ 这里会 fail-open，
 	// 把一个刚烧掉的槽位当首次接触发出去。
 	//
 	// 闸 2（LastTouch 在一个满血窗口内）用哪一份账本，取决于**这一发是不是他自己打的**：
-	// 是他自己（单账号模式）就必须用快照，否则等于拿自己刚写的 touch 把自己判死；
-	// 不是他自己（池子模式，别人代铸）那 20~90 秒里他一发都没打，现读才对——
+	// 是他自己就必须用快照，否则等于拿自己刚写的 touch 把自己判死；
+	// 不是他自己（别人代铸）那 20~90 秒里他一发都没打，现读才对——
 	// 并发的发现扫描（scan 直接写 LastTouch，而且裸铸不受网关锁约束）或者
 	// 「他正好被挑去给别人铸票」都会在这段时间里烧掉 (他 × landed)，而快照看不见。
 	burned := coolingBefore[landed]
@@ -860,23 +964,21 @@ func (s *Scheduler) deliverByFreshMint(ctx context.Context, consumer types.Accou
 	}
 	if burned || s.coolingByDeliver(consumer.ID, landed, cooldown) {
 		return types.Delivery{}, landed,
-			fmt.Errorf("现铸抽到 %s，而这个账号在它上面还在 %v 的冷却里", landed, cooldown)
+			fmt.Errorf("现铸落到 %s，而这个账号在它上面还在 %v 的冷却里", landed, cooldown)
 	}
 	var m minted
 	if got.mintedBySelf {
 		m = got.minted
 	}
-	// 漂了就按**落到的那个**网关重取出口：手上这个 exit 是「想去 A」的那个，
-	// 拿它去验 B 大概率再漂一次、把一张好票判成失败。UpsertGateway 已经把这一发
-	// 请求过的出口补进 landed 的 ReachableExits 了（就在 mintOnce 里），所以查得到。
-	// 锁那条不动：锁罩的是「为这个网关铸一张 pair」，已经出了临界区。
-	if landed != sl.Gateway {
-		if e, ok := pickExit(s.st.Gateways()[landed]); ok {
-			exit = e
-		}
+	// 出口按**落到的那个**网关重取：手上那个是「想去 A / 从区域 R 出发」的，拿它去验 B
+	// 大概率再漂一次、把一张好票判成失败。UpsertGateway 已经把这一发请求过的出口补进
+	// landed 的 ReachableExits 了（就在 mintOnce 里），所以这里必然查得到。
+	exit, ok := pickExit(s.st.Gateways()[landed])
+	if !ok {
+		return types.Delivery{}, landed, fmt.Errorf("网关 %s 没有已知可达出口", landed)
 	}
 	s.opt.Log.Info("一张活票都没有，现铸一发", "account", consumer.ID, "label", consumer.Label,
-		"asked", sl.Gateway, "landed", landed, "strict", want != "")
+		"aim", aim, "landed", landed, "by_self", got.mintedBySelf)
 	d, err := s.finish(ctx, consumer, landed, exit, got.pair, m, floor)
 	return d, landed, err
 }
@@ -1034,22 +1136,17 @@ type pairMint struct {
 	mintedBySelf bool
 }
 
-// mintPair 为这个网关补一张 pair。调用方必须已持该网关的铸票锁。
+// mintPair 用指定的铸票者打一发。定向铸时调用方必须已持该网关的铸票锁。
 //
-// want 是期望落点，留空表示「落到哪算哪」（回落抽签那条路）。
-// bias 是这一发**想**去哪：只用来在读不出落点时保守地记一次触碰。
-func (s *Scheduler) mintPair(ctx context.Context, consumer types.Account, gateway string,
+// **人由调用方定**：定向铸要「能到那个网关的出口」，先定出口再挑人；按区域铸要
+// 「这个号没走过的区域」，先挑人再定出口。两者顺序相反，在这里自己挑人就只能服务
+// 前者——那正是按区域铸挑不出新落点的老毛病（见 mintByRegion）。
+//
+// want 是期望落点，留空表示「落到哪算哪」。
+// bias 是这一发**想**去哪：只用来在读不出落点时保守地记一次触碰。按区域铸没有「想去哪」
+// ⇒ 传空串，由 mintOnce 按出口所在国家把能到的网关各记一次。
+func (s *Scheduler) mintPair(ctx context.Context, minter, consumer types.Account,
 	exit types.Exit, cur types.Pair, want, bias string) (pairMint, error) {
-	minter := consumer
-	if s.opt.Mode == types.ModePool {
-		// 补 pair 那一发交给别人打：它会烧掉铸票者在这个网关上的窗口，
-		// 烧消费者自己的就等于白跑一趟（这正是单账号模式不保温的原因）。
-		// 出口已经由网关定死，所以只要人、不要它挑的区域。
-		// 交付路径不节流：有人在等着拿 pair。
-		if sc, _, ok := s.minterFor(exit, consumer.ID, 0); ok {
-			minter = sc
-		}
-	}
 	sid, err := s.mint.NewSID(true)
 	if err != nil {
 		return pairMint{}, fmt.Errorf("要不到粘性出口: %w", err)
@@ -1061,6 +1158,33 @@ func (s *Scheduler) mintPair(ctx context.Context, consumer types.Account, gatewa
 		return pairMint{}, err
 	}
 	return pairMint{minted: got, mintedBySelf: minter.ID == consumer.ID}, nil
+}
+
+// claimRegion 占住「这个区域此刻有一发裸铸在打」，占不住返回 false。
+//
+// **刻意是占不住就走，不是排队等。** 裸铸出手前不知道会落到哪个网关，所以 SPEC B 条
+// 「同一个网关一次只许有一发在铸」在这条路上只能退化成按区域拦。但不能拿真锁去拦：
+// 两路交付各自的铸票者不同，排队等于让后一路在走到**账号锁**之前就停住，而前一路
+// 正等着账号锁 —— TestNoDeadlockBetweenAccounts 那个屏障要的就是两路都能走到账号锁，
+// 任何一把挡在前面的共享锁都会让它真死锁（2026-10-02 实测，全局锁版本 3 秒超时）。
+//
+// 占不住的那一路直接认「暂时没票」回去。调用方本来就会重试，而重试那一次
+// 前一路的票大概率已经在池子里了 —— 一发上游都不用打。
+func (s *Scheduler) claimRegion(key string) (func(), bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mintingRegions == nil {
+		s.mintingRegions = map[string]bool{}
+	}
+	if s.mintingRegions[key] {
+		return nil, false
+	}
+	s.mintingRegions[key] = true
+	return func() {
+		s.mu.Lock()
+		delete(s.mintingRegions, key)
+		s.mu.Unlock()
+	}, true
 }
 
 // lockGateway 取这个网关的铸票锁，返回解锁函数。
@@ -1123,6 +1247,17 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	}
 	if landed != "" {
 		s.touch(landed, a.ID, at)
+	} else if !nothingWentOut(err) {
+		// 读不出落点、而且这一发本来就没有「想去哪」（按区域铸）：按这个出口所在国家
+		// **已知能到的全部网关**各记一次触碰。那一发可能已经出站、烧掉了其中某一个，
+		// 而我们分不清是哪个。多记只是让那几个槽位多歇会儿，漏记会把烧过的当新鲜的发出去。
+		//
+		// 但「保守」只对**真分不清**的失败成立（超时、连接断）。要不到出口、撞上速率闸
+		// 这两种是一发都没出站，照样铺开记就等于一次池子自己的故障把这个出口能到的网关
+		// 全锁 4 小时 —— 而旧实现只按 bias 记一个，所以这是铺开记引入的新伤。
+		for _, g := range s.gatewaysFrom(e) {
+			s.touch(g, a.ID, at)
+		}
 	}
 
 	if err != nil {
@@ -1223,6 +1358,35 @@ func (s *Scheduler) usable() []types.Account {
 // 自己去就等于白跑一趟——它找到的每个新网关都被那一发当场烧掉。
 func (s *Scheduler) PickMinter(exclude int64) (types.Account, types.Region, bool) {
 	return s.minterFor(types.Exit{}, exclude, 0)
+}
+
+// mintPlan 给按区域铸定「派谁去、从哪个区域出发」（见 mintByRegion）。
+//
+// 先找别人：烧别人的窗口，要票的人拿到票时对那个落点仍是首次接触。找不到别人就自己上
+// ——单账号池里这是唯一能走的路，而且就算自己铸，挑一个**没走过的区域**也比在走熟的
+// 那几个区域里反复抽签强：前者有机会落到没烧过的网关，后者几乎必然落回烧过的。
+func (s *Scheduler) mintPlan(consumer types.Account) (types.Account, types.Region, bool) {
+	if s.opt.Mode == types.ModePool {
+		if a, r, ok := s.minterFor(types.Exit{}, consumer.ID, 0); ok {
+			return a, r, true
+		}
+	}
+	r, ok := s.regionFor(consumer)
+	return consumer, r, ok
+}
+
+// regionFor 给指定账号挑它最该去的区域：九个区域里本小时还有配额、且**终身铸得最少**的
+// 那个。和 minterFor 里的那次 bestRegion 同一把尺子，差别只是这里人已经定了。
+func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
+	perRegion, limit := s.mint.Rate(a.Creds.AccountID)
+	lifetime := map[string]int{}
+	for _, m := range s.st.RegionMints() {
+		if m.AccountID == a.ID {
+			lifetime[m.RegionKey] = m.Count
+		}
+	}
+	r, _, ok := bestRegion(types.Exit{}, perRegion, limit, lifetime)
+	return r, ok
 }
 
 // minterFor 挑「谁去铸这一发、经哪个区域」。
@@ -1660,6 +1824,33 @@ func (s *Scheduler) markDemand() {
 }
 
 // ---------- 小工具 ----------
+
+// gatewaysFrom 列出已知能从这个出口所在**国家**到达的网关。
+//
+// 按国家而不是按区域 key 匹配：us-east / us-west 的国家都是 US，分不开时宁可两个都算上
+// ——这个函数只给「读不出落点、保守记触碰」那条路用，多记让槽位多歇会儿，
+// 漏记会把烧过的当新鲜的发出去。
+func (s *Scheduler) gatewaysFrom(e types.Exit) []string {
+	var out []string
+	for name, g := range s.st.Gateways() {
+		for _, re := range g.ReachableExits {
+			if re.Region == e.Region {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// nothingWentOut 判这个失败是不是「一发都没出站」⇒ 既没烧掉任何槽位，也不是槽位的错。
+//
+// 速率闸是池子自己拦下来的，出口要不到是供应商的事，两样都和某个 (账号 × 网关) 无关，
+// 而且**整池同病**：换个网关再试只是把同一句话重复 N 遍。记退避或记触碰都等于拿池子
+// 自己的故障惩罚供给，故障恢复后还要再瞎等一轮（2026-10-01 现网实测）。
+func nothingWentOut(err error) bool {
+	return errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit)
+}
 
 // pickExit 随机取一条已知可达出口。随机而非固定第一条：城市库存不足时上游会
 // 回退到别的国家（实测 city-Dallas 给过尼日利亚 IP），死磕一条出口会卡死在那次回退上。

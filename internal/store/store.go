@@ -38,6 +38,11 @@ const (
 	// maxAccounts 封住托管账号数。每加一个账号都要全量重写 state.json，
 	// 不设上限的话「谁都能上传」这条路会把写放大推成 O(n²)。
 	maxAccounts = 500
+	// ownerPruneGrace 是空 owner 的宽限期：比这还新的空 owner 不删。
+	// 覆盖「AddOwner 已落盘、AddAccount 还没走到」那个窗口（两次写同一个文件，
+	// 毫秒级），一分钟是几个数量级的余量。见 PruneEmptyOwners。
+	ownerPruneGrace = time.Minute
+
 	// maxAnonAccounts 单独封匿名占位行（无凭据，sched.anonAccount 建的）。
 	// 两个数分开算，不是洁癖：占位行是匿名调用方随口报个 ID 就能长出来的，
 	// 和托管账号混在一个上限里，灌满之后**所有上传**永久失败，而服务内没有
@@ -47,7 +52,10 @@ const (
 
 // State 是 state.json 的全量内容。
 type State struct {
-	Accounts []types.Account          `json:"accounts"`
+	Accounts []types.Account `json:"accounts"`
+	// Owners 是上传者。老文件里没这个键 ⇒ nil ⇒ Open 的一次性迁移给已有的托管行
+	// 补一个（见 migrateOwners）。
+	Owners   []types.Owner            `json:"owners"`
 	Gateways map[string]types.Gateway `json:"gateways"` // key = "unified-142"
 	Slots    map[string]types.Slot    `json:"slots"`    // key = SlotKey()
 	Pairs    map[string]types.Pair    `json:"pairs"`    // key = gateway
@@ -56,6 +64,26 @@ type State struct {
 	// 全部线索。记在内存里的话每次重启所有号的九个格子一起归零，于是重启后的
 	// 头几发又全打在已经走烂了的区域上。
 	Mints map[string]types.RegionMint `json:"mints"`
+	// NextAccountID / NextOwnerID 是**永不回收**的 ID 计数器，见 bumpID。
+	// 老文件里没这两个键 ⇒ 0 ⇒ 第一次发号时按现有最大值兜底一次，不用迁移。
+	NextAccountID int64 `json:"next_account_id"`
+	NextOwnerID   int64 `json:"next_owner_id"`
+}
+
+// bumpID 发一个**永不回收**的 ID：计数器只增不减，max 只在老文件还没有计数器时兜底一次。
+//
+// 老写法是「现有最大 +1」，删掉末尾那个号之后下一个新号会**接上同一个 ID**，于是所有
+// 按 ID 挂的历史记录都被错挂到新主人头上。DeleteAccount 已经为此跟着删了槽位和区域台账，
+// 但网关表的 FirstSeenBy 没人删——2026-10-02 清空重传之后，四个新号的「发现网关」直接
+// 显示成老号的 8/8/5，21 个网关一个不差全被认领了。治本只能是不回收。
+//
+// 落盘失败时计数器不回退：ID 跳号无所谓，重号要命。
+func bumpID(counter *int64, max int64) int64 {
+	if *counter < max {
+		*counter = max
+	}
+	*counter++
+	return *counter
 }
 
 // Store 是并发安全的状态句柄。
@@ -135,6 +163,15 @@ func Open(dir string) (*Store, error) {
 			}
 			s.st.Pairs[gw] = p
 		}
+	}
+
+	if err := s.migrateOwners(); err != nil {
+		return nil, err
+	}
+	// 清掉历史遗留的孤儿 owner（上一次运行里 AddAccount 失败或并发竞争留下的）。
+	// store 层不打日志（它只把错误往上抛），清理数量无人关心就不返了。
+	if _, err := s.PruneEmptyOwners(); err != nil {
+		return nil, err
 	}
 
 	samplesPath := filepath.Join(dir, samplesFile)
@@ -250,6 +287,168 @@ func (s *Store) pruneDaily(prefix string) {
 	}
 }
 
+// ---------- 上传者 ----------
+
+// migrateOwners 把加 types.Account.OwnerID 之前写下的托管账号挂到一个自动建出来的
+// owner 下。不做这一步的话现有那几个账号的 /u/ 总览页谁都进不去。
+//
+// **幂等靠触发条件和效果互斥**：触发条件是「存在没有归属的托管行」，而这一趟会把
+// 所有这种行一次清完**并落盘** ⇒ 下一次 Open 找不到孤儿，一个 owner 都不会再建。
+// 刻意不靠「找找有没有那个迁移出来的 owner」——那要拿 Label 当标识，而 Label 是
+// 随时可改的自由文本。
+//
+// 必须落盘（不能只改内存）：token 是随机的，不落盘就等于每次重启换一个，
+// 管理页上给出去的那个链接立刻失效。
+//
+// 匿名占位行（没有 access_token）**不挂**：它不是谁托管的，挂上去只会让那个人的
+// 总览页上多出几行他从没上传过的东西。
+func (s *Store) migrateOwners() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	orphans := 0
+	for _, a := range s.st.Accounts {
+		if a.OwnerID == 0 && a.Creds.AccessToken != "" {
+			orphans++
+		}
+	}
+	if orphans == 0 {
+		return nil
+	}
+	o, err := s.newOwner("迁移：加 owner 之前就在的账号")
+	if err != nil {
+		return err
+	}
+	prev := append([]types.Account(nil), s.st.Accounts...)
+	for i := range s.st.Accounts {
+		if s.st.Accounts[i].OwnerID == 0 && s.st.Accounts[i].Creds.AccessToken != "" {
+			s.st.Accounts[i].OwnerID = o.ID
+		}
+	}
+	s.st.Owners = append(s.st.Owners, o)
+	if err := s.save(); err != nil {
+		s.st.Accounts = prev
+		s.st.Owners = s.st.Owners[:len(s.st.Owners)-1]
+		return fmt.Errorf("给已有账号补 owner: %w", err)
+	}
+	return nil
+}
+
+// PruneEmptyOwners 丢掉名下零账号的 owner。改了就落盘，返回删了几个。
+//
+// 为什么需要它：handleUpload 先 AddOwner（已落盘）再 AddAccount，而 AddAccount 会在
+// 撞上限（池子满 maxAccounts）或并发命中同一份新凭据时失败/不插入 —— 两种情况都留下
+// 一个谁都不属于的 owner。不清的话，拿着站点码反复贴新 account_id 就能让 owner 表
+// 无上限增长，每建一个还要全量重写 state.json。
+//
+// 所以 newOwner 上方那句「至多和托管账号一样多、已被 maxAccounts 封住」其实不成立
+// （上限检查在去重分支之后），这个方法是那句话的兜底。
+//
+// 清理是**滞后**的，不是即时的：刚建出来的空 owner 落在 ownerPruneGrace 宽限期里，
+// 连建它那一发自己的失败路径也删不掉它（见下方 cut 处的注释——即时删会踩并发上传）。
+// 它由下一次 prune 收走：之后任何一发上传失败，或者重启时 Open 这一遍。
+func (s *Store) PruneEmptyOwners() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	used := make(map[int64]bool, len(s.st.Accounts))
+	for _, a := range s.st.Accounts {
+		if a.OwnerID != 0 {
+			used[a.OwnerID] = true
+		}
+	}
+	// 刚建出来的空 owner 要留一段宽限期，**不能见空就删**。
+	//
+	// handleUpload 是「先 AddOwner 落盘、再 AddAccount」两步，中间那一瞬 owner 名下真的
+	// 是零账号。两个并发上传时，B 的失败路径会调到这里，而它锁住整个 store 之后看到的
+	// 「空 owner」里**包括 A 刚建出来、账号还没挂上去的那个** ⇒ A 的 owner 被删，随后
+	// A 的 AddAccount 照常成功，OwnerID 指向一个已经不存在的行。AddAccount 不校验
+	// OwnerID 是否存在，于是悬垂引用静默入库：那个账号的 /u/ 链接永远打不开，
+	// 而 migrateOwners 只收养 OwnerID==0 的行、修不了它 ⇒ 重启也不自愈，只能手工改库。
+	cut := time.Now().Add(-ownerPruneGrace)
+	kept := s.st.Owners[:0:0]
+	for _, o := range s.st.Owners {
+		if used[o.ID] || o.CreatedAt.After(cut) {
+			kept = append(kept, o)
+		}
+	}
+	if len(kept) == len(s.st.Owners) {
+		return 0, nil
+	}
+	removed := len(s.st.Owners) - len(kept)
+	prev := s.st.Owners
+	s.st.Owners = kept
+	if err := s.save(); err != nil {
+		s.st.Owners = prev
+		return 0, err
+	}
+	return removed, nil
+}
+
+// newOwner 造一个 owner（**不**追加进状态，也不落盘）。调用方必须已持写锁。
+//
+// 分两步是为了让「追加 + 落盘失败就回退」留在调用方那一个事务里：
+// 这个函数自己落盘的话，账号加失败时会在账本上留一个谁都不属于的 owner。
+//
+// 不在这里封 owner 数：孤儿 owner 由 pruneEmptyOwners 收口，不靠「造的时候不让造」。
+func (s *Store) newOwner(label string) (types.Owner, error) {
+	tok, err := newToken()
+	if err != nil {
+		return types.Owner{}, err
+	}
+	max := int64(0)
+	for _, x := range s.st.Owners {
+		if x.ID > max {
+			max = x.ID
+		}
+	}
+	id := bumpID(&s.st.NextOwnerID, max)
+	return types.Owner{ID: id, Token: tok, Label: label, CreatedAt: time.Now().UTC()}, nil
+}
+
+// Owners 返回 owner 副本。只有管理页读它（要把 token 显示出来，否则迁移出来的那个
+// owner 名下的账号没人进得去）。
+func (s *Store) Owners() []types.Owner {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]types.Owner(nil), s.st.Owners...)
+}
+
+// OwnerByToken 是 /u/{token} 的全部鉴权。
+//
+// 空串一律不认，理由和 AccountByViewToken 一样：历史上没分配过令牌的行会被空串
+// 整条匹配出来，等于把别人的总览页开给任何人。
+func (s *Store) OwnerByToken(tok string) (types.Owner, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if tok == "" {
+		return types.Owner{}, false
+	}
+	for _, o := range s.st.Owners {
+		if o.Token == tok {
+			return o, true
+		}
+	}
+	return types.Owner{}, false
+}
+
+// AccountsByOwner 列一个 owner 名下的账号。
+//
+// **ownerID 为 0 时回 nil**，不是「所有没归属的行」：0 是匿名占位行的常态值，
+// 照它匹配会把一堆匿名调用方的行摊到某个人的总览页上。
+func (s *Store) AccountsByOwner(ownerID int64) []types.Account {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if ownerID == 0 {
+		return nil
+	}
+	var out []types.Account
+	for _, a := range s.st.Accounts {
+		if a.OwnerID == ownerID {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // ---------- 账号 ----------
 
 // Accounts 返回账号副本。
@@ -304,6 +503,22 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 			if x.Creds.AccountID != up {
 				continue
 			}
+			// **已经属于别人的行：原样返回，一个字段都不碰。**
+			//
+			// 去重只认 Creds.AccountID，而 oauth.Parse 不验签（它自己的注释写着）：
+			// 知道别人上游 account_id 的人能自制一张票打上来命中这一行。下面那段
+			// 「重新上传就是我来修它」只对这一行的主人成立——对别人也执行的话，攻击者
+			// 的伪造票会覆盖受害者存着的 access_token、改掉他的 Label、解开他自己关掉的
+			// 停用，把别人托管的凭据静默弄废。归属（OwnerID）之外，这些字段同样只有
+			// 主人能改。被拒绝不是错误，上传在 handler 那头照常返回成功、但不交出任何
+			// 钥匙（见 httpapi.handleUpload 的 mine 判定）。
+			//
+			// a.OwnerID==0 的来路：handleUpload 发现这份凭据已属于别人时就不建新 owner，
+			// 所以传进来的 OwnerID 是 0，而 x.OwnerID 非 0 ⇒ 落进这个分支。
+			mine := x.OwnerID == 0 || x.OwnerID == a.OwnerID
+			if !mine {
+				return x, nil
+			}
 			prev := x
 			x.Creds.AccessToken = a.Creds.AccessToken
 			// 上游没轮换 refresh_token 时 oauth.Refresh 回空串，别把好的那个覆盖成空。
@@ -319,6 +534,11 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 			// 重新上传就是「我来修它」：解开停用、清掉原因。
 			x.Enabled = true
 			x.DisabledReason = ""
+			// 归属只补不改：没有 owner 的（老文件、或占位行刚升级成托管行）挂到上传者
+			// 名下；属于别人的在上面已经 return 掉了，到这儿只剩「无主」或「本来就是我的」。
+			if x.OwnerID == 0 {
+				x.OwnerID = a.OwnerID
+			}
 			s.st.Accounts[i] = x
 			if err := s.save(); err != nil {
 				s.st.Accounts[i] = prev
@@ -343,13 +563,13 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 		return types.Account{}, fmt.Errorf("%s数已达上限 %d", kind, limit)
 	}
 	if a.ID == 0 {
-		next := int64(1)
+		max := int64(0)
 		for _, x := range s.st.Accounts {
-			if x.ID >= next {
-				next = x.ID + 1
+			if x.ID > max {
+				max = x.ID
 			}
 		}
-		a.ID = next
+		a.ID = bumpID(&s.st.NextAccountID, max)
 	}
 	if a.CreatedAt.IsZero() {
 		a.CreatedAt = time.Now().UTC()
@@ -357,18 +577,41 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 	// 兜底生成：没有令牌的账号行会让 AccountByViewToken("") 整条匹配出来，
 	// 等于把上传者视图开给任何人。生成放在这里，调用方传了就用调用方的。
 	if a.ViewToken == "" {
-		tok, err := newViewToken()
+		tok, err := newToken()
 		if err != nil {
 			return types.Account{}, err
 		}
 		a.ViewToken = tok
 	}
+	// OwnerID 原样落（调用方负责先建好 owner，见 httpapi.handleUpload）。
+	// **刻意不在这儿兜底铸一个**：那样调用方就分不清回来的 a.OwnerID 是「刚为我铸的」
+	// 还是「去重命中了一个已经属于别人的账号」，而那两件事的处置完全相反
+	// （后者的令牌一个字都不许查——那一页上有对方每个账号的 consumer key）。
 	s.st.Accounts = append(s.st.Accounts, a)
 	if err := s.save(); err != nil {
 		s.st.Accounts = s.st.Accounts[:len(s.st.Accounts)-1] // 没落盘就别留在内存里
 		return types.Account{}, err
 	}
 	return a, nil
+}
+
+// AddOwner 建一个上传者。
+//
+// 这是 owner 唯一的入口（迁移那条路除外）：谁建的谁手上就有令牌，不存在「回头去问
+// 存储层刚才铸的是哪个」这回事——那个问题答错一次就是把别人的身份交出去。
+func (s *Store) AddOwner(label string) (types.Owner, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, err := s.newOwner(label)
+	if err != nil {
+		return types.Owner{}, err
+	}
+	s.st.Owners = append(s.st.Owners, o)
+	if err := s.save(); err != nil {
+		s.st.Owners = s.st.Owners[:len(s.st.Owners)-1] // 没落盘就别留在内存里
+		return types.Owner{}, err
+	}
+	return o, nil
 }
 
 // SetAccountEnabled 只翻 Enabled 这一个字段。
@@ -441,6 +684,12 @@ func (s *Store) DisableAccount(id int64, reason string) error {
 //
 // 顺手清掉 DisabledReason 并启用：能换出新票就说明凭据还活着，之前那次 401
 // 说的是上一张票的事。
+//
+// **只对自动停用的行这么做**（DisabledReason 非空）。手动停用（SetAccountEnabled，
+// 它刻意把 reason 留空）说的是「我先不参与」，和票的新旧毫无关系：上传者在自己页面上
+// 点了「停用账号」，页面承诺「不再用它发请求，接入 key 失效」，而续票循环遍历的是全部
+// 账号——照原来那样无条件启用，他的号最长九天（access_token 到期前 24h）后就会被池子
+// 静默打开、重新拿去铸票，key 也重新能用，而页面上看不出发生过任何事。
 func (s *Store) SetTokens(id int64, access, refresh string) error {
 	if access == "" {
 		return errors.New("access_token 不能写成空的")
@@ -456,8 +705,10 @@ func (s *Store) SetTokens(id int64, access, refresh string) error {
 		if refresh != "" {
 			s.st.Accounts[i].Creds.RefreshToken = refresh
 		}
-		s.st.Accounts[i].Enabled = true
-		s.st.Accounts[i].DisabledReason = ""
+		if s.st.Accounts[i].DisabledReason != "" {
+			s.st.Accounts[i].Enabled = true
+			s.st.Accounts[i].DisabledReason = ""
+		}
 		if err := s.save(); err != nil {
 			s.st.Accounts[i] = old
 			return err
@@ -842,8 +1093,11 @@ func (s *Store) Samples() ([]types.Sample, error) {
 	return out, sc.Err()
 }
 
-// newViewToken 生成上传者视图令牌。128 bit，URL 安全。
-func newViewToken() (string, error) {
+// newToken 生成一个进 URL 的随机令牌。128 bit，URL 安全。
+//
+// view_token 和 owner token 共用这一份：两者的威胁模型一模一样（进 URL、谁拿到
+// 谁就是他），强度也就该一模一样。另写一个只会让两边哪天不一致。
+func newToken() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err

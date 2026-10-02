@@ -6,7 +6,6 @@ package sched
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,10 +23,8 @@ func noVerifyRig(t *testing.T) (*Scheduler, *fakeStore, *fakeMinter, *clock) {
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
-	for _, gw := range []string{"unified-1", "unified-2", "unified-3"} {
-		region := strings.ToUpper(strings.TrimPrefix(gw, "unified-"))
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+	for i, gw := range []string{"unified-1", "unified-2", "unified-3"} {
+		seedGateway(st, mn, gw, i, 1)
 		mn.full[gw] = true
 	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
@@ -572,10 +569,8 @@ func warmRig(t *testing.T, gateways ...string) (*Scheduler, *fakeStore, *fakeMin
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
-	for _, gw := range gateways {
-		region := strings.ToUpper(strings.TrimPrefix(gw, "unified-"))
-		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: region}}}
-		mn.land[region] = gw
+	for i, gw := range gateways {
+		seedGateway(st, mn, gw, i, 1)
 		mn.full[gw] = true
 		exp := clk.now().Add(100 * time.Second)
 		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
@@ -674,20 +669,32 @@ func TestDisabledAccountDoesNotReopenPremintGate(t *testing.T) {
 func TestPublicReadsLiveConfig(t *testing.T) {
 	s, st, _, clk := noVerifyRig(t)
 	seedPairs(st, clk)
+	// 门槛数的是**铸过票**的账号（provenAccounts，见 types.AccountsForContinuous），
+	// 不是货架上的活 pair 数，也不是光上传没铸过的号。给每个号记一发成功铸票让它算数。
+	for _, a := range st.Accounts() {
+		if err := st.NoteRegionMint(a.ID, "us-east", clk.now()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if ps := s.Public(); ps.Enabled || ps.Open {
 		t.Fatalf("默认该是关的: %+v", ps)
 	}
+	// 基准取「铸过票的号」，别写死——写死的话 rig 加一个号这条就假绿。
+	have := s.provenAccounts()
+	if have == 0 {
+		t.Fatal("rig 里一个铸过票的账号都没有，这条测不出门槛")
+	}
 	c := s.opt.Live.Get()
 	c.PublicWhenSurplus.Enabled = true
-	c.PublicWhenSurplus.MinFreeGateways = 3
+	c.PublicWhenSurplus.MinAccounts = have
 	s.opt.Live = config.NewLive("", c)
-	if ps := s.Public(); !ps.Open || ps.Threshold != 3 {
-		t.Fatalf("改完配置没立即生效: %+v", ps)
+	if ps := s.Public(); !ps.Open || ps.Threshold != have || ps.Accounts != have {
+		t.Fatalf("改完配置没立即生效: %+v（有 %d 个号）", ps, have)
 	}
 	// 门槛调紧应当立刻关门。
-	c.PublicWhenSurplus.MinFreeGateways = 99
+	c.PublicWhenSurplus.MinAccounts = have + 1
 	s.opt.Live = config.NewLive("", c)
-	if ps := s.Public(); ps.Open || ps.Threshold != 99 {
+	if ps := s.Public(); ps.Open || ps.Threshold != have+1 {
 		t.Fatalf("门槛调紧没生效: %+v", ps)
 	}
 }
@@ -894,7 +901,9 @@ func TestConcurrentTouchDuringAnothersMintBlocksDelivery(t *testing.T) {
 	addAccount(st, 2, "acct-2")
 	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
 		ReachableExits: []types.Exit{{Region: "US"}}}
-	mn.land["US"] = "unified-1"
+	// 池子里只有这一个网关，裸铸从哪个区域出发都该落到它。只钉 "US" 不行：
+	// 第一发成功铸票会给 us-east 记一笔，第二发就改从 us-west 出发了。
+	landBare(mn, "unified-1")
 	mn.full["unified-1"] = true
 	// 铸票那一发拿到账号锁之后，模拟一次并发的发现扫描烧掉 (消费者 1 × unified-1)。
 	// 用这个回调而不是真起 goroutine：时序得是确定的。
@@ -929,6 +938,8 @@ func TestBackoffSlotIsNotACandidateAndFallsBackToMint(t *testing.T) {
 	s, st, mn, clk := noVerifyRig(t)
 	delete(st.gws, "unified-3")
 	// unified-1 有票但槽位正在退避；unified-2 没票、可现铸。
+	// 回落是从区域出发、不冲着候选网关去 ⇒ 落点显式钉在 unified-2 上。
+	landBare(mn, "unified-2")
 	putPair(st, "unified-1", cookiePrefix+"unified-1", clk.now().Add(types.PairLifetime))
 	st.mu.Lock()
 	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1",
@@ -961,16 +972,19 @@ func TestVerifyUsesLandedGatewayExit(t *testing.T) {
 	st := newStore(clk)
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
-	// 想去 unified-1，实到 unified-77，两个网关各有自己的出口。
+	// 裸铸落到 unified-1、被 drift 弹到 unified-77，两个网关各有自己的出口。
 	//
-	// 目标那个出口**刻意不带区域**：UpsertGateway 只合并带区域的出口（见它的实现），
-	// 否则这一发用过的出口会被并进 unified-77 的可达清单里，于是「用旧的」和
-	// 「按落点重取」都成了合法选择，两种行为再也分不开（pickExit 是随机挑的）。
+	// 原来这里把目标出口写成**不带区域**的，为的是让 UpsertGateway 不把它并进
+	// unified-77 的可达清单（它只合并带区域的出口），于是「用旧的」和「按落点重取」
+	// 泾渭分明。按需铸票之后出口一律取自 types.Regions、必然带区域 ⇒ 那一发用过的出口
+	// 一定会被并进落点的清单里，两个集合天生重叠，那个 A/B 构造再也造不出来。
+	// 改成验**真正还能证的那条**：echo 的出口必须属于**落到的那个**网关的可达清单，
+	// 而 unified-1 自己那条出口不在里面 —— 拿「想去哪」的出口去 echo 就会露出来。
 	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
-		ReachableExits: []types.Exit{{}}}
+		ReachableExits: []types.Exit{{Region: "R1"}}}
 	st.gws["unified-77"] = types.Gateway{Name: "unified-77", FirstSeenBy: 1,
 		ReachableExits: []types.Exit{{Region: "R77"}}}
-	mn.land[""], mn.land["R77"] = "unified-1", "unified-77"
+	landBare(mn, "unified-1")
 	mn.drift = map[string]string{"unified-1": "unified-77"}
 	mn.full["unified-77"] = true
 	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
@@ -983,10 +997,18 @@ func TestVerifyUsesLandedGatewayExit(t *testing.T) {
 	if d.Gateway != "unified-77" || !d.VerifiedFull {
 		t.Fatalf("交付不对: %+v", d)
 	}
+	landedExits := map[string]bool{}
+	for _, e := range st.gws["unified-77"].ReachableExits {
+		landedExits[e.Region] = true
+	}
+	if landedExits["R1"] {
+		t.Fatal("夹具坏了：unified-1 的出口串进了落点的可达清单，这条用例就什么都没证")
+	}
 	mn.mu.Lock()
 	defer mn.mu.Unlock()
-	if len(mn.echoExits) != 1 || mn.echoExits[0] != "R77" {
-		t.Fatalf("state-echo 用的出口是 %v，漂到 unified-77 之后该用它自己的 R77", mn.echoExits)
+	if len(mn.echoExits) != 1 || !landedExits[mn.echoExits[0]] {
+		t.Fatalf("state-echo 用的出口是 %v，漂到 unified-77 之后只能用它自己可达的 %v",
+			mn.echoExits, landedExits)
 	}
 }
 

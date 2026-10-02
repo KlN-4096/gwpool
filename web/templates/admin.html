@@ -7,6 +7,7 @@
 <nav class="tabs" data-tabs hidden data-js>
   <a href="#overview">概览</a>
   <a href="#proxies">出口代理 <span class="n">{{len .Proxies}}</span></a>
+  <a href="#owners">上传者 <span class="n">{{len .Owners}}</span></a>
   <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
   <a href="#gateways">网关 <span class="n">{{len .Gateways}}</span></a>
   <a href="#pairs">路由 Cookie <span class="n">{{len .Pairs}}</span></a>
@@ -19,6 +20,7 @@
 <section id="tab-overview">
   <div class="kpis wide">
     <a class="kpi" href="#proxies"><b>{{len .Proxies}}</b><span>出口代理</span><small>系统访问上游时使用的代理出口</small><small class="facets" data-facets-of="t-proxies"></small></a>
+    <a class="kpi" href="#owners"><b>{{len .Owners}}</b><span>上传者</span><small>每人名下可以挂好几份凭据</small></a>
     <a class="kpi" href="#accounts"><b>{{len .Accounts}}</b><span>账号</span><small>已登记的账号，有凭据的账号参与探测</small><small class="facets" data-facets-of="t-accounts"></small></a>
     <a class="kpi" href="#gateways"><b>{{len .Gateways}}</b><span>网关</span><small>探测过程中发现的上游网关</small></a>
     <a class="kpi" href="#pairs"><b>{{len .Pairs}}</b><span>路由 Cookie</span><small>各网关当前持有的路由 Cookie</small><small class="facets" data-facets-of="t-pairs"></small></a>
@@ -57,13 +59,39 @@
   </div>
 </section>
 
+<section id="tab-owners">
+  <div class="card">
+    <header class="card-head"><div><h2>上传者</h2><p>一个人可能托管好几份凭据，总览令牌是他进入 <code>/u/…</code> 的唯一凭证。</p></div></header>
+    {{if .Owners}}
+    <div class="table-wrap"><table id="t-owners" data-grid data-placeholder="搜索名称或令牌">
+      <thead><tr><th class="num">ID</th><th>名称</th><th class="num">账号数</th><th>添加时间（UTC）</th><th data-nosort>总览令牌</th><th data-nosort></th></tr></thead>
+      <tbody>
+      {{range .Owners}}
+        <tr>
+          <td class="num">{{.ID}}</td>
+          <td class="text">{{.Label}}</td>
+          <td class="num">{{.Accounts}}</td>
+          <td class="mono">{{.Since}}</td>
+          <td class="mono text">{{.Token}}</td>
+          <td><a href="/u/{{.Token}}">打开</a></td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="empty">还没有上传者。</p>
+    {{end}}
+    <p class="foot">账号专属页 <code>/a/…</code> <strong>刻意不显示</strong>总览令牌：那个页面地址是会被转发出去的，而总览令牌能打开这个人全部账号的页面和接入 key。所以这里是唯一的找回入口——有人丢了令牌，从这张表里给他。</p>
+  </div>
+</section>
+
 <section id="tab-accounts">
   <div class="card">
     <header class="card-head"><div><h2>账号</h2><p>没有凭据的账号（例如不带 key 调用时自动登记的调用方）只接收分发，不参与探测。</p></div></header>
     {{if .Accounts}}
     <div class="table-wrap"><table id="t-accounts" data-grid data-facets="on:启用:ok|off:已停用:bad|ext:无凭据" data-placeholder="搜索名称、套餐或上游账号 ID">
       <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>凭据</th><th>上游账号 ID</th>
-        <th class="num">请求数</th><th class="num">发现网关</th><th>添加时间（UTC）</th><th data-nosort>账号页</th><th data-nosort></th></tr></thead>
+        <th class="num">上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th>添加时间（UTC）</th><th data-nosort>账号页</th><th data-nosort></th></tr></thead>
       <tbody>
       {{range .Accounts}}
         <tr data-facet="{{if not .Enabled}}off{{else if not .HasCreds}}ext{{else}}on{{end}}">
@@ -72,6 +100,7 @@
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else}}{{.Plan}}{{end}}</td>
           <td>{{if .HasCreds}}<span class="badge ok">有</span>{{else}}<span class="badge">无</span>{{end}}</td>
           <td class="mono text">{{.Upstream}}</td>
+          <td class="num">{{if .OwnerID}}{{.OwnerID}}{{else}}<span class="muted" title="匿名占位行，不是谁托管的">—</span>{{end}}</td>
           <td class="num">{{.Requests}}</td>
           <td class="num">{{.Found}}</td>
           <td class="mono">{{.Since}}</td>
@@ -91,7 +120,21 @@
 
 <section id="tab-gateways">
   <div class="card">
-    <header class="card-head"><div><h2>网关</h2><p>探测过程中发现的全部网关，以及能连通各网关的出口地区。</p></div></header>
+    <header class="card-head">
+      <div><h2>网关</h2><p>探测过程中发现的全部网关，以及能连通各网关的出口地区。</p></div>
+      <form method="post" action="/admin/rescan">
+        <button type="submit" class="primary">找新网关</button>
+      </form>
+    </header>
+    {{if .Rescan}}
+    <div class="card-body">
+      {{if eq .Rescan "queued"}}<p class="ok">已排进发现队列，等它跑完刷新这一页。</p>
+      {{else}}<p class="err">没派出去：{{.Rescan}}</p>{{end}}
+    </div>
+    {{end}}
+    <div class="card-body"><p class="foot">池子<strong>自己走不出冷启动</strong>：发现扫描必须派要票的人<strong>以外</strong>的账号去
+      （派他自己的话，找到的落点被那一发当场烧掉），所以只有一个账号时它永远挑不出人。
+      这个按钮就是那时候唯一的出路——另一条是再传一份凭据。每踢一次会花掉被派中那个号的一发上游。</p></div>
     {{if .Gateways}}
     <div class="table-wrap"><table id="t-gateways" class="tiles gw" data-grid data-natsort data-size="240"
         data-placeholder="搜索网关或出口地区">
@@ -234,18 +277,20 @@
           </div>
         </fieldset>
         <div class="fields">
+          <label>对外根地址 <span class="hint">填进 sub2api 的那个地址，如 <code>https://pool.example.com</code>。只要协议和域名，不要路径。留空则页面上写「问管理员要」</span>
+            <input name="public_base_url" inputmode="url" autocomplete="off" spellcheck="false" value="{{.PublicBaseURL}}"></label>
           <label>别的模型名 <span class="hint">上面没列的手打，逗号或换行分隔</span>
             <input name="models_extra" autocomplete="off" spellcheck="false"></label>
           <label>每账号每区域每小时上限 <span class="hint">0 = 用默认值 6（九个区域合起来 54）。安全阀，不是吞吐量目标</span>
             <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
           <label>槽位冷却（分钟） <span class="hint">0 = 用默认值 240。账号×网关 烧掉后要歇多久，实测 30 分钟到 3 小时都见过</span>
             <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
-          <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。每多试一个就多花一发上游</span>
+          <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。<strong>交付前验证开着时</strong>每多试一个就多花一发上游（state-echo），关着时试的都是已有活票的网关、一发都不打</span>
             <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>
           <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2</span>
             <input name="spare_target" inputmode="numeric" value="{{.SpareTarget}}"></label>
-          <label>对外开放门槛 <span class="hint">空闲网关少于这个数就只服务上传者</span>
-            <input name="min_free_gateways" inputmode="numeric" value="{{.MinFreeGateways}}"></label>
+          <label>对外开放门槛（托管账号数） <span class="hint">托管账号少于这个数就只服务上传者。按账号数而不按活 pair 数：按需铸票的池子不囤票。默认按冷却推导，4 小时冷却 = 12 个</span>
+            <input name="min_accounts" inputmode="numeric" value="{{.MinAccounts}}"></label>
         </div>
         <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
           <span>票富裕时允许没上传凭据的人取</span></label>

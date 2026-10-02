@@ -89,6 +89,6 @@ func (l *Live) Watch(ctx context.Context, every time.Duration, log *slog.Logger)
 			"upstream_per_region_hour", c.UpstreamPerRegionHour,
 			"verify_full_at_deliver", c.VerifyFullAtDeliver, "renew_pairs", c.RenewPairs,
 			"slot_cooldown", c.SlotCooldown(),
-			"public", c.PublicWhenSurplus.Enabled, "min_free_gateways", c.PublicWhenSurplus.MinFreeGateways)
+			"public", c.PublicWhenSurplus.Enabled, "min_accounts", c.PublicWhenSurplus.MinAccounts)
 	}
 }

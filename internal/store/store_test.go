@@ -482,6 +482,41 @@ func TestSetTokensKeepsRefreshWhenNotRotated(t *testing.T) {
 	}
 }
 
+// 续票**不许**把上传者手动停用的号打开。
+//
+// 上传者在 /a/{token} 点「停用账号」，页面承诺「不再用它发请求，接入 key 失效」。而他交的是
+// 整份 auth.json ⇒ 有 refresh_token ⇒ 续票循环（refreshDue 遍历的是全部账号）最长九天后
+// 就会摸到他。原来 SetTokens 无条件启用，于是这个号被池子静默打开、重新拿去铸票，
+// key 也重新能用，而页面上看不出发生过任何事。
+//
+// 区分两种停用的数据本来就有：DisableAccount（自动）写原因，SetAccountEnabled（手动）
+// 刻意留空——「能换出新票说明凭据还活着」只对前者成立，后者说的是「我先不参与」。
+func TestSetTokensNeverReopensAManuallyDisabledAccount(t *testing.T) {
+	s := open(t, t.TempDir())
+	a, err := s.AddAccount(types.Account{
+		Label: "手动暂停的", Enabled: true,
+		Creds: types.Creds{AccessToken: "t", RefreshToken: "r", AccountID: "acct-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAccountEnabled(a.ID, false); err != nil { // 上传者自己点的
+		t.Fatal(err)
+	}
+
+	if err := s.SetTokens(a.ID, "new-access", "new-refresh"); err != nil {
+		t.Fatal(err)
+	}
+	got := accountByID(t, s, a.ID)
+	if got.Enabled {
+		t.Fatal("续票把上传者手动停用的号打开了")
+	}
+	// 票照换：凭据要保持新鲜，否则他重新启用时拿到的是一张九天前的死票。
+	if got.Creds.AccessToken != "new-access" || got.Creds.RefreshToken != "new-refresh" {
+		t.Fatalf("票没换: %+v", got.Creds)
+	}
+}
+
 // 自动停用要留下原因，手动开关要清掉它。
 func TestDisableAccountRecordsReasonAndManualTogglesClearIt(t *testing.T) {
 	s := open(t, t.TempDir())
@@ -643,6 +678,180 @@ func TestAddAccountDedupesByUpstreamID(t *testing.T) {
 	}
 	if sl, ok := s.Slot(first.ID, "unified-7"); !ok || sl.LastVerdict != types.VerdictDegraded {
 		t.Fatalf("槽位历史丢了: %+v", sl)
+	}
+}
+
+// 一次性迁移：加 OwnerID 之前写下的托管账号要挂到一个自动建出来的 owner 下，
+// 否则现有那几个账号的 /u/ 总览页谁都进不去。
+//
+// **幂等**是这条迁移唯一要紧的性质：再开一次不许又建一个 owner（那样每次重启都多
+// 一页，而上一次给出去的那个令牌还活着）。而且令牌必须真的落了盘——没落盘就等于
+// 每次重启换一个，管理页上给出去的链接立刻失效。
+func TestOpenMigratesAccountsToOneOwnerIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	// 手写一份老格式：两个托管行 + 一个匿名占位行，都没有 owner_id 这个键。
+	old := `{"accounts":[` +
+		`{"ID":1,"Label":"pro1","ViewToken":"vt1","Enabled":true,` +
+		`"Creds":{"AccessToken":"tok1","AccountID":"acct-1"}},` +
+		`{"ID":2,"Label":"plus2","ViewToken":"vt2","Enabled":true,` +
+		`"Creds":{"AccessToken":"tok2","AccountID":"acct-2"}},` +
+		`{"ID":3,"Label":"匿名 x","Enabled":true,"Creds":{"AccountID":"anon:x"}}]}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, dir)
+	owners := s.Owners()
+	if len(owners) != 1 {
+		t.Fatalf("该正好建一个 owner，实为 %d: %+v", len(owners), owners)
+	}
+	o := owners[0]
+	if len(o.Token) < 20 {
+		t.Fatalf("owner 令牌太短或没生成: %q", o.Token)
+	}
+	if !strings.Contains(o.Label, "迁移") {
+		t.Fatalf("备注名看不出是迁移来的: %q", o.Label)
+	}
+	for _, id := range []int64{1, 2} {
+		if got := accountByID(t, s, id).OwnerID; got != o.ID {
+			t.Fatalf("账号 %d 没挂上去: OwnerID=%d", id, got)
+		}
+	}
+	// 匿名占位行不挂：它不是谁托管的，挂上去那个人的总览页会多出几行他没上传过的东西。
+	if got := accountByID(t, s, 3).OwnerID; got != 0 {
+		t.Fatalf("匿名占位行被挂到 owner %d 下了", got)
+	}
+	if n := len(s.AccountsByOwner(o.ID)); n != 2 {
+		t.Fatalf("名下该有 2 个账号，实为 %d", n)
+	}
+	// ownerID 为 0 不许回「所有没归属的行」——0 是占位行的常态值。
+	if got := s.AccountsByOwner(0); got != nil {
+		t.Fatalf("AccountsByOwner(0) 回了 %d 行", len(got))
+	}
+	if _, ok := s.OwnerByToken(""); ok {
+		t.Fatal("空令牌认出了一个 owner（等于把总览页开给任何人）")
+	}
+
+	// 再开一次：一个都不许多建，令牌一个字都不许变。
+	s2 := open(t, dir)
+	owners2 := s2.Owners()
+	if len(owners2) != 1 || owners2[0].Token != o.Token || owners2[0].ID != o.ID {
+		t.Fatalf("迁移不幂等：第二次开出 %+v，第一次是 %+v", owners2, owners)
+	}
+}
+
+// PruneEmptyOwners 不许删「刚建出来、账号还没挂上去」的 owner。
+//
+// 这是并发上传的悬垂引用：handleUpload 先 AddOwner 落盘再 AddAccount，甲走到两步中间时，
+// 乙的失败路径调 PruneEmptyOwners，它锁住整个 store 后看到甲那个空 owner 一并删掉；
+// 随后甲的 AddAccount 照常成功，OwnerID 指向一个不存在的行。AddAccount 不校验 OwnerID、
+// migrateOwners 只收养 OwnerID==0 ⇒ 悬垂静默入库，重启也不自愈。
+func TestPruneEmptyOwnersSparesFreshlyCreatedOnes(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+
+	// 甲：刚建完 owner，还没 AddAccount。
+	jia, err := s.AddOwner("甲")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 乙：上传失败后清理。
+	if n, err := s.PruneEmptyOwners(); err != nil || n != 0 {
+		t.Fatalf("把刚建出来的空 owner 删了：removed=%d err=%v", n, err)
+	}
+	// 甲接着把账号挂上去，归属必须还在。
+	if _, err := s.AddAccount(types.Account{
+		Label: "pro1", Creds: types.Creds{AccessToken: "tok1", AccountID: "acct-1"}, OwnerID: jia.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.OwnerByToken(jia.Token); !ok {
+		t.Fatal("甲的 owner 没了：/u/ 链接打不开，而账号已落盘指向它")
+	}
+	if n := len(s.AccountsByOwner(jia.ID)); n != 1 {
+		t.Fatalf("甲名下该有 1 个账号，实为 %d", n)
+	}
+
+	// 宽限期过了的空 owner 照旧要收走，否则就只是把泄漏推后。
+	// 手写一份 CreatedAt 很旧的，重开一次让 Open 里那遍 prune 跑到。
+	old := `{"owners":[{"ID":9,"Token":"` + strings.Repeat("o", 32) +
+		`","Label":"陈年孤儿","CreatedAt":"2020-01-01T00:00:00Z"}]}`
+	dir2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir2, "state.json"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := open(t, dir2).Owners(); len(got) != 0 {
+		t.Fatalf("陈年空 owner 没被收走: %+v", got)
+	}
+}
+
+// 新建的托管账号必须有归属（调用方先建 owner 再传进来），而**已经属于别人的账号
+// 去重命中时不许改归属**：否则一份公开流传的凭据就是一把搬家钥匙，谁贴一次就把
+// 别人的账号搬到自己的总览页下，连带那把接入 key。
+func TestAddAccountClaimsOrphansButNeverReassigns(t *testing.T) {
+	s := open(t, t.TempDir())
+	a, err := s.AddOwner("甲")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AddOwner("乙")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Token == b.Token || a.ID == b.ID {
+		t.Fatalf("两个 owner 撞上了: %+v %+v", a, b)
+	}
+
+	mine, err := s.AddAccount(types.Account{Label: "甲的号", OwnerID: a.ID, Enabled: true,
+		Creds: types.Creds{AccessToken: "tok", AccountID: "acct-x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mine.OwnerID != a.ID {
+		t.Fatalf("归属没落上: %d", mine.OwnerID)
+	}
+
+	// 乙拿同一份凭据再上传一次：**一个字段都不动**，原样返回甲那一行。
+	// 从前这里会更新 token/plan（只守住归属），那是审查 B2 的静默覆盖攻击——
+	// oauth 不验签，乙拿一张自制的 acct-x 票就能把甲存着的 access_token 覆盖掉、
+	// 改掉它的 plan、解开它自己关的停用，把甲托管的凭据弄废。归属之外，这些字段
+	// 也只有甲能改。
+	again, err := s.AddAccount(types.Account{PlanType: "pro", OwnerID: b.ID, Enabled: true,
+		Creds: types.Creds{AccessToken: "tok2", AccountID: "acct-x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.OwnerID != a.ID {
+		t.Fatalf("归属被抢走了: 现在挂在 owner %d 下，应仍是 %d", again.OwnerID, a.ID)
+	}
+	if again.Creds.AccessToken != "tok" || again.PlanType != "" {
+		t.Fatalf("别人的凭据被伪造上传覆盖了（B2）: token=%q plan=%q", again.Creds.AccessToken, again.PlanType)
+	}
+	if n := len(s.AccountsByOwner(b.ID)); n != 0 {
+		t.Fatalf("乙名下冒出了 %d 个账号", n)
+	}
+
+	// 孤儿行（老文件、手改的）照旧**补**得上：只补不改。
+	s.mu.Lock()
+	s.st.Accounts = append(s.st.Accounts, types.Account{ID: 99, Label: "孤儿", Enabled: true,
+		Creds: types.Creds{AccessToken: "tok9", AccountID: "acct-orphan"}})
+	s.mu.Unlock()
+	claimed, err := s.AddAccount(types.Account{OwnerID: b.ID, Enabled: true,
+		Creds: types.Creds{AccessToken: "tok9b", AccountID: "acct-orphan"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.OwnerID != b.ID {
+		t.Fatalf("没归属的行该补上归属，实为 %d", claimed.OwnerID)
+	}
+
+	// 落盘了：重开一次还是这个样子。
+	s2 := open(t, s.dir)
+	if got := accountByID(t, s2, mine.ID).OwnerID; got != a.ID {
+		t.Fatalf("重启后归属变了: %d", got)
+	}
+	if n := len(s2.Owners()); n != 2 {
+		t.Fatalf("重开之后 owner 数变成 %d（迁移又建了一个？）", n)
 	}
 }
 

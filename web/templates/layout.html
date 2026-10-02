@@ -222,6 +222,19 @@ table.tiles tr.nomatch td { position: static; width: auto; height: auto; clip-pa
 .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--idle); margin-right: .35rem; vertical-align: -1px; }
 .legend .sw.ok { background: var(--ok-dot); }
 
+/* 九个区域的探测格子。文字和颜色一起表达状态：只靠红绿对色盲不友好 */
+.regions { display: grid; grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr)); gap: .4rem; margin: .5rem 0 1rem; }
+/* 没取到过的格子是红的（用户定的）。红＝「这里还没摸过」，不是错误——
+   所以靠 ✓ / ✗ 这个字形承载语义，只靠颜色的话色盲读者什么都读不到。 */
+.region { display: grid; gap: .1rem; padding: .4rem .55rem; border-radius: 8px;
+          background: var(--bad-soft); border: 1px solid transparent; color: var(--bad);
+          font-size: 12px; cursor: help; }
+.region b { color: var(--bad); font-size: 12.5px; font-weight: 600; }
+.region b::after { content: " ✗"; }
+.region.on { background: var(--ok-soft); color: var(--ok); }
+.region.on b { color: var(--ok); }
+.region.on b::after { content: " ✓"; }
+
 /* 表单与按钮 */
 form { display: grid; gap: 1rem; margin: 0; }
 label, legend { display: grid; gap: .35rem; font-size: 13px; font-weight: 600; color: var(--fg-2); }
@@ -249,6 +262,10 @@ button.primary:hover { background: var(--accent-2); border-color: var(--accent-2
 button.danger { color: var(--bad); }
 button.danger:hover { background: var(--bad-soft); border-color: var(--bad-dot); }
 button.sm { padding: .15rem .6rem; font-size: 12px; }
+/* 主按钮样子的链接（进入自己的账号后台那种「去另一页」的动作，不是提交） */
+a.btn { display: inline-flex; align-items: center; gap: .4rem; font-size: 13px; font-weight: 600; color: #fff;
+        background: var(--accent); border: 1px solid var(--accent); border-radius: 8px; padding: .45rem .9rem; box-shadow: var(--shadow); }
+a.btn:hover { background: var(--accent-2); border-color: var(--accent-2); text-decoration: none; }
 button:disabled { opacity: .55; cursor: default; }
 button[type=submit]:disabled { cursor: progress; }
 .err { margin: 0; padding: .55rem .8rem; border-radius: 8px; background: var(--bad-soft); color: var(--bad); white-space: pre-wrap; font-size: 13px; }
