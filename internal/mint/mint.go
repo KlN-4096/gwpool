@@ -915,6 +915,97 @@ func CflbOnly(pair string) string {
 	return cookieCflb + "=" + v
 }
 
+// CflbOf 取一张 pair 里的 `__cflb` 值，没有就回空串。
+func CflbOf(pair string) string { return parsePair(pair)[cookieCflb] }
+
+// CflbLease 是某个大区现有的、最长寿的那张 `__cflb`。
+type CflbLease struct {
+	Cflb string
+	Exp  time.Time
+}
+
+// BestCflb 按大区挑出最长寿的那张 `__cflb`。只看 `CflbExpiresAt`，不解 JWT。
+func BestCflb(pairs map[string]types.Pair, now time.Time) map[string]CflbLease {
+	out := map[string]CflbLease{}
+	for _, p := range pairs {
+		if p.RegionKey == "" || !p.CflbExpiresAt.After(now) {
+			continue
+		}
+		c := CflbOf(p.Cookie)
+		if c == "" {
+			continue
+		}
+		if cur, ok := out[p.RegionKey]; !ok || p.CflbExpiresAt.After(cur.Exp) {
+			out[p.RegionKey] = CflbLease{Cflb: c, Exp: p.CflbExpiresAt}
+		}
+	}
+	return out
+}
+
+// Rehome 把一张票的 `__cflb` 换成同大区最长寿的那张，寿命跟着延长。
+//
+// 为什么可以换：**有效的 `__oailb` 自己就钉死网关**（2026-10-03 pro1 实测，SPEC 第 2 节），
+// `__cflb` 只决定大区。种子铸票时一个大区的好几张票共用同一张种子 cflb ⇒ 种子一到点
+// 它们一起死，而各自的 `__oailb` 还有命（3900s > 3600s，而且是种子中途才长出来的）。
+// 换一张就把那部分寿命救回来，一发上游都不用打。
+//
+// 三条红线：
+//   - **果实过期就不换，原样返回**。果实一死落点就退回大区规则 ⇒ 这张票会把消费方送到
+//     他自己在那个大区的网关，而票上写的还是原来那个 ⇒ 降智票当满血票发出去。
+//   - **只在读的时候算，绝不写回库里**。`types.CookieVersion` 是整串 cookie 的哈希，
+//     换了 `__cflb` 票号就变，而 `/release`、`/pair/renew` 的归属闸押的是
+//     `Slot.LastDeliverVersion`（交付时真正发出去那一份）。在取票那一刻换、把换过的
+//     那一份记下去，两边自洽；在别处偷偷改库，所有在途的票号全部失配。
+//   - `RegionKey` 为空的老记录原样走，不猜大区。
+func Rehome(p types.Pair, best map[string]CflbLease, now time.Time) types.Pair {
+	if p.Cookie == "" || p.RegionKey == "" {
+		return p
+	}
+	b, ok := best[p.RegionKey]
+	if !ok || !b.Exp.After(p.CflbExpiresAt) {
+		return p
+	}
+	_, oailbExp, err := PairInfo(p.Cookie)
+	if err != nil || !oailbExp.After(now) {
+		return p
+	}
+	swapped := SwapCflb(p.Cookie, b.Cflb)
+	if swapped == p.Cookie {
+		return p
+	}
+	p.Cookie = swapped
+	p.CflbExpiresAt = b.Exp
+	p.ExpiresAt = b.Exp
+	if oailbExp.Before(p.ExpiresAt) {
+		p.ExpiresAt = oailbExp
+	}
+	return p
+}
+
+// SwapCflb 把 pair 的 `__cflb` 换成 cflb，`__oailb` 原样留着。
+//
+// 为什么这么做是对的（2026-10-03 pro1 实测，见 SPEC 第 2 节）：**有效的 `__oailb`
+// 自己就钉死网关**，`__cflb` 只在没有有效 `__oailb` 时才起作用（那时按大区 × 账号定）。
+// 所以同一个大区内换哪张 `__cflb` 都不影响落点，只影响这张票还能活多久。
+//
+// 换之前**必须**确认 `__oailb` 没过期（`PairInfo` 读得出 exp）：果实一死，落点就退回
+// 大区规则 ⇒ 这张票会把消费方送到他自己在那个大区的网关，而票上写的还是原来那个
+// ⇒ 降智票当满血票发出去。调用方见 `sched.rehome`。
+func SwapCflb(pair, cflb string) string {
+	kv := parsePair(pair)
+	if cflb == "" || kv[cookieOailb] == "" {
+		return pair
+	}
+	kv[cookieCflb] = cflb
+	parts := make([]string, 0, 2)
+	for _, k := range []string{cookieCflb, cookieOailb} {
+		if v := kv[k]; v != "" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
 func parsePair(pair string) map[string]string {
 	out := map[string]string{}
 	for _, seg := range strings.Split(pair, ";") {

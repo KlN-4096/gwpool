@@ -792,10 +792,18 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 //
 // 网关名不在请求里（消费端手上只有票号和 cookie 本体），所以只能扫一遍。
 // 网关数是十几个量级，为它建一份索引是白开销，而且那是第二份要和账本同步的状态。
+// 两个票号都要认：库里存的那一份，以及**换过 `__cflb` 之后真正发出去的**那一份
+// （见 mint.Rehome —— 换 cflb 会改票号，而消费端手上只有发出去那一份）。
 func (s *Server) pairByVersion(version string) (types.Pair, bool) {
-	for _, p := range s.st.Pairs() {
+	raw := s.st.Pairs()
+	best := mint.BestCflb(raw, time.Now())
+	for _, p := range raw {
 		if types.CookieVersion(p.Cookie) == version {
 			return p, true
+		}
+		if r := mint.Rehome(p, best, time.Now()); r.Cookie != p.Cookie &&
+			types.CookieVersion(r.Cookie) == version {
+			return r, true
 		}
 	}
 	return types.Pair{}, false

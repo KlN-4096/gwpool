@@ -567,9 +567,22 @@ func (s *Server) authAdmin(w http.ResponseWriter, r *http.Request) bool {
 // 恒等于「全部」，两边都失去分辨力。
 const supplyWindow = 15 * time.Minute
 
+// effectivePairs 是页面该显示的那一份：`__cflb` 已经换成同大区最长寿的那张，
+// 寿命和交付路径看到的一致（`sched.freshPair` 走同一对函数）。不这么做页面会显示
+// 「这张票 5 分钟后过期」而交付实际发出去的是一张还有 50 分钟的。
+func (s *Server) effectivePairs(now time.Time) map[string]types.Pair {
+	raw := s.st.Pairs()
+	best := mint.BestCflb(raw, now)
+	out := make(map[string]types.Pair, len(raw))
+	for k, p := range raw {
+		out[k] = mint.Rehome(p, best, now)
+	}
+	return out
+}
+
 func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	gws := s.st.Gateways()
-	pairs := s.st.Pairs()
+	pairs := s.effectivePairs(time.Now().UTC())
 	accounts := s.st.Accounts()
 	now := time.Now().UTC()
 
@@ -1988,7 +2001,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 	// 网关表顺带报它手上那张 pair 的剩余时间和铸它的账号（原来单独一个页签），
 	// cookie 本体一个字都不往页面上放。
-	pairs := s.st.Pairs()
+	pairs := s.effectivePairs(time.Now().UTC())
 	places := gatewayPlaces(samples)
 	for _, g := range gws {
 		exits := make([]string, 0, len(g.ReachableExits))

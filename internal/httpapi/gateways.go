@@ -24,7 +24,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	pairs := s.st.Pairs()
+	pairs := s.effectivePairs(now)
 	// 按网关名收一份这个账号自己的槽位：槽位表的键格式归 store 所有，
 	// 这里只认 Slot 自己带的两个字段，免得为一个拼键函数把 store 拖进来。
 	mine := map[string]types.Slot{}

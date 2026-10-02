@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/mint"
 	"gwpool/internal/types"
 )
 
@@ -604,14 +605,31 @@ func (s *Scheduler) FreeGateways() int { return len(s.liveGateways()) }
 // 「这一发会不会白打」的判据，而旧版那个「铸完看总数涨没涨」的比对会把
 // 「别的票刚好在这几秒里过期」算成自己白打了。
 func (s *Scheduler) liveGateways() map[string]bool {
-	now := s.now()
+	now, best := s.now(), s.bestCflb()
 	out := map[string]bool{}
 	for name := range s.st.Gateways() {
-		if p, ok := s.st.Pair(name); ok && p.ExpiresAt.Sub(now) >= types.DeliverFloor {
-			out[name] = true
+		if p, ok := s.st.Pair(name); ok {
+			if s.rehome(p, best).ExpiresAt.Sub(now) >= types.DeliverFloor {
+				out[name] = true
+			}
 		}
 	}
 	return out
+}
+
+// bestCflb 按大区挑出最长寿的那张 `__cflb`（实现在 mint，页面那边共用同一份）。
+func (s *Scheduler) bestCflb() map[string]mint.CflbLease {
+	pairs := map[string]types.Pair{}
+	for name := range s.st.Gateways() {
+		if p, ok := s.st.Pair(name); ok {
+			pairs[name] = p
+		}
+	}
+	return mint.BestCflb(pairs, s.now())
+}
+
+func (s *Scheduler) rehome(p types.Pair, best map[string]mint.CflbLease) types.Pair {
+	return mint.Rehome(p, best, s.now())
 }
 
 // PublicState 是「此刻对外开不开放」的全部读数。公开页要显示它，这是对外承诺。
@@ -1706,11 +1724,14 @@ func (s *Scheduler) gatewaysWithPair(cands []string, floor time.Duration) []stri
 //
 // floor 由调用方给（Request.Floor）：默认是 types.DeliverFloor，而调用方可以用
 // min_remaining 把它压低到 30 s —— 「我这一发很短，残票也要」是只有它自己知道的事。
+// freshPair 是**唯一**的取票口（交付路径全从这儿拿），所以换 cflb 也只在这儿做：
+// 返回的那张就是真正发出去的那一份，票号跟着它走（见 rehome 的三条红线）。
 func (s *Scheduler) freshPair(gateway string, floor time.Duration) (types.Pair, bool) {
 	p, ok := s.st.Pair(gateway)
 	if !ok {
 		return types.Pair{Gateway: gateway}, false
 	}
+	p = s.rehome(p, s.bestCflb())
 	return p, p.ExpiresAt.Sub(s.now()) >= floor
 }
 
