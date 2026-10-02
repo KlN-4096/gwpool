@@ -247,20 +247,14 @@ a.region:hover { border-color: var(--line-2); }
 a.region.on:hover { border-color: var(--ok-dot); }
 .region.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* 号池页「各区域的落点」：一区一行。
-   做成卡片网格时每格高度随网关数量从 2 行到 23 行不等，撑出一整屏参差的空白，
-   而「全部」那一格根本没有网关名可列、只剩一个空盒子。一行一区之后只需要对齐
-   三列，网关名在最后一列里横向流动，二十几个也只占两行。 */
-.regions-tbl th[scope="row"] { background: transparent; font-size: 13px; font-weight: 600; }
-.regions-tbl th[scope="row"] a { color: var(--fg-2); text-decoration: none; }
-.regions-tbl th[scope="row"] a:hover { color: var(--fg); text-decoration: underline; }
-/* 语义挂在 ✓ 这个字形上，不只靠颜色（同九宫格那条注释）。 */
-.regions-tbl tr.on th[scope="row"] a { color: var(--ok); }
-.regions-tbl tr.on th[scope="row"] a::after { content: " ✓"; }
-.regions-tbl tr.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
-.regions-tbl td.gws { white-space: normal; padding-top: .4rem; padding-bottom: .4rem; }
-.regions-tbl td.gws code { display: inline-block; font-size: 10.5px; margin: 0 .3rem .15rem 0; }
-.regions-tbl td.gws code.off { opacity: .5; }
+/* 号池页「各区域的落点」：十张等大的 KPI 小卡（全部 + 九区），5×2 排。
+   卡片网格里列网关名时每格高度从 2 行到 23 行不等；改成一区一行的表又是一整墙网关名。
+   这一格真正要答的只是「每个区域此刻能交付几个」，名字收进悬停提示——点一格会把下面
+   那张表收窄到该区域，名字在那里本来就有。 */
+.kpis.regions { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 0; }
+.kpis.regions .kpi { box-shadow: none; background: var(--sunken); padding: .7rem .85rem; }
+.kpis.regions .kpi > b small { font-size: .95rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.kpis.regions .kpi.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 
 /* 表单与按钮 */
 form { display: grid; gap: 1rem; margin: 0; }
@@ -315,6 +309,7 @@ button[type=submit]:disabled { cursor: progress; }
   .wrap { padding-left: .9rem; padding-right: .9rem; }
   .crumb { display: none; }
   .kpis { grid-template-columns: 1fr 1fr; gap: .6rem; }
+  .kpis.regions { grid-template-columns: 1fr 1fr; }
   .kpi > b { font-size: 1.4rem; }
   th, td { padding: .45rem .75rem; }
   .card-head, .card-body, .toolbar, .pager, .legend, .card > .foot { padding-left: .9rem; padding-right: .9rem; }

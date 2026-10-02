@@ -2217,16 +2217,16 @@ func regionCellOf(t *testing.T, body, label string) string {
 	return body[start : i+end]
 }
 
-// poolRegionRowOf 掐出号池页「各区域的落点」里某个区域那一行。那张卡是表格
-// （一区一行），不是 /a/ 页那种格子，所以切的边界是 <tr> 而不是 <div>。
+// poolRegionRowOf 掐出号池页「各区域的落点」里某个区域那一格。那张卡是一排 KPI 小卡
+// （每格一个 <a class="kpi">），不是 /a/ 页那种格子，所以切的边界是 <a> 而不是 <div>。
 func poolRegionRowOf(t *testing.T, body, label string) string {
 	t.Helper()
 	i := strings.Index(body, `title="`+label+`（`)
 	if i < 0 {
 		t.Fatalf("号池页上没有 %s 这一行", label)
 	}
-	start := strings.LastIndex(body[:i], "<tr")
-	end := strings.Index(body[i:], "</tr>")
+	start := strings.LastIndex(body[:i], "<a ")
+	end := strings.Index(body[i:], "</a>")
 	if start < 0 || end < 0 {
 		t.Fatalf("%s 那一行的 HTML 不完整", label)
 	}
@@ -2448,7 +2448,7 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 	}
 	// rig 里 unified-142 的出口是 IT ⇒ 落在欧洲那一格，而且它有活票 ⇒ 绿。
 	cell := poolRegionRowOf(t, body, "欧洲")
-	if !strings.Contains(cell, `class="on"`) || !strings.Contains(cell, "unified-142") {
+	if !strings.Contains(cell, `class="kpi ok"`) || !strings.Contains(cell, "unified-142") {
 		t.Fatalf("欧洲那一格没收下 unified-142：%s", cell)
 	}
 	for _, r := range types.Regions {
