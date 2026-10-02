@@ -385,6 +385,18 @@ func TestSpareTargetZeroIsMeaningful(t *testing.T) {
 	}
 }
 
+// 富余张数超过网关总数上限就拒：多半是把「目标总张数」填进了「富余几张」。
+func TestSpareTargetCappedAtGatewayCeiling(t *testing.T) {
+	over := fmt.Sprintf(`{"spare_target":%d,`, types.GatewayCeiling+1) + okProxies + `}`
+	if _, err := Load(writeCfg(t, over)); err == nil {
+		t.Fatal("超过网关总数上限的 spare_target 没被拒")
+	}
+	at := fmt.Sprintf(`{"spare_target":%d,`, types.GatewayCeiling) + okProxies + `}`
+	if _, err := Load(writeCfg(t, at)); err != nil {
+		t.Fatalf("恰好等于上限也被拒了: %v", err)
+	}
+}
+
 // 负数一律拒：它们的症状都和「上游挂了」长得一样，查起来要先怀疑一圈外部。
 func TestSchedulingKnobsRejectNegatives(t *testing.T) {
 	for _, body := range []string{

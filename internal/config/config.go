@@ -334,6 +334,11 @@ func Load(path string) (Config, error) {
 	if cfg.SpareTarget < 0 {
 		return Config{}, fmt.Errorf("spare_target 不能为负（0 = 不预铸、全按需）")
 	}
+	// 目标深度本来就封顶在网关总数（types.GatewayCeiling），富余张数比它还大没有意义——
+	// 多半是把「目标总张数」当成了「富余几张」填。
+	if cfg.SpareTarget > types.GatewayCeiling {
+		return Config{}, fmt.Errorf("spare_target 不能超过 %d：上游网关总共也就约 190–201 个", types.GatewayCeiling)
+	}
 	// 文件里到底显式写了哪些键——两处要用：折 model 时要分清「真写了 models」和
 	// 「这是 Defaults 填的」，以及下面拦改过名的旧键。
 	var raw map[string]json.RawMessage

@@ -499,16 +499,22 @@ const AnonPrefix = "anon:"
 
 // SpareTarget 是池子要比「最忙的那个号」多留几张活 pair。
 //
-//	目标活 pair 数 = max(每个号碰过的网关数) + SpareTarget
+//	目标活 pair 数 = min(max(每个号用过的网关数) + SpareTarget, GatewayCeiling)
 //
-// 「碰过的网关数」= 那个号 slot 表里 LastTouch 非零的行数，也就是它已经烧掉的落点。
+// 「用过的网关数」= 那个号 slot 表里 LastDeliver 非零的行数，也就是真有人取走过票的落点。
 // 多留两张的意思是：最忙的那个号手上**永远还有两个没碰过、且已经有活 pair 的网关**，
 // 来取票时不用现等铸票（一发上游要几秒到几十秒）。
 //
-// 这个目标天然被已知网关数封顶：最忙的号把所有网关都碰过之后，缺口只能靠**发现新
-// 网关**来补，再铸多少张 pair 都没用（pair 是路由，烧掉的是槽位）。那条路是
-// httpapi 在 ErrNoFullSlot 上挂的探索扫描。
+// 目标超过**已知**网关数时，缺口靠裸铸和探索扫描摸新网关来补；超过**上游网关总数**
+// 的那部分永远补不上，所以封顶在 GatewayCeiling。
 const SpareTarget = 2
+
+// GatewayCeiling 是上游网关总数的保守上限：活 pair 数（一个网关一张）不可能超过它。
+//
+// DNS 枚举 chat.gateway.unified-N.api.openai.com 得 201 个，别人统计是 215 个里 14 个
+// 黑洞；按 190 算，给走不到的那几个留余量。不封顶的话，最忙的号用遍全部网关之后
+// 目标就永远够不着，每轮保温都会为它白打几发上游（裸铸每轮最多白打两发，见 premintBare）。
+const GatewayCeiling = 190
 
 // RenewFailBudget 是一张 pair 连续续期失败几次就放弃它（丢掉，下一轮裸铸）。
 // 预算花在「别再拿同一张死票去续」上，不花在拉黑网关上。

@@ -1844,6 +1844,19 @@ func TestPairTargetTracksBusiestConsumer(t *testing.T) {
 	}
 }
 
+// 目标深度封顶在上游网关总数：最忙的号快用遍全部网关时，再加富余也铸不出来，
+// 不封顶的话每轮保温都会为够不着的那几张白打。
+func TestPairTargetCappedAtGatewayCeiling(t *testing.T) {
+	s, st, _, clk := rig(t, types.ModePool)
+	for i := 1; i < types.GatewayCeiling; i++ {
+		gw := fmt.Sprintf("unified-%d", i)
+		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw, LastTouch: clk.now(), LastDeliver: clk.now()}
+	}
+	if got := s.PairTarget(); got != types.GatewayCeiling {
+		t.Fatalf("最忙的号用过 %d 张时目标是 %d，应封顶在 %d", types.GatewayCeiling-1, got, types.GatewayCeiling)
+	}
+}
+
 // 续期失败预算：同一张 pair 连败 RenewFailBudget 次就把它丢掉，下一轮改裸铸。
 // **网关不许被拉黑**——续不上的是这张票，别的号随时可能在这个网关上铸出新的。
 func TestDeadPairDroppedAfterRenewFailures(t *testing.T) {

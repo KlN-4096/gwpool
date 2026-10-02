@@ -227,8 +227,9 @@ func (s *Scheduler) livePairs() int { return s.FreeGateways() }
 // **刻意不用 LastTouch**：铸票本身也是一次 touch，拿它当基数就成了自激——预铸一张
 // 让目标 +1、于是再铸一张、再 +1，一路把所有网关铸满，+2 的闸等于不存在。
 //
-// 目标天然被已知网关数封顶，所以当最忙的号把所有网关都用过之后，目标会高于网关总数
-// ——那个缺口**铸票补不上**（pair 是路由，烧掉的是槽位），只能靠发现新网关。
+// 目标高于已知网关数时，缺口靠裸铸、探索扫描摸新网关来补；但上游网关总共就那么多，
+// 所以封顶在 types.GatewayCeiling——不封的话最忙的号用遍全部网关之后目标永远够不着，
+// 每一轮保温都会为它白打几发。
 func (s *Scheduler) PairTarget() int {
 	used := map[int64]int{}
 	for _, sl := range s.st.Slots() {
@@ -243,7 +244,7 @@ func (s *Scheduler) PairTarget() int {
 		}
 	}
 	// 富余张数是配置项：0 就是「全按需，一发预铸都不打」。见 config.Config.SpareTarget。
-	return busiest + s.cfg().SpareTarget
+	return min(busiest+s.cfg().SpareTarget, types.GatewayCeiling)
 }
 
 // premintWasted 报告这一轮预铸没人能用：所有托管号在所有已知网关上都还在
