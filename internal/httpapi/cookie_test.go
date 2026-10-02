@@ -459,12 +459,164 @@ func TestWaitIsClamped(t *testing.T) {
 		{"?wait=3", 3 * time.Second},
 		{"?wait=999", maxWait},
 	} {
-		_, got, err := parseCookieRequest(httptest.NewRequest("GET", "/cookie"+c.q, nil))
+		_, got, _, err := parseCookieRequest(httptest.NewRequest("GET", "/cookie"+c.q, nil))
 		if err != nil {
 			t.Fatalf("%q: %v", c.q, err)
 		}
 		if got != c.want {
 			t.Fatalf("%q → wait=%v，应为 %v", c.q, got, c.want)
+		}
+	}
+}
+
+// count 的解析：缺省 1、越界**拒而不钳**、点名网关时压回 1。
+//
+// 越界拒掉而不是钳到 5（和 wait / min_remaining 刻意不同口径）：count 决定这一发烧掉
+// 几个 (账号 × 网关)，把 20 悄悄钳成 5 会让调用方一直以为自己拿到了 20 张。
+func TestCountIsParsedAndBounded(t *testing.T) {
+	for _, c := range []struct {
+		q       string
+		want    int
+		wantErr bool
+	}{
+		{q: "", want: 1},
+		{q: "?count=1", want: 1},
+		{q: "?count=5", want: 5},
+		{q: "?count=0", wantErr: true},
+		{q: "?count=-1", wantErr: true},
+		{q: "?count=6", wantErr: true},
+		{q: "?count=abc", wantErr: true},
+		// 点名了网关就只可能有一张，静默压回 1 而不是报错：
+		// 「顺带多拿几张」是合理写法，响应里的张数自己会说清。
+		{q: "?gateway=unified-1&count=5", want: 1},
+	} {
+		_, _, got, err := parseCookieRequest(httptest.NewRequest("GET", "/cookie"+c.q, nil))
+		if c.wantErr {
+			if err == nil {
+				t.Fatalf("%q 该被拒，却解析成了 count=%d", c.q, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%q: %v", c.q, err)
+		}
+		if got != c.want {
+			t.Fatalf("%q → count=%d，应为 %d", c.q, got, c.want)
+		}
+	}
+}
+
+// 批量取票：count=N 一次要走最多 N 张，每张**换一个落点**。
+//
+// 为什么要验「换落点」：候选排序是确定的，不把上一张的网关加进 exclude 的话第二发会
+// 原地再给同一个网关（而那张票刚被第一发烧过）⇒ 批量白拿。这是整个特性唯一的要害。
+func TestCookieBatchTakesDistinctGateways(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	now := time.Now().UTC()
+	for _, gw := range []string{"unified-1", "unified-2", "unified-3"} {
+		p.queue = append(p.queue, types.Delivery{Gateway: gw, Cookie: liveCookie,
+			ExpiresAt: now.Add(types.DeliverTTL), ValidForS: 150, VerifiedFull: true})
+	}
+
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?count=3", nil),
+		srv.ConsumerKeyFor(st.accounts[0])))
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Tickets []struct {
+			Gateway       string `json:"gateway"`
+			CookieVersion string `json:"cookie_version"`
+		} `json:"tickets"`
+		Count int `json:"count"`
+		Want  int `json:"want"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解不开: %v（body=%s）", err, w.Body.String())
+	}
+	if got.Count != 3 || got.Want != 3 || len(got.Tickets) != 3 {
+		t.Fatalf("要 3 张，回的是 count=%d want=%d len=%d", got.Count, got.Want, len(got.Tickets))
+	}
+	seen := map[string]bool{}
+	for i, tk := range got.Tickets {
+		if seen[tk.Gateway] {
+			t.Fatalf("第 %d 张又是 %s：上一张的落点没进 exclude", i+1, tk.Gateway)
+		}
+		seen[tk.Gateway] = true
+		if tk.CookieVersion == "" {
+			t.Fatalf("第 %d 张没带票号，调用方没法 /release 或 exclude_versions 它", i+1)
+		}
+	}
+	// 池子那边收到的排除名单必须逐发累加，否则上面那条断言靠 fake 的顺序也能过。
+	if len(p.reqs) != 3 {
+		t.Fatalf("取了 %d 次票，应为 3 次", len(p.reqs))
+	}
+	for i, want := range []int{0, 1, 2} {
+		if n := len(p.reqs[i].Exclude); n != want {
+			t.Fatalf("第 %d 发的 exclude 有 %d 个，应为 %d 个: %+v", i+1, n, want, p.reqs[i].Exclude)
+		}
+	}
+	if !p.reqs[2].Exclude["unified-1"] || !p.reqs[2].Exclude["unified-2"] {
+		t.Fatalf("第 3 发没排掉前两张的落点: %+v", p.reqs[2].Exclude)
+	}
+}
+
+// 凑不满照样 200：语义是「**最多** N 张」。
+//
+// 不做全有或全无：调用方带 count 来就是为了少等，而为了凑满把已经拿到的退回去再回 503
+// 只会更慢，那几张的槽位还已经烧了。count 和 want 都回，调用方据此更新它那个
+// 「平均要试几次」的估计。
+func TestCookieBatchReturnsWhatItGot(t *testing.T) {
+	srv, h, p, st, _ := rig(t, types.ModePool)
+	now := time.Now().UTC()
+	p.queue = []types.Delivery{{Gateway: "unified-1", Cookie: liveCookie,
+		ExpiresAt: now.Add(types.DeliverTTL), ValidForS: 150}}
+
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?count=4", nil),
+		srv.ConsumerKeyFor(st.accounts[0])))
+	if w.Code != http.StatusOK {
+		t.Fatalf("拿到一张就该成功，状态 %d: %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Tickets []json.RawMessage `json:"tickets"`
+		Count   int               `json:"count"`
+		Want    int               `json:"want"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解不开: %v", err)
+	}
+	if got.Count != 1 || got.Want != 4 || len(got.Tickets) != 1 {
+		t.Fatalf("count=%d want=%d len=%d，应为 1 / 4 / 1", got.Count, got.Want, len(got.Tickets))
+	}
+	// 一张都拿不到才算失败，而且**不能**变成 200 空数组。
+	p.queue = []types.Delivery{}
+	w = do(h, authed(httptest.NewRequest("GET", "/cookie?count=4", nil),
+		srv.ConsumerKeyFor(st.accounts[0])))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("一张都没拿到该回 503，状态 %d: %s", w.Code, w.Body.String())
+	}
+	if decodeFail(t, w).Error.Code != codeNoLivePair {
+		t.Fatalf("码不对: %+v", decodeFail(t, w))
+	}
+}
+
+// 没带 count 时**原样回老形状**：存量调用方读的是顶层 gateway/cookie，不是 tickets。
+func TestCookieWithoutCountKeepsTheFlatShape(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModePool)
+	for _, q := range []string{"/cookie", "/cookie?count=1"} {
+		w := do(h, authed(httptest.NewRequest("GET", q, nil), srv.ConsumerKeyFor(st.accounts[0])))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: 状态 %d", q, w.Code)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%s: 解不开: %v", q, err)
+		}
+		if _, ok := got["tickets"]; ok {
+			t.Fatalf("%s: 回成了批量形状，存量调用方会读不到字段: %s", q, w.Body.String())
+		}
+		if _, ok := got["gateway"]; !ok {
+			t.Fatalf("%s: 顶层 gateway 没了: %s", q, w.Body.String())
 		}
 	}
 }

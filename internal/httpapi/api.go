@@ -1451,14 +1451,14 @@ func regionCells(accountID int64, mints map[string]types.RegionMint,
 // ---------- /cookie ----------
 
 func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
-	req, wait, perr := parseCookieRequest(r)
+	req, wait, count, perr := parseCookieRequest(r)
 	if perr != nil {
 		s.badRequest(w, http.StatusBadRequest, perr.Error())
 		return
 	}
 	c, ok := s.resolveCaller(r)
 	if !ok {
-		s.serveAnonymous(w, r, req, wait)
+		s.serveAnonymous(w, r, req, wait, count)
 		return
 	}
 	acct := c.acct
@@ -1492,7 +1492,7 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 		//
 		// authed=true：这条路的调用方**鉴权过了**，走 DeliverAnonymous 只是因为池子
 		// 手上没有那个号的凭据（验不了、也不替它铸），不该连带吃匿名的开放门槛。
-		s.serveCookie(w, r, acct.ID, s.rowFor(types.AnonPrefix+ref), req, wait,
+		s.serveCookie(w, r, acct.ID, s.rowFor(types.AnonPrefix+ref), req, wait, count,
 			func(rq sched.Request) (types.Delivery, error) {
 				d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
 				if err == nil {
@@ -1503,7 +1503,7 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 挑不出可交付的槽位就 503。宁可 503，也不把降智的东西发出去。
-	s.serveCookie(w, r, acct.ID, acct.ID, req, wait, func(rq sched.Request) (types.Delivery, error) {
+	s.serveCookie(w, r, acct.ID, acct.ID, req, wait, count, func(rq sched.Request) (types.Delivery, error) {
 		return s.pool.Deliver(r.Context(), acct.ID, rq)
 	})
 }
@@ -1512,7 +1512,8 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 //
 // 票富裕时自动对外开放、回落就自动关上（见 sched.PublicState）。
 // 刻意不做限流/配额：现在没需求，门槛本身就是闸门。
-func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sched.Request, wait time.Duration) {
+func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sched.Request,
+	wait time.Duration, count int) {
 	ps := s.pool.Public()
 	if !ps.Enabled {
 		// 没带有效 key，而池子又不对外开放 ⇒ 这就是「你的 key 不认」。
@@ -1531,7 +1532,7 @@ func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sche
 		s.badRequest(w, http.StatusBadRequest, "匿名取用必须带 account 参数（你自己的上游 account_id）")
 		return
 	}
-	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait,
+	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait, count,
 		func(rq sched.Request) (types.Delivery, error) {
 			// authed=false：真匿名，门槛照常卡他（那是给上传者留的余量）。
 			d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, false)
@@ -1572,6 +1573,17 @@ type deliveryResponse struct {
 	// 过了这张 cookie 谁都用不了）。消费端拿它决定要不要在业务请求里顺手续一发
 	// （剩不到 12 分钟才续，见 /pair/renew）。混成一个的后果是每发都续、或者永不续。
 	PairRemainingS int `json:"pair_remaining_s"`
+}
+
+// batchResponse 是带 count 的 /cookie 的回话。**count 没带时不走这个形状**——
+// 那条路原样回 deliveryResponse，存量调用方读的顶层字段一个都不动。
+//
+// Count 和 Want 都要给：语义是「最多这么多张」，拿到几张调用方必须能直接读出来，
+// 而不是去数数组长度再和自己发的参数比对（它那头还要据此更新「平均要试几次」）。
+type batchResponse struct {
+	Tickets []deliveryResponse `json:"tickets"`
+	Count   int                `json:"count"` // 实际给了几张
+	Want    int                `json:"want"`  // 请求的 count，原样回显
 }
 
 func (s *Server) delivered(d types.Delivery) deliveryResponse {

@@ -61,6 +61,10 @@ type fakePool struct {
 	// calls 数一共取了几次票：wait 那条路最要紧的保证是「等不到就别重跑」，
 	// 重跑一次可能真打一发上游。
 	calls int
+	// queue 非空时逐次弹一张（批量取票用：每张必须是不同落点，而 delivery 那个字段
+	// 每次都回同一张）。弹空之后回 queueErr —— 「要 3 张只拿到 1 张」要能铺出来。
+	queue    []types.Delivery
+	queueErr error
 	// hasCand 顶替 sched.HasCandidate。nil = 一张候选都没有。
 	// 判据归调度（只有它看得见冷却），HTTP 那层照它的答案办——而「池子里有票」
 	// 和「这个账号拿得到票」是两件事，这个 fake 必须能把它们分开。
@@ -80,7 +84,27 @@ func (p *fakePool) Deliver(_ context.Context, accountID int64, req sched.Request
 	p.calls++
 	p.reqs = append(p.reqs, req)
 	p.delivered = append(p.delivered, fmt.Sprintf("%d|%s|force=%v", accountID, req.Gateway, req.Force))
+	if d, err, ok := p.next(); ok {
+		return d, err
+	}
 	return p.delivery, p.err
+}
+
+// next 从 queue 里弹一张。queue 为 nil 时回 ok=false，老用例一个字都不用改。
+func (p *fakePool) next() (types.Delivery, error, bool) {
+	if p.queue == nil {
+		return types.Delivery{}, nil, false
+	}
+	if len(p.queue) == 0 {
+		err := p.queueErr
+		if err == nil {
+			err = sched.ErrNoLivePair
+		}
+		return types.Delivery{}, err, true
+	}
+	d := p.queue[0]
+	p.queue = p.queue[1:]
+	return d, nil, true
 }
 
 func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sched.Request, authed bool) (types.Delivery, error) {

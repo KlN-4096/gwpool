@@ -151,13 +151,13 @@ const (
 // parseCookieRequest 是 /cookie 的信任边界：查完长度和范围，往后各层直接信。
 //
 // 第二个返回值是调用方愿意等多久（wait），它只活在 HTTP 这一层，不进调度。
-func parseCookieRequest(r *http.Request) (sched.Request, time.Duration, error) {
+func parseCookieRequest(r *http.Request) (sched.Request, time.Duration, int, error) {
 	q := r.URL.Query()
 	req := sched.Request{Force: truthy(q.Get("force"))}
 
 	if gw := q.Get("gateway"); gw != "" {
 		if !validName(gw) {
-			return req, 0, errors.New("gateway 名字不合法")
+			return req, 0, 0, errors.New("gateway 名字不合法")
 		}
 		req.Gateway = gw
 	}
@@ -166,19 +166,19 @@ func parseCookieRequest(r *http.Request) (sched.Request, time.Duration, error) {
 	// 为此拒掉整个请求等于让它去猜池子的状态。
 	ex, err := parseList(q.Get("exclude"), "exclude")
 	if err != nil {
-		return req, 0, err
+		return req, 0, 0, err
 	}
 	req.Exclude = ex
 	vs, err := parseList(strings.ToLower(q.Get("exclude_versions")), "exclude_versions")
 	if err != nil {
-		return req, 0, err
+		return req, 0, 0, err
 	}
 	req.ExcludeVersions = vs
 
 	if v := q.Get("min_remaining"); v != "" {
 		n, err := strconv.Atoi(strings.TrimSpace(v))
 		if err != nil {
-			return req, 0, errors.New("min_remaining 不是整数秒")
+			return req, 0, 0, errors.New("min_remaining 不是整数秒")
 		}
 		req.MinRemaining = clampDur(time.Duration(n)*time.Second, minRemainingFloor, minRemainingCap)
 	}
@@ -187,11 +187,32 @@ func parseCookieRequest(r *http.Request) (sched.Request, time.Duration, error) {
 	if v := q.Get("wait"); v != "" {
 		n, err := strconv.Atoi(strings.TrimSpace(v))
 		if err != nil {
-			return req, 0, errors.New("wait 不是整数秒")
+			return req, 0, 0, errors.New("wait 不是整数秒")
 		}
 		wait = clampDur(time.Duration(n)*time.Second, 0, maxWait)
 	}
-	return req, wait, nil
+
+	count := 1
+	if v := q.Get("count"); v != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return req, 0, 0, errors.New("count 不是整数")
+		}
+		// **拒而不钳**，和 min_remaining / wait 刻意不同口径：那两个钳的是时长，钳过头只是
+		// 建议值差一点；count 决定这一发烧掉几个 (账号 × 网关)，把 20 悄悄钳成 5 会让调用方
+		// 一直以为自己拿到了 20 张、而「少拿的那 15 张去哪了」查不出来。
+		if n < 1 || n > cookieBatchMax {
+			return req, 0, 0, fmt.Errorf("count 要在 1..%d 之间", cookieBatchMax)
+		}
+		count = n
+	}
+	// 点名了网关就只可能有一张：那个参数的意思是「我要这一个落点」。
+	// 静默收到 1 而不是报错：带着 gateway 和 count 一起来是「顺带多拿几张」的合理写法，
+	// 为此拒掉整个请求没有收益（响应里的张数自己会说清拿到了几张）。
+	if req.Gateway != "" {
+		count = 1
+	}
+	return req, wait, count, nil
 }
 
 // parseList 解一个逗号分隔的名单。项数超限就拒（那是畸形请求，不是口味），
@@ -346,29 +367,85 @@ func (s *Server) waitForCandidate(ctx context.Context, d time.Duration, accountI
 	}
 }
 
+// cookieBatchMax 是一次 /cookie 最多下发几张票（count 参数的上限，用户定的 5）。
+//
+// 为什么要有批量：客户端那头的流程是「取一张 → 自己验满血 → 不满血再取一张」，每一轮
+// 都是一个 HTTP 往返，而池子内部还可能顺带现铸一发（几十秒）。它自己能学出平均要试几次
+// （比如 3），一次把 3 张要走、并发验，等待时间从 3 个往返压成 1 个 —— 减少客户端等待
+// 时间是这个参数的全部目的。
+//
+// 封顶而不是不限：每一张都真的烧掉一个 (账号 × 网关)，而那是池子最紧的资源。要多了就是
+// 让一个消费者把自己的触达面一轮摸干净，后面的人无票可用（同一个坑写在
+// sched.Options.MaxTriesPerDeliver 那边）。
+const cookieBatchMax = 5
+
 // serveCookie 是 /cookie 三条身份路径共用的尾段：取票 → 成了就回，没成按码回话。
 //
 // 两个账号参数是**两件事**，刻意分开：acctID 是记账用的（卡片、日志，上传者该在
 // 自己页面上看见的那一行），consumerID 是**真正在要票的那一行**（跨账号/匿名是占位行）。
-// 合成一个的后果是静默的：轮询会按上传者的冷却去判，而发现扫描会把上传者排除掉。
+// 合成一个的后果是静默的：轮询会按上传者的那本账去判，而发现扫描会把上传者排除掉。
 //
 // get 收 Request 而不是闭包捕获它：重跑那一次必须用**同一份**请求参数，
-// 否则等到的票和筛选条件可能对不上。
+// 否则等到的票和筛选条件可能对不上；批量那几张也靠它逐张换掉排除名单。
+//
+// count > 1 时语义是「**最多**这么多张」：拿到一张就算成功，剩下的拿不到照样 200。
+// 不是「全有或全无」——调用方要的是少等，而为了凑满张数把已经拿到的那几张退回去
+// （/release）再回 503，等待时间反而更长，而且那几张的槽位已经烧了。
 func (s *Server) serveCookie(w http.ResponseWriter, r *http.Request, acctID, consumerID int64,
-	req sched.Request, wait time.Duration, get func(sched.Request) (types.Delivery, error)) {
-	d, err := get(req)
-	if err != nil && wait > 0 {
-		if code, _, _ := s.classify(err); waitableCode(code) &&
-			s.waitForCandidate(r.Context(), wait, consumerID, req) {
-			d, err = get(req)
-		}
+	req sched.Request, wait time.Duration, count int,
+	get func(sched.Request) (types.Delivery, error)) {
+	if count < 1 {
+		count = 1
 	}
-	if err != nil {
+	got := make([]deliveryResponse, 0, count)
+	cur := req
+	var err error
+	for len(got) < count {
+		var d types.Delivery
+		d, err = get(cur)
+		// **只给第一张挂等。** 后面那几张是「顺带多拿」，让它们各挂一次 wait 会把这一发的
+		// 墙上时间乘上 count，而调用方带 count 来就是为了少等。
+		if err != nil && wait > 0 && len(got) == 0 {
+			if code, _, _ := s.classify(err); waitableCode(code) &&
+				s.waitForCandidate(r.Context(), wait, consumerID, cur) {
+				d, err = get(cur)
+			}
+		}
+		if err != nil {
+			break
+		}
+		got = append(got, s.delivered(d))
+		if len(got) >= count {
+			break
+		}
+		// 下一张换个落点：不排掉的话候选排序是确定的，下一发会原地再给同一个网关
+		// （而且那张票刚被这一发烧过）。**复制一份再改**——Exclude 是调用方那个 map，
+		// 就地改会让后面 deliverFailed / noteMinRemainingTooHigh 看到的请求和它发来的不一样。
+		next := make(map[string]bool, len(cur.Exclude)+1)
+		for k := range cur.Exclude {
+			next[k] = true
+		}
+		next[d.Gateway] = true
+		cur.Exclude = next
+	}
+	if len(got) == 0 {
 		s.noteMinRemainingTooHigh(consumerID, req)
 		s.deliverFailed(w, err, acctID, consumerID, req.Gateway)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.delivered(d))
+	// 没凑满要留痕：200 + 少几张和「正好要这么多」在读数上一模一样，不说一句的话
+	// 「批量到底有没有用」事后查不出来。
+	if len(got) < count {
+		s.opt.Log.Info("批量取票没凑满", "account", acctID, "consumer", consumerID,
+			"want", count, "got", len(got), "reason", err)
+	}
+	// count 没带（或只要一张）时**原样回老形状**，一个字节都不变：存量调用方都在读
+	// 顶层那几个字段。
+	if count == 1 {
+		writeJSON(w, http.StatusOK, got[0])
+		return
+	}
+	writeJSON(w, http.StatusOK, batchResponse{Tickets: got, Count: len(got), Want: count})
 }
 
 // noteMinRemainingTooHigh 在「只有这个参数把候选筛空了」时单说一句。
