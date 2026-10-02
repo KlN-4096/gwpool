@@ -2143,11 +2143,12 @@ func accountFacets(rows []accountRow, owners []types.Owner, ownerName map[int64]
 	}, ";")
 }
 
-// facetLabel 去掉会把筛选串拆坏的三个分隔符，再截短：下拉框有多宽由最长那一项决定。
+// facetLabel 去掉会把筛选串拆坏的三个分隔符，再截短。上限按「#编号 + 64 字备注 + 等 N 个」
+// 留够：截到「等 10 个」中间会变成「等 1…」，读起来是另一个数。只防票里声明的超长套餐名。
 func facetLabel(s string) string {
 	s = strings.NewReplacer(":", "：", "|", "｜", ";", "；").Replace(s)
-	if r := []rune(s); len(r) > 40 {
-		s = string(r[:40]) + "…"
+	if r := []rune(s); len(r) > 80 {
+		s = string(r[:80]) + "…"
 	}
 	return s
 }

@@ -1960,11 +1960,13 @@ func TestFacetLabelStripsSeparators(t *testing.T) {
 	if got := facetLabel("a:b|c;d"); got != "a：b｜c；d" {
 		t.Fatalf("分隔符没换掉：%q", got)
 	}
-	if got := facetLabel(strings.Repeat("一", 41)); got != strings.Repeat("一", 40)+"…" {
+	if got := facetLabel(strings.Repeat("一", 81)); got != strings.Repeat("一", 80)+"…" {
 		t.Fatalf("没按字符截：%q", got)
 	}
-	if got := facetLabel(strings.Repeat("一", 40)); got != strings.Repeat("一", 40) {
-		t.Fatalf("刚好 40 个字也截了：%q", got)
+	// 备注上限 64 字 + 编号 + 「等 N 个」不能被截：截到中间「等 10 个」会变成「等 1…」。
+	full := fmt.Sprintf("#999 %s 等 100 个", strings.Repeat("长", labelMaxRunes))
+	if got := facetLabel(full); got != full {
+		t.Fatalf("最长的上传者显示名被截了：%q", got)
 	}
 	if got := planFacet(" Pro+ "); got != "plan-pro" {
 		t.Fatalf("套餐标签没清洗：%q", got)
