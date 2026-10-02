@@ -18,7 +18,6 @@ type configView struct {
 
 	UpstreamPerRegionHour int
 	VerifyFullAtDeliver   bool
-	RenewPairs            bool
 	SlotCooldownMinutes   int
 	MaxTriesPerDeliver    int
 	SpareTarget           int
@@ -61,7 +60,6 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	v.Models = c.Models
 	v.UpstreamPerRegionHour = c.UpstreamPerRegionHour
 	v.VerifyFullAtDeliver = c.VerifyFullAtDeliver
-	v.RenewPairs = c.RenewPairs
 	v.SlotCooldownMinutes = c.SlotCooldownMinutes
 	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
 	v.SpareTarget = c.SpareTarget
@@ -124,7 +122,7 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opt.Log.Info("管理页改了配置", "models", c.Models,
 		"upstream_per_region_hour", c.UpstreamPerRegionHour,
-		"verify_full_at_deliver", c.VerifyFullAtDeliver, "renew_pairs", c.RenewPairs,
+		"verify_full_at_deliver", c.VerifyFullAtDeliver,
 		"slot_cooldown", c.SlotCooldown(),
 		"public", c.PublicWhenSurplus.Enabled, "min_accounts", c.PublicWhenSurplus.MinAccounts)
 	s.adminConfigDone(w, r, "已保存并立即生效", "")
@@ -135,11 +133,9 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	models := r.Form["models"]
 	// extra 收手打的模型名，一行一个 / 逗号空格分隔都行。
-	for _, f := range strings.FieldsFunc(r.FormValue("models_extra"), func(c rune) bool {
+	models = append(models, strings.FieldsFunc(r.FormValue("models_extra"), func(c rune) bool {
 		return c == ',' || c == '\n' || c == '\r' || c == ' ' || c == '\t'
-	}) {
-		models = append(models, f)
-	}
+	})...)
 	if len(models) == 0 {
 		return nil, errEmptyModels
 	}
@@ -188,7 +184,6 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 		// 换一个读数」）。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
 		// 不能靠「缺键不动」。
 		"verify_full_at_deliver": truthy(r.FormValue("verify_full_at_deliver")),
-		"renew_pairs":            truthy(r.FormValue("renew_pairs")),
 		"slot_cooldown_minutes":  cooldown,
 		"max_tries_per_deliver":  tries,
 		"spare_target":           spare,

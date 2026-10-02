@@ -231,7 +231,7 @@ type Options struct {
 	IdleAfter time.Duration
 	// MintGap 是两发铸票之间的间隔，速率纪律，别把供给打空。负数 = 不等（测试用）。
 	MintGap time.Duration
-	// RenewGap 是**同一个账号**两次续期之间的最小间隔。
+	// RenewGap 是**同一个账号**两次铸票之间的最小间隔（名字是续期时代留下的）。
 	// 供给不是瓶颈（十几个网关一小时才十几发），打得密才是封号特征。
 	RenewGap time.Duration
 
@@ -1477,8 +1477,19 @@ func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
 			lifetime[m.RegionKey] = m.Count
 		}
 	}
-	r, _, ok := bestRegion(types.Exit{}, perRegion, limit, lifetime, nil)
+	r, _, _, ok := bestRegion(types.Exit{}, perRegion, limit, lifetime, nil, nil)
 	return r, ok
+}
+
+// premintPolicy 是预铸给挑选器的两条偏好。交付路径传 nil（见 minterFor）。
+//
+// 合成一个结构而不是两个函数参数：这两条是同一件事的两半（哪些组合不要、哪些区域先要），
+// 而 minterFor 的参数表已经够长了。
+type premintPolicy struct {
+	// skip 说这个 (账号, 区域) 组合这一轮不要。
+	skip func(accountID int64, regionKey string) bool
+	// prefer 说这个区域要优先（同一档防封规矩之内）。
+	prefer func(regionKey string) bool
 }
 
 // minterFor 挑「谁去铸这一发、经哪个区域」。
@@ -1490,20 +1501,22 @@ func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
 //
 //  1. 候选 = 九个区域里至少还有一个区域没打满**本小时**配额的号；全满的跳过
 //     （不先问一声的话那一发会一路走到速率闸才被拒，而要票的人已经等了一个往返）
-//  2. 本小时总发数最少的优先——集中打一个号正是 2026-09-29 把通道打废的那个模式
-//  3. 并列时优先它**终身没铸过**的区域：那是唯一可能出新落点的地方
-//  4. 再并列挑最久没被用作铸票者的号
+//  2. 本小时总发数最少的优先——集中打一个号正是 2026-09-29 把通道打废的那个模式。
+//     这条是防封规矩，所以它永远排在后面那几条优化前面
+//  3. 并列时优先**丢了种子票**的区域（见 premintPolicy.prefer）
+//  4. 再并列优先它**终身没铸过**的区域：那是唯一可能出新落点的地方
+//  5. 再并列挑最久没被用作铸票者的号
 //
-// want 非零时是**定向铸票**（续期、点名网关）：出口已经被网关的 ReachableExits 定死，
+// want 非零时是**定向铸票**（点名网关）：出口已经被网关的 ReachableExits 定死，
 // 只剩「它在那个区域还有配额吗」这个问题，返回的区域就是那个出口自己。
 //
 // throttle > 0 时跳过「刚铸过票不到这么久」的账号（保温路径用；交付路径传 0，
 // 那边有人在等，节流会直接变成服务不可用）。
 //
-// skip 非 nil 时按 (账号, 区域) 再筛一道，预铸用它排掉「这一轮已经试过」和「预测落点
-// 已经有活票」的组合。交付路径传 nil：那边有人在等票，少一个候选就可能直接变成 503。
+// pol 非 nil 时按预铸的两条偏好再筛/再排一道。交付路径传 nil：那边有人在等票，
+// 少一个候选就可能直接变成 503。
 func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Duration,
-	skip func(accountID int64, regionKey string) bool) (types.Account, types.Region, bool) {
+	pol *premintPolicy) (types.Account, types.Region, bool) {
 	now := s.now()
 	s.mu.Lock()
 	lastUsed := make(map[int64]time.Time, len(s.lastMintedAt))
@@ -1525,6 +1538,7 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		a      types.Account
 		r      types.Region
 		sent   int  // 本小时总发数
+		reseed bool // 挑中的那个区域此刻没有种子票
 		unseen bool // 挑中的那个区域终身还没铸过
 		used   time.Time
 	}
@@ -1546,15 +1560,19 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		for _, n := range perRegion {
 			total += n
 		}
-		var drop func(string) bool
-		if skip != nil {
-			drop = func(key string) bool { return skip(a.ID, key) }
+		var drop, prefer func(string) bool
+		if pol != nil {
+			if pol.skip != nil {
+				drop = func(key string) bool { return pol.skip(a.ID, key) }
+			}
+			prefer = pol.prefer
 		}
-		pick, picked, ok := bestRegion(want, perRegion, limit, lifetime[a.ID], drop)
+		pick, picked, reseed, ok := bestRegion(want, perRegion, limit, lifetime[a.ID], drop, prefer)
 		if !ok {
 			continue // 九个区域（或点名的那一个）本小时都打满了、或者都被 skip 排掉了
 		}
-		cs = append(cs, cand{a: a, r: pick, sent: total, unseen: picked == 0, used: lastUsed[a.ID]})
+		cs = append(cs, cand{a: a, r: pick, sent: total, reseed: reseed,
+			unseen: picked == 0, used: lastUsed[a.ID]})
 	}
 	if len(cs) == 0 {
 		return types.Account{}, types.Region{}, false
@@ -1562,6 +1580,9 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 	sort.Slice(cs, func(i, j int) bool {
 		if cs[i].sent != cs[j].sent {
 			return cs[i].sent < cs[j].sent
+		}
+		if cs[i].reseed != cs[j].reseed {
+			return cs[i].reseed
 		}
 		if cs[i].unseen != cs[j].unseen {
 			return cs[i].unseen
@@ -1574,17 +1595,18 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 	return cs[0].a, cs[0].r, true
 }
 
-// bestRegion 给一个号挑它最该去的区域：还有本小时配额的里面，终身铸得最少的那个。
-// 返回挑中的区域、它的终身计数、以及「还有没有配额」。
+// bestRegion 给一个号挑它最该去的区域：还有本小时配额的里面，**先看 prefer**，
+// 同档内挑终身铸得最少的那个。返回挑中的区域、它的终身计数、它是不是 prefer 那一档、
+// 以及「还有没有配额」。
 //
 // limit <= 0 当「不设限」：只有没接配置的裸 mint.Client 会这样，生产的
 // mint.perRegionHour 永远回正数。
 //
-// drop 非 nil 时再排掉它说不要的区域（预铸用，见 minterFor 的 skip）。
+// drop / prefer 非 nil 时分别排掉和优先某些区域（预铸用，见 premintPolicy）。
 func bestRegion(want types.Exit, perRegion map[string]int, limit int, lifetime map[string]int,
-	drop func(regionKey string) bool) (types.Region, int, bool) {
+	drop, prefer func(regionKey string) bool) (types.Region, int, bool, bool) {
 	var best types.Region
-	bestCount, found := 0, false
+	bestCount, bestPrefer, found := 0, false, false
 	for _, r := range candidateRegions(want) {
 		if limit > 0 && perRegion[r.Key] >= limit {
 			continue
@@ -1592,12 +1614,18 @@ func bestRegion(want types.Exit, perRegion map[string]int, limit int, lifetime m
 		if drop != nil && drop(r.Key) {
 			continue
 		}
+		p := prefer != nil && prefer(r.Key)
 		n := lifetime[r.Key]
-		if !found || n < bestCount {
-			best, bestCount, found = r, n, true
+		// prefer 那一档整体优先；同档内才比终身计数。
+		switch {
+		case !found, p && !bestPrefer:
+		case p == bestPrefer && n < bestCount:
+		default:
+			continue
 		}
+		best, bestCount, bestPrefer, found = r, n, p, true
 	}
-	return best, bestCount, found
+	return best, bestCount, bestPrefer, found
 }
 
 // candidateRegions 是这一发可以走哪些区域。
@@ -2054,40 +2082,6 @@ func drop(ss []string, v string) []string {
 		}
 	}
 	return out
-}
-
-// noteRenewFail 给这张 pair 记一次续期失败。连败到预算就**丢掉这张票**，
-// 下一轮改成裸铸。
-//
-// 刻意**不拉黑网关**：续不上的是这张具体的票，网关本身照旧——别的号随时可能在它
-// 上面铸出一张新的，拉黑会把那条路也一起堵了。
-func (s *Scheduler) noteRenewFail(name string, cause error) {
-	drop := false
-	if err := s.st.UpdateGateway(name, func(g *types.Gateway) {
-		g.RenewFails++
-		if g.RenewFails >= types.RenewFailBudget {
-			g.RenewFails = 0
-			drop = true
-		}
-	}); err != nil {
-		s.opt.Log.Error("记续期失败没落盘", "gateway", name, "err", err)
-		return
-	}
-	if !drop {
-		return
-	}
-	s.opt.Log.Warn("这张 pair 连续续不上，丢掉改裸铸", "gateway", name,
-		"budget", types.RenewFailBudget, "last", cause)
-	if err := s.st.DeletePair(name); err != nil {
-		s.opt.Log.Error("丢弃死票失败", "gateway", name, "err", err)
-	}
-}
-
-// clearRenewFails 续上了就把预算还回去。
-func (s *Scheduler) clearRenewFails(name string) {
-	if err := s.st.UpdateGateway(name, func(g *types.Gateway) { g.RenewFails = 0 }); err != nil {
-		s.opt.Log.Error("清续期失败计数没落盘", "gateway", name, "err", err)
-	}
 }
 
 // noteDeliver 记一次「这个账号在这个网关上真的拿到票了」。

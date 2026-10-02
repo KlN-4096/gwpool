@@ -139,9 +139,9 @@ func TestDeliverFloorOutlastsWindow(t *testing.T) {
 		t.Fatalf("DeliverFloor=%v 不比交付窗口 %v 长，发出去的票会在客户端手里到点",
 			DeliverFloor, DeliverTTL)
 	}
-	if DeliverFloor >= RenewLead {
-		t.Fatalf("DeliverFloor=%v 不低于续期线 %v：两个数一样会让低于门槛的票"+
-			"同时「不能发」和「该续了」，供给紧时交付只能原地等保温", DeliverFloor, RenewLead)
+	if DeliverFloor >= PairLifetime {
+		t.Fatalf("DeliverFloor=%v 不短于一张票的总寿命 %v：那样每张票刚铸出来就低于"+
+			"交付门槛，池子一张都发不出去", DeliverFloor, PairLifetime)
 	}
 }
 

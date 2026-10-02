@@ -445,7 +445,7 @@ func TestVerifyFullRequiresTicket(t *testing.T) {
 
 func TestGeoParsesIpinfo(t *testing.T) {
 	c, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"ip":"126.109.254.208","country":"JP","city":"Kyoto",
+		_, _ = fmt.Fprint(w, `{"ip":"126.109.254.208","country":"JP","city":"Kyoto",
 		                "region":"Kyoto","org":"AS2516 KDDI CORPORATION"}`)
 	})
 	obs, err := c.Geo(context.Background(), types.Exit{Region: "JP"}, "sid1")
@@ -467,7 +467,7 @@ func TestGeoRetriesOnce(t *testing.T) {
 			w.WriteHeader(503) // 住宅 IP 打 ipinfo 偶发抽风
 			return
 		}
-		fmt.Fprint(w, `{"ip":"1.2.3.4","country":"US","org":"AS1 X"}`)
+		_, _ = fmt.Fprint(w, `{"ip":"1.2.3.4","country":"US","org":"AS1 X"}`)
 	})
 	obs, err := c.Geo(context.Background(), types.Exit{Region: "US"}, "sid1")
 	if err != nil || obs.IP != "1.2.3.4" {
@@ -585,7 +585,7 @@ func TestSIDStaysOnOneProxy(t *testing.T) {
 		t.Fatal("外来 sid 该被自动绑一条粘性出口")
 	}
 	for i := 0; i < 10; i++ {
-		c.NewSID(true) // 把游标转起来
+		_, _ = c.NewSID(true) // 把游标转起来
 		if got := c.proxyName(foreign); got != first {
 			t.Fatalf("同一个 sid 换了出口：%q → %q", first, got)
 		}
@@ -831,13 +831,13 @@ func TestSocks5ConnectThroughFakeProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		user, target, err := fakeSocks5Handshake(conn)
 		if err != nil {
 			t.Error(err)
@@ -849,7 +849,7 @@ func TestSocks5ConnectThroughFakeProxy(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		defer back.Close()
+		defer func() { _ = back.Close() }()
 		go func() { _, _ = io.Copy(back, conn) }()
 		_, _ = io.Copy(conn, back)
 	}()
@@ -889,7 +889,7 @@ func TestDeadExitDoesNotTripSupplierBreaker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	// 握手照回成功，然后立刻挂断：这就是死掉的住宅节点的样子。
 	go func() {
 		for {
@@ -965,7 +965,7 @@ func TestDeadExitDoesNotRefundRateWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -1005,7 +1005,7 @@ func TestCallerCancelDoesNotRefundRateWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -1015,7 +1015,7 @@ func TestCallerCancelDoesNotRefundRateWindow(t *testing.T) {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				_, _, _ = fakeSocks5Handshake(conn)
 				<-done // 隧道建好之后什么都不回：这一发就卡在等响应上
 			}()

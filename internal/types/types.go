@@ -309,11 +309,6 @@ type Gateway struct {
 	FirstSeenBy    int64
 	FirstSeenAt    time.Time
 	ReachableExits []Exit
-
-	// RenewFails 是这个网关当前那张 pair **连续**续期失败几次了，续上一次就清零。
-	// 连败到 RenewFailBudget 就把那张票丢掉，下一轮改成裸铸——**不拉黑这个网关**：
-	// 续不上的是那张具体的票，网关本身照旧，别的号随时可能在它上面铸出一张新的。
-	RenewFails int
 }
 
 // 槽位判定的三个取值。VerdictUnknown 不只是「还没验」，也是客户端回报里**唯一
@@ -460,12 +455,9 @@ const (
 	OailbLifetime = 3900 * time.Second
 	FullWindow    = 183 * time.Second // 首次接触后的满血窗口，静默失效
 	DeliverTTL    = 150 * time.Second // 交付给消费者的有效期，FullWindow 留 18% 余量
-	RenewLead     = 600 * time.Second // pair 剩余不足这么多就续
 	// DeliverFloor 是交付的最低 pair 剩余量，量的是 Pair.ExpiresAt（= 路由死期，
 	// 也就是 __cflb 那个）。
 	//
-	// 比 RenewLead 低一截是刻意的：两个数相等时，一张低于门槛的票同时意味着
-	// 「不能发」和「该续了」，于是供给紧的时候交付路径只能原地等保温。
 	// 300 s 的含义是「消费者手上这张至少还能活过两个交付窗口」。
 	//
 	// 它和 OailbLifetime−PairLifetime 都是 300 s 纯属巧合，别把两件事绑在一起：
@@ -524,12 +516,8 @@ const SpareTarget = 2
 //
 // DNS 枚举 chat.gateway.unified-N.api.openai.com 得 201 个，别人统计是 215 个里 14 个
 // 黑洞；按 190 算，给走不到的那几个留余量。不封顶的话，最忙的号用遍全部网关之后
-// 目标就永远够不着，每轮保温都会为它白打几发上游（裸铸每轮最多白打两发，见 premintBare）。
+// 目标就永远够不着，每轮保温都会为它白打几发上游（一轮的失手预算 = 缺口，见 premintBare）。
 const GatewayCeiling = 190
-
-// RenewFailBudget 是一张 pair 连续续期失败几次就放弃它（丢掉，下一轮裸铸）。
-// 预算花在「别再拿同一张死票去续」上，不花在拉黑网关上。
-const RenewFailBudget = 3
 
 // ErrRateLimited 是速率闸拦下来的。闸是**按上游账号**算的，不是全局：
 // 一个号打太猛不该让别的号跟着挨饿。

@@ -105,14 +105,14 @@ func TestProbeProxyGoesThroughThatProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	gotUser := make(chan string, 1)
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		user, target, err := fakeSocks5Handshake(conn)
 		if err != nil {
 			t.Error(err)
@@ -124,7 +124,7 @@ func TestProbeProxyGoesThroughThatProxy(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		defer back.Close()
+		defer func() { _ = back.Close() }()
 		go func() { _, _ = io.Copy(back, conn) }()
 		_, _ = io.Copy(conn, back)
 	}()
@@ -153,13 +153,13 @@ func TestProbeProxyReportsAuthFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		head := make([]byte, 2)
 		if _, err := io.ReadFull(conn, head); err != nil {
 			return

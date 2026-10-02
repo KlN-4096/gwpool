@@ -49,7 +49,7 @@ func TestEnqueueDiscoveryPicksAnotherAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	add := func(label, token string, enabled bool) int64 {
 		a, err := st.AddAccount(types.Account{
@@ -102,7 +102,7 @@ func TestEnqueueDiscoveryNoOpWhenAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	a, err := st.AddAccount(types.Account{
 		Label:   "solo",

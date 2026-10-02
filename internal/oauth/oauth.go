@@ -110,7 +110,7 @@ func Refresh(ctx context.Context, hc *http.Client, refreshToken string) (access,
 	if err != nil {
 		return "", "", fmt.Errorf("换票请求失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode/100 != 2 {
 		// 带上上游原话：换票失败最常见的原因是 refresh_token 本身被撤销了，

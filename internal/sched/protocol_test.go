@@ -559,74 +559,6 @@ func TestExcludeBeatsGatewayHint(t *testing.T) {
 	}
 }
 
-// warmRig 搭一个「续期开着、只有快到点的票」的保温场景。
-//
-// 票剩 100 秒：低于交付门槛 ⇒ livePairs()=0，也低于续期线 ⇒ 每个网关都该被续一次。
-func warmRig(t *testing.T, gateways ...string) (*Scheduler, *fakeStore, *fakeMinter, *clock) {
-	t.Helper()
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	addAccount(st, 1, "acct-1")
-	addAccount(st, 2, "acct-2")
-	for i, gw := range gateways {
-		seedGateway(st, mn, gw, i, 1)
-		mn.full[gw] = true
-		exp := clk.now().Add(100 * time.Second)
-		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
-			ExpiresAt: exp, CflbExpiresAt: exp, MintedBy: 2}
-	}
-	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(func(c *config.Config) { c.RenewPairs = true })})
-	s.markDemand()
-	return s, st, mn, clk
-}
-
-// N-3：保温的「深度」计数必须按实测重数，不能每续成一发就 +1。
-//
-// 上游接受了一张还有效的 pair 时不下发新 cookie（SPEC 第 2 节），那张票的 ExpiresAt
-// 一个字没变 ⇒ 无条件自增会让计数器虚高、本轮提前收手，而深度其实没涨。
-func TestRenewCountsLivePairsNotSuccesses(t *testing.T) {
-	s, _, mn, _ := warmRig(t, "unified-1", "unified-2", "unified-3")
-	mn.noNewPair = true // 带着旧 pair 打进去，上游接受、不换 cookie
-
-	s.warmOnce(context.Background())
-	// 目标深度 2、实测深度恒为 0 ⇒ 三个网关都该被试过一遍，而不是续成两发就收手。
-	if n := len(mn.mintedGateways()); n != 3 {
-		t.Fatalf("只续了 %d 发：计数器把「没换成新票」当成深度涨了", n)
-	}
-}
-
-// N-3（后半）：保温的续期也要拿网关锁，否则它和交付路径的现铸能同时为一个网关
-// 各打一发，而一张 pair 本来就能同时服务多个消费者 —— 第二发纯属白烧一个槽位。
-func TestRenewTakesGatewayLock(t *testing.T) {
-	s, _, mn, _ := warmRig(t, "unified-1")
-	release := s.lockGateway("unified-1")
-
-	done := make(chan struct{})
-	go func() {
-		s.warmOnce(context.Background())
-		close(done)
-	}()
-	select {
-	case <-done:
-		t.Fatalf("锁着这个网关还续了 %d 发", len(mn.mintedGateways()))
-	case <-time.After(100 * time.Millisecond):
-	}
-	if n := len(mn.mintedGateways()); n != 0 {
-		t.Fatalf("锁着这个网关还续了 %d 发", n)
-	}
-	release()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("锁放了还卡着")
-	}
-	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("锁放了之后续了 %d 发，应为 1", n)
-	}
-}
-
 // S-4：被自动停用的托管号的交付历史不许解开预铸的成本闸。
 //
 // 「有外部消费者在取票就不算白烧」这条豁免要按 types.AnonPrefix 认人。按
@@ -835,29 +767,6 @@ func TestPairLifeFollowsCflbNotOailb(t *testing.T) {
 	}
 	if want := clk.now().Add(time.Second); !p.ExpiresAt.Equal(want) {
 		t.Fatalf("ExpiresAt=%v，应按 __cflb 算成 %v", p.ExpiresAt, want)
-	}
-}
-
-// 洞 2：续期只补发 __oailb 时，寿命必须还按**旧 __cflb** 算。
-//
-// 新 __oailb 的 65 分钟盖不住旧 __cflb——后者是 AEAD 密文、读不出时间，
-// 只有账本上那个字段知道它什么时候死。盖掉的话虚报量无上限。
-func TestRenewKeepsOldCflbDeadline(t *testing.T) {
-	s, st, mn, clk := warmRig(t, "unified-1")
-	dead := clk.now().Add(400 * time.Second) // 低于 RenewLead ⇒ 该续了
-	putPair(st, "unified-1", cookiePrefix+"unified-1", dead)
-	mn.onlyOailb = true // 上游只补发 __oailb，钉路由那张原样留着
-
-	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("续了 %d 发，这个用例要的就是一发", n)
-	}
-	p, _ := st.Pair("unified-1")
-	if !p.ExpiresAt.Equal(dead) {
-		t.Fatalf("ExpiresAt=%v，只补发 __oailb 时该还是旧 __cflb 的 %v", p.ExpiresAt, dead)
-	}
-	if !p.CflbExpiresAt.Equal(dead) {
-		t.Fatalf("CflbExpiresAt=%v，应为 %v", p.CflbExpiresAt, dead)
 	}
 }
 

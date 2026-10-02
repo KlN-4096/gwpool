@@ -173,13 +173,6 @@ type Config struct {
 	// 放出去，所以默认仍然关。
 	VerifyFullAtDeliver bool `json:"verify_full_at_deliver"`
 
-	// RenewPairs 决定保温要不要「带着旧 pair 去续同一个网关」。**默认关**。
-	//
-	// 续期能让一张 pair 一直活着，但每续一发都要烧掉执行者在那个网关上的窗口，
-	// 而池子真正缺的是**落点**不是票。关掉之后保温只做裸铸（落到哪个网关算哪个），
-	// 同样的上游预算花在扩大触达面上。
-	RenewPairs bool `json:"renew_pairs"`
-
 	// SlotCooldownMinutes 是 (账号 × 网关) 烧掉之后要歇多久，0 时按 types.SlotCooldown。
 	//
 	// 这个数至今没测准：实测见过 30 分钟就恢复的，也见过 3 小时还没恢复的，
@@ -273,7 +266,6 @@ func Defaults() Config {
 		MintConcurrency:       defaultMintConcurrency,
 		// 这两个开关默认关，理由在字段注释里：两个都是「花一个满血窗口换一个读数」。
 		VerifyFullAtDeliver: false,
-		RenewPairs:          false,
 	}
 }
 
@@ -406,6 +398,11 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("配置键 %s 已经改名为 %s（%s），请手动改掉", k.old, k.now, k.why)
 		}
 	}
+	for _, k := range removedKeys {
+		if _, present := raw[k.key]; present {
+			return Config{}, fmt.Errorf("配置键 %s 已经没有了（%s），请从配置文件里删掉这一行", k.key, k.why)
+		}
+	}
 
 	// 老配置的单值 model 折进 Models，放在最前面（它原本就是默认值）。
 	//
@@ -485,6 +482,20 @@ var renamedKeys = []renamedKey{
 }
 
 type renamedKey struct{ old, now, why string }
+
+// removedKeys 是**功能已经删掉**的配置键。和 renamedKeys 同一个理由：这个文件是手改的，
+// 静默忽略一个「我以为我打开了某个功能」的键，现象和上游出问题长得一样。
+//
+// 代价是**部署时必须先把这些键从 config.json 里删掉**，否则 gwpool 起不来。这是刻意的：
+// 留着一个没人读的开关，下一个人迟早会去拨它，然后花半天查「为什么拨了没反应」。
+var removedKeys = []removedKey{
+	{key: "renew_pairs",
+		why: "带着旧 pair 去续同一个网关这件事整个删了（2026-10-03）：实测上游不接受" +
+			"定向续期（`__cflb` 钉大区不钉网关、两件齐送不回 cookie），打开它只会让保温" +
+			"失败刷屏、把裸铸挤掉。现在保温只做裸铸，票一律靠 ExpiresAt 自然过期退场"},
+}
+
+type removedKey struct{ key, why string }
 
 // normalizeBaseURL 校验并规范化 public_base_url：空串照过，非空必须是
 // scheme + 主机名，回出来一律没有末尾斜杠。

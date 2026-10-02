@@ -62,10 +62,6 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 		return
 	}
 	s.opt.Log.Info("预铸：补到目标深度", "live", live, "target", target)
-	if s.cfg().RenewPairs {
-		s.renewStalePairs(ctx, live, target)
-		return
-	}
 	s.premintBare(ctx, target-live)
 }
 
@@ -257,21 +253,30 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 	if r.halt {
 		return premintPlan{}, false
 	}
-	skip := func(id int64, key string) bool {
-		combo := comboKey(id, key)
-		if r.tried[combo] {
-			return true
-		}
-		gw := landed[combo]
-		if gw == "" {
-			return false // 没铸过 ⇒ 去摸新落点
-		}
-		return live[gw] || r.aimed[gw]
+	pol := &premintPolicy{
+		skip: func(id int64, key string) bool {
+			combo := comboKey(id, key)
+			if r.tried[combo] {
+				return true
+			}
+			gw := landed[combo]
+			if gw == "" {
+				return false // 没铸过 ⇒ 去摸新落点
+			}
+			return live[gw] || r.aimed[gw]
+		},
+		// 丢了种子票的大区优先补：它一掉，那个大区的所有账号都回落到住宅出口，
+		// 而**一张**票就能把整个大区的便宜路径恢复（种子不绑账号，见 seedPairFor）。
+		// 所以它的收益高于普通的「去摸一个新落点」—— 后者只多一个槽位。
+		prefer: func(key string) bool {
+			_, ok := s.seedPairFor(key)
+			return !ok
+		},
 	}
 	for try := 0; try < premintPickTries; try++ {
-		// 本小时打得最少的号优先、它终身没走过的区域优先；
+		// 本小时打得最少的号优先、丢了种子的大区优先、它终身没走过的区域优先；
 		// 节流同一个号两次铸票至少隔 RenewGap。
-		a, reg, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap, skip)
+		a, reg, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap, pol)
 		if !ok {
 			s.opt.Log.Info("没有可挑的 (账号 × 大区) 组合了，本轮预铸收尾",
 				"got", r.got, "want", r.want, "tried", len(r.tried))
@@ -380,72 +385,6 @@ func (s *Scheduler) lastLandings() map[string]string {
 // 这里只是进程内的一轮临时记账，不该跟着它走。
 func comboKey(accountID int64, regionKey string) string {
 	return strconv.FormatInt(accountID, 10) + "|" + regionKey
-}
-
-// renewStalePairs 是 renew_pairs 打开时的保温：带着旧 pair 去续同一个网关。
-//
-// 上游会回一张**同网关**的新 65 分钟 pair（pair 自我续期，SPEC 第 6 节）。
-// 代价是烧掉执行者在那个网关上的窗口——想「稳住已知落点」而不是「多摸落点」时才开它。
-func (s *Scheduler) renewStalePairs(ctx context.Context, live, target int) {
-	for name, gw := range s.st.Gateways() {
-		if ctx.Err() != nil {
-			return
-		}
-		if live >= target {
-			return
-		}
-		if p, ok := s.st.Pair(name); ok && p.ExpiresAt.Sub(s.now()) > types.RenewLead {
-			continue
-		}
-		exit, ok := pickExit(gw)
-		if !ok {
-			continue
-		}
-		// 本小时打得最少的号优先，节流同一个号两次续期至少隔 RenewGap。
-		// 都在节流里就跳过这一轮，pair 还有 RenewLead 的余量，等下一轮不迟。
-		// 出口由这个网关定死，所以只要人、不要它挑的区域。
-		sc, _, ok := s.minterFor(exit, 0, s.opt.RenewGap, nil)
-		if !ok {
-			continue
-		}
-		sid, err := s.mint.NewSID(true)
-		if err != nil {
-			s.opt.Log.Warn("要不到粘性出口，本轮不保温", "err", err)
-			return
-		}
-		cur, _ := s.st.Pair(name)
-		// 带着旧 pair 打：pair 自我续期，上游会回一张**同网关**的新 65 分钟 pair。
-		//
-		// 要拿网关锁：不拿的话保温和交付路径的现铸能同时为同一个网关各打一发，
-		// 而一张 pair 本来就能同时服务多个消费者（types.Pair），第二发纯属白烧
-		// 一个槽位加一发请求——正是这一轮要消掉的浪费。
-		// 锁序恒为「先网关、再账号」，和交付那边一致 ⇒ 不存在 ABBA。
-		relGW := s.lockGateway(name)
-		unlock := s.st.LockAccount(sc.ID)
-		_, err = s.mintOnce(ctx, sc, exit, sid, cur, name, name)
-		unlock()
-		relGW()
-		switch {
-		case err == nil:
-			// 按实测重数，**不是** live++：上游接受了一张还有效的 pair 时不下发新
-			// cookie（SPEC 第 2 节），那张票的 ExpiresAt 一个字没变 ⇒ 无条件自增会让
-			// 计数器虚高、本轮提前收手，而深度其实没涨。
-			live = s.livePairs()
-			s.clearRenewFails(name)
-		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
-			// 闸门和基础设施故障不是这个网关的错，别给它记失败预算，也别接着打。
-			s.opt.Log.Warn("续期撞上闸门，本轮停", "gateway", name, "reason", err)
-			return
-		default:
-			s.opt.Log.Info("保温失败", "gateway", name, "scanner", sc.ID, "label", sc.Label, "reason", err)
-			s.noteRenewFail(name, err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(s.opt.MintGap):
-		}
-	}
 }
 
 func (s *Scheduler) idle() bool {

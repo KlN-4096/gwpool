@@ -352,7 +352,7 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		return types.MintResult{}, err
 	}
 	// 只读响应头就断：body 是 SSE 流，读完它要等上游把整轮推完，白等几十秒。
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Max-Age 是**相对收到响应的时刻**算的，所以时刻要在这儿取，别拖到后面。
 	at := time.Now().UTC()
@@ -437,7 +437,7 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 非 200 不下结论：429/403 的响应头里本来就没有 turn-state，
 	// 照「无新 state = 满血」读就是假阳（作者原版的漏洞，实测 12 发撞出 2 个）。
@@ -446,10 +446,10 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 	}
 	newState := resp.Header.Get(stateHeader)
 	v := &types.Verdict{Status: resp.StatusCode}
-	switch {
-	case newState == "":
+	switch newState {
+	case "":
 		v.Full, v.Note = true, "未下发新 state"
-	case newState == ticket:
+	case ticket:
 		v.Full, v.Note = true, "回下同一张票"
 	default:
 		v.Full, v.Note = false, "下发了不同的新 state"
@@ -506,7 +506,7 @@ func (c *Client) geoRequest(ctx context.Context) (*http.Request, error) {
 
 // readGeo 读 ipinfo 的回答，读完关掉响应体。
 func readGeo(resp *http.Response) (types.Observed, error) {
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return types.Observed{}, fmt.Errorf("查 geo 返回 HTTP %d", resp.StatusCode)
 	}

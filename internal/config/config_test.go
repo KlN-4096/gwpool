@@ -159,7 +159,7 @@ func TestSecretNeverPrinted(t *testing.T) {
 		fmt.Sprintf("%v", cfg),
 		fmt.Sprintf("%+v", cfg),
 		fmt.Sprintf("%#v", cfg),
-		fmt.Sprintf("%s", cfg.Proxies[0].Pass),
+		cfg.Proxies[0].Pass.String(),
 		fmt.Sprintf("%q", cfg.AdminKey),
 		string(b),
 	}
@@ -286,9 +286,9 @@ func TestSchedulingKnobDefaults(t *testing.T) {
 		t.Errorf("每区每小时默认该是 6（九区合起来 54 = 原先按账号算的那个数），得到 %d",
 			cfg.UpstreamPerRegionHour)
 	}
-	// 两个开关都是「花一个满血窗口换一个读数」，所以默认关。
-	if cfg.VerifyFullAtDeliver || cfg.RenewPairs {
-		t.Errorf("两个开关默认都该关: verify=%v renew=%v", cfg.VerifyFullAtDeliver, cfg.RenewPairs)
+	// 交付前验满血是「花一个满血窗口换一个读数」，所以默认关。
+	if cfg.VerifyFullAtDeliver {
+		t.Error("verify_full_at_deliver 默认该关")
 	}
 	if cfg.MaxTriesPerDeliver != 2 {
 		t.Errorf("一次交付最多试几个网关默认该是 2，得到 %d", cfg.MaxTriesPerDeliver)
@@ -445,5 +445,22 @@ func TestRenamedUpstreamPerHourIsRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "upstream_per_region_hour") {
 		t.Fatalf("报错没告诉人该改成什么: %v", err)
+	}
+}
+
+// 功能删掉的键同理要明着拒，而且两种取值都要拒：留着 false 的那一行，下一个人
+// 迟早会把它改成 true，然后花半天查「为什么拨了没反应」。
+//
+// 代价是**部署时必须先把这一行从 config.json 里删掉**，否则起不来。这条用例就是
+// 那个代价的记录：看见它红了就知道线上配置还带着这个键。
+func TestRemovedRenewPairsIsRejected(t *testing.T) {
+	for _, v := range []string{"true", "false"} {
+		_, err := Load(writeCfg(t, `{"renew_pairs":`+v+`,`+okProxies+`}`))
+		if err == nil {
+			t.Fatalf("renew_pairs:%s 被静默忽略了", v)
+		}
+		if !strings.Contains(err.Error(), "renew_pairs") || !strings.Contains(err.Error(), "删掉") {
+			t.Fatalf("报错没说清该把它删掉: %v", err)
+		}
 	}
 }

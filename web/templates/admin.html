@@ -360,8 +360,6 @@
           <span>票富裕时允许没上传凭据的人取</span></label>
         <label class="choice"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}>
           <span>交付前用 state-echo 验一次满血 <span class="hint">每次交付多花两发上游（和铸票共用每区每小时那份预算）。不会烧掉窗口，只是让窗口提前开始计时</span></span></label>
-        <label class="choice"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}>
-          <span>保温时续期已有的路由 Cookie <span class="hint">关掉则只裸铸：同样一发上游花在摸新落点上</span></span></label>
         <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>
       </form>
       {{end}}

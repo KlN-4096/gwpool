@@ -471,7 +471,7 @@ func (s *Server) ConsumerKeyFor(a types.Account) string {
 		return ""
 	}
 	m := hmac.New(sha256.New, []byte(s.opt.ConsumerKey))
-	fmt.Fprintf(m, "gwpool-consumer-key|%d|%s", a.ID, a.Creds.AccountID)
+	_, _ = fmt.Fprintf(m, "gwpool-consumer-key|%d|%s", a.ID, a.Creds.AccountID)
 	return base64.RawURLEncoding.EncodeToString(m.Sum(nil)[:18])
 }
 

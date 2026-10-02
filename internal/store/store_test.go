@@ -387,7 +387,7 @@ func TestCredsMaskedInPrintButPersisted(t *testing.T) {
 	}
 	for _, d := range []string{
 		fmt.Sprintf("%v", a), fmt.Sprintf("%+v", a), fmt.Sprintf("%#v", a),
-		fmt.Sprintf("%v", a.Creds), fmt.Sprintf("%s", a.Creds),
+		fmt.Sprintf("%v", a.Creds), a.Creds.String(),
 	} {
 		if strings.Contains(d, "TOKEN-SECRET") {
 			t.Errorf("打印漏出了 token: %s", d)

@@ -64,7 +64,7 @@ func run(path string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	// 配置的活引用：管理页改旋钮、或者有人直接编辑文件，都当场生效，不用重启。
 	// 重启会丢掉进程里的速率窗口、铸票计数、需求时间戳——而调度正依据那些。

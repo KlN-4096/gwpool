@@ -316,11 +316,11 @@ type fakeMinter struct {
 	seedSIDErr error
 	// seedSent 记每一发带种子铸票送进去的 cookie，key = sid。
 	// 用它证明「有活种子票时走的是种子出口、而且把那张票送出去了」。
-	seedSent  map[string]string
-	sidSeq    int
-	mints     []types.Sample // 只借这个结构记 (account, gateway) 调用流水
-	echoes    int
-	echoExits []string // 每发 state-echo 用的出口区域键
+	seedSent    map[string]string
+	sidSeq      int
+	mints       []types.Sample // 只借这个结构记 (account, gateway) 调用流水
+	echoes      int
+	echoExits   []string // 每发 state-echo 用的出口区域键
 	inflight    map[int64]int
 	maxPerAcc   int
 	allInflight int
@@ -608,14 +608,10 @@ func rig(t *testing.T, mode types.Mode) (*Scheduler, *fakeStore, *fakeMinter, *c
 		seedGateway(st, mn, gw, i, 1)
 		mn.full[gw] = true
 	}
-	// 这组用例测的是**两个开关都打开**那条路：交付前验满血、保温走续期。
-	// 两个开关默认都关（见 config.Config 的字段注释），默认那条路由
-	// TestDeliverWithoutVerifyNeverEchoes / TestPremintBareDoesNotRenew 盯着。
+	// 这组用例测的是**交付前验满血打开**那条路。它默认关（见 config.Config 的字段
+	// 注释），默认那条路由 TestDeliverWithoutVerifyNeverEchoes 盯着。
 	s := New(st, mn, Options{Mode: mode, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(func(c *config.Config) {
-			c.VerifyFullAtDeliver = true
-			c.RenewPairs = true
-		})})
+		Live: liveCfg(func(c *config.Config) { c.VerifyFullAtDeliver = true })})
 	return s, st, mn, clk
 }
 
@@ -854,30 +850,34 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 		t.Fatalf("从没人要过就保温了 %d 发", n)
 	}
 
-	// 没有号碰过任何网关 ⇒ 目标深度就是 SpareTarget，三个网关里只铸够数的那几个。
+	// 没有号碰过任何网关 ⇒ 目标深度就是 SpareTarget，补到够数就停。
+	// 断言量的是**达成的深度**不是发数：失手（落回已有活票的网关）会多花一发，
+	// 那是 premintBare 的正常行为，写死发数会让这个用例变成在测别的东西。
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != types.SpareTarget {
-		t.Fatalf("有需求时保温了 %d 发，目标深度是 %d", n, types.SpareTarget)
+	if n := s.FreeGateways(); n != types.SpareTarget {
+		t.Fatalf("有需求时补到了 %d 张活票，目标深度是 %d（发数 %d）",
+			n, types.SpareTarget, len(mn.mintedGateways()))
 	}
 
 	// 够数了就不再打：pair 还新鲜，而且目标也没涨。
+	spent := len(mn.mintedGateways())
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != types.SpareTarget {
-		t.Fatalf("够数了却又续了，共 %d 发", n)
+	if n := len(mn.mintedGateways()); n != spent {
+		t.Fatalf("够数了却又打了 %d 发", n-spent)
 	}
 
-	// 需求停了：即便 pair 快过期也不续。
-	// 按 DeliverFloor 算（不是 RenewLead）：livePairs 数的是「还够不够交付」的票。
+	// 需求停了：即便 pair 快过期也一发不打。
+	// 按 DeliverFloor 算：livePairs 数的是「还够不够交付」的票。
 	clk.add(types.PairLifetime - types.DeliverFloor + time.Minute)
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != types.SpareTarget {
-		t.Fatalf("静默期还在续，共 %d 发", n)
+	if n := len(mn.mintedGateways()); n != spent {
+		t.Fatalf("静默期还打了 %d 发", n-spent)
 	}
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != 2*types.SpareTarget {
-		t.Fatalf("需求回来后该把深度补回 %d，共 %d 发", types.SpareTarget, n)
+	if n := s.FreeGateways(); n != types.SpareTarget {
+		t.Fatalf("需求回来后该把深度补回 %d，实际 %d 张活票", types.SpareTarget, n)
 	}
 }
 
@@ -1356,11 +1356,12 @@ func TestPoolModeNeedsTwoAccounts(t *testing.T) {
 	if !strings.Contains(buf.String(), "可用账号不足两个") {
 		t.Fatalf("没留下为什么不保温的记录: %s", buf.String())
 	}
-	// 第二个号进来就该恢复保温。
+	// 第二个号进来就该恢复保温（量达成的深度，不量发数，见 TestPoolModeWarmsOnlyOnDemand）。
 	addAccount(st, 2, "acct-2")
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != types.SpareTarget {
-		t.Fatalf("两个号了却保温了 %d 发，目标深度是 %d", n, types.SpareTarget)
+	if n := s.FreeGateways(); n != types.SpareTarget {
+		t.Fatalf("两个号了却只补到 %d 张活票，目标深度是 %d（发数 %d）",
+			n, types.SpareTarget, len(mn.mintedGateways()))
 	}
 }
 
@@ -1796,16 +1797,6 @@ func TestRenewThrottlePerAccount(t *testing.T) {
 	}
 }
 
-// slotOf 取一个槽位，取不到就直接 fail——断言里不该出现零值误判成「判定被清空」。
-func slotOf(t *testing.T, st *fakeStore, acct int64, gw string) types.Slot {
-	t.Helper()
-	sl, ok := st.Slot(acct, gw)
-	if !ok {
-		t.Fatalf("槽位 %d|%s 不存在", acct, gw)
-	}
-	return sl
-}
-
 // 上游否决这个账号（400/401/403）就当场停用：保温/续期是个循环，
 // 不停用它会一直按这个节奏白打下去。
 func TestUpstreamRejectionDisablesAccount(t *testing.T) {
@@ -1894,9 +1885,9 @@ func TestPairTargetTracksBusiestConsumer(t *testing.T) {
 		t.Fatalf("没人用过票时目标应是 %d，实为 %d", types.SpareTarget, got)
 	}
 	s.warmOnce(context.Background())
-	first := len(mn.mintedGateways())
-	if first != types.SpareTarget {
-		t.Fatalf("第一轮铸了 %d 张，目标 %d", first, types.SpareTarget)
+	if n := s.FreeGateways(); n != types.SpareTarget {
+		t.Fatalf("第一轮补到 %d 张活票，目标 %d（发数 %d）",
+			n, types.SpareTarget, len(mn.mintedGateways()))
 	}
 	// 关键的一条：铸票写的是 LastTouch，目标**不许**因此上涨。
 	if got := s.PairTarget(); got != types.SpareTarget {
@@ -1938,46 +1929,6 @@ func TestSpareOverCeilingStopsPremint(t *testing.T) {
 	s.warmOnce(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("富余张数超过上限还预铸了 %d 发", n)
-	}
-}
-
-// 续期失败预算：同一张 pair 连败 RenewFailBudget 次就把它丢掉，下一轮改裸铸。
-// **网关不许被拉黑**——续不上的是这张票，别的号随时可能在这个网关上铸出新的。
-func TestDeadPairDroppedAfterRenewFailures(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModePool)
-	addAccount(st, 2, "acct-2")
-	s.markDemand()
-
-	// 先给每个网关一张快到期的票，这样保温走的是「续期」而不是裸铸。
-	// 剩余要压到 DeliverFloor 以下：livePairs 只数够交付的那些，不压就是「深度已达标」，
-	// warmOnce 一发不打、失败预算永远攒不满。
-	for name := range st.gws {
-		st.pairs[name] = types.Pair{Gateway: name, Cookie: "__cflb=x; __oailb=y",
-			ExpiresAt: clk.now().Add(types.DeliverFloor / 2)}
-	}
-	mn.mintErr = errors.New("上游不理")
-
-	// 每轮推进一个满血窗口：失败的续期也会保守地记一次触碰（那一发可能已经出站），
-	// 而触碰过的槽位在一个窗口内不参与挑选——不推够的话最后那次交付会被自己的
-	// 保温触碰挡掉。
-	for i := 0; i < types.RenewFailBudget; i++ {
-		s.warmOnce(context.Background())
-		clk.add(types.FullWindow + time.Second)
-		s.markDemand()
-	}
-	if n := len(st.pairs); n != 0 {
-		t.Fatalf("连败 %d 轮后死票还留着 %d 张: %+v", types.RenewFailBudget, n, st.pairs)
-	}
-	// 预算用掉就归零，别让它一路累加到下一张票头上。
-	for name, gw := range st.gws {
-		if gw.RenewFails != 0 {
-			t.Fatalf("%s 的失败计数没归零: %d", name, gw.RenewFails)
-		}
-	}
-	// 网关本身照旧是候选：这里只要求它不被静默排除，交付成不成是满血判定的事。
-	mn.mintErr = nil
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err != nil {
-		t.Fatalf("网关被拉黑了: %v", err)
 	}
 }
 
@@ -2502,31 +2453,6 @@ func TestPremintBareDoesNotRenew(t *testing.T) {
 	}
 }
 
-// renew_pairs 打开才回到「带旧 pair 续同一个网关」那条路。
-func TestRenewPairsSwitchRestoresRenewal(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	addAccount(st, 1, "acct-1")
-	addAccount(st, 2, "acct-2")
-	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
-		ReachableExits: []types.Exit{{Region: "US"}}}
-	for _, r := range types.Regions {
-		mn.land[exitKey(r.Exit)] = "unified-9"
-	}
-	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: clk.now().Add(time.Minute), MintedBy: 2}
-	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(func(c *config.Config) { c.RenewPairs = true })})
-	s.markDemand()
-
-	s.warmOnce(context.Background())
-	got := mn.mintedGateways()
-	if len(got) == 0 || got[0] != "unified-1" {
-		t.Fatalf("开了 renew_pairs 该续 unified-1，实际落点 %v", got)
-	}
-}
-
 // 种子票：这个大区手上有活 __cflb 时，预铸走我们自己的普通机房出口、把那张票送出去，
 // 而落点是**执行这一发的号自己**在那个大区的网关，不是种子那张票的网关。
 //
@@ -2546,15 +2472,19 @@ func TestPremintUsesASeedTicketWhenTheRegionHasOne(t *testing.T) {
 		comboKey(1, exitKey(us.Exit)): "unified-9",
 		comboKey(2, exitKey(us.Exit)): "unified-9",
 	}
-	// us-east 手上有一张活票 ⇒ 它的 __cflb 就是这个大区的种子。
-	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
-		ReachableExits: []types.Exit{us.Exit}}
-	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		RegionKey: us.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
-		CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
-	// 目标 2、已有 1 张活票 ⇒ 缺口 1 发。
+	// **每个大区都有一张活票**（= 都有种子）。这是池子热起来之后的常态，也是这个用例
+	// 必须这样铺的原因：「丢了种子的大区优先」会让缺种子的大区排在前面，只给 us-east
+	// 铺种子的话挑中的是别的大区，这个用例就测不到种子路了。
+	for i, r := range types.Regions {
+		gw := fmt.Sprintf("unified-s%d", i)
+		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{r.Exit}}
+		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
+			RegionKey: r.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
+			CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	}
+	// 目标 = 大区数 + 1、已有大区数张活票 ⇒ 缺口 1 发。
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 2 })})
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) + 1 })})
 	s.markDemand()
 
 	s.warmOnce(context.Background())
@@ -2569,9 +2499,46 @@ func TestPremintUsesASeedTicketWhenTheRegionHasOne(t *testing.T) {
 		if !strings.HasPrefix(sid, "seed") {
 			t.Fatalf("sid %q 不是种子出口的", sid)
 		}
-		if cookie != cookiePrefix+"unified-1" {
+		if cookie != cookiePrefix+"unified-s0" {
 			t.Fatalf("送出去的不是 us-east 那张种子票：%q", cookie)
 		}
+	}
+}
+
+// 丢了种子票的大区优先补：它一掉，那个大区的所有账号都回落到住宅出口，而一张票就能
+// 把整个大区的便宜路径恢复 ⇒ 收益高于普通的「去摸一个新落点」（后者只多一个槽位）。
+func TestPremintRefillsSeedlessRegionsFirst(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	// 除了最后一个大区，其余都有活种子票。每个大区的落点各不相同。
+	seedless := types.Regions[len(types.Regions)-1]
+	for i, r := range types.Regions {
+		gw := fmt.Sprintf("unified-s%d", i)
+		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{r.Exit}}
+		mn.land[exitKey(r.Exit)] = fmt.Sprintf("unified-n%d", i) // 裸铸会落到的新落点
+		if r.Key == seedless.Key {
+			continue
+		}
+		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
+			RegionKey: r.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
+			CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	}
+	// 缺口 1 发：那一发必须花在没有种子的那个大区上。
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) })})
+	s.markDemand()
+
+	s.warmOnce(context.Background())
+	want := fmt.Sprintf("unified-n%d", len(types.Regions)-1)
+	if got := mn.mintedGateways(); len(got) != 1 || got[0] != want {
+		t.Fatalf("该先补没种子的 %s（落点 %s），实际打了 %v", seedless.Key, want, got)
+	}
+	// 而且那一发只能走住宅：那个大区本来就没有种子票可送。
+	if sent := mn.seedShots(); len(sent) != 0 {
+		t.Fatalf("没种子的大区不该走种子出口，实际 %v", sent)
 	}
 }
 

@@ -87,7 +87,7 @@ func (l *Live) Watch(ctx context.Context, every time.Duration, log *slog.Logger)
 		// 不打全量配置：里面有密钥和 socks 口令。只报几个能说明「换没换对」的旋钮。
 		log.Info("配置已热重载", "models", c.Models,
 			"upstream_per_region_hour", c.UpstreamPerRegionHour,
-			"verify_full_at_deliver", c.VerifyFullAtDeliver, "renew_pairs", c.RenewPairs,
+			"verify_full_at_deliver", c.VerifyFullAtDeliver,
 			"slot_cooldown", c.SlotCooldown(),
 			"public", c.PublicWhenSurplus.Enabled, "min_accounts", c.PublicWhenSurplus.MinAccounts)
 	}

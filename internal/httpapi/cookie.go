@@ -530,8 +530,9 @@ type renewResponse struct {
 //     ref 现场建行并把槽位记上去。所以归属闸对它形同虚设：换个 ref 连冷却都不吃
 //     （全新占位行 = 零槽位历史），实测一把合法 key 能扫掉 5/5 个网关。
 //  3. **钳位**：死期一律不许超过 now+PairLifetime。没有它，一个远期 exp 就能把
-//     这张 pair 放大成「永不临期」⇒ renewStalePairs 永不重铸 ⇒ 漂移检测和失败预算
-//     全部失效 ⇒ 那个网关从此只发这张死票，还持久化进 state.json、重启不自愈。
+//     这张 pair 放大成「永不过期」⇒ 它是唯一的退场条件（池子不再有任何重铸/丢弃
+//     临期票的路径，2026-10-03 删掉了 renewStalePairs）⇒ 那个网关从此只发这张死票，
+//     还计入 livePairs() 压住别的网关的预铸，并持久化进 state.json、重启不自愈。
 //
 // # 剩下的残余面（别再写成「只能害自己」）
 //
@@ -669,10 +670,12 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 	// 不可能活过 now+PairLifetime。这一层必须自己钳，因为上面那个死期是从调用方写的
 	// exp 推出来的。
 	//
-	// 漏掉它不是「数字难看一点」，而是**没有回头路**：被放大的 pair 永不临期 ⇒
-	// warm.renewStalePairs（只在剩余 ≤ RenewLead 时重铸）永不重铸 ⇒ 漂移检测永不触发
-	// ⇒ RenewFailBudget 永不攒满 ⇒ DeletePair 永不被调用。那个网关从此只发这张死票，
-	// 还计入 livePairs() 压住别的网关的预铸，而且持久化进 state.json、重启不自愈。
+	// 漏掉它不是「数字难看一点」，而是**这张票再也不会自己退场**：真实 __cflb 一小时
+	// 就死，而被放大的死期让它在账本上永远「还活着」—— 一直计入 livePairs() 压住别的
+	// 网关的预铸，一直被当成可交付的票发出去（实际路由已经失效），而且持久化进
+	// state.json、重启不自愈。池子**没有**别的机制会丢掉它：唯一会按行为丢票的那条
+	// （定向续期的漂移检测 + 失败预算）2026-10-03 已随 renew_pairs 一起删掉，
+	// 现在所有票都只靠 ExpiresAt 自然过期退场。
 	// 它顺带救回 RenewAccept 的等价性：「> PairLifetime−RenewAccept ⟺ 刚换过不到
 	// 60 秒」只在死期不超过 now+PairLifetime 时成立。
 	if hardCap := time.Now().Add(types.PairLifetime); route.After(hardCap) {

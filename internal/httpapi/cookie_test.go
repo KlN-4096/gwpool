@@ -1139,9 +1139,7 @@ func TestRenewSkipsTheWriteWhenThePoolsTicketIsStillFresh(t *testing.T) {
 // 旧的），收下就是自己把池子最紧的供给换短。信任边界就在这一层。
 func TestRenewRefusesACookieThatDiesSooner(t *testing.T) {
 	srv, h, p, st, _ := rig(t, types.ModePool)
-	old := agePair(st, 30*time.Minute)
 	grantTicket(p, 1)
-	ver := types.CookieVersion(old.Cookie)
 	key := srv.ConsumerKeyFor(st.accounts[0])
 
 	// 场景得挑在**容差窗口之内**：明显过期/明显短的 cookie 由前面那道「不像是刚
@@ -1151,8 +1149,8 @@ func TestRenewRefusesACookieThatDiesSooner(t *testing.T) {
 	// 算一下（容差 5 min）：提交 exp = now+OailbLifetime−4min ⇒ 路由死期
 	// = now+PairLifetime−4min = now+3360；现持那张剩 3450（低于 RenewAccept 的
 	// 3540 线，所以不会走「跳过落盘」）⇒ 3360 < 3450 ⇒ 这一发白续。
-	old = agePair(st, types.PairLifetime-150*time.Second)
-	ver = types.CookieVersion(old.Cookie)
+	old := agePair(st, types.PairLifetime-150*time.Second)
+	ver := types.CookieVersion(old.Cookie)
 	short := routeCookie("NEW", "unified-142",
 		time.Now().Add(types.OailbLifetime-renewExpSkew+time.Minute))
 	w := do(h, authed(renewReq(ver, short), key))
