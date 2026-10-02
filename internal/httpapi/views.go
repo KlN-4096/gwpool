@@ -227,7 +227,10 @@ type regionCell struct {
 // 区域派」——九个格子全绿但全是重复的号，再派也只是白烧窗口。
 type regionGateway struct {
 	Name string
-	Dup  bool
+	// Short 是去掉恒定前缀 unified- 之后的编号：九个格子排一行，每格只放得下数字。
+	// 完整名字进悬停提示。
+	Short string
+	Dup   bool
 }
 
 // regionLabels 把区域 key 翻成人话。

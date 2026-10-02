@@ -1387,10 +1387,18 @@ func regionCells(accountID int64, mints map[string]types.RegionMint,
 			if g, ok := gws[name]; ok && g.FirstSeenBy != accountID {
 				dup = true
 			}
-			c.Gateways = append(c.Gateways, regionGateway{Name: name, Dup: dup})
+			c.Gateways = append(c.Gateways, regionGateway{Name: name,
+				Short: strings.TrimPrefix(name, "unified-"), Dup: dup})
 		}
-		// 名字序：map 遍历每次都换顺序，刷新一下页面就跳。
-		sort.Slice(c.Gateways, func(i, j int) bool { return c.Gateways[i].Name < c.Gateways[j].Name })
+		// 按编号排：map 遍历每次都换顺序，刷新一下页面就跳。先比长度再比字面 = 数值序——
+		// 格子里只显示编号，字面序会把 126 排在 73 前面，看着像乱的。
+		sort.Slice(c.Gateways, func(i, j int) bool {
+			a, b := c.Gateways[i].Short, c.Gateways[j].Short
+			if len(a) != len(b) {
+				return len(a) < len(b)
+			}
+			return a < b
+		})
 		grid.Cells = append(grid.Cells, c)
 	}
 	return grid

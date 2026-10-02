@@ -727,9 +727,10 @@ func TestOwnerPageDrawsNineRegionCells(t *testing.T) {
 	if n != len(types.Regions) {
 		t.Fatalf("画了 %d 个格子，该是 %d 个：台账里那条空 RegionKey 画成了第十个？", n, len(types.Regions))
 	}
-	// europe 的最近一次在窗口内 ⇒ 绿 + 文字 + 带时间的 title；别的区域是灰的。
-	if !strings.Contains(body, `class="region on"`) || !strings.Contains(body, "前取得") {
-		t.Fatalf("europe 该标成窗口内取过票：\n%s", body)
+	// europe 的最近一次在窗口内 ⇒ 绿 + 文字（✓ 多久前）+ 带时间的 title；别的区域是灰的。
+	if eu := regionCellOf(t, body, "欧洲"); !strings.Contains(eu, `class="region on"`) ||
+		!strings.Contains(eu, "✓ ") || !strings.Contains(eu, "前</b>") {
+		t.Fatalf("europe 该标成窗口内取过票：\n%s", eu)
 	}
 	if !strings.Contains(body, "累计 3 次，最近一次 ") {
 		t.Fatal("格子的 title 里没有累计次数和最近一次时间")

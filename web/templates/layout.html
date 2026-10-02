@@ -222,39 +222,37 @@ table.tiles tr.nomatch td { position: static; width: auto; height: auto; clip-pa
 .legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--idle); margin-right: .35rem; vertical-align: -1px; }
 .legend .sw.ok { background: var(--ok-dot); }
 
-/* 九个区域的探测格子。文字和颜色一起表达状态：只靠红绿对色盲不友好 */
-.regions { display: grid; grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr)); gap: .4rem; margin: .5rem 0 1rem; }
-/* 号池页那张九宫格里每格要装一串网关名，7rem 会把名字挤成两行。 */
-.regions.wide { grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); }
-/* 窗口内没取到过的格子是**灰**的：那不是错误，是「这儿还空着，可以派人去」——
-   红色会把一张机会表读成故障表（用户 10-02 定的）。语义照样挂在 ✓ / · 这个字形上，
-   只靠颜色的话色盲读者什么都读不到。 */
-.region { display: grid; align-content: start; gap: .1rem; padding: .4rem .55rem; border-radius: 8px;
-          background: var(--sunken); border: 1px solid var(--line); color: var(--muted);
-          font-size: 12px; cursor: help; }
-/* 格子里的网关名。重复的靠「重」这个字承载语义，淡化只是辅助（同上，别只靠颜色）。 */
-.region .gws { display: flex; flex-wrap: wrap; gap: .1rem .3rem; margin-top: .15rem; }
-.region .gws code { font-size: 10.5px; white-space: nowrap; }
-.region .gws code.dup { opacity: .75; }
-.region b { color: var(--fg-2); font-size: 12.5px; font-weight: 600; }
-.region b::after { content: " ·"; }
-.region.on { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
-.region.on b { color: var(--ok); }
-.region.on b::after { content: " ✓"; }
-/* 号池页的格子是链接：点一格把下面那张表收窄到那个区域。 */
-a.region { text-decoration: none; }
-a.region:hover { border-color: var(--line-2); }
-a.region.on:hover { border-color: var(--ok-dot); }
-.region.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 账号页（/a、/u、/admin/accounts）的九区域格子：九格排一行，窄屏 3×3。
+   每格三层：区域名 → 状态（「✓ 3.1 小时前」或「可铸票」）→ 打过的网关编号。
+   窗口内没取到过的格子是**灰**的：那不是错误，是「这儿还空着，可以派人去」——
+   红色会把一张机会表读成故障表（用户 10-02 定的）。状态靠文字表达（✓ / 可铸票），
+   颜色只是辅助，色盲读者照样读得到。 */
+.regions { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: .5rem; margin: .25rem 0 .6rem; }
+.region { display: grid; align-content: start; gap: .15rem; min-width: 0; padding: .6rem .7rem;
+          border-radius: 10px; background: var(--sunken); border: 1px solid var(--line); cursor: help; }
+.region .rg-name { color: var(--muted); font-size: 12px; font-weight: 500; }
+.region b { color: var(--fg-2); font-size: 13.5px; font-weight: 600; line-height: 1.35; }
+.region.on { background: var(--ok-soft); border-color: transparent; }
+.region.on .rg-name, .region.on b { color: var(--ok); }
+/* 网关只显示编号。重复的靠右上角那个「重」字承载语义，淡化只是辅助（同上，别只靠颜色）。 */
+.region .gws { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .35rem; }
+.region .gws code { font-size: 11px; padding: .05rem .35rem; border-radius: 6px; white-space: nowrap; }
+.region .gws code.dup { opacity: .6; }
+.region .gws code sup { font-size: 9px; margin-left: .1rem; }
+.rg-legend { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem 1rem; margin: 0; color: var(--muted); font-size: 12px; }
+.rg-legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 3px; margin-right: .35rem; vertical-align: -1px;
+               background: var(--sunken); border: 1px solid var(--line); }
+.rg-legend i.on { background: var(--ok-soft); border-color: var(--ok-dot); }
 
 /* 号池页「各区域的落点」：十张等大的 KPI 小卡（全部 + 九区），5×2 排。
    卡片网格里列网关名时每格高度从 2 行到 23 行不等；改成一区一行的表又是一整墙网关名。
    这一格真正要答的只是「每个区域此刻能交付几个」，名字收进悬停提示——点一格会把下面
-   那张表收窄到该区域，名字在那里本来就有。 */
-.kpis.regions { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 0; }
-.kpis.regions .kpi { box-shadow: none; background: var(--sunken); padding: .7rem .85rem; }
-.kpis.regions .kpi > b small { font-size: .95rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
-.kpis.regions .kpi.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+   那张表收窄到该区域，名字在那里本来就有。
+   类名刻意不叫 .regions：那是账号页九区域格子的容器，共用会把它的 gap/margin 串过来。 */
+.kpis.region-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 0; }
+.kpis.region-kpis .kpi { box-shadow: none; background: var(--sunken); padding: .7rem .85rem; }
+.kpis.region-kpis .kpi > b small { font-size: .95rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.kpis.region-kpis .kpi.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 
 /* 表单与按钮 */
 form { display: grid; gap: 1rem; margin: 0; }
@@ -302,6 +300,7 @@ button[type=submit]:disabled { cursor: progress; }
 .gate form button { width: 100%; }
 
 @media (max-width: 900px) {
+  .regions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid-2 { grid-template-columns: 1fr; }
   .kpis.wide { grid-template-columns: 1fr 1fr; }
 }
@@ -309,7 +308,7 @@ button[type=submit]:disabled { cursor: progress; }
   .wrap { padding-left: .9rem; padding-right: .9rem; }
   .crumb { display: none; }
   .kpis { grid-template-columns: 1fr 1fr; gap: .6rem; }
-  .kpis.regions { grid-template-columns: 1fr 1fr; }
+  .kpis.region-kpis { grid-template-columns: 1fr 1fr; }
   .kpi > b { font-size: 1.4rem; }
   th, td { padding: .45rem .75rem; }
   .card-head, .card-body, .toolbar, .pager, .legend, .card > .foot { padding-left: .9rem; padding-right: .9rem; }
@@ -609,17 +608,16 @@ button[type=submit]:disabled { cursor: progress; }
 <div class="regions">
 {{range .Cells}}
   <div class="region{{if .Fresh}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
-    <b>{{.Label}}</b>
-    <span>{{if .Fresh}}{{.Ago}}前取得{{else}}可铸票{{end}}</span>
-    {{if .Gateways}}<span class="gws">
+    <span class="rg-name">{{.Label}}</span>
+    <b>{{if .Fresh}}✓ {{.Ago}}前{{else}}可铸票{{end}}</b>
+    {{- if .Gateways}}<span class="gws">
       {{- range .Gateways}}
-      {{- if .Dup}}<code class="dup" title="重复：池中已有此网关">{{.Name}} 重复</code>
-      {{- else}}<code title="由该账号首次发现">{{.Name}} 新增</code>{{end}}
+      {{- if .Dup}}<code class="dup" title="{{.Name}} 重复：池中已有此网关">{{.Short}}<sup>重</sup></code>
+      {{- else}}<code title="{{.Name}} 新增：由该账号首次发现">{{.Short}}</code>{{end}}
       {{- end}}
     </span>{{end}}
   </div>
 {{end}}
 </div>
-<p class="foot">绿色表示最近 {{.Window}}内该账号在此区域取得过路由 Cookie；灰色表示窗口内未取得，<strong>可安排该账号前往此区域铸票</strong>（窗口长度等于槽位冷却）。悬停可查看累计次数与最近一次时间。
-格子内列出该账号在此区域<strong>历史上</strong>接触过的网关：<code>新增</code>表示由该账号首次发现，<code>重复</code>表示池中已有（其他账号先发现，或该账号已在更早的区域接触过）。</p>
+<p class="rg-legend"><span><i class="on"></i>最近 {{.Window}}内在此区域取得过路由 Cookie（冷却中）</span><span><i></i>窗口内未取得，<strong>可安排去此区域铸票</strong></span><span>数字是网关编号，<sup>重</sup> = 池中已有；悬停看全名与累计次数</span></p>
 {{- end}}

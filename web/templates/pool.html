@@ -52,7 +52,7 @@
   <div class="card">
     <header class="card-head"><div><h2>各区域的落点</h2><p>各出口区域此刻可交付 / 已发现的网关数。<strong>点一格</strong>把下面的表收窄到该区域，悬停看网关名。</p></div></header>
     <div class="card-body">
-      <div class="kpis regions">
+      <div class="kpis region-kpis">
       {{range .Regions}}
         <a class="kpi{{if .Ready}} ok{{else}} off{{end}}{{if .Active}} sel{{end}}" href="{{.Href}}"
            title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}{{if .Active}}　（正在只看这一格）{{end}}{{range $i, $g := .Gateways}}{{if $i}}、{{else}}&#10;{{end}}{{$g.Name}}{{if not $g.Ready}}（暂不可交付）{{end}}{{end}}">
