@@ -172,6 +172,30 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 		return Landing{}, fmt.Errorf("落样本: %w", err)
 	}
 	if mintErr != nil {
+		// **带着状态码回来的失败要先按状态码分类**，不能原样抛出去。
+		//
+		// 原样抛的那一版（2026-10-02 现场）漏了两件事，因为这条 return 在下面那段状态码
+		// 分类**之前**：401 的裸铸只下发 `__cflb`、没有 `__oailb`（网关身份在它里面）⇒
+		// mint 报 ErrNoLanding ⇒ 这里早返回 ⇒ 下面那段 RejectedByUpstream 永远到不了。
+		// 于是
+		//   - 外层那个三发重试照打（它只认 errAnswered / ErrAccountRejected / 限流 / 无出口），
+		//     而每一发都过速率闸、碰到过上游就**不退款**，(账号 × 区域) 每小时只有 4 发
+		//     ⇒ 一个凭据作废的账号能把某个区域整小时预算吃掉 3/4；
+		//   - 账号也永远不会被自动停用，于是下一轮再来一次。
+		// 现场读数：当天 40 发「读不出落点」里 25 发来自同一个 401 的测试克隆。
+		//
+		// 分类口径和下面那段**逐字一致**（400/401/403 判账号、其余非 200 判「已答复」）：
+		// 两处用同一条判据，不另立一套。
+		if res.Status != 0 && res.Status != http.StatusOK {
+			msg := fmt.Sprintf("HTTP %d", res.Status)
+			if res.ErrBody != "" {
+				msg += "：" + res.ErrBody
+			}
+			if types.RejectedByUpstream(res.Status) {
+				return Landing{}, fmt.Errorf("%w（%s）", ErrAccountRejected, msg)
+			}
+			return Landing{}, fmt.Errorf("铸票: %w（%s，%w）", mintErr, msg, errAnswered)
+		}
 		return Landing{}, fmt.Errorf("铸票: %w", mintErr)
 	}
 	// 限流/鉴权失败的响应也可能带 set-cookie。那种落点不是「这个账号能到这个网关」的

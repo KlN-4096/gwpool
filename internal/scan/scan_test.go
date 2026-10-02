@@ -94,7 +94,15 @@ func (f *fakeMinter) Mint(_ context.Context, _ types.Creds, e types.Exit, sid, s
 		return types.MintResult{}, errors.New("扫描必须裸打，不许带 pair")
 	}
 	if err := f.failMint[e.Region]; err != nil {
-		return types.MintResult{Status: 429}, err
+		// **默认不带状态码**：传输层失败（代理抽风、连不上）本来就没有状态码可报，
+		// 而「带没带状态码」正是重试与停用的判据（见 attempt）。要模拟「上游答过话了但
+		// 铸票还是失败」就显式配 statusFor —— 真实的 401 裸铸就是这一格：只下发 `__cflb`、
+		// 没有 `__oailb` ⇒ 既有 401 又有「读不出落点」。
+		status := 0
+		if s, ok := f.statusFor[e.Region]; ok {
+			status = s
+		}
+		return types.MintResult{Status: status}, err
 	}
 	gw := f.gatewayFor[e.Region]
 	if gw == "" {
@@ -344,6 +352,8 @@ func TestCoarseScanSkipsGeo(t *testing.T) {
 // 失败的区域：样本仍要落盘，那一发是真打出去的。
 func TestScanFailureStillRecordsSample(t *testing.T) {
 	f := newFake()
+	// 真的打出去过、上游答了 429：状态码要显式配，不然这个桩模拟的是「连都没连上」。
+	f.statusFor["BR"] = 429
 	f.failMint["BR"] = errors.New("429 挡了")
 	f.failGeo["AU"] = errors.New("ipinfo 超时")
 	s, st := newScanner(t, f)
@@ -370,8 +380,11 @@ func TestScanFailureStillRecordsSample(t *testing.T) {
 			t.Error("geo 都没拿到时没有可信地理，不该落样本")
 		}
 	}
-	if br != 2 {
-		t.Errorf("BR 该落 2 行（重试次数），得到 %d", br)
+	// 1 行而不是 2：上游答了 429 就不再重试（见 TestRetryOnlyForTransportFailures）。
+	// 2026-10-02 之前这里是 2 —— 那时带状态码的铸票失败绕过了分类，三发重试照打，
+	// 而每一发都吃掉 (账号 × 区域) 每小时只有 4 发的配额。
+	if br != 1 {
+		t.Errorf("BR 该落 1 行（429 不重试），得到 %d", br)
 	}
 }
 
@@ -474,6 +487,59 @@ func TestRejectedAccountIsDisabledOnTheSpot(t *testing.T) {
 	if got.Enabled || got.DisabledReason == "" {
 		t.Fatalf("没停用或没记原因: enabled=%v reason=%q", got.Enabled, got.DisabledReason)
 	}
+}
+
+// 铸票**带着状态码失败**时也要按状态码分类，不许原样抛出去让外层重试。
+//
+// 2026-10-02 现场的那个洞：401 的裸铸只下发 `__cflb`、没有 `__oailb`（网关身份在它里面）
+// ⇒ mint 报「读不出落点」⇒ attempt 在状态码分类**之前**就早返回 ⇒ 既不是 ErrAccountRejected
+// 也不是 errAnswered ⇒ 三发重试照打、账号永不停用。而每一发都过速率闸、碰到过上游就不退款，
+// (账号 × 区域) 每小时只有 4 发 ⇒ 一个凭据作废的账号吃掉某区域整小时预算的 3/4。
+// 当天 40 发「读不出落点」里 25 发来自同一个 401 的测试克隆。
+func TestMintFailureIsClassifiedByItsStatus(t *testing.T) {
+	t.Run("401 + 读不出落点 ⇒ 当场停用、一发都不重试", func(t *testing.T) {
+		f := newFake()
+		f.statusFor["US"] = 401
+		f.failMint["US"] = errors.New("上游既没下发 __oailb，本次也没发 pair，读不出落点")
+		s, st := newScanner(t, f)
+		a, err := st.AddAccount(types.Account{Label: "凭据作废的号", Enabled: true,
+			Creds: types.Creds{AccessToken: "tok", AccountID: "acc"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ScanRegion(context.Background(), a, types.Regions[0]); !errors.Is(err, ErrAccountRejected) {
+			t.Fatalf("401 该认成「上游否决这个账号」，得到 %v", err)
+		}
+		if len(f.sids) != 1 {
+			t.Fatalf("401 之后还重试了，共打了 %d 发", len(f.sids))
+		}
+		got, _ := st.Account(a.ID)
+		if got.Enabled {
+			t.Fatal("401 该当场停用，不然下一轮还会来一次")
+		}
+	})
+
+	t.Run("非否决的状态码 + 铸票失败 ⇒ 不重试但不停用", func(t *testing.T) {
+		f := newFake()
+		f.statusFor["US"] = 500
+		f.failMint["US"] = errors.New("读不出落点")
+		s, st := newScanner(t, f)
+		a, err := st.AddAccount(types.Account{Label: "好号", Enabled: true,
+			Creds: types.Creds{AccessToken: "tok", AccountID: "acc"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.ScanRegion(context.Background(), a, types.Regions[0])
+		if err == nil || errors.Is(err, ErrAccountRejected) {
+			t.Fatalf("5xx 是这一发的事，不是这个账号的事，得到 %v", err)
+		}
+		if len(f.sids) != 1 {
+			t.Fatalf("上游已经答过话了还重试，共打了 %d 发", len(f.sids))
+		}
+		if got, _ := st.Account(a.ID); !got.Enabled {
+			t.Fatal("5xx 不许停用账号")
+		}
+	})
 }
 
 // S-3：上游已经答过话就不重试，只有本地/传输层的失败才值得再打一发。
