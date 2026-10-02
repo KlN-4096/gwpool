@@ -1898,13 +1898,73 @@ func TestAdminAccountFacets(t *testing.T) {
 	}
 }
 
+// 现建的上传者全叫「上传者」：管理页换成他名下第一个托管账号的名字，自己起了名的不动。
+func TestOwnerNames(t *testing.T) {
+	owners := []types.Owner{
+		{ID: 1, Label: "我"},               // 自己起了名
+		{ID: 2, Label: defaultOwnerLabel}, // 两个号：取 ID 小的那个，加「等 2 个」
+		{ID: 3, Label: defaultOwnerLabel}, // 一个号：不加「等」
+		{ID: 4, Label: defaultOwnerLabel}, // 名下没有托管号：照旧
+		{ID: 5, Label: ""},                // 空名和默认名一样处理
+	}
+	tok := types.Creds{AccessToken: "x"}
+	got := ownerNames(owners, []types.Account{
+		{ID: 9, Label: "b@x.com", OwnerID: 2, Creds: tok},
+		{ID: 7, Label: "a@x.com", OwnerID: 2, Creds: tok},
+		{ID: 8, Label: "c@x.com", OwnerID: 3, Creds: tok},
+		{ID: 1, Label: "mine", OwnerID: 1, Creds: tok},
+		{ID: 10, Label: "e@x.com", OwnerID: 5, Creds: tok},
+		// 没凭据的外部账号不算谁名下的号
+		{ID: 3, Label: "外部", OwnerID: 4, Creds: types.Creds{AccountID: types.AnonPrefix + "z"}},
+	})
+	want := map[int64]string{1: "我", 2: "a@x.com 等 2 个", 3: "c@x.com", 4: defaultOwnerLabel, 5: "e@x.com"}
+	if len(got) != len(want) {
+		t.Fatalf("得到 %v", got)
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Fatalf("上传者 %d 显示成 %q，应该是 %q", id, got[id], w)
+		}
+	}
+}
+
+// 管理页三处「上传者」（账号表那一列、筛选下拉框、上传者表）都用显示名；
+// 账号表的名字链到账号页，上游账号 ID 在名字下面一行，不再单占一列。
+func TestAdminAccountsTableLayout(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	st.owners = append(st.owners, types.Owner{ID: 3, Token: "tok-3", Label: defaultOwnerLabel})
+	st.accounts = append(st.accounts,
+		types.Account{ID: 5, Label: "x@y.com", Enabled: true, OwnerID: 3, ViewToken: "vt-5",
+			Creds: types.Creds{AccessToken: "t5", AccountID: "acct-5"}},
+		types.Account{ID: 4, Label: "w@y.com", Enabled: true, OwnerID: 3, ViewToken: "vt-4",
+			Creds: types.Creds{AccessToken: "t4", AccountID: "acct-4"}})
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	for _, want := range []string{
+		`;上传者=o1:#1 我|o2:#2 朋友|o3:#3 w@y.com 等 2 个"`,
+		`<span class="clip short" title="#3 w@y.com 等 2 个">#3 w@y.com 等 2 个</span>`,
+		`<td class="text">w@y.com 等 2 个</td>`,
+		`<a class="clip" href="/a/vt-1" title="pro1（打开账号页）">pro1</a>`,
+		`<div class="sub mono nowrap">acct-upstream</div>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("管理页缺了 %q", want)
+		}
+	}
+	if strings.Contains(body, "<th data-nosort>账号页</th>") {
+		t.Fatal("账号页那一列还在")
+	}
+}
+
 // 筛选按钮的文字来自上传者起的名字：里面的分隔符会把整串筛选拆坏。
 func TestFacetLabelStripsSeparators(t *testing.T) {
 	if got := facetLabel("a:b|c;d"); got != "a：b｜c；d" {
 		t.Fatalf("分隔符没换掉：%q", got)
 	}
-	if got := facetLabel("一二三四五六七八九十一二三四五六七"); got != "一二三四五六七八九十一二三四五六…" {
+	if got := facetLabel(strings.Repeat("一", 41)); got != strings.Repeat("一", 40)+"…" {
 		t.Fatalf("没按字符截：%q", got)
+	}
+	if got := facetLabel(strings.Repeat("一", 40)); got != strings.Repeat("一", 40) {
+		t.Fatalf("刚好 40 个字也截了：%q", got)
 	}
 	if got := planFacet(" Pro+ "); got != "plan-pro" {
 		t.Fatalf("套餐标签没清洗：%q", got)

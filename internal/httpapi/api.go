@@ -1044,7 +1044,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	createdOwner := false // 这一发新建了 owner ⇒ AddAccount 失败时要把它清掉
 	if !hasOwner {
 		if !exists || ex.OwnerID == 0 {
-			o, oerr := s.st.AddOwner("上传者")
+			o, oerr := s.st.AddOwner(defaultOwnerLabel)
 			if oerr != nil {
 				s.opt.Log.Error("建上传者失败", "err", oerr)
 				http.Error(w, "存储失败", http.StatusInternalServerError)
@@ -1896,9 +1896,10 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	name := func(id int64) string { return acctName(byID, id) }
 	owners := s.st.Owners()
+	ownerLabels := ownerNames(owners, accounts)
 	ownerName := map[int64]string{}
 	for _, o := range owners {
-		ownerName[o.ID] = fmt.Sprintf("#%d %s", o.ID, o.Label)
+		ownerName[o.ID] = fmt.Sprintf("#%d %s", o.ID, ownerLabels[o.ID])
 	}
 	covered := regionsCovered(s.st.RegionMints())
 	slots := s.st.Slots()
@@ -1952,13 +1953,13 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
 	sort.Slice(v.External, func(i, j int) bool { return v.External[i].ID < v.External[j].ID })
-	v.AccountFacets = accountFacets(v.Accounts, owners)
+	v.AccountFacets = accountFacets(v.Accounts, owners, ownerName)
 
 	// owner 的令牌必须在**这一页**看得见：迁移出来那个 owner 的令牌没人见过，
 	// 不显示就等于现有那几个账号的总览页谁都进不去。而 /a/ 那一页刻意**不**印它
 	// （见 handleAccount），所以这里是唯一的找回入口。
 	for _, o := range owners {
-		v.Owners = append(v.Owners, ownerRow{ID: o.ID, Label: o.Label, Token: o.Token,
+		v.Owners = append(v.Owners, ownerRow{ID: o.ID, Label: ownerLabels[o.ID], Token: o.Token,
 			Accounts: ownerAccounts[o.ID], Since: o.CreatedAt.Format(time.DateTime)})
 	}
 	sort.Slice(v.Owners, func(i, j int) bool { return v.Owners[i].ID < v.Owners[j].ID })
@@ -2077,9 +2078,38 @@ func planFacet(plan string) string {
 	return "plan-" + key
 }
 
-// accountFacets 拼账号表那几组筛选按钮（格式见 layout.html 的 grid()；「状态=」是组名）。
-// 套餐和上传者只列表里真有的：按钮点下去一行都没有，等于没给。
-func accountFacets(rows []accountRow, owners []types.Owner) string {
+// defaultOwnerLabel 是上传时现建的上传者的名字（没地方让他起名）。
+const defaultOwnerLabel = "上传者"
+
+// ownerNames 是管理页上「上传者」的显示名。现建的全叫「上传者」，十几个人分不出谁是谁，
+// 就换成他名下第一个托管账号的名字（不止一个时加「等 N 个」）。只改显示，不改数据。
+func ownerNames(owners []types.Owner, accounts []types.Account) map[int64]string {
+	first, n := map[int64]types.Account{}, map[int64]int{}
+	for _, a := range accounts {
+		if a.Creds.AccessToken == "" {
+			continue // 外部账号不归任何人
+		}
+		n[a.OwnerID]++
+		if f, ok := first[a.OwnerID]; !ok || a.ID < f.ID {
+			first[a.OwnerID] = a
+		}
+	}
+	out := make(map[int64]string, len(owners))
+	for _, o := range owners {
+		out[o.ID] = o.Label
+		if f, ok := first[o.ID]; ok && (o.Label == defaultOwnerLabel || o.Label == "") {
+			out[o.ID] = f.Label
+			if n[o.ID] > 1 {
+				out[o.ID] += fmt.Sprintf(" 等 %d 个", n[o.ID])
+			}
+		}
+	}
+	return out
+}
+
+// accountFacets 拼账号表那几组筛选（格式见 layout.html 的 grid()；「状态=」是组名，带组名的是下拉框）。
+// 套餐和上传者只列表里真有的：选下去一行都没有，等于没给。
+func accountFacets(rows []accountRow, owners []types.Owner, ownerName map[int64]string) string {
 	plans := map[string]string{}
 	inTable := map[int64]bool{}
 	for _, r := range rows {
@@ -2102,7 +2132,7 @@ func accountFacets(rows []accountRow, owners []types.Owner) string {
 	var ownerGroup []string
 	for _, o := range owners {
 		if inTable[o.ID] {
-			ownerGroup = append(ownerGroup, fmt.Sprintf("o%d:#%d %s", o.ID, o.ID, facetLabel(o.Label)))
+			ownerGroup = append(ownerGroup, fmt.Sprintf("o%d:%s", o.ID, facetLabel(ownerName[o.ID])))
 		}
 	}
 	return strings.Join([]string{
@@ -2113,11 +2143,11 @@ func accountFacets(rows []accountRow, owners []types.Owner) string {
 	}, ";")
 }
 
-// facetLabel 去掉会把筛选串拆坏的三个分隔符，再截到按钮放得下的长度。
+// facetLabel 去掉会把筛选串拆坏的三个分隔符，再截短：下拉框有多宽由最长那一项决定。
 func facetLabel(s string) string {
 	s = strings.NewReplacer(":", "：", "|", "｜", ";", "；").Replace(s)
-	if r := []rune(s); len(r) > 16 {
-		s = string(r[:16]) + "…"
+	if r := []rune(s); len(r) > 40 {
+		s = string(r[:40]) + "…"
 	}
 	return s
 }

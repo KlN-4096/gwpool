@@ -93,23 +93,23 @@
     <header class="card-head"><div><h2>账号</h2><p>池里托管着凭据的账号。只来取票、池里没有凭据的在「外部账号」那一页。</p></div>
       <a class="btn" href="/admin/accounts">查看全部账号 →</a></header>
     {{if .Accounts}}
-    <div class="table-wrap"><table id="t-accounts" data-grid data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、套餐或上游账号 ID">
-      <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>上游账号 ID</th>
-        <th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间（UTC）</th><th data-nosort>账号页</th><th data-nosort></th></tr></thead>
+    <div class="table-wrap"><table id="t-accounts" class="dense" data-grid data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、套餐或上游账号 ID">
+      <thead><tr><th class="num">ID</th><th>名称 / 上游账号 ID</th><th>套餐</th>
+        <th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间（UTC）</th><th data-nosort></th></tr></thead>
       <tbody>
       {{range .Accounts}}
         <tr data-facet="{{.Facet}}">
           <td class="num">{{.ID}}</td>
-          <td class="text">{{.Label}}
-            {{- if not .Enabled}} <span class="badge bad">已停用</span>{{if .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}{{end}}</td>
+          <td>{{if .ViewToken}}<a class="clip" href="/a/{{.ViewToken}}" title="{{.Label}}（打开账号页）">{{.Label}}</a>{{else}}<span class="clip" title="{{.Label}}">{{.Label}}</span>{{end}}
+            {{- if not .Enabled}} <span class="badge bad">已停用</span>{{end}}
+            <div class="sub mono nowrap">{{.Upstream}}</div>
+            {{- if and (not .Enabled) .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}</td>
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else}}{{.Plan}}{{end}}</td>
-          <td class="mono text">{{.Upstream}}</td>
-          <td>{{.Owner}}</td>
+          <td><span class="clip short" title="{{.Owner}}">{{.Owner}}</span></td>
           <td class="num">{{.Requests}}</td>
           <td class="num">{{.Found}}</td>
           <td class="num" title="九个区域里铸出过票的有几个">{{.Covered}}</td>
           <td class="mono">{{.Since}}</td>
-          <td>{{if .ViewToken}}<a href="/a/{{.ViewToken}}">打开</a>{{else}}<span class="muted">—</span>{{end}}</td>
           <td><div class="row-actions">
             <form method="post" action="/admin/accounts/{{.ID}}/enabled"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
               <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>

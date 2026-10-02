@@ -175,8 +175,10 @@ table.spec td:first-child { white-space: nowrap; }
 .seg .dot.ok { background: var(--ok-dot); }
 .seg .dot.warn { background: var(--warn-dot); }
 .seg .dot.bad { background: var(--bad-dot); }
-.seg-group { display: inline-flex; align-items: center; gap: .35rem; }
-.seg-title { color: var(--muted); font-size: 12px; }
+/* 带组名的筛选是下拉框（管理页账号表那四组）；选了「全部」以外的值时描边提示 */
+.facet { display: inline-flex; align-items: center; gap: .4rem; color: var(--muted); font-size: 12px; font-weight: 400; white-space: nowrap; }
+.facet select { max-width: 15rem; } /* 框宽由最长那项决定，上传者名很长；展开的列表不受这个限制 */
+.facet select.on { border-color: var(--accent); }
 .seg button b { margin-left: .35rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
 .search { flex: 0 1 15rem; }
 .search input { height: 2rem; padding: .25rem .6rem .25rem 2rem;
@@ -188,7 +190,7 @@ table.spec td:first-child { white-space: nowrap; }
 .pager .pages button { min-width: 2rem; padding: .2rem .5rem; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .pager .pages button[aria-current] { background: var(--accent); border-color: var(--accent); color: #fff; }
 .pager .gap { color: var(--muted); padding: 0 .25rem; }
-.pager select { width: auto; height: 2rem; padding: .2rem .5rem; font-size: 12.5px; }
+.pager select, .facet select { width: auto; height: 2rem; padding: .2rem .5rem; font-size: 12.5px; }
 
 /* 网关格子：同一张表，换成网格排布 */
 table.tiles, table.tiles tbody { display: block; }
@@ -213,7 +215,13 @@ table.tiles.pool tr.ready td:nth-child(3) { color: var(--ok); font-weight: 600; 
 table.tiles.pool td:nth-child(4) { grid-area: exits; text-align: right; }
 table.tiles.pool td:nth-child(4)::before { content: "出口 "; }
 /* 表格里的一排小按钮（管理页的停用 / 删除） */
-.row-actions { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+.row-actions { display: flex; gap: .35rem; align-items: center; }
+/* 单元格里不许折行的一段（账号表名称下面那行上游 ID），和截断显示的一段（上传者名，悬停看全名） */
+td .sub.nowrap { white-space: nowrap; }
+.clip { display: inline-block; max-width: 20em; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.clip.short { max-width: 12em; }
+/* 列多的表（管理页账号表 9 列）收窄单元格左右留白，免得在常见宽度下被横向滚动截掉 */
+table.dense th, table.dense td { padding-left: .75rem; padding-right: .75rem; }
 .row-actions form { margin: 0; }
 /* 表格单元格里点开看明细（网关到达过的城市、账号×网关的明细） */
 details.places > summary { cursor: pointer; }
@@ -448,7 +456,7 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
     const tbody = table.tBodies[0];
     let rows = tbody ? Array.from(tbody.rows) : [];
     if (!rows.length) return;
-    // data-facets 可以有好几组（";" 隔开），每组一排按钮，组前可写「组名=」；行上的 data-facet
+    // data-facets 可以有好几组（";" 隔开），组前可写「组名=」：带组名的是一个下拉框，不带的是一排按钮；行上的 data-facet
     // 是空格分隔的标签，每一组选中的那个都在行上才显示。第一组兼管概览卡片的计数和
     // data-facet-first 的排序。
     const facetGroups = (table.dataset.facets || '').split(';').map(function (g) {
@@ -492,8 +500,27 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
     });
 
     const bar = make('div', 'toolbar');
-    const segBtns = [];
+    const painters = []; // 每组一个：拿到「某个标签现在有几行」的函数，把计数写到按钮或选项上
     facetGroups.forEach(function (g, gi) {
+      if (g.title) {
+        // 带组名的组是下拉框：管理页账号表有四组、上传者一组就十几个人，一排排按钮摆不下。
+        const pick = make('select');
+        pick.setAttribute('aria-label', g.title);
+        [['', '全部']].concat(g.items).forEach(function (f) {
+          const o = new Option(f[1], f[0], false, f[0] === st.fs[gi]);
+          o.dataset.label = f[1];
+          pick.append(o);
+        });
+        pick.addEventListener('change', function () { st.fs[gi] = pick.value; st.page = 1; render(); });
+        const labelled = make('label', 'facet');
+        labelled.append(g.title, pick);
+        bar.append(labelled);
+        painters.push(function (count) {
+          for (const o of pick.options) o.textContent = o.dataset.label + ' · ' + count(o.value);
+          pick.classList.toggle('on', pick.value !== '');
+        });
+        return;
+      }
       const seg = make('div', 'seg');
       seg.setAttribute('role', 'group');
       if (g.title) seg.setAttribute('aria-label', g.title);
@@ -509,7 +536,9 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
         seg.append(b);
         btns.push(b);
       });
-      segBtns.push(btns);
+      painters.push(function (count) {
+        btns.forEach(function (b) { b.lastChild.textContent = String(count(b.dataset.f)); });
+      });
       seg.addEventListener('click', function (e) {
         const b = e.target.closest('button');
         if (!b) return;
@@ -518,13 +547,7 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
         for (const x of seg.children) x.setAttribute('aria-pressed', String(x === b));
         render();
       });
-      if (g.title) {
-        const labelled = make('span', 'seg-group');
-        labelled.append(make('span', 'seg-title', g.title), seg);
-        bar.append(labelled);
-      } else {
-        bar.append(seg);
-      }
+      bar.append(seg);
     });
     const box = make('label', 'search');
     const q = make('input');
@@ -574,12 +597,10 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
           (!needle || r.textContent.toLowerCase().includes(needle));
       };
       let vis = rows.filter(function (r) { return hit(r, -1); });
-      // 按钮上的数跟着别的组和搜索走：选了上传者以后「pro 3」却只出 2 行，是在说谎。
-      segBtns.forEach(function (btns, gi) {
+      // 计数跟着别的组和搜索走：选了上传者以后「pro 3」却只出 2 行，是在说谎。
+      painters.forEach(function (paint, gi) {
         const base = rows.filter(function (r) { return hit(r, gi); });
-        btns.forEach(function (b) {
-          b.lastChild.textContent = String(b.dataset.f ? base.filter(function (r) { return has(r, b.dataset.f); }).length : base.length);
-        });
+        paint(function (k) { return k ? base.filter(function (r) { return has(r, k); }).length : base.length; });
       });
       if (saveKey) {
         try { sessionStorage.setItem(saveKey, JSON.stringify({ q: st.q, fs: st.fs })); } catch (e) { /* 存不了就不记 */ }
