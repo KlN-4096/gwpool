@@ -2303,6 +2303,87 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 }
 
+// 号池页按九个出口区域摊开已知网关：这一页要回答的是「哪个区域的落点还不够」，
+// 一条平表答不了。一个网关能从几个区域连通就在几格里出现；反查不到区域的落在「未归类」，
+// 否则九格加起来对不上页面自己写的网关总数。
+func TestPoolRegionCells(t *testing.T) {
+	rows := []gatewayRow{
+		{Name: "unified-142", PairReady: true},
+		{Name: "unified-73"},
+		{Name: "unified-900", PairReady: true},
+		{Name: "unified-404"},
+	}
+	gws := map[string]types.Gateway{
+		// 两个区域都连得通 ⇒ 两格里都出现。
+		"unified-142": {ReachableExits: []types.Exit{{Region: "IT"}, {Region: "JP"}}},
+		"unified-73":  {ReachableExits: []types.Exit{{Region: "IT"}}},
+		// 代理商给的出口不在 types.Regions 那张表里（精确匹配 Region+City）⇒ 未归类。
+		"unified-900": {ReachableExits: []types.Exit{{Region: "US", City: "Dallas"}}},
+		// 一个出口都没记过的也要有地方落。
+		"unified-404": {},
+	}
+	cells := poolRegionCells(rows, gws)
+
+	byKey := map[string]poolRegionCell{}
+	for _, c := range cells {
+		byKey[c.Key] = c
+	}
+	if len(cells) != len(types.Regions)+1 {
+		t.Fatalf("画了 %d 格，该是九格加一个未归类", len(cells))
+	}
+	if eu := byKey["europe"]; eu.Total != 2 || eu.Ready != 1 {
+		t.Fatalf("欧洲那一格的读数不对：%+v", eu)
+	}
+	// 可交付的排前面：这一格最常被问的是「现在这儿能不能拿到票」。
+	if eu := byKey["europe"]; eu.Gateways[0].Name != "unified-142" || !eu.Gateways[0].Ready {
+		t.Fatalf("欧洲那一格没把可交付的排前面：%+v", eu.Gateways)
+	}
+	if ea := byKey["east-asia"]; ea.Total != 1 || ea.Gateways[0].Name != "unified-142" {
+		t.Fatalf("跨区域的网关没在东亚那一格出现：%+v", ea)
+	}
+	if un := byKey[""]; un.Label != "未归类" || un.Total != 2 {
+		t.Fatalf("未归类那一格该收下反查不到区域的和没有出口的：%+v", un)
+	}
+	if oc := byKey["oceania"]; oc.Total != 0 || !strings.Contains(oc.Note, "还没在这个区域发现过网关") {
+		t.Fatalf("空区域该如实说没发现过网关：%+v", oc)
+	}
+	// 回填的那一列要和格子出自同一次计算，否则两处读数会对不上。
+	if got := rows[0].Regions; len(got) != 2 || got[0] != "欧洲" || got[1] != "东亚" {
+		t.Fatalf("网关行的区域列没回填：%v", got)
+	}
+	if got := rows[2].Regions; len(got) != 0 {
+		t.Fatalf("反查不到区域的不该回填区域名：%v", got)
+	}
+
+	// 全都不可交付的区域不许标绿。
+	cells = poolRegionCells([]gatewayRow{{Name: "unified-73"}}, map[string]types.Gateway{
+		"unified-73": {ReachableExits: []types.Exit{{Region: "IT"}}},
+	})
+	for _, c := range cells {
+		if c.Key == "europe" && (c.Ready != 0 || !strings.Contains(c.Note, "都没有可交付")) {
+			t.Fatalf("没有活票的区域不该报可交付：%+v", c)
+		}
+	}
+}
+
+func TestPoolPageShowsRegionCells(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
+	if !strings.Contains(body, "各区域的落点") {
+		t.Fatalf("号池页没有区域分格：\n%s", body)
+	}
+	// rig 里 unified-142 的出口是 IT ⇒ 落在欧洲那一格，而且它有活票 ⇒ 绿。
+	cell := regionCellOf(t, body, "欧洲")
+	if !strings.Contains(cell, "region on") || !strings.Contains(cell, "unified-142") {
+		t.Fatalf("欧洲那一格没收下 unified-142：%s", cell)
+	}
+	for _, r := range types.Regions {
+		if !strings.Contains(body, regionLabel(r.Key)) {
+			t.Fatalf("号池页缺了区域 %s 的格子", r.Key)
+		}
+	}
+}
+
 // /admin/accounts 是「所有账号一人一张卡」：管理页那张扁平表看不见九宫格、
 // 接入 key 和取票失败，排查「谁的号在哪个区域还没落点」只能一个个点开 /a/。
 func TestAdminAccountsPage(t *testing.T) {

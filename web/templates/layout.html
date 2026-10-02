@@ -224,6 +224,8 @@ table.tiles tr.nomatch td { position: static; width: auto; height: auto; clip-pa
 
 /* 九个区域的探测格子。文字和颜色一起表达状态：只靠红绿对色盲不友好 */
 .regions { display: grid; grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr)); gap: .4rem; margin: .5rem 0 1rem; }
+/* 号池页那张九宫格里每格要装一串网关名，7rem 会把名字挤成两行。 */
+.regions.wide { grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); }
 /* 窗口内没取到过的格子是**灰**的：那不是错误，是「这儿还空着，可以派人去」——
    红色会把一张机会表读成故障表（用户 10-02 定的）。语义照样挂在 ✓ / · 这个字形上，
    只靠颜色的话色盲读者什么都读不到。 */

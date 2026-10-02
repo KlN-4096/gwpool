@@ -50,6 +50,26 @@
 
 <section id="tab-gateways">
   <div class="card">
+    <header class="card-head"><div><h2>各区域的落点</h2><p>九个出口区域各自能摸到哪些网关。一个网关能从多个区域连通时，它在那几格里都出现。</p></div></header>
+    <div class="card-body">
+      <div class="regions wide">
+      {{range .Regions}}
+        <div class="region{{if .Ready}} on{{end}}" title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}">
+          <b>{{.Label}}</b>
+          <span>{{if .Total}}{{.Ready}} / {{.Total}} 可交付{{else}}未发现网关{{end}}</span>
+          {{if .Gateways}}<span class="gws">
+            {{- range .Gateways}}
+            {{- if .Ready}}<code title="此刻可交付">{{.Name}}</code>
+            {{- else}}<code class="dup" title="此刻没有可交付的路由 Cookie">{{.Name}}</code>{{end}}
+            {{- end}}
+          </span>{{end}}
+        </div>
+      {{end}}
+      </div>
+      <p class="foot">绿色表示这个区域此刻至少有一个网关可交付；灰色表示已知的网关都没有可用的路由 Cookie，或者还没在这个区域发现过网关。网关名里颜色较淡的那些是此刻不可交付的。</p>
+    </div>
+  </div>
+  <div class="card">
     {{if .Gateways}}
     <div class="table-wrap"><table class="tiles pool" data-grid data-natsort data-facet-first data-size="240"
         data-facets="ready:可交付:ok|idle:暂不可交付" data-placeholder="搜索网关名称">
@@ -57,7 +77,7 @@
       <tbody>
       {{range .Gateways}}
         <tr class="{{if .PairReady}}ready{{end}}" data-facet="{{if .PairReady}}ready{{else}}idle{{end}}"
-            title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　空闲槽位 {{.RestedSlots}}　可达出口 {{.Exits}}">
+            title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　空闲槽位 {{.RestedSlots}}　可达出口 {{.Exits}}　区域 {{if .Regions}}{{range $i, $r := .Regions}}{{if $i}} / {{end}}{{$r}}{{end}}{{else}}未归类{{end}}">
           <td class="mono">{{.Name}}</td>
           <td>{{if .PairReady}}<span class="badge ok">可交付</span>{{else}}<span class="badge">暂不可交付</span>{{end}}</td>
           <td>{{.PairLeft}}</td>

@@ -607,6 +607,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			v.ReadyCount++
 		}
 	}
+	v.Regions = poolRegionCells(v.Gateways, gws)
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
@@ -620,6 +621,72 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 	v.EnterErr = r.URL.Query().Get("enter") == "bad"
 	s.render(w, s.tplPool, v)
+}
+
+// poolRegionCells 把已知网关按出口区域摊成九格（出口反查不到区域的另起一格「未归类」）。
+//
+// 顺带回填每一行的 Regions 那一列，所以它接的是 rows 的**切片**（元素可改）而不是副本。
+// 两处读数必须出自同一次计算：表里写着「欧洲」而九宫格的欧洲格子里没有它，没人查得出
+// 是哪一边错了。
+func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegionCell {
+	byRegion := map[string][]poolRegionGateway{}
+	for i := range rows {
+		item := poolRegionGateway{Name: rows[i].Name, Ready: rows[i].PairReady}
+		seen := map[string]bool{}
+		for _, e := range gws[rows[i].Name].ReachableExits {
+			// 反查不到就归「未归类」（key 为空）：这些出口是代理商给的，不在
+			// types.Regions 那张表里（精确匹配 Region+City，见那边的注释）。
+			k := types.RegionKeyOf(e)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			byRegion[k] = append(byRegion[k], item)
+			if k != "" {
+				rows[i].Regions = append(rows[i].Regions, regionLabel(k))
+			}
+		}
+		// 一个出口都没记过的网关也要有地方落，否则它在这一页上凭空消失。
+		if len(gws[rows[i].Name].ReachableExits) == 0 {
+			byRegion[""] = append(byRegion[""], item)
+		}
+	}
+	out := make([]poolRegionCell, 0, len(types.Regions)+1)
+	keys := make([]string, 0, len(types.Regions)+1)
+	for _, r := range types.Regions {
+		keys = append(keys, r.Key)
+	}
+	if len(byRegion[""]) > 0 {
+		keys = append(keys, "")
+	}
+	for _, k := range keys {
+		c := poolRegionCell{Key: k, Label: regionLabel(k), Gateways: byRegion[k]}
+		if k == "" {
+			c.Label = "未归类"
+		}
+		sort.Slice(c.Gateways, func(i, j int) bool {
+			if c.Gateways[i].Ready != c.Gateways[j].Ready {
+				return c.Gateways[i].Ready
+			}
+			return c.Gateways[i].Name < c.Gateways[j].Name
+		})
+		c.Total = len(c.Gateways)
+		for _, g := range c.Gateways {
+			if g.Ready {
+				c.Ready++
+			}
+		}
+		switch {
+		case c.Total == 0:
+			c.Note = "还没在这个区域发现过网关"
+		case c.Ready == 0:
+			c.Note = fmt.Sprintf("已知 %d 个网关，此刻都没有可交付的路由 Cookie", c.Total)
+		default:
+			c.Note = fmt.Sprintf("已知 %d 个网关，其中 %d 个此刻可交付", c.Total, c.Ready)
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // publicBaseURL 是对外根地址。接了配置文件就现读（管理页改完立刻生效），

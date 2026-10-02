@@ -41,6 +41,10 @@ type poolView struct {
 	Threshold     int
 
 	Gateways []gatewayRow
+	// Regions 把已知网关按**出口区域**摊开：这张表要回答的是「哪个区域的落点还不够」，
+	// 一条 57 行的平表答不了。一个网关能从好几个区域连通时，它在那几格里都出现——
+	// 那是事实，不是重复计数（格子里数的是「这个区域能摸到几个落点」）。
+	Regions []poolRegionCell
 	// ReadyCount 在服务端算好。原来这张卡片靠 JS 数表格行，关掉 JS 就只剩「—」。
 	ReadyCount  int
 	Accounts    int
@@ -64,6 +68,28 @@ type gatewayRow struct {
 	PairReady   bool   // 池里有剩余 ≥ DeliverFloor 的 pair
 	PairLeft    string // 人读的剩余时间；**不含 cookie 本体**
 	RestedSlots int
+	// Regions 是这个网关能从哪几个区域连通（人读的区域名），给表里那一列用。
+	// 空 = 它的出口一个都反查不到区域（见 types.RegionKeyOf 的精确匹配）。
+	Regions []string
+}
+
+// poolRegionCell 是号池页九宫格的一格：这个区域已知哪些网关、其中几个此刻可交付。
+//
+// 末尾可能多出一格「未归类」：出口反查不到区域的网关要有地方落，否则九格加起来
+// 对不上页面自己写的网关总数，而那种对不上没人查得出来。
+type poolRegionCell struct {
+	Key   string
+	Label string
+	Total int
+	Ready int
+	Note  string
+	// Gateways 按名字排，可交付的在前——这一格最常被问的是「现在这儿能不能拿到票」。
+	Gateways []poolRegionGateway
+}
+
+type poolRegionGateway struct {
+	Name  string
+	Ready bool
 }
 
 // ---------- 上传者页 ----------
@@ -197,6 +223,7 @@ var regionLabels = map[string]string{
 }
 
 // regionLabel 查不到就回 key 本身：往 types.Regions 里加一个区域不该让页面出现空格子。
+// 空 key（出口反查不到区域）由调用方自己起名，这里不兜底——那不是一个区域。
 func regionLabel(key string) string {
 	if v, ok := regionLabels[key]; ok {
 		return v
