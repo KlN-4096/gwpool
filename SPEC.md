@@ -402,14 +402,21 @@ type State struct {
 `gateway` 和 `exclude` 自相矛盾时**按 `exclude` 办**（拒）：`exclude` 编码的是
 「我烧过这个」，照它办永远不会发出一张坏票。
 
-成功响应（现有字段一个字不动，加了 `cookie_version` 和 `pair_remaining_s`）：
+成功响应（现有字段一个字不动，加了 `cookie_version`、`pair_remaining_s` 和 `region`）：
 
 ```json
-{"gateway":"unified-142","cookie":"__cflb=...; __oailb=...",
+{"gateway":"unified-142","region":"europe","cookie":"__cflb=...; __oailb=...",
  "expires_at":"2026-10-01T06:40:00Z","valid_for_s":150,
  "verified_full":true,"ttl_is_advisory":true,"cookie_version":"3f2a9c1b7d04",
  "pair_remaining_s":3000}
 ```
+
+- `region` = **铸这张票的出口**属于哪个区域（第 4 节那九个 key 之一）。网关 =
+  (区域 × 账号) ⇒ 同一个网关名在不同账号眼里可能来自不同区域，所以这件事只有铸票
+  那一刻知道，事后反查不出来。消费端拿它按区域归档自己的落点历史。
+  **它不是「这一发会落在哪个区域」**：cflb 跨出口回放必漂（第 4 节），真实落点只有
+  响应里的新 `__oailb` 说得准。字段缺失 = 池子不知道（老 pair / 出口反查不到九个
+  代表出口），消费端按「未归类」处理，不要猜
 
 - `valid_for_s` = `min(满血窗口剩余, 这张 pair 的剩余寿命)`，**建议值**不是承诺
 - `expires_at` = **同一次计算**出来的那个时刻（`min(窗口末尾, pair 硬过期)`）。

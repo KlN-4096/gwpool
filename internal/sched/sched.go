@@ -734,6 +734,7 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 		exp, validFor := s.deliverWindow(at.Add(types.DeliverTTL), p.ExpiresAt)
 		return types.Delivery{
 			Gateway:      sl.Gateway,
+			Region:       p.RegionKey,
 			Cookie:       p.Cookie,
 			ExpiresAt:    exp,
 			ValidForS:    validFor,
@@ -1042,6 +1043,7 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 		exp, validFor := s.deliverWindow(at.Add(types.DeliverTTL), pair.ExpiresAt)
 		return types.Delivery{
 			Gateway:      gateway,
+			Region:       pair.RegionKey,
 			Cookie:       pair.Cookie,
 			ExpiresAt:    exp,
 			ValidForS:    validFor,
@@ -1100,6 +1102,7 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	exp, validFor := s.deliverWindow(windowEnd, pair.ExpiresAt)
 	return types.Delivery{
 		Gateway:      gateway,
+		Region:       pair.RegionKey,
 		Cookie:       pair.Cookie,
 		ExpiresAt:    exp,
 		ValidForS:    validFor,
@@ -1306,7 +1309,9 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		// 那时旧 __cflb 原样留在 cookie 里，新 __oailb 的 65 分钟盖不住它。
 		route, cflb := res.RouteDeadline(cur.CflbExpiresAt)
 		p = types.Pair{Gateway: res.Gateway, Cookie: res.NewPair,
-			ExpiresAt: route, CflbExpiresAt: cflb, MintedBy: a.ID}
+			ExpiresAt: route, CflbExpiresAt: cflb, MintedBy: a.ID,
+			// 区域取**这一发实际用的出口**，和上面那条区域台账同一个口径。
+			RegionKey: types.RegionKeyOf(e)}
 		if err := s.st.PutPair(p); err != nil {
 			s.opt.Log.Warn("写 pair 失败", "gateway", p.Gateway, "err", err)
 		}
@@ -1615,6 +1620,7 @@ func (s *Scheduler) redeliver(accountID int64, req Request) (types.Delivery, boo
 		"gateway", best.Gateway, "left", exp.Sub(now).Truncate(time.Second))
 	return types.Delivery{
 		Gateway:   best.Gateway,
+		Region:    p.RegionKey,
 		Cookie:    p.Cookie,
 		ExpiresAt: exp,
 		ValidForS: validFor,

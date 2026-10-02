@@ -2492,3 +2492,61 @@ func TestPoolWideFailureStopsTryingOtherGateways(t *testing.T) {
 		t.Fatalf("出口全没了还试了 %d 个网关", n)
 	}
 }
+
+// 交付要如实报出**铸这张票的出口**属于哪个区域，而且和区域台账记的那一格是同一个口径。
+//
+// 消费端（sub2api）拿它把自己的落点按大区归档。网关 = (区域 × 账号)：同一个网关名在
+// 不同账号眼里可能来自不同区域 ⇒ 事后反查不出来，只有铸票那一刻知道。口径和台账错开
+// 一格的后果是消费端把落点记到别的大区，于是「这个号在哪个大区还有没烧过的落点」全错。
+func TestDeliveryCarriesTheMintRegion(t *testing.T) {
+	s, st, _, _ := driftRig(t, "unified-1", "unified-77")
+
+	d, err := s.Deliver(context.Background(), 1, Request{})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	mints := st.RegionMints()
+	if len(mints) != 1 {
+		t.Fatalf("区域台账 %d 格，这一发现铸该恰好记一格: %+v", len(mints), mints)
+	}
+	var want string
+	for _, m := range mints {
+		want = m.RegionKey
+	}
+	if want == "" {
+		t.Fatal("台账记了个空区域，这条用例什么都没验到")
+	}
+	if d.Region != want {
+		t.Fatalf("交付报的区域是 %q，台账记的是 %q", d.Region, want)
+	}
+	if p, ok := st.Pair("unified-77"); !ok || p.RegionKey != want {
+		t.Fatalf("pair 上存的区域是 %q，应为 %q", p.RegionKey, want)
+	}
+}
+
+// 不是现铸那条路（直接发池子手上的票）也要报区域；读不出来时报空，不许拿别的顶上。
+func TestDeliveryReportsThePairsRegion(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	// 两个开关都关着（默认）：这一发直接发池子手上那张票，不会重铸 —— 重铸会按**那一发的
+	// 出口**重算区域，就验不到「交付报的是手上这张的区域」。
+	for i, gw := range []string{"unified-1", "unified-2"} {
+		seedGateway(st, mn, gw, i, 1)
+	}
+	seedPairs(st, clk)
+	pr := st.pairs["unified-1"]
+	pr.RegionKey = "europe"
+	st.pairs["unified-1"] = pr
+	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1})
+
+	if d := mustDeliver(t, s, 1, "unified-1"); d.Region != "europe" {
+		t.Fatalf("交付报的区域是 %q，池子手上这张是从 europe 铸的", d.Region)
+	}
+	// 老 state.json 里的 pair 没这个字段 ⇒ 空。猜一个区域比不报更坏：
+	// 消费端会据此认为某个大区已经烧过。
+	if d := mustDeliver(t, s, 1, "unified-2"); d.Region != "" {
+		t.Fatalf("老 pair 报了区域 %q，应为空", d.Region)
+	}
+}

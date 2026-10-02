@@ -387,6 +387,15 @@ type Pair struct {
 	// 零值**绝不能**当成「不过期」，见 store.Open 里的兜底。
 	CflbExpiresAt time.Time
 	MintedBy      int64
+	// RegionKey 是**铸这张票时走的那个出口**所属的区域（Regions 里的 key）。
+	//
+	// 为什么要存下来而不是事后反查：网关 = (区域 × 账号)，同一个网关名在不同账号
+	// 眼里可能来自不同区域 ⇒ 「这张票属于哪个区域」只有铸它的那一刻知道。
+	//
+	// 空串有两个来源，都不是错：老 state.json 里的记录（那时还没这个字段），
+	// 以及 RegionKeyOf 反查不到的出口（续期型铸票的出口取自 ReachableExits，
+	// 不保证正好等于 Regions 里那九个代表出口）。消费端按「未归类」展示。
+	RegionKey string
 }
 
 // CookieVersionLen 是 cookie_version 的长度（十六进制字符数）。
@@ -585,7 +594,13 @@ const (
 
 // Delivery 是 /cookie 的返回。
 type Delivery struct {
-	Gateway      string    `json:"gateway"`
+	Gateway string `json:"gateway"`
+	// Region 是交付出去这张票的 Pair.RegionKey：**铸它的出口**属于哪个区域。
+	// 空 = 池子不知道（老记录 / 反查不到），消费端按「未归类」处理，不要猜。
+	//
+	// 注意它不是「消费端这一发会落在哪个区域」：cflb 跨出口回放会漂（SPEC 第 4 节），
+	// 真实落点只有响应里的新 __oailb 说得准。这个字段只回答「这张票是哪儿铸的」。
+	Region       string    `json:"region,omitempty"`
 	Cookie       string    `json:"cookie"`
 	ExpiresAt    time.Time `json:"expires_at"`
 	ValidForS    int       `json:"valid_for_s"`
