@@ -1,7 +1,8 @@
 {{define "content"}}
 <div class="page-head">
-  <h1>我的账号<span class="badge">{{len .Accounts}} 份凭据</span></h1>
-  <p>创建于 {{.Since}} UTC。</p>
+  <h1>{{.Title}}<span class="badge">{{len .Accounts}} 份凭据</span></h1>
+  {{if .Admin}}<p>池子里全部账号，一份凭据一张卡。<a href="/admin/">← 回管理页</a></p>
+  {{else}}<p>创建于 {{.Since}} UTC。</p>{{end}}
 </div>
 
 <div class="kpis">
@@ -11,7 +12,7 @@
   <div class="kpi"><b>{{.NewGateways}}</b><span>新发现网关</span></div>
 </div>
 
-<div class="grid-2">
+<div class="{{if not .Admin}}grid-2{{end}}">
   <div class="card">
     <header class="card-head"><div><h2>接口地址</h2><p>填进 sub2api 的<strong>根地址</strong>。</p></div></header>
     <div class="card-body">
@@ -26,6 +27,7 @@
       </div>
     </div>
   </div>
+  {{if not .Admin}}
   <div class="card">
     <header class="card-head"><div><h2>本页地址</h2><p>进入这一页的唯一入口。</p></div></header>
     <div class="card-body">
@@ -40,6 +42,7 @@
       {{end}}
     </div>
   </div>
+  {{end}}
 </div>
 
 {{if .Accounts}}
@@ -64,15 +67,7 @@
     {{end}}
 
     <h3>各区域探测情况</h3>
-    <div class="regions">
-    {{range .Regions}}
-      <div class="region{{if .Minted}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
-        <b>{{.Label}}</b>
-        <span>{{if .Minted}}已探测 {{.Count}} 次{{else}}未探测{{end}}</span>
-      </div>
-    {{end}}
-    </div>
-    <p class="foot">绿＝这个账号在该区域取到过路由 Cookie（终身计数）；红＝还没取到过。悬停看最近一次时间。</p>
+    {{template "regions" .Regions}}
 
     {{if .Fails}}
     <h3>最近的取票失败</h3>
@@ -93,9 +88,10 @@
 </div>
 {{end}}
 {{else}}
-<div class="card"><p class="empty">你名下还没有凭据。回<a href="/">首页</a>上传一份。</p></div>
+<div class="card"><p class="empty">{{if .Admin}}池子里还没有账号。{{else}}你名下还没有凭据。回<a href="/">首页</a>上传一份。{{end}}</p></div>
 {{end}}
 
+{{if not .Admin}}
 <div class="card">
   <header class="card-head"><div><h2>再挂一份凭据</h2></div></header>
   <div class="card-body">
@@ -104,4 +100,5 @@
     <p class="foot">探测请求固定为 <code>ping</code>（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），带 <code>store=false</code>，不在账号里留对话记录。</p>
   </div>
 </div>
+{{end}}
 {{end}}

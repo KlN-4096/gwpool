@@ -258,6 +258,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
+	mux.HandleFunc("GET /admin/accounts", s.handleAdminAccounts)
 	mux.HandleFunc("GET /admin/", s.handleAdmin)
 	return noStore(mux)
 }
@@ -1000,6 +1001,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.OwnerToken = o.Token
 	}
 	v.NewGateways = s.foundBy(a.ID)
+	v.Regions = regionCells(a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
 	for _, sm := range samples {
 		if sm.AccountID != a.ID {
 			continue
@@ -1053,13 +1055,6 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "读账本失败", http.StatusInternalServerError)
 		return
 	}
-	// 请求数按账号先汇总一遍：账号可能有好几个，每个都扫一遍全量样本是 O(n×m)。
-	reqs := map[int64]int{}
-	for _, sm := range samples {
-		reqs[sm.AccountID]++
-	}
-	mints := s.st.RegionMints()
-
 	// **这一页一个字的身份 cookie 都不写。** 曾经写过，条件是「还没有身份时才记」，
 	// 图的是「来都来了，下次进首页就是一个按钮」。那是一个身份固定漏洞：
 	//
@@ -1090,8 +1085,63 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 		BaseURL:   s.publicBaseURL(),
 		CanLogout: had && cur.ID == o.ID,
 	}
-	for _, a := range s.st.AccountsByOwner(o.ID) {
-		row := ownerAccountRow{
+	v.Accounts = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
+	for _, row := range v.Accounts {
+		v.Requests += row.Requests
+		v.NewGateways += row.NewGateways
+	}
+	s.render(w, s.tplOwner, v)
+}
+
+// handleAdminAccounts 出 GET /admin/accounts：**所有**账号一人一张卡，和上传者
+// 自己的 /u/ 页同一套读数、同一个模板。
+//
+// 管理页那张账号表是扁平清单，看不见九宫格、接入 key 和取票失败——要查「谁的号在
+// 哪个区域还没落点」只能一个个点开 /a/ 链接。这一页把它们摊开。
+func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
+	if !s.authAdmin(w, r) {
+		return
+	}
+	samples, err := s.samples()
+	if err != nil {
+		s.opt.Log.Error("读样本失败", "err", err)
+		http.Error(w, "读账本失败", http.StatusInternalServerError)
+		return
+	}
+	v := ownerView{
+		base:    base{Title: "全部账号", Mode: s.pool.Mode()},
+		Model:   s.probeModel(),
+		Effort:  probeEffort,
+		BaseURL: s.publicBaseURL(),
+		Admin:   true,
+	}
+	v.Accounts = s.ownerAccountRows(s.st.Accounts(), samples)
+	for _, row := range v.Accounts {
+		v.Requests += row.Requests
+		v.NewGateways += row.NewGateways
+	}
+	s.render(w, s.tplOwner, v)
+}
+
+// ownerAccountRows 把一串账号摊成卡片行。/u/{token} 和 /admin/accounts 共用：
+// 两边要的是同一套读数，分两份写迟早只有一边加字段。
+//
+// 失败行两边都按**上传者口径**取（只要真失败、不带 Detail）：这张卡的标题就是
+// 「最近的取票失败」，把归还和续期混进来会让人读错；管理员要的 Detail 在管理页
+// 那张全量失败表里，带原始错误。
+func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) []ownerAccountRow {
+	// 请求数按账号先汇总一遍：账号可能有好几个，每个都扫一遍全量样本是 O(n×m)。
+	reqs := map[int64]int{}
+	for _, sm := range samples {
+		reqs[sm.AccountID]++
+	}
+	mints := s.st.RegionMints()
+	gws := s.st.Gateways()
+	// 九宫格的滑窗 = 槽位冷却：和调度那把尺子同一个值（见 regionCells）。
+	window := s.slotCooldown()
+	out := make([]ownerAccountRow, 0, len(accs))
+	for _, a := range accs {
+		out = append(out, ownerAccountRow{
 			ID: a.ID, Label: a.Label, Plan: a.PlanType,
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
 			Since:       a.CreatedAt.Format(time.DateTime),
@@ -1099,17 +1149,13 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 			ConsumerKey: s.ConsumerKeyFor(a),
 			Requests:    reqs[a.ID],
 			NewGateways: s.foundBy(a.ID),
-			Regions:     regionCells(a.ID, mints),
-			// Detail 不给上传者：里面是出口名、上游状态码这类内部读数（照 handleAccount）。
-			Fails: s.fails.failRows(a.ID, 20, false),
-		}
-		v.Accounts = append(v.Accounts, row)
-		v.Requests += row.Requests
-		v.NewGateways += row.NewGateways
+			Regions:     regionCells(a.ID, mints, samples, gws, window),
+			Fails:       s.fails.failRows(a.ID, 20, false),
+		})
 	}
 	// 稳定顺序：加入先后就是人心里的顺序，而 map 遍历不是。
-	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
-	s.render(w, s.tplOwner, v)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // regionCells 画一个账号的九宫格：types.Regions 那九个区域，终身铸过票的算绿。
@@ -1119,27 +1165,81 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 //
 // 顺带兜住一件事：台账里可能有 RegionKeyOf 反查回空串的行（手改的 state.json），
 // 而这里是**照 types.Regions 画格子、再回头查台账**，所以那种行天然画不出第十个格子。
-func regionCells(accountID int64, mints map[string]types.RegionMint) []regionCell {
+// 绿/灰按 window 这个**滑窗**判（调用方传 slot_cooldown，默认 4 小时），不按终身台账：
+// 这张卡的用处是「此刻这个号还能派去哪个区域铸票」，终身绿会把早就凉了的区域标成绿。
+// 终身读数（台账的 Count/LastAt）退到 Note 里，悬停还看得见。
+//
+// 网关名只在样本里（台账只记计数），所以 samples/gws 一起传进来：gws 用来判
+// 「这个网关是不是记在别人名下」。两者为 nil 时格子照画，只是列不出名字。
+func regionCells(accountID int64, mints map[string]types.RegionMint,
+	samples []types.Sample, gws map[string]types.Gateway, window time.Duration) regionGrid {
 	byRegion := map[string]types.RegionMint{}
 	for _, m := range mints {
 		if m.AccountID == accountID && m.RegionKey != "" {
 			byRegion[m.RegionKey] = m
 		}
 	}
-	out := make([]regionCell, 0, len(types.Regions))
+	// 按**样本原序**走（samples.jsonl 就是追加序），于是「这个账号第一次在哪个区域
+	// 撞见这个网关」天然按时间定下来，后面那几个区域才算重复。
+	// 只认画得出格子的那九个区域 key。样本里的 RegionKey 反查不到区域时退回国家码
+	// （"IT"，见 sched.sampleRegion），放进来的话它会**悄悄占掉**某个网关的「第一次」，
+	// 于是九宫格里真正第一次撞见它的那格被标成「重」，配对的「新」在页面上根本不存在。
+	//
+	// 也正因为样本那一列会是国家码，**绿/灰不能按样本数**——那等于把一部分真实铸票
+	// 判成没发生。绿按铸票台账（NoteRegionMint 只记成功、而且只用真区域 key）。
+	known := make(map[string]bool, len(types.Regions))
 	for _, r := range types.Regions {
-		// 措辞统一成对外那套「探测」，别和格子正文的「已探测 N 次」打架（N11）。
-		c := regionCell{Key: r.Key, Label: regionLabel(r.Key), Note: "未探测"}
-		if m, ok := byRegion[r.Key]; ok && m.Count > 0 {
-			c.Minted, c.Count = true, m.Count
-			c.Note = fmt.Sprintf("已探测 %d 次", m.Count)
+		known[r.Key] = true
+	}
+	firstRegion := map[string]string{}
+	inRegion := map[string]map[string]bool{}
+	for _, sm := range samples {
+		// Gateway 非空就是「这一发真取到了路由」——照 types.MintResult 的语义，
+		// 取不到的那几发 Gateway 为空。
+		if sm.AccountID != accountID || sm.Gateway == "" || !known[sm.RegionKey] {
+			continue
+		}
+		if _, ok := firstRegion[sm.Gateway]; !ok {
+			firstRegion[sm.Gateway] = sm.RegionKey
+		}
+		if inRegion[sm.RegionKey] == nil {
+			inRegion[sm.RegionKey] = map[string]bool{}
+		}
+		inRegion[sm.RegionKey][sm.Gateway] = true
+	}
+	now := time.Now()
+	grid := regionGrid{Window: shortDur(window), Cells: make([]regionCell, 0, len(types.Regions))}
+	for _, r := range types.Regions {
+		c := regionCell{Key: r.Key, Label: regionLabel(r.Key)}
+		m, had := byRegion[r.Key]
+		c.Fresh = had && m.Count > 0 && !m.LastAt.IsZero() && now.Sub(m.LastAt) < window
+		if c.Fresh {
+			c.Ago = shortDur(now.Sub(m.LastAt))
+			c.Note = c.Ago + "前在这里取到过票"
+		} else {
+			c.Note = grid.Window + "内没在这里取到过票，可以派去这里铸"
+		}
+		// 终身读数退到悬停：窗口是「现在能不能去」，终身是「以前去过没有」。
+		if had && m.Count > 0 {
+			c.Note += fmt.Sprintf("；终身 %d 次", m.Count)
 			if !m.LastAt.IsZero() {
 				c.Note += "，最近 " + m.LastAt.UTC().Format(time.DateTime) + " UTC"
 			}
+		} else {
+			c.Note += "；终身也没取到过"
 		}
-		out = append(out, c)
+		for name := range inRegion[r.Key] {
+			dup := firstRegion[name] != r.Key
+			if g, ok := gws[name]; ok && g.FirstSeenBy != accountID {
+				dup = true
+			}
+			c.Gateways = append(c.Gateways, regionGateway{Name: name, Dup: dup})
+		}
+		// 名字序：map 遍历每次都换顺序，刷新一下页面就跳。
+		sort.Slice(c.Gateways, func(i, j int) bool { return c.Gateways[i].Name < c.Gateways[j].Name })
+		grid.Cells = append(grid.Cells, c)
 	}
-	return out
+	return grid
 }
 
 // ---------- /cookie ----------

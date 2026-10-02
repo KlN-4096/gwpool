@@ -85,6 +85,10 @@ type accountView struct {
 	Effort         string
 	Rows           []sampleRow
 	Truncated      int
+	// Regions 和总览页那一格同一份读数（regionCells）：拿着 /a/ 链接的人也该看得见
+	// 「我这个号在哪几个区域取到过票」—— 那是他判断自己这份凭据有没有在干活的最直观读数，
+	// 而他手上可能只有这一个链接（总览令牌只在自己浏览器里认得出他时才显示）。
+	Regions regionGrid
 	// Fails 是最近几次没给出票的交付：客户端那头只看到一个 502/503。
 	Fails []failRow
 	// OwnerToken 只在**请求自己带着**这个账号 owner 的 cookie 时才填（见 handleAccount）：
@@ -112,6 +116,10 @@ type ownerView struct {
 	// CanLogout：访客的身份 cookie 正好是这个 owner，给一个「登出」按钮。
 	CanLogout bool
 	Accounts  []ownerAccountRow
+	// Admin = 这一页是 /admin/accounts（全部账号），不是某一个人的总览。模板据此
+	// 收掉「本页地址」「再挂一份凭据」那两张只讲上传者自己的卡，换成回管理页的链接。
+	// 用一个显式字段而不是「Token 为空」去推：那是两件事，哪天 owner 没令牌了就串台。
+	Admin bool
 }
 
 type ownerAccountRow struct {
@@ -129,7 +137,7 @@ type ownerAccountRow struct {
 	Requests    int
 	NewGateways int
 	// Regions 恒为 types.Regions 那九个，顺序一致。
-	Regions []regionCell
+	Regions regionGrid
 	Fails   []failRow
 }
 
@@ -137,12 +145,39 @@ type ownerAccountRow struct {
 //
 // Note 是给人读的那句（「铸过 3 次，最近 … UTC」）：纯靠红绿传达信息对色盲不友好，
 // 所以格子里必须有文字，而不只是 title 属性。
+// regionGrid 是九宫格整块。窗口文案在格子外面说一次，不在九个格子里各写一遍。
+type regionGrid struct {
+	// Window 是「最近多久」的人读文案（跟着 slot_cooldown 走，默认 4 小时）。
+	Window string
+	Cells  []regionCell
+}
+
 type regionCell struct {
-	Key    string
-	Label  string
-	Minted bool
-	Count  int
-	Note   string
+	Key   string
+	Label string
+	// Fresh = **窗口内**在这个区域取到过路由 Cookie。
+	//
+	// 刻意不是终身计数：这张卡要回答的是「此刻这个号还能去哪个区域铸票」，而终身绿
+	// 会把一个三天前摸过、现在早凉了的区域画成「已探测」，正好把答案盖掉。
+	// 终身读数降级进 Note（悬停还看得到）。
+	Fresh bool
+	// Ago 是最近一次取到票距今多久（Fresh 时才有意义）。
+	Ago  string
+	Note string
+	// Gateways 是这个账号在这个区域**历史上**见过的网关名（样本里的，台账只有计数）。
+	// 这一列刻意是终身的：它回答的是「这个区域能给到哪些落点」，窗口内没铸过的格子
+	// 照样该看得见——否则最该被派出去的那几格永远空着。
+	Gateways []regionGateway
+}
+
+// regionGateway 是九宫格某一格里见过的一个网关。
+//
+// Dup = 这一格没给池子添新落点：这个网关要么记在别人名下（池子里先有了），
+// 要么这个账号自己在更早的区域已经撞到过。标出来是为了让人看出「还值得往哪个
+// 区域派」——九个格子全绿但全是重复的号，再派也只是白烧窗口。
+type regionGateway struct {
+	Name string
+	Dup  bool
 }
 
 // regionLabels 把区域 key 翻成人话。

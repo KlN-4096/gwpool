@@ -23,6 +23,10 @@
     <p>该账号已累计发送 <strong>{{.Requests}} 次请求</strong>（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>，每次消耗 <strong>0 token</strong>），共发现 <strong>{{.NewGateways}} 个新网关</strong>。</p>
     <p class="muted">探测请求的内容固定为 <code>ping</code>，并设置 <code>store=false</code>，不会在账号中留下对话记录。</p>
   </div>
+  <div class="card">
+    <header class="card-head"><div><h2>各区域探测情况</h2><p>九个出口区域里，这个账号最近一个冷却窗口内在哪些区域取到过路由 Cookie——灰的那几格就是现在还能去铸的。</p></div></header>
+    <div class="card-body">{{template "regions" .Regions}}</div>
+  </div>
   <div class="grid-2">
     <div class="card">
       <header class="card-head"><div><h2>接入 key</h2><p>调用 <code>/cookie</code> 时放在 Authorization 头里，别外泄。</p></div></header>

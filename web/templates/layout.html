@@ -224,14 +224,19 @@ table.tiles tr.nomatch td { position: static; width: auto; height: auto; clip-pa
 
 /* 九个区域的探测格子。文字和颜色一起表达状态：只靠红绿对色盲不友好 */
 .regions { display: grid; grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr)); gap: .4rem; margin: .5rem 0 1rem; }
-/* 没取到过的格子是红的（用户定的）。红＝「这里还没摸过」，不是错误——
-   所以靠 ✓ / ✗ 这个字形承载语义，只靠颜色的话色盲读者什么都读不到。 */
+/* 窗口内没取到过的格子是**灰**的：那不是错误，是「这儿还空着，可以派人去」——
+   红色会把一张机会表读成故障表（用户 10-02 定的）。语义照样挂在 ✓ / · 这个字形上，
+   只靠颜色的话色盲读者什么都读不到。 */
 .region { display: grid; gap: .1rem; padding: .4rem .55rem; border-radius: 8px;
-          background: var(--bad-soft); border: 1px solid transparent; color: var(--bad);
+          background: var(--sunken); border: 1px solid var(--line); color: var(--muted);
           font-size: 12px; cursor: help; }
-.region b { color: var(--bad); font-size: 12.5px; font-weight: 600; }
-.region b::after { content: " ✗"; }
-.region.on { background: var(--ok-soft); color: var(--ok); }
+/* 格子里的网关名。重复的靠「重」这个字承载语义，淡化只是辅助（同上，别只靠颜色）。 */
+.region .gws { display: flex; flex-wrap: wrap; gap: .1rem .3rem; margin-top: .15rem; }
+.region .gws code { font-size: 10.5px; white-space: nowrap; }
+.region .gws code.dup { opacity: .75; }
+.region b { color: var(--fg-2); font-size: 12.5px; font-weight: 600; }
+.region b::after { content: " ·"; }
+.region.on { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
 .region.on b { color: var(--ok); }
 .region.on b::after { content: " ✓"; }
 
@@ -579,4 +584,25 @@ button[type=submit]:disabled { cursor: progress; }
 </script>
 </body>
 </html>
+{{- end}}
+
+{{/* 九宫格。参数是 regionGrid，/u/、/a/、/admin/accounts 共用这一份——
+     三个页面各抄一遍的话，加一列读数就得改三处，漏一处没人看得出来。 */}}
+{{define "regions" -}}
+<div class="regions">
+{{range .Cells}}
+  <div class="region{{if .Fresh}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
+    <b>{{.Label}}</b>
+    <span>{{if .Fresh}}{{.Ago}}前取过{{else}}可去铸{{end}}</span>
+    {{if .Gateways}}<span class="gws">
+      {{- range .Gateways}}
+      {{- if .Dup}}<code class="dup" title="重复：池子里已经有这个网关了">{{.Name}} 重</code>
+      {{- else}}<code title="这个账号第一个发现它">{{.Name}} 新</code>{{end}}
+      {{- end}}
+    </span>{{end}}
+  </div>
+{{end}}
+</div>
+<p class="foot">绿＝最近 {{.Window}}内这个账号在该区域取到过路由 Cookie；灰＝没取到过，<strong>可以派它去这个区域铸</strong>（窗口＝槽位冷却）。悬停看终身次数和最近时间。
+格子里列的是这个账号在那个区域<strong>历史上</strong>见过的网关：<code>新</code>＝由它第一个发现，<code>重</code>＝池子里已经有了（别人先发现，或它自己在更早的区域撞到过）。</p>
 {{- end}}

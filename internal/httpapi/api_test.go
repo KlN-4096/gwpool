@@ -727,15 +727,15 @@ func TestOwnerPageDrawsNineRegionCells(t *testing.T) {
 	if n != len(types.Regions) {
 		t.Fatalf("画了 %d 个格子，该是 %d 个：台账里那条空 RegionKey 画成了第十个？", n, len(types.Regions))
 	}
-	// europe 铸过 3 次 ⇒ 绿 + 文字 + 带时间的 title；别的区域是灰的。
-	if !strings.Contains(body, `class="region on"`) || !strings.Contains(body, "已探测 3 次") {
-		t.Fatalf("europe 该标成铸过 3 次：\n%s", body)
+	// europe 的最近一次在窗口内 ⇒ 绿 + 文字 + 带时间的 title；别的区域是灰的。
+	if !strings.Contains(body, `class="region on"`) || !strings.Contains(body, "前取过") {
+		t.Fatalf("europe 该标成窗口内取过票：\n%s", body)
 	}
-	if !strings.Contains(body, "已探测 3 次，最近 ") {
-		t.Fatal("格子的 title 里没有「最近一次什么时候」")
+	if !strings.Contains(body, "终身 3 次，最近 ") {
+		t.Fatal("格子的 title 里没有终身次数和最近一次什么时候")
 	}
-	if !strings.Contains(body, "未探测") {
-		t.Fatal("没铸过的区域该有文字说明，不能只靠颜色")
+	if !strings.Contains(body, "可去铸") {
+		t.Fatal("窗口内没取过的区域该有文字说明，不能只靠颜色")
 	}
 	// 2 号的那一格（oceania）不许串到 1 号的页面上。
 	if strings.Count(body, `class="region on"`) != 1 {
@@ -2197,5 +2197,139 @@ func TestDeliverFailuresShowOnPages(t *testing.T) {
 	}
 	if !strings.Contains(admin, codeNoLivePair) {
 		t.Fatal("管理页没显示错误码")
+	}
+}
+
+// regionCellOf 掐出某个区域那一格的 HTML。按整页 Contains 断言的话，「绿」和
+// 「列出了某个网关」会互相串台——两件事都在页面上，但可能落在不同的格子里。
+func regionCellOf(t *testing.T, body, label string) string {
+	t.Helper()
+	i := strings.Index(body, `title="`+label+`（`)
+	if i < 0 {
+		t.Fatalf("页面上没有 %s 这一格", label)
+	}
+	// 往前退到这一格的 <div，再往后切到它的 </div>。
+	start := strings.LastIndex(body[:i], "<div")
+	end := strings.Index(body[i:], "</div>")
+	if start < 0 || end < 0 {
+		t.Fatalf("%s 那一格的 HTML 不完整", label)
+	}
+	return body[start : i+end]
+}
+
+// /a/ 这一页也要有九区域格子：拿着它的人判断「我这份凭据在不在干活」最直观的就是这个，
+// 而他手上可能只有这一个链接——总览令牌只在他自己的浏览器里认得出他时才显示。
+//
+// 格子的语义是**滑窗**（绿＝窗口内取到过、灰＝可以派去铸），终身计数退到悬停文案里：
+// 这一页回答的是「现在还能往哪儿派」，终身绿会把早凉了的区域画成绿、正好盖掉答案。
+func TestAccountPageShowsRegionGrid(t *testing.T) {
+	_, h, _, st, _ := rig(t, types.ModePool)
+	now := time.Now().UTC()
+	win := shortDur(types.SlotCooldown)
+	// 另一个账号先发现的网关，用来验「重」。
+	st.gws["unified-73"] = types.Gateway{Name: "unified-73", FirstSeenBy: 2, FirstSeenAt: now.Add(-time.Hour)}
+	// 终身铸过很多次、但最近一次已经在窗口外 ⇒ 必须是灰的（这一格正是「现在还能去」的答案）。
+	st.mints["1|us-west"] = types.RegionMint{AccountID: 1, RegionKey: "us-west", Count: 5, LastAt: now.Add(-2 * types.SlotCooldown)}
+	st.samples = append(st.samples,
+		// 欧洲第一次撞见 unified-142 ⇒ 这一格算「新」。
+		types.Sample{AccountID: 1, RegionKey: "europe", Gateway: "unified-142", Status: 200, At: now.Add(-30 * time.Minute)},
+		// 同一个网关又在美东出现 ⇒ 对美东是「重」（它自己在更早的区域撞到过）。
+		types.Sample{AccountID: 1, RegionKey: "us-east", Gateway: "unified-142", Status: 200, At: now.Add(-20 * time.Minute)},
+		// 别人先发现的 ⇒ 「重」。
+		types.Sample{AccountID: 1, RegionKey: "south-america", Gateway: "unified-73", Status: 200, At: now.Add(-10 * time.Minute)},
+		// 窗口**外**：名字照列（终身读数），但格子必须是灰的。
+		types.Sample{AccountID: 1, RegionKey: "middle-east", Gateway: "unified-900", Status: 200, At: now.Add(-2 * types.SlotCooldown)},
+		// 取不到路由的那几发 Gateway 为空，不许把格子染绿。
+		types.Sample{AccountID: 1, RegionKey: "oceania", Gateway: "", Status: 429, At: now.Add(-time.Minute)},
+	)
+	body := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String()
+	if !strings.Contains(body, "各区域探测情况") {
+		t.Fatalf("账号页没有九区域格子：\n%s", body)
+	}
+	for _, r := range types.Regions {
+		if !strings.Contains(body, regionLabel(r.Key)) {
+			t.Fatalf("缺了区域 %s 的格子", r.Key)
+		}
+	}
+
+	// 窗口内 ⇒ 绿，且终身计数（rig 里 europe 是 3 次）退到悬停文案里。
+	eu := regionCellOf(t, body, "欧洲")
+	if !strings.Contains(eu, "region on") {
+		t.Fatalf("窗口内取到过票的格子没变绿：%s", eu)
+	}
+	if !strings.Contains(eu, "前在这里取到过票") || !strings.Contains(eu, "终身 3 次") {
+		t.Fatalf("欧洲那一格的读数不对：%s", eu)
+	}
+	if !strings.Contains(eu, "unified-142 新") {
+		t.Fatalf("欧洲那一格没标出自己发现的网关：%s", eu)
+	}
+
+	// 同一个网关在更晚的区域再出现 ⇒ 重复。
+	if us := regionCellOf(t, body, "美国东部"); !strings.Contains(us, "unified-142 重") {
+		t.Fatalf("美东那一格没把重复网关标出来：%s", us)
+	}
+	// 别人先发现的 ⇒ 重复。
+	if sa := regionCellOf(t, body, "南美"); !strings.Contains(sa, "unified-73 重") {
+		t.Fatalf("南美那一格没把别人先发现的网关标成重复：%s", sa)
+	}
+
+	// 窗口外 ⇒ 灰（不带 on），但网关名还得在：那一格正是最该被派出去的。
+	me := regionCellOf(t, body, "中东")
+	if strings.Contains(me, "region on") {
+		t.Fatalf("窗口外的格子不该是绿的：%s", me)
+	}
+	if !strings.Contains(me, "unified-900") || !strings.Contains(me, win+"内没在这里取到过票，可以派去这里铸") {
+		t.Fatalf("中东那一格丢了终身网关名或没说可以去铸：%s", me)
+	}
+
+	// 终身绿不算绿：台账上最近一次已经在窗口外的格子必须是灰的，终身次数退到悬停。
+	uw := regionCellOf(t, body, "美国西部")
+	if strings.Contains(uw, "region on") {
+		t.Fatalf("最近一次在窗口外，格子不该是绿的：%s", uw)
+	}
+	if !strings.Contains(uw, "终身 5 次") {
+		t.Fatalf("美西那一格丢了终身读数：%s", uw)
+	}
+
+	// Gateway 为空的样本不算取到票。
+	if oc := regionCellOf(t, body, "大洋洲"); strings.Contains(oc, "region on") {
+		t.Fatalf("没取到路由的样本把格子染绿了：%s", oc)
+	}
+
+	// 2 号没在 europe 取过票，不许把 1 号的数算到它头上。
+	b2 := do(h, httptest.NewRequest("GET", "/a/vt-2", nil)).Body.String()
+	if eu2 := regionCellOf(t, b2, "欧洲"); strings.Contains(eu2, "region on") || strings.Contains(eu2, "unified-142") {
+		t.Fatalf("1 号的格子串到 2 号页面上了：%s", eu2)
+	}
+}
+
+// /admin/accounts 是「所有账号一人一张卡」：管理页那张扁平表看不见九宫格、
+// 接入 key 和取票失败，排查「谁的号在哪个区域还没落点」只能一个个点开 /a/。
+func TestAdminAccountsPage(t *testing.T) {
+	_, h, _, _, _ := rig(t, types.ModePool)
+	// 没带 admin key 一律 401：这一页上有每个账号的接入 key。
+	if w := do(h, httptest.NewRequest("GET", "/admin/accounts", nil)); w.Code != http.StatusUnauthorized {
+		t.Fatalf("/admin/accounts 没鉴权就给了：%d", w.Code)
+	}
+	r := httptest.NewRequest("GET", "/admin/accounts", nil)
+	r.SetBasicAuth("admin", "akey")
+	w := do(h, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("/admin/accounts = %d", w.Code)
+	}
+	body := w.Body.String()
+	// 两个账号都在（它们挂在**不同的** owner 下，这一页不按归属筛）。
+	for _, want := range []string{"pro1", "朋友的号", "各区域探测情况", "全部账号"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/admin/accounts 少了 %q：\n%s", want, body)
+		}
+	}
+	// 这一页不是某个人的总览：别把「本页地址/令牌」那套上传者文案摆上来。
+	if strings.Contains(body, "换设备时在首页粘这个令牌") || strings.Contains(body, ownerTok1) {
+		t.Fatal("/admin/accounts 混进了上传者总览令牌")
+	}
+	// 凭据一个字都不许出现（和其他页面同一条哨兵）。
+	if strings.Contains(body, secretToken) {
+		t.Fatal("/admin/accounts 泄漏了凭据")
 	}
 }
