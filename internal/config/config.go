@@ -197,8 +197,9 @@ type Config struct {
 
 	// MintConcurrency 是预铸同时派几个**不同账号**去铸票，0 时按 Defaults（1 = 串行）。
 	//
-	// 并发是**跨账号**的：同一个号仍然串行（store.LockAccount，SPEC 红线 2），同一个区域
-	// 也仍然一次只许一发裸铸在打（sched.claimRegion）⇒ 实际并发物理封顶在九个区域。
+	// 并发是**跨账号**的：同一个号仍然串行（store.LockAccount，SPEC 红线 2），而且同一个号
+	// 不许同时两发裸铸走同一个大区（sched.claimRegion 按 (账号 × 大区) 拦）。
+	// 几个**不同**号同时走同一个大区是允许的 —— 实测它们大概率落到不同网关。
 	// 调大它买的是「一轮就把缺口补完」，代价是上游请求更密，而打得密本身就是封号特征
 	// （见 sched.Options.RenewGap）。
 	MintConcurrency int `json:"mint_concurrency"`
@@ -360,11 +361,13 @@ func Load(path string) (Config, error) {
 	if cfg.MintConcurrency < 0 {
 		return Config{}, fmt.Errorf("mint_concurrency 不能为负（0 = 用默认值 %d = 串行）", defaultMintConcurrency)
 	}
-	// 九个区域是物理上限：同一个区域一次只许一发裸铸在打（sched.claimRegion），
-	// 填得更大只会让多出来的 worker 全卡在抢区域上空转。
+	// 封顶是**防手滑**，不再是物理上限：claimRegion 2026-10-03 改成按 (账号 × 大区) 拦
+	// 之后，并发的真上限是「账号数 × 大区数」，Load 的时候数不出来。留着这个数是因为
+	// 打得密本身就是封号特征（见 sched.Options.RenewGap），而九路并发已经远超实际缺口
+	// （spare_target 量级是 20~30，premintWorkers 还会再按缺口收一次）。
 	if n := len(types.Regions); cfg.MintConcurrency > n {
-		return Config{}, fmt.Errorf("mint_concurrency 最多 %d：同一个区域一次只许一发裸铸在打，"+
-			"九个区域就是并发的物理上限", n)
+		return Config{}, fmt.Errorf("mint_concurrency 最多 %d：再大也只是把上游请求打得更密，"+
+			"而密集铸票是封号特征；真要放开先改这里", n)
 	}
 	if cfg.MaxTriesPerDeliver == 0 {
 		cfg.MaxTriesPerDeliver = Defaults().MaxTriesPerDeliver

@@ -938,13 +938,14 @@ func (s *Scheduler) mintByRegion(ctx context.Context, consumer types.Account,
 		return types.Delivery{}, "",
 			fmt.Errorf("%w：能派的账号九个区域本小时都打满了", ErrMintFailed)
 	}
-	// 这个区域已经有一发在打 ⇒ 不排队、直接认「暂时没票」。两发裸铸烧的是**两个**
-	// 铸票者槽位去发现可能同一个落点，而槽位是池子最紧的资源。用 ErrNoLivePair 回：
+	// 这个号在这个大区已经有一发在打 ⇒ 不排队、直接认「暂时没票」。同号同出口的两发
+	// 落点逐字相同，第二发白烧一个铸票者槽位，而槽位是池子最紧的资源。用 ErrNoLivePair 回：
 	// Deliver 把它归成「等得起」那一格，调用方重试那一次前一路的票大概率已经在池里了。
-	done, ok := s.claimRegion(region.Key)
+	done, ok := s.claimRegion(minter.ID, region.Key)
 	if !ok {
 		return types.Delivery{}, "",
-			fmt.Errorf("%w（区域 %s 已经有一发裸铸在打，等它的结果）", ErrNoLivePair, region.Key)
+			fmt.Errorf("%w（账号 %d 在区域 %s 已经有一发裸铸在打，等它的结果）",
+				ErrNoLivePair, minter.ID, region.Key)
 	}
 	defer done()
 
@@ -1203,17 +1204,29 @@ func (s *Scheduler) mintPair(ctx context.Context, minter, consumer types.Account
 	return pairMint{minted: got, mintedBySelf: minter.ID == consumer.ID}, nil
 }
 
-// claimRegion 占住「这个区域此刻有一发裸铸在打」，占不住返回 false。
+// claimRegion 占住「**这个号**此刻有一发裸铸走这个大区」，占不住返回 false。
 //
-// **刻意是占不住就走，不是排队等。** 裸铸出手前不知道会落到哪个网关，所以 SPEC B 条
-// 「同一个网关一次只许有一发在铸」在这条路上只能退化成按区域拦。但不能拿真锁去拦：
-// 两路交付各自的铸票者不同，排队等于让后一路在走到**账号锁**之前就停住，而前一路
-// 正等着账号锁 —— TestNoDeadlockBetweenAccounts 那个屏障要的就是两路都能走到账号锁，
-// 任何一把挡在前面的共享锁都会让它真死锁（2026-10-02 实测，全局锁版本 3 秒超时）。
+// 粒度是 (账号 × 大区)，不是整个大区。裸铸出手前不知道会落到哪个网关，所以 SPEC B 条
+// 「同一个网关一次只许有一发在铸」在这条路上只能近似，而最接近的近似是按 (账号 × 大区)：
+// 同一个号同一个出口连铸几发，落点逐字相同（见 types.RegionMint.Gateway）⇒ 第二发白烧
+// 一个槽位，该拦。
+//
+// **两个不同号同时走同一个大区不拦。** 原来拦了，理由是「两发裸铸去发现可能同一个落点」，
+// 但实测不支持那个「可能」：us-east 一个大区 253 发摸到 36 个不同落点，105 个网关里
+// 100 个被多个账号打到过 ⇒ 两个号走同一个大区大概率落到两个不同网关，拦住是白拦。
+// 而代价是它成了并发的**物理上限 9**，开局还更糟：所有号的首选大区都是台账里铸得最少
+// 的那一个，几个 worker 必然撞在一起（2026-10-02 实测，三个 worker 只铸出一发就收尾）。
+// 现在上限由 mint_concurrency 自己管。
+//
+// **刻意是占不住就走，不是排队等。** 不能拿真锁去拦：两路交付各自的铸票者不同，排队
+// 等于让后一路在走到**账号锁**之前就停住，而前一路正等着账号锁 ——
+// TestNoDeadlockBetweenAccounts 那个屏障要的就是两路都能走到账号锁，任何一把挡在前面的
+// 共享锁都会让它真死锁（2026-10-02 实测，全局锁版本 3 秒超时）。
 //
 // 占不住的那一路直接认「暂时没票」回去。调用方本来就会重试，而重试那一次
 // 前一路的票大概率已经在池子里了 —— 一发上游都不用打。
-func (s *Scheduler) claimRegion(key string) (func(), bool) {
+func (s *Scheduler) claimRegion(accountID int64, regionKey string) (func(), bool) {
+	key := comboKey(accountID, regionKey)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mintingRegions == nil {
@@ -1371,16 +1384,39 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		return minted{}, fmt.Errorf("%w：没拿到落点", ErrMintFailed)
 	}
 
+	// 出口国家不符 ⇒ 这一发对「哪个大区能到哪个网关」什么都没证明，两本按大区分格的账
+	// 都不能记。住宅代理库存不足时会回退到别的国家（1650 发里 23 次，要美国拿到了
+	// BR/AR/CL/CD/JM/MQ/MX），而落点是上游按**真实出口 IP** 分的：
+	//
+	//   - 记进 ReachableExits 等于留一条假线索，pickExit 下次照它定向铸、必然漂移
+	//   - 记进 (账号 × 大区) 台账等于把一个这个号还没走通的大区标成走过了，
+	//     而 bestRegion 优先挑「终身没铸过」的 ⇒ 从此不再去试它
+	//
+	// 网关本体照记（它确实存在、确实要进候选清单），只是不记「从哪儿能到它」——
+	// UpsertGateway 对零值出口会跳过追加那一步。
+	//
+	// obs 查不到地理时 Country 是空串 ⇒ 不判，照旧按请求的出口记：那是没有观测，
+	// 不是观测到不符。
+	reached := e
+	if obs.Country != "" && obs.Country != e.Region {
+		reached = types.Exit{}
+		s.opt.Log.Info("出口国家不符，这一发不记可达出口、不记大区台账",
+			"account", a.ID, "want", e.Region, "got", obs.Country, "gateway", res.Gateway)
+	}
 	// 落点入网关表。裸铸（预铸、发现）**必须**有这一步：Gateways() 是候选清单的
 	// 唯一来源，不在表上的网关哪怕有票也永远不会被挑中。定向铸票走到这儿是幂等的，
 	// 顺带把这个请求过的出口补进 ReachableExits（「下次想回来该怎么请求」）。
-	if _, err := s.st.UpsertGateway(res.Gateway, a.ID, e); err != nil {
+	if _, err := s.st.UpsertGateway(res.Gateway, a.ID, reached); err != nil {
 		s.opt.Log.Warn("记网关失败", "gateway", res.Gateway, "err", err)
 	}
 	// 记进 (账号 × 区域) 台账：挑下一个铸票者时「这个号哪个区域还没走过」、
 	// 以及「再派这个组合会落到哪」全靠它。
-	if err := s.st.NoteRegionMint(a.ID, types.RegionKeyOf(e), res.Gateway, at); err != nil {
-		s.opt.Log.Warn("记区域台账失败", "account", a.ID, "err", err)
+	//
+	// 区域 key 一定非空：pickExit 只给九个大区的代表出口，裸铸和扫描直接用 types.Regions。
+	if reached != (types.Exit{}) {
+		if err := s.st.NoteRegionMint(a.ID, types.RegionKeyOf(e), res.Gateway, at); err != nil {
+			s.opt.Log.Warn("记区域台账失败", "account", a.ID, "err", err)
+		}
 	}
 
 	p := cur
@@ -2020,16 +2056,19 @@ func (s *Scheduler) markDemand() {
 
 // ---------- 小工具 ----------
 
-// gatewaysFrom 列出已知能从这个出口所在**国家**到达的网关。
+// gatewaysFrom 列出已知能从**这个出口**到达的网关。
 //
-// 按国家而不是按区域 key 匹配：us-east / us-west 的国家都是 US，分不开时宁可两个都算上
-// ——这个函数只给「读不出落点、保守记触碰」那条路用，多记让槽位多歇会儿，
-// 漏记会把烧过的当新鲜的发出去。
+// 比整个出口（国家 + 城市），不是只比国家。这条路的用途是「读不出落点、保守记触碰」，
+// 方向本来就偏多记——但只比国家会多到离谱：`{US,""}` 会把只从 `{US,"Seattle"}` 摸到过
+// 的网关也算进来，而那两个出口的落点集实测是 36 / 29、交集 27（2026-10-03 现网
+// ReachableExits），于是一发失败的 us-east 裸铸会按住 64 个槽位里多出来的那 9 个
+// ——它们从没在这个出口上被摸到过，按住纯属白按。ReachableExits 记的恰好就是
+// 「请求过的那个出口」（见 store.UpsertGateway），逐字比它就是现成的正确答案。
 func (s *Scheduler) gatewaysFrom(e types.Exit) []string {
 	var out []string
 	for name, g := range s.st.Gateways() {
 		for _, re := range g.ReachableExits {
-			if re.Region == e.Region {
+			if re == e {
 				out = append(out, name)
 				break
 			}
@@ -2047,13 +2086,37 @@ func nothingWentOut(err error) bool {
 	return errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit)
 }
 
-// pickExit 随机取一条已知可达出口。随机而非固定第一条：城市库存不足时上游会
-// 回退到别的国家（实测 city-Dallas 给过尼日利亚 IP），死磕一条出口会卡死在那次回退上。
+// pickExit 随机取一条已知可达出口，**只认九个大区的代表出口**。
+//
+// 为什么挑剔：出口的大区 key 是反查出来的（types.RegionKeyOf 精确比 Region+City），
+// 反查不到就是空串，而这个空串会被一路带进两本按大区分格的账：
+//
+//   - 速率闸的分桶键（mint.rateKey = acct|""）⇒ 九个大区的定向铸票挤进**同一个**
+//     4 发/小时的桶，互相饿死，而九个大区的安全阀对这条路整个失效
+//   - (账号 × 大区) 台账（NoteRegionMint）⇒ 多出一行键为空串的记录，挑下一个铸票者
+//     就看这本账
+//
+// 在这儿拦掉，上面两处就永远拿到真大区，各自不必再兜底一次（那种兜底会让每个野出口
+// 凭空多出一整份配额）。pickExit 是唯一会产出非九个之一的出口的地方：裸铸和扫描都
+// 直接用 types.Regions 里的代表出口，而 ReachableExits 存的就是「请求过的出口」
+// ⇒ 筛掉之后这条回路就闭上了，野出口再也写不回来。
+//
+// 现网 105 个网关的 ReachableExits 全是九个之一（2026-10-03 核过 state.json，
+// no_standard_exit = 0），所以这道筛子今天一个候选都没排掉。
+//
+// 随机而非固定第一条：城市库存不足时上游会回退到别的国家（实测 city-Dallas 给过
+// 尼日利亚 IP），死磕一条出口会卡死在那次回退上。
 func pickExit(g types.Gateway) (types.Exit, bool) {
-	if len(g.ReachableExits) == 0 {
+	std := make([]types.Exit, 0, len(g.ReachableExits))
+	for _, e := range g.ReachableExits {
+		if types.RegionKeyOf(e) != "" {
+			std = append(std, e)
+		}
+	}
+	if len(std) == 0 {
 		return types.Exit{}, false
 	}
-	return g.ReachableExits[rand.IntN(len(g.ReachableExits))], true
+	return std[rand.IntN(len(std))], true
 }
 
 func exitKey(e types.Exit) string {

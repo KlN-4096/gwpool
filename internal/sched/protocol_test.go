@@ -680,6 +680,13 @@ func TestHasCandidateUsesTheSameJudgeAsDeliver(t *testing.T) {
 //
 // 池子模式下 minterFor 常常挑中另一个消费者，于是等到的票恰好是他自己刚铸的——
 // 他对这个网关的满血窗口已经烧了几十秒，而铸票前的快照看不见这件事。
+//
+// **走定向铸（点名网关）而不是裸铸。** 「等锁」这件事只存在于定向路：那边 lockGateway
+// 会让后一路真的等前一路铸完，然后走 freshPair 那一支、现读一遍自己的闸
+// （见 mintToward 里「闸 2 在这一支要现读」那段）。裸铸路没有网关可锁，后一路撞上
+// claimRegion 是**占不住就走**、当场回 ErrNoLivePair，根本走不到那个现读分支。
+// 这条用例原先写的是裸铸，靠的是「按大区拦」顺带把两路串起来——2026-10-03 把
+// claimRegion 收窄到 (账号 × 大区) 之后那个顺带效果就没了，而它本来也没验到想验的分支。
 func TestWaitingForAnothersMintRechecksOwnWindow(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)
@@ -701,7 +708,7 @@ func TestWaitingForAnothersMintRechecksOwnWindow(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = s.Deliver(context.Background(), int64(i+1), Request{})
+			_, errs[i] = s.Deliver(context.Background(), int64(i+1), Request{Gateway: "unified-1"})
 		}(i)
 	}
 	wg.Wait()

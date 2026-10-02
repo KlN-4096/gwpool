@@ -71,34 +71,34 @@ func TestGatewaysForContinuousFollowsCooldown(t *testing.T) {
 	}
 }
 
-// 对外开放门槛按**账号数**算：⌈所需网关数 ÷ 区域数⌉ + 1 的重叠余量。
-func TestAccountsForContinuousFollowsCooldown(t *testing.T) {
-	// 默认 4h：⌈96/9⌉ = 11，+1 = 12。这个数是用户定的，改了要先问。
-	if got, want := AccountsForContinuous(SlotCooldown), 12; got != want {
-		t.Fatalf("4 小时冷却算出 %d 个账号，应是 %d", got, want)
+// 对外开放门槛是**冗余底线**，不再是容量除法，所以它**不随冷却变**。
+//
+// 原先算的是「⌈所需网关数 ÷ 区域数⌉ + 1」，前提是「一个账号最多摸到 len(Regions)
+// 个落点」。2026-10-03 核现网 state.json 的槽位台账推翻了这个前提：130 个有槽位的
+// 账号里摸得最多的三个分别碰过 105 / 105 / 103 个网关，而池子一共只认得 105 个 ——
+// 单号触达面是整张网关表，那个除法高估门槛约 11 倍。
+//
+// 容量这一问因此已经被满足（105 个可达网关 ≥ 所需的 96），剩下的只有冗余：
+// 一个号被上游否决会当场停用、429 会把它按住最多两小时，只托管一个号时任何一件
+// 都等于整池停摆 ⇒ 门槛 2。
+func TestAccountsForContinuousIsARedundancyFloor(t *testing.T) {
+	if got, want := AccountsForContinuous(SlotCooldown), 2; got != want {
+		t.Fatalf("门槛算出 %d 个账号，应是 %d", got, want)
 	}
-	// 冷却测准成 30 分钟就该大幅降门槛：⌈12/9⌉ = 2，+1 = 3。
-	if got, want := AccountsForContinuous(30*time.Minute), 3; got != want {
-		t.Fatalf("30 分钟冷却算出 %d 个账号，应是 %d", got, want)
-	}
-	// 0 和负数退回默认冷却，别算出 0（那等于对外完全敞开）。
-	if got := AccountsForContinuous(0); got != AccountsForContinuous(SlotCooldown) {
-		t.Fatalf("0 没退回默认冷却: %d", got)
-	}
-	// 那个 +1 是重叠余量（一个区域在不同账号上常落回同一个网关），不是凑整。
-	// 刚好整除时也必须留着，否则门槛退回成偏乐观的那个值。
-	exact := time.Duration(len(Regions)) * DeliverTTL // ⌈9/9⌉ = 1，+1 = 2
-	if got, want := AccountsForContinuous(exact), 2; got != want {
-		t.Fatalf("刚好整除时算出 %d，重叠余量被吃掉了（应是 %d）", got, want)
-	}
-	// 门槛必须随冷却单调不减：测准的冷却越长，要的账号越多。
-	prev := 0
-	for _, d := range []time.Duration{time.Minute, 30 * time.Minute, time.Hour, 4 * time.Hour, 12 * time.Hour} {
-		got := AccountsForContinuous(d)
-		if got < prev {
-			t.Fatalf("冷却 %v 算出 %d，比更短的冷却还少（上一个 %d）", d, got, prev)
+	// **不随冷却变**是这条用例的全部重点：回到「÷ 区域数」那个除法的改动会在这儿红。
+	for _, d := range []time.Duration{0, -time.Hour, time.Minute, 30 * time.Minute,
+		time.Hour, 4 * time.Hour, 12 * time.Hour, 72 * time.Hour} {
+		if got := AccountsForContinuous(d); got != 2 {
+			t.Fatalf("冷却 %v 算出 %d：门槛不该再随冷却动（容量由网关数决定，不由账号数）", d, got)
 		}
-		prev = got
+	}
+	// 永远不许算出 0 或负数：那等于对外完全敞开。
+	if got := AccountsForContinuous(0); got <= 0 {
+		t.Fatalf("门槛算出 %d，对外就彻底敞开了", got)
+	}
+	// 容量那一问改由网关数回答，这条断言钉住那个替代判据仍然算得出 96。
+	if got, want := GatewaysForContinuous(SlotCooldown), 96; got != want {
+		t.Fatalf("所需网关数算出 %d，应是 %d（真要按容量判就是数它）", got, want)
 	}
 }
 

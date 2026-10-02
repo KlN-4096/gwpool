@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -332,6 +333,10 @@ type fakeMinter struct {
 	rateUsed    map[string]int
 	ratePerAcct map[string]map[string]int
 	rateLimit   int
+
+	// geoCountry 非空时盖掉**观测到的**出口国家，用来造「出口国家不符」：住宅代理
+	// 库存不足时会回退到别的国家（1650 发里 23 次），而落点由真实出口 IP 决定。
+	geoCountry string
 }
 
 func newMinter(clk *clock) *fakeMinter {
@@ -552,7 +557,13 @@ func (m *fakeMinter) NewSeedSID() (string, error) {
 }
 
 func (m *fakeMinter) Geo(ctx context.Context, e types.Exit, sid string) (types.Observed, error) {
-	return types.Observed{IP: "203.0.113.1", Country: e.Region, City: e.City}, nil
+	m.mu.Lock()
+	country := m.geoCountry
+	m.mu.Unlock()
+	if country == "" {
+		country = e.Region
+	}
+	return types.Observed{IP: "203.0.113.1", Country: country, City: e.City}, nil
 }
 
 // Rate 照真实 mint 的语义：按区域报本小时用量，外加每区上限。
@@ -2328,7 +2339,14 @@ func TestStalePairDoesNotCountAsLive(t *testing.T) {
 // 而被挡回去的那一路重试时第一路的票已经在池里了，一发上游都不用打——下面最后一段
 // 就是在证这件事。
 //
-// 三个号、消费者是 2 和 3：铸票者必然是账号 1（minterFor 只排掉消费者自己，剩下按 ID）。
+// 三个号、消费者是 2 和 3，而 2 和 3 的本小时配额**打满**⇒ 两路的铸票者都只能是
+// 账号 1，于是两路是同一个 (账号 × 大区)，正是 claimRegion 该拦的那一格。
+//
+// 配额不打满的那一版是条随调度顺序摆的用例：前一路一进 mint.spend 就把账号 1 在
+// us-east 的发数抬成 1，后一路的 minterFor 按「本小时总发数最少的优先」就改挑账号 3
+// ⇒ 两个不同的号走同一个大区 ⇒ 2026-10-03 收窄粒度之后这是**允许**的
+// （见 TestConcurrentBareMintsShareARegionAcrossAccounts），于是它时红时绿。
+//
 // 铸票者不能是其中一个消费者，否则等到票的那个人该被拒——那是另一条规则，由
 // TestWaitingForAnothersMintRechecksOwnWindow 盯着。mintCost 非零，不然「等到的票
 // 还剩多久」这件事恒为真，用例就什么都没证。
@@ -2341,6 +2359,13 @@ func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 	addAccount(st, 1, "acct-1")
 	addAccount(st, 2, "acct-2")
 	addAccount(st, 3, "acct-3")
+	// 把两个消费者从铸票者候选里剔掉：九个大区全打满本小时配额。
+	mn.rateLimit = 6
+	full := map[string]int{}
+	for _, r := range types.Regions {
+		full[r.Key] = 6
+	}
+	mn.ratePerAcct = map[string]map[string]int{"acct-2": full, "acct-3": full}
 	// 只有一个网关、一张票都没有 ⇒ 两个人必然撞上同一个区域。
 	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
 		ReachableExits: []types.Exit{{Region: "US"}}}
@@ -2392,6 +2417,161 @@ func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
 	}
 	if n := len(mn.mintedGateways()); n != 1 {
 		t.Fatalf("重试又打了上游，共 %d 发", n)
+	}
+}
+
+// claimRegion 的粒度就是 (账号 × 大区)，三条都要钉：同号同区拦、**换号不拦**、换区不拦。
+//
+// 中间那条是 2026-10-03 改的方向，也是唯一会被「顺手改回去」的一条：按大区整体拦
+// 看着更安全，代价是并发被焊死在 9，而实测不支持那个安全（us-east 一个大区 253 发
+// 摸到 36 个不同落点，105 个网关里 100 个被多个账号打到过 ⇒ 两个号走同一个大区
+// 大概率是两个不同落点）。直接测这个方法而不是拿两路 Deliver 并发去测：后者的铸票者
+// 由 minterFor 按本小时发数现挑，前一路一进速率闸就把读数改了，用例会随调度顺序摆。
+func TestClaimRegionIsPerAccountAndRegion(t *testing.T) {
+	clk := newClock()
+	s := New(newStore(clk), newMinter(clk), Options{Mode: types.ModePool, Now: clk.now})
+
+	release, ok := s.claimRegion(1, "us-east")
+	if !ok {
+		t.Fatal("头一发就占不住")
+	}
+	if _, ok := s.claimRegion(1, "us-east"); ok {
+		t.Fatal("同一个号在同一个大区占住了两发：第二发落点和第一发逐字相同，白烧一个槽位")
+	}
+	other, ok := s.claimRegion(2, "us-east")
+	if !ok {
+		t.Fatal("换个号走同一个大区被拦了：这是并发被焊死在 9 的那个老毛病")
+	}
+	elsewhere, ok := s.claimRegion(1, "east-asia")
+	if !ok {
+		t.Fatal("同一个号换个大区被拦了")
+	}
+	other()
+	elsewhere()
+
+	// 放掉之后要能再占，否则一轮预铸之后这个组合就永久不可用了。
+	release()
+	if again, ok := s.claimRegion(1, "us-east"); !ok {
+		t.Fatal("release 之后占不回来")
+	} else {
+		again()
+	}
+}
+
+// pickExit 只许给九个大区的代表出口：它是唯一会产出「反查不到大区」的出口的地方，
+// 而那个空串会一路带进速率闸的分桶键（acct|""，九个大区的定向铸票挤一个桶互相饿死）
+// 和 (账号 × 大区) 台账。
+func TestPickExitOnlyReturnsStandardRegionExits(t *testing.T) {
+	wild := types.Exit{Region: "US", City: "Chicago"}
+	if types.RegionKeyOf(wild) != "" {
+		t.Fatalf("这条用例的前提坏了：%+v 居然反查到了大区", wild)
+	}
+	// 混着放：野出口在前，防「取第一条」式的实现碰巧蒙对。
+	mixed := types.Gateway{Name: "unified-1", ReachableExits: []types.Exit{
+		wild, {Region: "US", City: "Dallas"}, {Region: "JP"}}}
+	for i := 0; i < 20; i++ { // pickExit 是随机取，多转几圈
+		got, ok := pickExit(mixed)
+		if !ok {
+			t.Fatal("有一条 JP 代表出口，不该说没有可达出口")
+		}
+		if got != (types.Exit{Region: "JP"}) {
+			t.Fatalf("挑到了反查不到大区的出口 %+v", got)
+		}
+	}
+	// 一条标准出口都没有 ⇒ 认「没有已知可达出口」，而不是拿野出口去定向铸：
+	// 那一发的配额会记进空串桶，落点也不会进任何一个大区的台账。
+	if _, ok := pickExit(types.Gateway{Name: "unified-2",
+		ReachableExits: []types.Exit{wild}}); ok {
+		t.Fatal("只有野出口时仍然挑了一条出来")
+	}
+}
+
+// gatewaysFrom 逐字比整个出口，不只比国家。
+//
+// 它只给「读不出落点、保守记触碰」那条路用，方向偏多记——但只比国家会多到离谱：
+// {US,""} 会把只从 {US,"Seattle"} 摸到过的网关也按住 183 秒，而那两个出口的落点集
+// 实测是 36 / 29、交集 27，多出来的那些从没在这个出口上被摸到过。
+func TestGatewaysFromMatchesTheWholeExitNotJustTheCountry(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	east, west := types.Exit{Region: "US"}, types.Exit{Region: "US", City: "Seattle"}
+	st.gws["only-east"] = types.Gateway{Name: "only-east", ReachableExits: []types.Exit{east}}
+	st.gws["only-west"] = types.Gateway{Name: "only-west", ReachableExits: []types.Exit{west}}
+	st.gws["both"] = types.Gateway{Name: "both", ReachableExits: []types.Exit{east, west}}
+	st.gws["jp"] = types.Gateway{Name: "jp", ReachableExits: []types.Exit{{Region: "JP"}}}
+	s := New(st, newMinter(clk), Options{Mode: types.ModePool, Now: clk.now})
+
+	for _, tc := range []struct {
+		name string
+		exit types.Exit
+		want []string
+	}{
+		{"us-east", east, []string{"both", "only-east"}},
+		{"us-west", west, []string{"both", "only-west"}},
+	} {
+		got := s.gatewaysFrom(tc.exit)
+		sort.Strings(got)
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%s: 得到 %v，要 %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// 出口国家不符的那一发，两本按大区分格的账都不许记。
+//
+// 1650 发里 23 次（us-east 要美国，拿到 BR/AR/CL/CD/JM/MQ/MX）。落点是上游按真实
+// 出口 IP 分的 ⇒ 这一发对「哪个大区能到哪个网关」什么都没证明：
+//   - 记进 ReachableExits 会留一条假线索，pickExit 下次照它定向铸、必然漂移
+//   - 记进 (账号 × 大区) 台账会把一个还没走通的大区标成走过，而 bestRegion 优先挑
+//     「终身没铸过」的 ⇒ 从此不再去试它
+//
+// 网关本体要照记：它确实存在，而 Gateways() 是候选清单的唯一来源。
+func TestMintDoesNotChargeTheRegionWhenTheExitCountryDisagrees(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	// 要巴西，住宅代理给了阿根廷。
+	mn.geoCountry = "AR"
+	landBare(mn, "unified-9")
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
+
+	acct, _ := s.account(1)
+	got, err := s.mintOnce(context.Background(), acct, types.Exit{Region: "BR"}, "sid-1",
+		types.Pair{}, "", "")
+	if err != nil {
+		t.Fatalf("铸票本身不该失败（国家不符不是失败）: %v", err)
+	}
+	if got.pair.Gateway != "unified-9" {
+		t.Fatalf("落点不对: %+v", got.pair)
+	}
+	if _, ok := st.gws["unified-9"]; !ok {
+		t.Fatal("网关本体没记：Gateways() 是候选清单的唯一来源，漏了它这个落点就永远挑不中")
+	}
+	if ex := st.gws["unified-9"].ReachableExits; len(ex) != 0 {
+		t.Fatalf("把假线索记进了 ReachableExits: %+v", ex)
+	}
+	if ms := st.RegionMints(); len(ms) != 0 {
+		t.Fatalf("把这一发记进了大区台账: %+v", ms)
+	}
+
+	// 对照组：国家相符时两本账都要记，否则上面那条断言用「什么都不记」也能过。
+	mn.geoCountry = ""
+	if _, err := s.mintOnce(context.Background(), acct, types.Exit{Region: "BR"}, "sid-2",
+		types.Pair{}, "", ""); err != nil {
+		t.Fatalf("对照组铸票失败: %v", err)
+	}
+	if ex := st.gws["unified-9"].ReachableExits; len(ex) != 1 || ex[0] != (types.Exit{Region: "BR"}) {
+		t.Fatalf("国家相符时该把出口记进 ReachableExits，得到 %+v", ex)
+	}
+	ms := st.RegionMints()
+	if len(ms) != 1 {
+		t.Fatalf("国家相符时该恰好记一笔台账，得到 %+v", ms)
+	}
+	for _, m := range ms {
+		if m.RegionKey != "south-america" || m.Count != 1 || m.AccountID != 1 {
+			t.Fatalf("台账那一笔不对: %+v", m)
+		}
 	}
 }
 

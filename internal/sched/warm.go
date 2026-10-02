@@ -151,8 +151,10 @@ func (s *Scheduler) premintBare(ctx context.Context, n int) {
 //   - 缺口 n：worker 比缺口还多，多出来的那几个一定空跑
 //   - 至少 1（0 个 worker = 保温彻底不铸票，那不是任何人想要的配置）
 //
-// **刻意不再按「有种子票的大区数」收一次**：claimRegion 已经保证一个大区同时只有
-// 一发裸铸在打，占不住的 worker 换组合、换不到就收尾，不会去抢同一个大区。
+// **刻意不再按「有种子票的大区数」收一次**：claimRegion 保证一个号同时只有一发裸铸
+// 走同一个大区，占不住的 worker 换组合、换不到就收尾。它**不**按大区整体拦（那一版
+// 把并发焊死在 9，见 claimRegion），所以几个 worker 同时走同一个大区是正常的，
+// 只要它们是不同的号。
 func (s *Scheduler) premintWorkers(n int) int {
 	return max(1, min(s.cfg().MintWorkers(), n))
 }
@@ -285,13 +287,16 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 		if gw := landed[combo]; gw != "" {
 			r.aimed[gw] = true
 		}
-		// **先占大区、再占账号**，顺序不能反：占不住大区时账号那一占就白花了一个
-		// RenewGap（几十秒），而大区冲突在冷启动时是常态——所有新号的首选大区都是
-		// 台账里铸得最少的那一个，于是几个 worker 开局必然撞在同一个大区上。
-		// 反过来写的那一版实测只铸出一发就收尾（三个号全被自己白占掉了）。
-		release, free := s.claimRegion(reg.Key)
+		// **先占大区、再占账号**，顺序不能反：占不住时账号那一占就白花了一个
+		// RenewGap（几十秒），方向是少铸不是多铸。
+		//
+		// claimRegion 的粒度是 (账号 × 大区)，所以这里占不住只意味着**同一个号**在
+		// 同一个大区已经有一发在飞 —— 和 r.tried 比起来是条更紧的线（tried 只管本轮，
+		// 交付路径的现铸也会占）。按大区拦的那一版在这儿是个真坑：所有号的首选大区都是
+		// 台账里铸得最少的那一个，几个 worker 开局必然撞在一起，实测只铸出一发就收尾。
+		release, free := s.claimRegion(a.ID, reg.Key)
 		if !free {
-			continue // 别的 worker 正在这个大区打；组合已标试过，挑下一个
+			continue // 这个号正在这个大区打；组合已标试过，挑下一个
 		}
 		if s.claimAccount(a.ID, s.opt.RenewGap) {
 			return premintPlan{acct: a, region: reg, live: live, release: release}, true
