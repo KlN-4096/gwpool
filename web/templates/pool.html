@@ -52,22 +52,28 @@
   <div class="card">
     <header class="card-head"><div><h2>各区域的落点</h2><p>九个出口区域各自能摸到哪些网关。一个网关能从多个区域连通时，它在那几格里都出现。<strong>点一格只看那个区域</strong>。</p></div></header>
     <div class="card-body">
-      <div class="regions wide">
-      {{range .Regions}}
-        <a class="region{{if .Ready}} on{{end}}{{if .Active}} sel{{end}}" href="{{.Href}}"
-           title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}{{if .Active}}　（正在只看这一格）{{end}}">
-          <b>{{.Label}}</b>
-          <span>{{if .Total}}{{.Ready}} / {{.Total}} 可交付{{else}}未发现网关{{end}}</span>
-          {{if .Gateways}}<span class="gws">
-            {{- range .Gateways}}
-            {{- if .Ready}}<code title="此刻可交付">{{.Name}}</code>
-            {{- else}}<code class="dup" title="此刻没有可交付的路由 Cookie">{{.Name}}</code>{{end}}
-            {{- end}}
-          </span>{{end}}
-        </a>
-      {{end}}
-      </div>
-      <p class="foot">绿色表示这个区域此刻至少有一个网关可交付；灰色表示已知的网关都没有可用的路由 Cookie，或者还没在这个区域发现过网关。网关名里颜色较淡的那些是此刻不可交付的。点任意一格把下面那张表收窄到该区域，点「全部」回到整池。</p>
+      <div class="table-wrap"><table class="regions-tbl">
+        <thead><tr><th>区域</th><th>可交付</th><th>已发现的网关</th></tr></thead>
+        <tbody>
+        {{range .Regions}}
+          <tr class="{{if .Ready}}on{{end}}{{if .Active}} sel{{end}}">
+            <th scope="row"><a href="{{.Href}}"
+               title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}{{if .Active}}　（正在只看这一格）{{end}}">{{.Label}}</a></th>
+            <td class="num">{{if .Total}}{{.Ready}} / {{.Total}}{{else}}—{{end}}</td>
+            <td class="gws">
+              {{- if .All}}<span class="sub">整池；点左边的区域名把下面那张表收窄到该区域</span>
+              {{- else if .Gateways}}
+                {{- range .Gateways}}
+                {{- if .Ready}}<code title="此刻可交付">{{.Name}}</code>
+                {{- else}}<code class="off" title="此刻没有可交付的路由 Cookie">{{.Name}}</code>{{end}}
+                {{- end}}
+              {{- else}}<span class="sub">未发现网关</span>{{end}}
+            </td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table></div>
+      <p class="foot">区域名是绿的（带 ✓）表示这个区域此刻至少有一个网关可交付；灰的表示已知网关都没有可用的路由 Cookie，或者还没在这个区域发现过网关。网关名颜色较淡的是此刻不可交付的。点区域名把下面那张表收窄到该区域，点「全部」回到整池。</p>
     </div>
   </div>
   <div class="card">
