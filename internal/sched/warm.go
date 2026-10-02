@@ -68,9 +68,16 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 
 // seedCflbFloor 是一张票还能当「大区种子」用的最低 `__cflb` 剩余寿命。
 //
-// 它只要活过这一次往返：路由在请求到达上游的那一刻就定下来了，之后这张 cflb 什么时候
-// 死都不影响这一发的落点。给 60 秒是为了兜住代理慢的那几次（铸票超时本身是 90 秒级）。
-const seedCflbFloor = 60 * time.Second
+// 定这个数的**不是**这一次往返：路由在请求到达上游的那一刻就定下来了，之后那张 cflb
+// 什么时候死都不影响这一发的落点（所以一度写成 60 秒）。真正定它的是**铸出来那张票
+// 的寿命**：只送 `__cflb` 时上游一般不补发新的 `__cflb`（10-03 实测 3/3 不补），
+// 于是新票原样留着种子那张，寿命跟着种子一起到点（见 types.MintResult.RouteDeadline
+// 第二级）。种子剩 60 秒 ⇒ 铸出来的票也只剩 60 秒 ⇒ 低于 DeliverFloor、生下来就发不出去，
+// 而且它还会被记成「补上了一格」（liveGateways 按 DeliverFloor 过滤，那一格其实是空的）。
+//
+// 所以门槛要让铸出来那张**确实能发**：DeliverFloor 是 300 秒，这里留到 10 分钟，
+// 使用侧还有几分钟余量。低于它就回落住宅——住宅裸铸拿的是一张满寿命的新 cflb。
+const seedCflbFloor = 10 * time.Minute
 
 // seedPairFor 找一张能把路由钉到这个大区的票：该区域里 `__cflb` 活得最久的那张。
 //
@@ -339,8 +346,16 @@ func (s *Scheduler) premintNote(r *premintRound, plan premintPlan,
 		r.stop()
 		return false
 	default:
+		// 失败也吃失手预算。不吃的话「本轮总发数封顶 2n」就是空话：失败既不加 got
+		// 也不加 missed ⇒ 循环只被候选集（账号数 × 9）兜住，一次系统性故障
+		// （比如模型名下架、全员 400）就是一轮上百发真实上游请求。
+		// 判据按结果不按原因：这一发没补上格子，就是一次失手。
+		r.mu.Lock()
+		r.missed++
+		missed, budget := r.missed, r.want
+		r.mu.Unlock()
 		s.opt.Log.Info("裸铸失败", "account", plan.acct.ID, "label", plan.acct.Label,
-			"region", plan.region.Key, "reason", err)
+			"region", plan.region.Key, "reason", err, "missed", missed, "budget", budget)
 		return true
 	}
 }
@@ -382,10 +397,6 @@ func (s *Scheduler) lastLandings() map[string]string {
 	return out
 }
 
-// comboKey 是 (账号 × 大区) 在本文件这几张临时表里的键。
-//
-// 刻意不用 store.MintKey：那个键的格式归 store 所有（见 Store.RegionMints 的注释），
-// 这里只是进程内的一轮临时记账，不该跟着它走。
 // seedlessRegions 列出手上没有活种子票的大区。**一轮挑选只算一次**：bestRegion 会对
 // 每个 (账号 × 大区) 都问一次 prefer，而 seedPairFor 一次要扫全部网关的 pair ⇒ 写成
 // 闭包里现算就是「账号数 × 9 遍全表扫描」（113 个号时十万次 store.Pair），
@@ -400,6 +411,10 @@ func (s *Scheduler) seedlessRegions() map[string]bool {
 	return out
 }
 
+// comboKey 是 (账号 × 大区) 在本文件这几张临时表里的键。
+//
+// 刻意不用 store.MintKey：那个键的格式归 store 所有（见 Store.RegionMints 的注释），
+// 这里只是进程内的一轮临时记账，不该跟着它走。
 func comboKey(accountID int64, regionKey string) string {
 	return strconv.FormatInt(accountID, 10) + "|" + regionKey
 }

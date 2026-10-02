@@ -2685,6 +2685,52 @@ func TestPremintUsesASeedTicketWhenTheRegionHasOne(t *testing.T) {
 	}
 }
 
+// 快死的票不许当种子：只送 `__cflb` 时上游一般不补发新的，铸出来那张会原样留着种子
+// 那张、寿命跟着它一起到点 ⇒ 种子剩两分钟就只能铸出一张剩两分钟的票，低于 DeliverFloor、
+// 生下来就发不出去，还会被记成「补上了一格」。这种时候该回落住宅（拿一张满寿命的新 cflb），
+// 而不是花一发上游换一张死胎。门槛见 seedCflbFloor。
+func TestPremintSkipsASeedThatDiesTooSoon(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	us := types.Regions[0]
+	mn.landByAcct = map[string]string{
+		comboKey(1, exitKey(us.Exit)): "unified-9",
+		comboKey(2, exitKey(us.Exit)): "unified-9",
+	}
+	// 每个大区都铺一张票，但 us-east 那张只剩 2 分钟（低于 seedCflbFloor）⇒ 它算
+	// 「没有种子」，于是「丢了种子的大区优先」正好把这一发派到 us-east 上。
+	for i, r := range types.Regions {
+		gw := fmt.Sprintf("unified-s%d", i)
+		left := types.PairLifetime
+		if r.Key == us.Key {
+			left = 2 * time.Minute
+		}
+		st.gws[gw] = types.Gateway{Name: gw, FirstSeenBy: 1, ReachableExits: []types.Exit{r.Exit}}
+		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
+			RegionKey: r.Key, ExpiresAt: clk.now().Add(left),
+			CflbExpiresAt: clk.now().Add(left), MintedBy: 2}
+	}
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) + 1 })})
+	s.markDemand()
+
+	s.warmOnce(context.Background())
+	if got := mn.mintedGateways(); len(got) == 0 {
+		t.Fatal("该照常铸票，只是走住宅")
+	}
+	// 判据只盯那张快死的票有没有被送出去。本轮后面几发会用上刚铸出来的新票当种子，
+	// 那是对的，不该一起拦。
+	for sid, cookie := range mn.seedShots() {
+		if cookie == cookiePrefix+"unified-s0" {
+			t.Fatalf("把只剩 2 分钟的那张票当种子送出去了（sid %s）：铸出来的票会跟着它一起死",
+				sid)
+		}
+	}
+}
+
 // 丢了种子票的大区优先补：它一掉，那个大区的所有账号都回落到住宅出口，而一张票就能
 // 把整个大区的便宜路径恢复 ⇒ 收益高于普通的「去摸一个新落点」（后者只多一个槽位）。
 func TestPremintRefillsSeedlessRegionsFirst(t *testing.T) {
