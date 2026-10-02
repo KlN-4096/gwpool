@@ -13,18 +13,17 @@
   {{end}}
 </div>
 
-<div class="grid-2">
+<div class="grid-2 even">
   <div class="card">
     <header class="card-head"><div><h2>我的账号后台</h2><p>自己托管的凭据、各自的接入 key 与探测情况。</p></div></header>
     <div class="card-body">
       {{if .OwnerToken}}
       <div class="actions"><a class="btn" href="/u/{{.OwnerToken}}">进入我的账号后台 →</a></div>
       {{else}}
-      <form method="post" action="/enter">
-        <label>账号总览令牌 <span class="hint">上传后给你的那一串；单个账号的页面令牌也能用</span>
-          <input name="token" autocomplete="off" spellcheck="false" required placeholder="粘贴令牌"></label>
+      <form method="post" action="/enter" class="compact">
+        <label for="enter-token">账号总览令牌 <span class="hint">上传后给你的那一串；单个账号的页面令牌也能用</span></label>
+        <div class="inline-field"><input id="enter-token" name="token" autocomplete="off" spellcheck="false" required placeholder="粘贴令牌"><button type="submit" class="primary">进入</button></div>
         {{if .EnterErr}}<p class="err" role="alert">认不出这个令牌。</p>{{end}}
-        <div class="actions"><button type="submit" class="primary">进入</button></div>
       </form>
       {{end}}
     </div>
@@ -87,7 +86,7 @@
     <div class="legend">
       <span><i class="sw ok"></i>可交付：路由 Cookie 剩余有效期充足</span>
       <span><i class="sw"></i>暂不可交付：没有路由 Cookie，或剩余不足</span>
-      <span><b>槽位</b>还能用这个网关的账号数（距上次<strong>取走票</strong>超过 {{.RestedLabel}}，且不在退避期）。这是<strong>接触记录</strong>不是锁——路由 Cookie 不互斥，一张可以同时发给好几个账号，所以 0 是「每个账号最近都取过它」，不是「被谁占着」</span>
+      <span title="距上次取走票超过 {{.RestedLabel}}、且不在退避期的账号数。这是接触记录不是锁——路由 Cookie 不互斥，一张可以同时发给好几个账号，所以 0 是「每个账号最近都取过它」，不是「被谁占着」"><b>槽位</b>还能用这个网关的账号数（{{.RestedLabel}}内没取过）</span>
       <span><b>出口</b>能连通这个网关的出口地区数</span>
     </div>
     {{else}}

@@ -102,15 +102,18 @@ a.kpi:hover { border-color: var(--accent); text-decoration: none; }
 .card-body { padding: 1rem 1.1rem; }
 .card-body > :first-child { margin-top: 0; }
 .card-body > :last-child { margin-bottom: 0; }
-.card-body h3 { font-size: 14px; font-weight: 600; margin: 1.5rem 0 .5rem; }
+.card-body h3 { font-size: 14px; font-weight: 600; margin: 1.25rem 0 .5rem; }
 .card-body p { margin: .5rem 0; }
 .card-body ul { margin: .5rem 0; padding-left: 1.25rem; }
 .card-body li + li { margin-top: .3rem; }
 .card > .foot { margin: 0; padding: .65rem 1.1rem; border-top: 1px solid var(--line); }
 .foot { color: var(--muted); font-size: 12.5px; margin: .75rem 0 0; }
 .empty { margin: 0; padding: 2.5rem 1rem; text-align: center; color: var(--muted); }
-.grid-2 { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 1rem; align-items: start; }
-.grid-2 > .card { margin-bottom: 0; }
+/* 并排两张卡等高：按内容高度各自收的话，矮的那张下沿悬在半空，整排看着参差。 */
+.grid-2 { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 1rem; align-items: stretch; margin-bottom: 1rem; }
+.grid-2.even { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-2 > .card { display: flex; flex-direction: column; margin-bottom: 0; }
+.grid-2 > .card > .card-body { flex: 1; }
 
 /* 提示块与代码 */
 .note { margin: 0 0 1rem; padding: .7rem .9rem; border-radius: 8px; background: var(--sunken); border: 1px solid var(--line); color: var(--fg-2); }
@@ -200,9 +203,12 @@ table.tiles td { display: block; width: auto; padding: 0; border: 0; color: var(
 table.tiles td:nth-child(1) { grid-area: name; color: var(--fg); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 /* 池子页：状态那列只留给搜索用，视觉上由左侧色条和底色表达 */
 table.tiles.pool td:nth-child(2) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-table.tiles.pool td:nth-child(3) { grid-area: left; text-align: right; }
+/* 名字独占首行：和剩余时间挤一行时，长一点的时间就把名字截成「unified-1…」。 */
+table.tiles.pool tbody tr { grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "name name name" "left slots exits"; column-gap: .6rem; }
+table.tiles.pool td:nth-child(3) { grid-area: left; text-align: left; overflow: hidden; text-overflow: ellipsis; }
+table.tiles.pool tr.ready td:nth-child(3)::before { content: "剩 "; color: var(--muted); font-weight: 400; }
 table.tiles.pool tr.ready td:nth-child(3) { color: var(--ok); font-weight: 600; }
-table.tiles.pool td:nth-child(4) { grid-area: slots; text-align: left; }
+table.tiles.pool td:nth-child(4) { grid-area: slots; text-align: right; }
 table.tiles.pool td:nth-child(5) { grid-area: exits; text-align: right; }
 table.tiles.pool td:nth-child(4)::before { content: "槽位 "; }
 table.tiles.pool td:nth-child(5)::before { content: "出口 "; }
@@ -272,6 +278,9 @@ legend { padding: 0; margin-bottom: .45rem; }
 .choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
 .choice small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+.inline-field { display: flex; gap: .5rem; align-items: stretch; }
+.inline-field input { flex: 1; min-width: 0; }
+form.compact { gap: .5rem; }
 button { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; font: inherit; font-size: 13px; font-weight: 600;
          color: var(--fg); background: var(--surface); border: 1px solid var(--line-2); border-radius: 8px; padding: .45rem .9rem;
          cursor: pointer; white-space: nowrap; box-shadow: var(--shadow); }
@@ -301,7 +310,7 @@ button[type=submit]:disabled { cursor: progress; }
 
 @media (max-width: 900px) {
   .regions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .grid-2 { grid-template-columns: 1fr; }
+  .grid-2, .grid-2.even { grid-template-columns: 1fr; }
   .kpis.wide { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 640px) {
