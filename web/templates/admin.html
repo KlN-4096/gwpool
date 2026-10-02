@@ -122,33 +122,38 @@
 
 <section id="tab-accounts">
   <div class="card">
-    <header class="card-head"><div><h2>账号</h2><p>池里托管着凭据的账号。只来取票、池里没有凭据的在「外部账号」那一页。</p></div>
-      <a class="btn" href="/admin/accounts">查看全部账号 →</a></header>
+    <header class="card-head"><div><h2>账号</h2><p>池里托管着凭据的账号，一号一张卡；点名称进账号页看请求记录。只来取票、池里没有凭据的在「外部账号」那一页。</p>
+      {{- if .Accounts}}{{template "region-legend" (index .Accounts 0).Card.Regions}}{{end}}</div></header>
     {{if .Accounts}}
-    <div class="table-wrap"><table id="t-accounts" class="dense" data-grid data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、套餐或上游账号 ID">
-      <thead><tr><th class="num">ID</th><th>名称 / 上游账号 ID</th><th>套餐</th>
-        <th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间（UTC）</th><th data-nosort></th></tr></thead>
+    <div class="table-wrap"><table id="t-accounts" class="acards" data-grid data-size="500" data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、上游账号 ID、上传者或接入 key">
+      <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>最近取票</th><th data-nosort>操作</th>
+        <th data-nosort>上游账号 ID</th><th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间</th>
+        <th data-nosort>停用原因</th><th data-nosort>九区域</th></tr></thead>
       <tbody>
       {{range .Accounts}}
         <tr data-facet="{{.Facet}}">
-          <td class="num">{{.ID}}</td>
-          <td>{{if .ViewToken}}<a class="clip" href="/a/{{.ViewToken}}" title="{{.Label}}（打开账号页）">{{.Label}}</a>{{else}}<span class="clip" title="{{.Label}}">{{.Label}}</span>{{end}}
+          <td class="a-id">{{.ID}}</td>
+          <td class="a-name">{{if .ViewToken}}<a class="clip" href="/a/{{.ViewToken}}" title="{{.Label}}（打开账号页）">{{.Label}}</a>{{else}}<span class="clip" title="{{.Label}}">{{.Label}}</span>{{end}}
             {{- if not .Enabled}} <span class="badge bad">已停用</span>{{end}}
-            <div class="sub mono nowrap">{{.Upstream}}</div>
-            {{- if and (not .Enabled) .DisabledReason}}<div class="sub mono">{{.DisabledReason}}</div>{{end}}</td>
-          <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else}}{{.Plan}}{{end}}</td>
-          <td><span class="clip short" title="{{.Owner}}">{{.Owner}}</span></td>
-          <td class="num">{{.Requests}}</td>
-          <td class="num">{{.Found}}</td>
-          <td class="num" title="九个区域里铸出过票的有几个">{{.Covered}}</td>
-          <td class="mono">{{.Since}}</td>
+            {{- with .Card.Fails}} <a class="badge bad" href="#fails" title="最近几次没给出票，明细在「取票失败」页签">取票失败 {{len .}}</a>{{end}}</td>
+          <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else if .Plan}}<span class="badge">{{.Plan}}</span>{{end}}</td>
+          <td class="a-fetch" data-sort="{{.Card.LastFetchAt}}">{{if .Card.LastFetch}}<span title="{{.Card.LastFetchAt}} UTC">{{.Card.LastFetch}}</span>{{else}}还没取到过{{end}}</td>
           <td><div class="row-actions">
+            {{- if .Card.ConsumerKey}}<span id="akey-{{.ID}}" hidden>{{.Card.ConsumerKey}}</span><button class="sm" type="button" data-copy="#akey-{{.ID}}" hidden data-js>复制 key</button>{{end}}
             <form method="post" action="/admin/accounts/{{.ID}}/enabled"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
               <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
             <form method="post" action="/admin/accounts/{{.ID}}/delete"
                 onsubmit="return confirm('确定删除账号 {{.ID}}（{{.Label}}）？此操作无法撤销。')">
               <button class="danger sm" type="submit">删除</button></form>
           </div></td>
+          <td class="l2 mono">{{.Upstream}}</td>
+          <td class="l2 a-owner"><span class="clip short" title="{{.Owner}}">{{.Owner}}</span></td>
+          <td class="l2 a-req">{{.Requests}}</td>
+          <td class="l2 a-found">{{.Found}}</td>
+          <td class="l2 a-cov" title="九个区域里铸出过票的有几个">{{.Covered}}</td>
+          <td class="l2 a-since" title="UTC">{{.Since}}</td>
+          <td class="l2 a-why">{{if and (not .Enabled) .DisabledReason}}停用原因：{{.DisabledReason}}{{end}}</td>
+          <td class="a-rg">{{template "region-cells" .Card.Regions}}</td>
         </tr>
       {{end}}
       </tbody>

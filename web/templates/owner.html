@@ -1,8 +1,7 @@
 {{define "content"}}
 <div class="page-head">
   <h1>{{.Title}}<span class="badge">{{len .Accounts}} 份凭据</span></h1>
-  {{if .Admin}}<p>池内全部账号，每份凭据一张卡片。<a href="/admin/">← 返回管理页</a></p>
-  {{else}}<p>创建于 {{.Since}} UTC。</p>{{end}}
+  <p>创建于 {{.Since}} UTC。</p>
 </div>
 
 <div class="kpis">
@@ -12,7 +11,7 @@
   <div class="kpi"><b>{{.NewGateways}}</b><span>新发现网关</span></div>
 </div>
 
-<div class="{{if not .Admin}}grid-2{{end}}">
+<div class="grid-2">
   <div class="card">
     <header class="card-head"><div><h2>接口地址</h2><p>填进 sub2api 的<strong>根地址</strong>。</p></div></header>
     <div class="card-body">
@@ -27,7 +26,6 @@
       </div>
     </div>
   </div>
-  {{if not .Admin}}
   <div class="card">
     <header class="card-head"><div><h2>本页地址</h2><p>进入这一页的唯一入口。</p></div></header>
     <div class="card-body">
@@ -42,15 +40,12 @@
       {{end}}
     </div>
   </div>
-  {{end}}
 </div>
 
-{{if not .Admin}}
 <nav class="tabs" data-tabs hidden data-js>
   <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
   <a href="#import">添加账号</a>
 </nav>
-{{end}}
 
 <section id="tab-accounts">
 {{if .Accounts}}
@@ -97,26 +92,14 @@
     </table></div>
     {{end}}
   </div>
-  <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明{{if not $.Admin}}、停用开关{{end}}在那边）</p>
-  {{if $.Admin}}
-  <div class="foot row-actions">
-    <form method="post" action="/admin/accounts/{{.ID}}/enabled"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
-      <input type="hidden" name="back" value="accounts">
-      <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
-    <form method="post" action="/admin/accounts/{{.ID}}/delete"
-        onsubmit="return confirm('确定删除账号 {{.ID}}（{{.Label}}）？此操作无法撤销。')">
-      <input type="hidden" name="back" value="accounts">
-      <button class="danger sm" type="submit">删除</button></form>
-  </div>
-  {{end}}
+  <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明、停用开关在那边）</p>
 </details>
 {{end}}
 {{else}}
-<div class="card"><p class="empty">{{if .Admin}}池内暂无账号。{{else}}你名下还没有凭据，到<a href="#import">添加账号</a>里上传。{{end}}</p></div>
+<div class="card"><p class="empty">你名下还没有凭据，到<a href="#import">添加账号</a>里上传。</p></div>
 {{end}}
 </section>
 
-{{if not .Admin}}
 <section id="tab-import">
 <div class="card">
   <header class="card-head"><div><h2>添加账号</h2><p>可一次贴多份，不填备注就用 token 里的邮箱。</p></div></header>
@@ -126,5 +109,4 @@
   </div>
 </div>
 </section>
-{{end}}
 {{end}}

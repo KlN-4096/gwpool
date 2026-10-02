@@ -180,10 +180,6 @@ type ownerView struct {
 	// CanLogout：访客的身份 cookie 正好是这个 owner，给一个「登出」按钮。
 	CanLogout bool
 	Accounts  []ownerAccountRow
-	// Admin = 这一页是 /admin/accounts（全部账号），不是某一个人的总览。模板据此
-	// 收掉「本页地址」「再挂一份凭据」那两张只讲上传者自己的卡，换成回管理页的链接。
-	// 用一个显式字段而不是「Token 为空」去推：那是两件事，哪天 owner 没令牌了就串台。
-	Admin bool
 }
 
 type ownerAccountRow struct {
@@ -363,6 +359,9 @@ type accountRow struct {
 	SameAs      string // 报上来的上游 ID 正好是池里某个托管账号的：「#3 xxx（已停用）」
 	Delivered   int    // 取过票的网关数（槽位台账里 LastDeliver 非零的）
 	LastDeliver string // 最近一次取票（UTC）；空 = 一张都没取到过
+	// Card 是 /u/ 那张卡的同一份读数（ownerAccountRows）：最近取票、接入 key、九区域格子、
+	// 取票失败。只给托管着凭据的号——管理页账号页签一号一张紧凑卡，就是拿它画的。
+	Card ownerAccountRow
 }
 
 // proxyRow 是一条出口供应商。**没有密码字段**，用户名只给前 4 个字符：

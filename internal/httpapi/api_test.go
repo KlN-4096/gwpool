@@ -1273,11 +1273,14 @@ func TestAdminView(t *testing.T) {
 			t.Fatalf("管理页缺了 %q", want)
 		}
 	}
-	for _, leak := range []string{secretToken, "OAILB-SECRET", "CFLB-SECRET",
-		srv.ConsumerKeyFor(st.accounts[0])} {
+	for _, leak := range []string{secretToken, "OAILB-SECRET", "CFLB-SECRET"} {
 		if strings.Contains(body, leak) {
 			t.Fatalf("管理页漏了 %q", leak)
 		}
+	}
+	// 账号的 key 只藏在账号卡片「复制 key」按钮背后那一处，页面上不显示。
+	if n := strings.Count(body, srv.ConsumerKeyFor(st.accounts[0])); n != 1 {
+		t.Fatalf("1 号的 key 在管理页出现了 %d 次", n)
 	}
 	if w := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")); w.Code != 200 {
 		t.Fatalf("Bearer 进不去 %d", w.Code)
@@ -1826,18 +1829,16 @@ func TestAdminAccountEnabledToggle(t *testing.T) {
 	if st.accounts[0].Enabled {
 		t.Fatal("没停掉")
 	}
-	cards := httptest.NewRequest("GET", "/admin/accounts", nil)
-	cards.SetBasicAuth("admin", "akey")
-	if !strings.Contains(adminPage(), toggle+`1">`) || !strings.Contains(do(h, cards).Body.String(), toggle+`1">`) {
-		t.Fatal("停用了的号，两页上的按钮都该发 enabled=1（启用）")
+	if !strings.Contains(adminPage(), toggle+`1">`) {
+		t.Fatal("停用了的号，按钮该发 enabled=1（启用）")
 	}
 	// 表单体有上限。
 	if w := post("/admin/accounts/1/enabled", "enabled=1&pad="+strings.Repeat("x", 5<<10)); w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("超大表单拿到 %d", w.Code)
 	}
-	// 从「全部账号」卡片页点的，回那一页。
-	if loc := post("/admin/accounts/1/enabled", "enabled=1&back=accounts").Header().Get("Location"); loc != "/admin/accounts" {
-		t.Fatalf("从全部账号页启用完跳到 %q", loc)
+	// 原来「全部账号」卡片页发的 back=accounts：那一页并进了账号页签，回页签。
+	if loc := post("/admin/accounts/1/enabled", "enabled=1&back=accounts").Header().Get("Location"); loc != "/admin/#accounts" {
+		t.Fatalf("启用完跳到 %q", loc)
 	}
 	if !st.accounts[0].Enabled {
 		t.Fatal("没启用回来")
@@ -1851,15 +1852,6 @@ func TestAdminAccountEnabledToggle(t *testing.T) {
 	}
 	if w := post("/admin/accounts/abc/enabled", "enabled=0"); w.Code != 400 {
 		t.Fatalf("乱填 ID 拿到 %d", w.Code)
-	}
-	// 「全部账号」卡片上也有这两个按钮，不用再进详情页。
-	r := httptest.NewRequest("GET", "/admin/accounts", nil)
-	r.SetBasicAuth("admin", "akey")
-	body := do(h, r).Body.String()
-	for _, want := range []string{toggle + `0">`, `action="/admin/accounts/1/delete"`, `name="back" value="accounts"`} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("/admin/accounts 缺了 %q", want)
-		}
 	}
 	// 上传者自己的总览页上不许有管理员按钮。
 	if strings.Contains(do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String(), "/admin/accounts/") {
@@ -1928,8 +1920,8 @@ func TestOwnerNames(t *testing.T) {
 	}
 }
 
-// 管理页三处「上传者」（账号表那一列、筛选下拉框、上传者表）都用显示名；
-// 账号表的名字链到账号页，上游账号 ID 在名字下面一行，不再单占一列。
+// 管理页三处「上传者」（账号卡片、筛选下拉框、上传者表）都用显示名；
+// 账号卡片的名字链到账号页，上游账号 ID 在卡片第二行。
 func TestAdminAccountsTableLayout(t *testing.T) {
 	_, h, _, st, _ := rig(t, types.ModePool)
 	st.owners = append(st.owners, types.Owner{ID: 3, Token: "tok-3", Label: defaultOwnerLabel})
@@ -1944,7 +1936,7 @@ func TestAdminAccountsTableLayout(t *testing.T) {
 		`<span class="clip short" title="#3 w@y.com 等 2 个">#3 w@y.com 等 2 个</span>`,
 		`<td class="text">w@y.com 等 2 个</td>`,
 		`<a class="clip" href="/a/vt-1" title="pro1（打开账号页）">pro1</a>`,
-		`<div class="sub mono nowrap">acct-upstream</div>`,
+		`<td class="l2 mono">acct-upstream</td>`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("管理页缺了 %q", want)
@@ -2957,43 +2949,47 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 	}
 }
 
-// /admin/accounts 是「所有账号一人一张卡」：管理页那张扁平表看不见九宫格、
-// 接入 key 和取票失败，排查「谁的号在哪个区域还没落点」只能一个个点开 /a/。
-func TestAdminAccountsPage(t *testing.T) {
-	_, h, _, st, _ := rig(t, types.ModePool)
+// 管理页账号页签一号一张紧凑卡：/u/ 那张卡的读数（九区域格子、接入 key、最近取票）
+// 全摊在这里，排查「谁的号在哪个区域还没落点」不用一个个点开 /a/。原来的
+// /admin/accounts 卡片页并了进来，旧链接跳过来。
+func TestAdminAccountCards(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModePool)
 	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 acct-outside",
 		Creds: types.Creds{AccountID: types.AnonPrefix + "acct-outside"}, Enabled: true, ViewToken: "vt-9"})
-	// 没带 admin key 一律 401：这一页上有每个账号的接入 key。
-	if w := do(h, httptest.NewRequest("GET", "/admin/accounts", nil)); w.Code != http.StatusUnauthorized {
-		t.Fatalf("/admin/accounts 没鉴权就给了：%d", w.Code)
+	if w := do(h, httptest.NewRequest("GET", "/admin/accounts", nil)); w.Code != http.StatusSeeOther ||
+		w.Header().Get("Location") != "/admin/#accounts" {
+		t.Fatalf("/admin/accounts 拿到 %d，跳到 %q", w.Code, w.Header().Get("Location"))
 	}
-	r := httptest.NewRequest("GET", "/admin/accounts", nil)
-	r.SetBasicAuth("admin", "akey")
-	w := do(h, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("/admin/accounts = %d", w.Code)
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	from, to := strings.Index(body, `<section id="tab-accounts">`), strings.Index(body, `<section id="tab-external">`)
+	if from < 0 || to < from {
+		t.Fatal("找不到账号页签")
 	}
-	body := w.Body.String()
-	// 两个账号都在（它们挂在**不同的** owner 下，这一页不按归属筛）。
-	for _, want := range []string{"pro1", "朋友的号", "各区域探测情况", "全部账号"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("/admin/accounts 少了 %q：\n%s", want, body)
-		}
+	tab := body[from:to]
+	// 两个托管账号各一张卡（挂在不同的 owner 下，这一页不按归属筛），各带九区域格子；
+	// 外部账号没凭据，卡片上全是空的，不上这一页。
+	if n := strings.Count(tab, `<div class="regions">`); n != 2 {
+		t.Fatalf("九区域格子有 %d 份，应该 2 份", n)
 	}
-	// 这一页不是某个人的总览：别把「本页地址/令牌」那套上传者文案摆上来。
-	if strings.Contains(body, "换设备时在首页粘这个令牌") || strings.Contains(body, ownerTok1) {
-		t.Fatal("/admin/accounts 混进了上传者总览令牌")
+	if strings.Contains(tab, "acct-outside") {
+		t.Fatal("账号页签混进了外部账号")
 	}
-	// 上传表单只属于某个人的 /u/ 页：管理员这页传上去该挂给谁，答不出来。
-	if strings.Contains(body, `id="upload"`) {
-		t.Fatal("/admin/accounts 混进了上传表单")
+	// 图例整页只说一次，不在每张卡里重复。
+	if n := strings.Count(tab, `class="rg-legend"`); n != 1 {
+		t.Fatalf("图例出现了 %d 次", n)
 	}
-	// 外部账号没凭据，卡片上全是空的：它们在管理页「外部账号」页签，不上这一页。
-	if strings.Contains(body, "acct-outside") || strings.Contains(body, `data-acct="9"`) {
-		t.Fatal("/admin/accounts 混进了外部账号")
+	// 接入 key 不占版面：藏在复制按钮背后（也能拿来搜索）。
+	key := srv.ConsumerKeyFor(st.accounts[0])
+	if key == "" || !strings.Contains(tab, `<span id="akey-1" hidden>`+key+`</span>`) ||
+		!strings.Contains(tab, `data-copy="#akey-1"`) {
+		t.Fatal("卡片上没有 1 号的接入 key 复制按钮")
 	}
 	// 凭据一个字都不许出现（和其他页面同一条哨兵）。
 	if strings.Contains(body, secretToken) {
-		t.Fatal("/admin/accounts 泄漏了凭据")
+		t.Fatal("管理页泄漏了凭据")
+	}
+	// 上传者自己的 /u/ 页照旧每张卡带图例。
+	if !strings.Contains(do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String(), `class="rg-legend"`) {
+		t.Fatal("/u/ 页的九区域格子丢了图例")
 	}
 }

@@ -271,7 +271,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
 	mux.Handle("POST /admin/proxies", s.sameOrigin(http.HandlerFunc(s.handleAdminAddProxy)))
 	mux.Handle("POST /admin/proxies/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminProxyEnabled)))
-	mux.HandleFunc("GET /admin/accounts", s.handleAdminAccounts)
+	// 原来的「全部账号」卡片页并进了管理页账号页签，旧链接跳过去。
+	mux.Handle("GET /admin/accounts", http.RedirectHandler("/admin/#accounts", http.StatusSeeOther))
 	mux.HandleFunc("GET /admin/", s.handleAdmin)
 	return noStore(mux)
 }
@@ -1276,45 +1277,7 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 	s.render(w, s.tplOwner, v)
 }
 
-// handleAdminAccounts 出 GET /admin/accounts：**所有**账号一人一张卡，和上传者
-// 自己的 /u/ 页同一套读数、同一个模板。
-//
-// 管理页那张账号表是扁平清单，看不见九宫格、接入 key 和取票失败——要查「谁的号在
-// 哪个区域还没落点」只能一个个点开 /a/ 链接。这一页把它们摊开。
-func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
-	if !s.authAdmin(w, r) {
-		return
-	}
-	samples, err := s.samples()
-	if err != nil {
-		s.opt.Log.Error("读样本失败", "err", err)
-		http.Error(w, "读账本失败", http.StatusInternalServerError)
-		return
-	}
-	v := ownerView{
-		base:    base{Title: "全部账号", Mode: s.pool.Mode()},
-		Model:   s.probeModel(),
-		Effort:  probeEffort,
-		BaseURL: s.publicBaseURL(),
-		Admin:   true,
-	}
-	// 外部账号（匿名占位行）不上这一页：它没凭据，卡片上的接入 key、九宫格、请求数全是空的。
-	// 它们在管理页的「外部账号」页签。
-	var hosted []types.Account
-	for _, a := range s.st.Accounts() {
-		if a.Creds.AccessToken != "" {
-			hosted = append(hosted, a)
-		}
-	}
-	v.Accounts, v.LastFetch = s.ownerAccountRows(hosted, samples)
-	for _, row := range v.Accounts {
-		v.Requests += row.Requests
-		v.NewGateways += row.NewGateways
-	}
-	s.render(w, s.tplOwner, v)
-}
-
-// ownerAccountRows 把一串账号摊成卡片行。/u/{token} 和 /admin/accounts 共用：
+// ownerAccountRows 把一串账号摊成卡片行。/u/{token} 和管理页账号页签共用：
 // 两边要的是同一套读数，分两份写迟早只有一边加字段。
 //
 // 失败行两边都按**上传者口径**取（只要真失败、不带 Detail）：这张卡的标题就是
@@ -1787,7 +1750,7 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, r *http.Request
 	http.Redirect(w, r, adminBack(form), http.StatusSeeOther)
 }
 
-// handleAdminAccountEnabled 停用/启用一个账号：管理页账号表和「全部账号」卡片上直接点，
+// handleAdminAccountEnabled 停用/启用一个账号：管理页账号页签的卡片上直接点，
 // 不用再进账号详情页。和上传者自己点的是同一个方法（翻了开关才清自动停用的理由）。
 func (s *Server) handleAdminAccountEnabled(w http.ResponseWriter, r *http.Request) {
 	if !s.authAdmin(w, r) {
@@ -1841,8 +1804,6 @@ func (s *Server) adminAccountForm(w http.ResponseWriter, r *http.Request) (int64
 // adminBack 是点完按钮回哪一页。只认这几个固定值：拿表单里的字符串直接当地址就是开放重定向。
 func adminBack(form url.Values) string {
 	switch form.Get("back") {
-	case "accounts":
-		return "/admin/accounts"
 	case "external":
 		return "/admin/#external"
 	}
@@ -1957,6 +1918,19 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
 	sort.Slice(v.External, func(i, j int) bool { return v.External[i].ID < v.External[j].ID })
 	v.AccountFacets = accountFacets(v.Accounts, owners, ownerName)
+	// 账号页签一号一张紧凑卡：最近取票、接入 key、九区域格子和 /u/ 那张卡同一份读数。
+	hosted := make([]types.Account, 0, len(v.Accounts))
+	for _, row := range v.Accounts {
+		hosted = append(hosted, byID[row.ID])
+	}
+	cards, _ := s.ownerAccountRows(hosted, samples)
+	cardOf := make(map[int64]ownerAccountRow, len(cards))
+	for _, c := range cards {
+		cardOf[c.ID] = c
+	}
+	for i := range v.Accounts {
+		v.Accounts[i].Card = cardOf[v.Accounts[i].ID]
+	}
 
 	// owner 的令牌必须在**这一页**看得见：迁移出来那个 owner 的令牌没人见过，
 	// 不显示就等于现有那几个账号的总览页谁都进不去。而 /a/ 那一页刻意**不**印它
