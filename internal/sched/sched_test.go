@@ -321,8 +321,10 @@ type fakeMinter struct {
 	mints     []types.Sample // 只借这个结构记 (account, gateway) 调用流水
 	echoes    int
 	echoExits []string // 每发 state-echo 用的出口区域键
-	inflight  map[int64]int
-	maxPerAcc int
+	inflight    map[int64]int
+	maxPerAcc   int
+	allInflight int
+	maxAll      int
 
 	// rateUsed / rateLimit 是速率闸的读数。默认 limit=0 = 「不设限」，
 	// 于是不碰配额的用例不用管它（生产的 mint.perRegionHour 永远回正数）。
@@ -386,13 +388,27 @@ func (m *fakeMinter) enter(id int64) {
 	if m.inflight[id] > m.maxPerAcc {
 		m.maxPerAcc = m.inflight[id]
 	}
+	// maxAll 是**跨账号**的同时在飞数，和 maxPerAcc 管的是两件事：后者守 SPEC 红线 2
+	// （单账号并发 1），前者是预铸的 worker pool 到底有没有并行起来的唯一读数。
+	m.allInflight++
+	if m.allInflight > m.maxAll {
+		m.maxAll = m.allInflight
+	}
 	m.mu.Unlock()
 }
 
 func (m *fakeMinter) leave(id int64) {
 	m.mu.Lock()
 	m.inflight[id]--
+	m.allInflight--
 	m.mu.Unlock()
+}
+
+// peakInflight 是整场跑下来最多几发铸票同时在飞。
+func (m *fakeMinter) peakInflight() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxAll
 }
 
 func (m *fakeMinter) Mint(ctx context.Context, c types.Creds, e types.Exit, sid, sentPair string,
@@ -2834,5 +2850,59 @@ func TestDeliveryReportsThePairsRegion(t *testing.T) {
 	// 消费端会据此认为某个大区已经烧过。
 	if d := mustDeliver(t, s, 1, "unified-2"); d.Region != "" {
 		t.Fatalf("老 pair 报了区域 %q，应为空", d.Region)
+	}
+}
+
+// 九个大区各落一个没见过的网关 ⇒ 每一发都算补上一格，不会撞失手预算。
+func landEachRegionSomewhereNew(mn *fakeMinter) {
+	for i, r := range types.Regions {
+		mn.land[exitKey(r.Exit)] = fmt.Sprintf("unified-%d", i+1)
+	}
+}
+
+// 预铸并发起来之后，同一个号在一个 RenewGap 里只许被派一发。
+//
+// 登记（lastMintedAt）要是还留在 mintOnce 里面——那是一发上游**之后**才落笔的——
+// 几个 worker 会在第一发落笔前全部选中这同一个号，而「同一个号两次铸票至少隔
+// RenewGap」是防封节奏（见 Options.RenewGap），账号锁拦得住并发但拦不住节奏。
+func TestPremintDoesNotDispatchOneAccountTwiceWithinTheRenewGap(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	landEachRegionSomewhereNew(mn)
+	// 三个 worker、一个号、RenewGap 一小时：缺口 9 格，所以「只打一发」只可能来自节流。
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: time.Hour,
+		Live: liveCfg(func(c *config.Config) { c.MintConcurrency = 3 })})
+
+	s.premintBare(context.Background(), 9)
+	if n := len(mn.mintedGateways()); n != 1 {
+		t.Fatalf("同一个号在一个 RenewGap 里被派了 %d 发，只该有 1 发", n)
+	}
+	if mn.maxPerAcc > 1 {
+		t.Fatalf("单账号同时在飞 %d 发，SPEC 红线 2 要求 1", mn.maxPerAcc)
+	}
+}
+
+// worker pool 真的并行：三个号三个大区，铸票要同时在飞，不是一发接一发。
+func TestPremintRunsDifferentAccountsInParallel(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	// 让每一发在上游那儿待一会儿，不然串行实现也可能"看起来"重叠不了也测不出来。
+	mn.delay = 30 * time.Millisecond
+	for id := int64(1); id <= 3; id++ {
+		addAccount(st, id, fmt.Sprintf("acct-%d", id))
+	}
+	landEachRegionSomewhereNew(mn)
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: time.Hour,
+		Live: liveCfg(func(c *config.Config) { c.MintConcurrency = 3 })})
+
+	s.premintBare(context.Background(), 9)
+	if n := len(mn.mintedGateways()); n != 3 {
+		t.Fatalf("三个号各该打一发（之后全被 RenewGap 节流），实际 %d 发", n)
+	}
+	if peak := mn.peakInflight(); peak < 2 {
+		t.Fatalf("最大同时在飞 %d 发，worker pool 没并行起来", peak)
 	}
 }

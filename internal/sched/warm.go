@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gwpool/internal/mint"
@@ -132,83 +133,217 @@ func (s *Scheduler) seedPairFor(regionKey string) (types.Pair, bool) {
 // 机房出口（config.KindSeed），不花住宅代理 ⇒ 「去摸新落点」基本免费。
 // 没有种子票的大区照旧走住宅。
 func (s *Scheduler) premintBare(ctx context.Context, n int) {
-	tried := map[string]bool{} // 本轮试过的 (账号 × 大区)
-	aimed := map[string]bool{} // 本轮已经有人冲着去的网关，别两个组合撞同一个
-	missed := 0
-	for got := 0; got < n && missed < n; {
-		if ctx.Err() != nil {
-			return
-		}
-		live := s.liveGateways()
-		landed := s.lastLandings()
-		skip := func(id int64, key string) bool {
-			combo := comboKey(id, key)
-			if tried[combo] {
-				return true
-			}
-			gw := landed[combo]
-			if gw == "" {
-				return false // 没铸过 ⇒ 去摸新落点
-			}
-			return live[gw] || aimed[gw]
-		}
-		// 本小时打得最少的号优先、它终身没走过的区域优先；
-		// 节流同一个号两次铸票至少隔 RenewGap。
-		a, r, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap, skip)
+	workers := s.premintWorkers(n)
+	r := &premintRound{want: n, tried: map[string]bool{}, aimed: map[string]bool{}}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.premintLoop(ctx, r)
+		}()
+	}
+	wg.Wait()
+	got, missed, combos := r.result()
+	s.opt.Log.Info("预铸一轮结束", "want", n, "got", got, "missed", missed,
+		"combos_tried", combos, "workers", workers)
+}
+
+// premintWorkers 是这一轮派几个 worker 去铸。三道封顶：
+//
+//   - 配置的 mint_concurrency（config.Load 已经把它钳在区域数以内）
+//   - 缺口 n：worker 比缺口还多，多出来的那几个一定空跑
+//   - 至少 1（0 个 worker = 保温彻底不铸票，那不是任何人想要的配置）
+//
+// **刻意不再按「有种子票的大区数」收一次**：claimRegion 已经保证一个大区同时只有
+// 一发裸铸在打，占不住的 worker 换组合、换不到就收尾，不会去抢同一个大区。
+func (s *Scheduler) premintWorkers(n int) int {
+	return max(1, min(s.cfg().MintWorkers(), n))
+}
+
+// premintPickTries 是一次挑选最多抢几回账号。抢不到只会是「别的 worker 刚登记了
+// 同一个号」，而登记之后 minterFor 自己就跳过它 ⇒ 最多碰并发数那么多次。
+const premintPickTries = 4
+
+// premintRound 是一轮预铸的共享进度，几个 worker 共用它。
+//
+// 每个字段都只在 mu 里读写，**循环条件本身也在里面**：got 和 missed 一起封顶这一轮
+// 的总发数（最多 2n 发），各个 worker 分头各算一份就等于把那个封顶乘上并发数。
+type premintRound struct {
+	mu     sync.Mutex
+	want   int             // 缺口，同时也是失手预算
+	got    int             // 补上的格子数
+	missed int             // 落回了已有活票的网关的发数
+	halt   bool            // 整池同病：组合挑完了、要不到出口、撞上闸
+	tried  map[string]bool // 本轮试过的 (账号 × 大区)
+	aimed  map[string]bool // 本轮已经有人冲着去的网关，别两个组合撞同一个
+}
+
+func (r *premintRound) more() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.halt && r.got < r.want && r.missed < r.want
+}
+
+func (r *premintRound) stop() {
+	r.mu.Lock()
+	r.halt = true
+	r.mu.Unlock()
+}
+
+func (r *premintRound) result() (got, missed, combos int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.got, r.missed, len(r.tried)
+}
+
+// premintPlan 是挑出来的一发：谁、经哪个大区、以及**出手前**哪些网关有活票。
+//
+// live 必须是出手前的快照：铸完再数的话自己刚落下的那张票也在里面，
+// 「这一发有没有补上一格」就永远答「没有」。并发之后更要紧——别的 worker 的新落点
+// 会把读数一起抬高，原先那个「全局活票数比铸票前多了没有」的判据会直接失效。
+type premintPlan struct {
+	acct   types.Account
+	region types.Region
+	live   map[string]bool
+	// release 放掉这个大区的裸铸标记，铸完**必须**调（见 claimRegion）。
+	release func()
+}
+
+func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
+	for ctx.Err() == nil && r.more() {
+		plan, ok := s.premintPick(r)
 		if !ok {
-			s.opt.Log.Info("没有可挑的 (账号 × 大区) 组合了，本轮预铸收尾",
-				"got", got, "want", n, "tried", len(tried))
+			// 两种情形都该让这个 worker 退休，而不是接着挑：组合挑完了（pick 里已经
+			// 置了 halt），或者连试几个号都在 RenewGap 的节流里。后者**不能原地重试**
+			// ——节流是 RenewGap 量级（几十秒），重试只会空转；别的 worker 还在跑，
+			// 全退休了 wg.Wait 自然收尾，一分钟后的下一轮巡检再来。
 			return
 		}
-		tried[comboKey(a.ID, r.Key)] = true
-		if gw := landed[comboKey(a.ID, r.Key)]; gw != "" {
-			aimed[gw] = true
-		}
-		// 同一个区域一次只许一发裸铸在打。占不住就换下一个组合——不排队，见 claimRegion。
-		release, free := s.claimRegion(r.Key)
-		if !free {
-			continue
-		}
-		sid, seed, err := s.premintSID(r.Key)
+		sid, seed, err := s.premintSID(plan.region.Key)
 		if err != nil {
-			release()
-			s.opt.Log.Warn("要不到出口，本轮不预铸", "region", r.Key, "err", err)
+			plan.release()
+			// 出口要不到是整池同病，别的 worker 接着挑只是把同一句话重复 N 遍。
+			s.opt.Log.Warn("要不到出口，本轮不预铸", "region", plan.region.Key, "err", err)
+			r.stop()
 			return
 		}
-		unlock := s.st.LockAccount(a.ID)
+		unlock := s.st.LockAccount(plan.acct.ID)
 		// want 留空：裸铸就是去看它能落到哪，谈不上「落点漂移」。带种子也一样——
 		// 种子只钉大区，具体网关是这个号自己的，出手前并不知道是哪个。
-		got2, err := s.mintOnce(ctx, a, r.Exit, sid, seed, "", "")
+		got, err := s.mintOnce(ctx, plan.acct, plan.region.Exit, sid, seed, "", "")
 		unlock()
+		plan.release()
+		if !s.premintNote(r, plan, got, err, seed.Cookie != "") {
+			return
+		}
+		if !waitGap(ctx, s.opt.MintGap) {
+			return
+		}
+	}
+}
+
+// premintPick 挑下一个 (账号 × 大区) 组合并就地占住它。
+//
+// 整段在 r.mu 里：挑选要读 tried/aimed，占住要写它们，分成两步就会让两个 worker
+// 挑中同一个组合——而「一个组合一轮最多试一次」正是这个循环能靠穷举收尾的前提。
+//
+// 锁序恒为 r.mu → s.mu，反向不存在：r.mu 只有本文件这几个方法碰，而 minterFor 自己
+// 那把 s.mu 在候选循环**之前**就放掉了（skip 不在它里面跑）。
+func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
+	live, landed := s.liveGateways(), s.lastLandings()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.halt {
+		return premintPlan{}, false
+	}
+	skip := func(id int64, key string) bool {
+		combo := comboKey(id, key)
+		if r.tried[combo] {
+			return true
+		}
+		gw := landed[combo]
+		if gw == "" {
+			return false // 没铸过 ⇒ 去摸新落点
+		}
+		return live[gw] || r.aimed[gw]
+	}
+	for try := 0; try < premintPickTries; try++ {
+		// 本小时打得最少的号优先、它终身没走过的区域优先；
+		// 节流同一个号两次铸票至少隔 RenewGap。
+		a, reg, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap, skip)
+		if !ok {
+			s.opt.Log.Info("没有可挑的 (账号 × 大区) 组合了，本轮预铸收尾",
+				"got", r.got, "want", r.want, "tried", len(r.tried))
+			r.halt = true
+			return premintPlan{}, false
+		}
+		combo := comboKey(a.ID, reg.Key)
+		r.tried[combo] = true
+		if gw := landed[combo]; gw != "" {
+			r.aimed[gw] = true
+		}
+		// **先占大区、再占账号**，顺序不能反：占不住大区时账号那一占就白花了一个
+		// RenewGap（几十秒），而大区冲突在冷启动时是常态——所有新号的首选大区都是
+		// 台账里铸得最少的那一个，于是几个 worker 开局必然撞在同一个大区上。
+		// 反过来写的那一版实测只铸出一发就收尾（三个号全被自己白占掉了）。
+		release, free := s.claimRegion(reg.Key)
+		if !free {
+			continue // 别的 worker 正在这个大区打；组合已标试过，挑下一个
+		}
+		if s.claimAccount(a.ID, s.opt.RenewGap) {
+			return premintPlan{acct: a, region: reg, live: live, release: release}, true
+		}
 		release()
-		switch {
-		case err == nil:
-			s.opt.Log.Info("裸铸拿到落点", "account", a.ID, "label", a.Label,
-				"region", r.Key, "gateway", got2.pair.Gateway, "seeded", seed.Cookie != "")
-			// 只有「落到一个刚才没有活票的网关」才算补上了一格。落回已有活票的网关
-			// 说明预测错了（区域划分随 cohort 变，SPEC 第 4 节）——台账已经按实际
-			// 落点更新过了，这个组合也标成试过了，所以不会原地打转，接着挑下一个。
-			if !live[got2.pair.Gateway] {
-				got++
-				break
-			}
-			missed++
-			s.opt.Log.Info("落回了已有活票的网关，算一次失手，换下一个组合",
-				"account", a.ID, "region", r.Key, "gateway", got2.pair.Gateway,
-				"missed", missed, "budget", n)
-		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
-			// 闸门和出口故障都不是这个号的错，也不是重试能解决的，本轮直接停。
-			s.opt.Log.Warn("预铸撞上闸门，本轮停", "account", a.ID, "region", r.Key, "reason", err)
-			return
-		default:
-			s.opt.Log.Info("裸铸失败", "account", a.ID, "label", a.Label,
-				"region", r.Key, "reason", err)
+	}
+	return premintPlan{}, false
+}
+
+// premintNote 把一发的结果记进本轮进度，返回「这个 worker 还该接着挑吗」。
+func (s *Scheduler) premintNote(r *premintRound, plan premintPlan,
+	got minted, err error, seeded bool,
+) bool {
+	switch {
+	case err == nil:
+		s.opt.Log.Info("裸铸拿到落点", "account", plan.acct.ID, "label", plan.acct.Label,
+			"region", plan.region.Key, "gateway", got.pair.Gateway, "seeded", seeded)
+		// 只有「落到一个出手前没有活票的网关」才算补上了一格。落回已有活票的网关
+		// 说明预测错了（区域划分随 cohort 变，SPEC 第 4 节）——台账已经按实际落点
+		// 更新过了，这个组合也标成试过了，所以不会原地打转，接着挑下一个。
+		r.mu.Lock()
+		if !plan.live[got.pair.Gateway] {
+			r.got++
+			r.mu.Unlock()
+			return true
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(s.opt.MintGap):
-		}
+		r.missed++
+		missed, budget := r.missed, r.want
+		r.mu.Unlock()
+		s.opt.Log.Info("落回了已有活票的网关，算一次失手，换下一个组合",
+			"account", plan.acct.ID, "region", plan.region.Key, "gateway", got.pair.Gateway,
+			"missed", missed, "budget", budget)
+		return true
+	case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
+		// 闸门和出口故障都不是这个号的错，也不是重试能解决的，而且**整池同病**：
+		// 别的 worker 接着挑只是把同一句话重复 N 遍，本轮直接停。
+		s.opt.Log.Warn("预铸撞上闸门，本轮停",
+			"account", plan.acct.ID, "region", plan.region.Key, "reason", err)
+		r.stop()
+		return false
+	default:
+		s.opt.Log.Info("裸铸失败", "account", plan.acct.ID, "label", plan.acct.Label,
+			"region", plan.region.Key, "reason", err)
+		return true
+	}
+}
+
+// waitGap 等一个铸票间隔，ctx 死了回 false。
+func waitGap(ctx context.Context, gap time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(gap):
+		return true
 	}
 }
 

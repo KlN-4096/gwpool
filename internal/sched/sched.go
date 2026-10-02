@@ -1230,6 +1230,29 @@ func (s *Scheduler) claimRegion(key string) (func(), bool) {
 	}, true
 }
 
+// claimAccount 抢下「这个号现在去铸一发」，throttle 内已经有人登记过就回 false。
+//
+// 为什么挑人之后还要单独抢一次：登记（lastMintedAt）原先只在 mintOnce 里落笔，
+// 那是一发上游**之后**的事，而 minterFor 读的就是它。串行时没问题；预铸并发起来
+// （mint_concurrency > 1）之后，几个 worker 会在第一发落笔之前**全部选中同一个号**。
+// 账号锁（store.LockAccount）拦得住并发，但拦不住「同一个号两次铸票至少隔 RenewGap」
+// 那条防封节奏——而那正是 RenewGap 存在的全部理由（见 Options.RenewGap）。
+//
+// 抢到了但后面没铸成（要不到出口、撞上闸）会让这个号白歇一个 RenewGap。方向是
+// **少铸不是多铸**，而池子里有上百个号，可以接受。
+//
+// throttle <= 0 时只登记、不拒：交付路径那边有人在等票，节流会直接变成服务不可用。
+func (s *Scheduler) claimAccount(id int64, throttle time.Duration) bool {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if throttle > 0 && now.Sub(s.lastMintedAt[id]) < throttle {
+		return false
+	}
+	s.lastMintedAt[id] = now
+	return true
+}
+
 // lockGateway 取这个网关的铸票锁，返回解锁函数。
 //
 // 只罩「为这个网关铸一张 pair」那一段。不落在 store 上：它拦的是**本进程**里
