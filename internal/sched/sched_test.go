@@ -1714,6 +1714,43 @@ func TestMinterPicksByRegionLedger(t *testing.T) {
 	}
 }
 
+// bestRegion 的三档排序，整条钉一遍：没有活种子票 > 没摸过的大区 > 终身铸得最少。
+//
+// 要紧的是**第一档压过第二档**：丢了种子的大区哪怕已经铸过几十发，也排在一个终身
+// 没摸过的大区前面。理由不对称——种子一掉，那个大区的所有账号都回落到住宅出口，
+// 一张票就能把整个大区的便宜路径恢复；而「摸一个新落点」只多一个槽位。
+// 另外两条用例各自只盖一档（TestMinterPicksByRegionLedger 盖第二三档、
+// TestPremintRefillsSeedlessRegionsFirst 盖第一档但那里所有大区终身计数都是 0），
+// 跨档那一格没人盯，而 bestRegion 里正是那个 `p && !bestPrefer` 分支。
+func TestBestRegionPrefersSeedlessOverUnseen(t *testing.T) {
+	seedless, unseen := types.Regions[0], types.Regions[1]
+	prefer := func(key string) bool { return key == seedless.Key }
+	// 第一档那个大区铸得最多，第二档那个终身没铸过 —— 排序只能靠档位分开它们。
+	lifetime := map[string]int{seedless.Key: 99}
+	for _, r := range types.Regions[2:] {
+		lifetime[r.Key] = 50
+	}
+
+	got, count, preferred, ok := bestRegion(types.Exit{}, nil, 6, lifetime, nil, prefer)
+	if !ok {
+		t.Fatal("配额没打满，不该说挑不出来")
+	}
+	if got.Key != seedless.Key {
+		t.Fatalf("挑了 %s，该挑丢了种子的 %s（它铸过 99 发也要先补）", got.Key, seedless.Key)
+	}
+	if !preferred || count != 99 {
+		t.Fatalf("回报不对: preferred=%v count=%d", preferred, count)
+	}
+
+	// 种子都齐了（prefer 恒 false）⇒ 退到第二档：挑终身没铸过的那个。
+	got, _, preferred, ok = bestRegion(types.Exit{}, nil, 6, lifetime, nil,
+		func(string) bool { return false })
+	if !ok || got.Key != unseen.Key || preferred {
+		t.Fatalf("种子齐了该挑终身没铸过的 %s，得到 %s（preferred=%v, ok=%v）",
+			unseen.Key, got.Key, preferred, ok)
+	}
+}
+
 // 九个区域本小时都打满的号直接跳过：不先问一声的话，那一发会一路走到速率闸才被拒。
 func TestMinterSkipsAccountWithAllRegionsSpent(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModePool)
