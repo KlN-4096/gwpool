@@ -1491,6 +1491,7 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		p = s.rehome(p, s.bestCflb())
 		if err := s.st.PutPair(p); err != nil {
 			s.opt.Log.Warn("写 pair 失败", "gateway", p.Gateway, "err", err)
+			return minted{}, fmt.Errorf("%w: 写 pair: %w", ErrMintFailed, err)
 		}
 	}
 	if res.Gateway != want && want != "" {

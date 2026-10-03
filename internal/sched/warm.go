@@ -92,6 +92,7 @@ type renewTarget struct {
 	acct    types.Account
 	exit    types.Exit
 	pair    types.Pair
+	source  types.Pair // 锁前原始记录；pair 已装上捐赠者，不能拿它比对库里的票。
 	// reach 是台账里有几个**不同的号**最近落到过这个网关。越小越难再摸到。
 	reach int
 }
@@ -122,10 +123,15 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		}
 		return
 	}
-	done, skipped := 0, 0
+	attempted, renewed, failed, skipped := 0, 0, 0, 0
 	for _, t := range due {
-		if ctx.Err() != nil || done >= renewBudgetPerRound {
+		if ctx.Err() != nil || attempted >= renewBudgetPerRound {
 			break
+		}
+		used, limit := s.mint.Rate(t.acct.Creds.AccountID)
+		if s.accountHeldFor(t.acct.ID) > 0 || (limit > 0 && used[t.pair.RegionKey] >= limit) {
+			skipped++
+			continue
 		}
 		// 防封节奏：同一个号两次铸票至少隔 RenewGap。抢不到就留给下一轮，
 		// 票还有 renewPairLead 的余量。
@@ -136,31 +142,46 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		// 锁序恒为「先网关、再账号」，和交付那边一致 ⇒ 不存在 ABBA。
 		relGW := s.lockGateway(t.gateway)
 		unlock := s.st.LockAccount(t.acct.ID)
+		current, present := s.st.Pair(t.gateway)
+		acct, enabled := s.account(t.acct.ID)
+		if !present || current != t.source || !enabled || ctx.Err() != nil ||
+			t.pair.CflbExpiresAt.Sub(s.now()) < seedCflbFloor {
+			// 等锁时可能已经换票、停号或耗尽种子寿命；不能拿旧快照再盖回去。
+			unlock()
+			relGW()
+			skipped++
+			continue
+		}
 		sid, err := s.renewSID()
 		var got minted
 		if err == nil {
 			// want 和 bias 都填这个网关：这是一发**定向**铸票，落点漂了要被当成漂移处理
 			// （mintOnce 自己判），别静悄悄把别的网关的票记成这一张续好了。
-			got, err = s.mintOnce(ctx, t.acct, t.exit, sid, t.pair, t.gateway, t.gateway)
+			got, err = s.mintOnce(ctx, acct, t.exit, sid, t.pair, t.gateway, t.gateway)
+			attempted++ // 失败也吃预算，避免一轮系统性故障烧上百发。
 		}
 		unlock()
 		relGW()
 		switch {
 		case err == nil:
-			done++
+			renewed++
 			s.opt.Log.Info("续票", "gateway", t.gateway, "account", t.acct.ID,
-				"reach", t.reach, "landed", got.pair.Gateway)
-		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
-			// 整池同病，接着试只是把同一句话重复 N 遍。
-			s.opt.Log.Warn("续票撞上闸门，本轮停", "gateway", t.gateway, "reason", err)
+				"region", t.pair.RegionKey, "reach", t.reach, "landed", got.pair.Gateway,
+				"remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()))
+		case errors.Is(err, types.ErrRateLimited):
+			// 本号本区限流不是全池故障；也覆盖预检后刚被其他请求用完配额的竞态。
+			skipped++
+			s.opt.Log.Info("续票账号限流，跳过", "gateway", t.gateway, "account", t.acct.ID)
+		case errors.Is(err, types.ErrNoExit):
+			s.opt.Log.Warn("续票无种子出口，本轮停", "gateway", t.gateway, "reason", err)
 			return
 		default:
-			done++ // 失败也吃预算：否则一次系统性故障就是一轮上百发真实上游请求
+			failed++
 			s.opt.Log.Info("续票失败", "gateway", t.gateway, "account", t.acct.ID,
-				"reach", t.reach, "reason", err)
+				"region", t.pair.RegionKey, "reach", t.reach, "reason", err)
 		}
 	}
-	s.opt.Log.Info("续票一轮结束", "due", len(due), "done", done,
+	s.opt.Log.Info("续票一轮结束", "due", len(due), "attempted", attempted, "renewed", renewed, "failed", failed,
 		"throttled", skipped, "no_donor", noDonor)
 }
 
@@ -200,9 +221,16 @@ func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 	}
 	var out []renewTarget
 	noDonor := 0
-	for name, gw := range s.st.Gateways() {
+	for name := range s.st.Gateways() {
 		p, ok := s.st.Pair(name)
 		if !ok || p.ExpiresAt.Sub(now) > renewPairLead {
+			continue
+		}
+		source := p
+		// 种子出口靠 cookie 路由；e 仅用于速率桶、样本和新票的区域标签。
+		// 不要求存在住宅历史出口，更不能从 ReachableExits 随机挑另一区。
+		exit, ok := renewalExit(p.RegionKey)
+		if !ok {
 			continue
 		}
 		// 来源号被停用/删了就续不了这一张：换个号去打落的是别的网关（见函数头）。
@@ -224,12 +252,8 @@ func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 			continue
 		}
 		p.Cookie, p.CflbExpiresAt = swapped, donor.Exp
-		exit, ok := pickExit(gw)
-		if !ok {
-			continue
-		}
 		out = append(out, renewTarget{gateway: name, acct: acct, exit: exit,
-			pair: p, reach: len(reach[name])})
+			pair: p, source: source, reach: len(reach[name])})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].reach != out[j].reach {
@@ -241,6 +265,15 @@ func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 		return out[i].gateway < out[j].gateway // 稳定可复现
 	})
 	return out, noDonor
+}
+
+func renewalExit(regionKey string) (types.Exit, bool) {
+	for _, r := range types.Regions {
+		if r.Key == regionKey {
+			return r.Exit, true
+		}
+	}
+	return types.Exit{}, false
 }
 
 // seedCflbFloor 是一张票还能当「大区种子」用的最低 `__cflb` 剩余寿命。
