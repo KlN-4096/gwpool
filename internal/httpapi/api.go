@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/cooldown"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
 	"gwpool/internal/sched"
@@ -107,6 +108,8 @@ type Store interface {
 	// DeleteAccount 删掉账号连同它的槽位，不动已经铸出来的 pair。
 	DeleteAccount(id int64) error
 	Samples() ([]types.Sample, error)
+	CooldownReports() []types.CooldownReport
+	AddCooldownReport(types.CooldownReport) (bool, error)
 }
 
 // Scanner 排一次「去找新落点」的裸铸。
@@ -272,6 +275,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /release", s.handleRelease)
 	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
 	mux.HandleFunc("POST /pair/renew", s.handleRenew)
+	mux.HandleFunc("POST /cooldown/report", s.handleCooldownReport)
 	mux.HandleFunc("GET /gateways", s.handleGateways)
 	// 管理面的 POST 也要罩 sameOrigin：authAdmin 走 HTTP Basic，而浏览器一旦缓存了
 	// 这个 realm 的凭据，**跨站请求照样会自动带上**——和 cookie 一样是「环境凭证」。
@@ -1882,6 +1886,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode()}}
+	v.CooldownStats = cooldown.Summarize(s.st.CooldownReports(), now)
 	if s.opt.MintAll != nil {
 		v.MintAllAvailable = true
 		v.MintAll = s.opt.MintAll.Status()

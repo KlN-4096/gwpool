@@ -357,6 +357,7 @@ type adminView struct {
 	MintAll          sched.MintAllStatus
 	MintAllStarted   string
 	MintAllFinished  string
+	CooldownStats    []types.CooldownStats
 
 	base
 	Proxies  []proxyRow

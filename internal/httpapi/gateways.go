@@ -24,6 +24,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
+	recommendations := s.cooldownRecommendations(r, now)
 	pairs := s.effectivePairs(now)
 	// 按网关名收一份这个账号自己的槽位：槽位表的键格式归 store 所有，
 	// 这里只认 Slot 自己带的两个字段，免得为一个拼键函数把 store 拖进来。
@@ -43,8 +44,9 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		ValidForS int  `json:"valid_for_s"`
 		// 刻意没有 leased：一张 pair 同时给几个号用是允许的（见 types.Pair 的注释），
 		// 「被别人占着」这个状态不存在了。
-		UsedByYou  bool   `json:"used_by_you"`
-		LastUsedAt string `json:"last_used_at,omitempty"`
+		UsedByYou  bool                          `json:"used_by_you"`
+		LastUsedAt string                        `json:"last_used_at,omitempty"`
+		Cooldown   *types.CooldownRecommendation `json:"cooldown,omitempty"`
 	}
 	out := struct {
 		Account string `json:"account"`
@@ -76,6 +78,9 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Live++
 		it := row{Name: name, PairReady: true, ValidForS: int(left.Seconds())}
+		if recommendation, ok := recommendations[name]; ok {
+			it.Cooldown = &recommendation
+		}
 		if sl, ok := mine[name]; ok && !sl.LastTouch.IsZero() {
 			// 按 LastTouch 算，**不按 LastVerdict**：判定只有上传者那条交付路径写得出来，
 			// 跨账号和匿名的交付一个判定都不落 ⇒ 按判定算的话外部消费者看到的永远是

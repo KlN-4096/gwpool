@@ -186,6 +186,7 @@ type fakeStore struct {
 	pairs    map[string]types.Pair
 	slots    map[string]types.Slot
 	samples  []types.Sample
+	reports  []types.CooldownReport
 	added    []types.Account
 	deleted  []int64
 	// addedOwners 留住每一次 AddOwner：「贴了一份已经属于别人的凭据」那条路上**不许**

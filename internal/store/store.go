@@ -52,7 +52,8 @@ const (
 
 // State 是 state.json 的全量内容。
 type State struct {
-	Accounts []types.Account `json:"accounts"`
+	CooldownReports []types.CooldownReport `json:"cooldown_reports,omitempty"`
+	Accounts        []types.Account        `json:"accounts"`
 	// Owners 是上传者。老文件里没这个键 ⇒ nil ⇒ Open 的一次性迁移给已有的托管行
 	// 补一个（见 migrateOwners）。
 	Owners   []types.Owner            `json:"owners"`

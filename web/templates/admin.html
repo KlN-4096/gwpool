@@ -56,6 +56,24 @@
     {{end}}
   </div>
   {{end}}
+  <div class="card">
+    <header class="card-head"><div><h2>消费端冷却统计</h2>
+      <p>最近 7 天、最多 8192 个匿名自报样本，每个消费方最多保留 1024 个。个人至少 2 次成功才推荐；池子参考值需至少 3 个有足够样本的独立消费方。推荐参与消费端下一周期，不改正在执行的窗口。</p>
+      <p>失败只指明确降级，网络错误不计。账号差异只是观测差异，不能据此认定账号本身是原因。</p>
+    </div></header>
+    {{if .CooldownStats}}
+    <div class="table-wrap"><table>
+      <thead><tr><th>网关</th><th>账号数</th><th>成功 / 失败</th><th>池子建议</th><th>账号差异与明细</th></tr></thead>
+      <tbody>{{range .CooldownStats}}<tr>
+        <td>{{.Gateway}}</td><td>{{len .Accounts}}</td><td>{{.Successes}} / {{.Failures}}</td>
+        <td>{{if .Recommendation.Seconds}}{{.Recommendation.Seconds}} 秒（{{.Recommendation.Samples}} 样本）{{else}}样本不足{{end}}</td>
+        <td>{{if .AccountDifferences}}观察到档位差异{{else}}尚无充分差异证据{{end}}
+          <details><summary>各匿名账号</summary>{{range .Accounts}}<p>来源 {{.ReporterID}} / {{printf "%.10s" .AccountTag}}：{{.Successes}} 成功 / {{.Failures}} 失败；{{if .Recommendation.Seconds}}建议 {{.Recommendation.Seconds}} 秒{{else}}样本不足{{end}}</p>{{end}}</details>
+        </td>
+      </tr>{{end}}</tbody>
+    </table></div>
+    {{else}}<div class="card-body"><p class="muted">尚无冷却观察样本。只使用自然业务与已有预热结果，不额外打上游探测。</p></div>{{end}}
+  </div>
   <div class="kpis wide">
     <a class="kpi" href="#proxies"><b>{{len .Proxies}}</b><span>出口代理</span><small>系统访问上游时使用的代理出口</small><small class="facets" data-facets-of="t-proxies"></small></a>
     <a class="kpi" href="#owners"><b>{{len .Owners}}</b><span>上传者</span><small>每人名下可以挂好几份凭据</small></a>
