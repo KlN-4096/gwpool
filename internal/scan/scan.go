@@ -247,6 +247,15 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 			ExpiresAt:     route,
 			CflbExpiresAt: cflb,
 			MintedBy:      acct.ID,
+			// 和上面那条区域台账、那条样本同一个口径：这一发是从 r.Exit 出去的，
+			// 它的区域就是 r.Key。漏了它的那一版（到 2026-10-03）让扫描铸出来的票
+			// 整片没有大区 ⇒ 消费端收到空 RegionKey、九宫格画成「未归类」
+			// （现场：63 张活票里 8 张，8/8 都来自发现铸票）。
+			//
+			// 用 r.Key 而不是 sched 那边的 sampleRegion(e)：那个兜底是给续期型铸票的
+			// —— 它的出口取自 ReachableExits，不保证正好是 Regions 里那九个代表出口。
+			// 扫描恒从 r.Exit 出去，r.Key 本来就是那九个之一，不需要兜底。
+			RegionKey: r.Key,
 		}); err != nil {
 			return Landing{}, fmt.Errorf("记 pair: %w", err)
 		}

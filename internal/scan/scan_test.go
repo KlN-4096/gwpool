@@ -252,6 +252,28 @@ func TestScanRecordsRequestedExitForReplay(t *testing.T) {
 	}
 }
 
+// 扫描铸出来的票必须带大区。漏了的那一版让消费端收到空 RegionKey、整片画成「未归类」。
+func TestScanPairCarriesRegion(t *testing.T) {
+	s, st := newScanner(t, newFake())
+	scanAll(t, s)
+
+	pairs := st.Pairs()
+	if len(pairs) == 0 {
+		t.Fatal("一张票都没铸出来")
+	}
+	// 一个落点可能被多个区域落到（us-east / us-west 的 Exit.Region 都是 US），
+	// 后写的那一发顶掉前一发 ⇒ 只断言「不为空且是九个里的某一个」，不钉具体是哪个。
+	known := map[string]bool{}
+	for _, r := range types.Regions {
+		known[r.Key] = true
+	}
+	for name, p := range pairs {
+		if !known[p.RegionKey] {
+			t.Errorf("%s 的票 RegionKey=%q，要是 types.Regions 里的某一个", name, p.RegionKey)
+		}
+	}
+}
+
 // 同一个网关被多个区域落到时，每个区域请求过的出口都要进 ReachableExits：
 // 那张表的用途是「下次想回到这个网关该怎么请求」。
 func TestRepeatLandingsAccumulateExits(t *testing.T) {
