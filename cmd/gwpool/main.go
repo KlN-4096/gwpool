@@ -79,6 +79,7 @@ func run(path string, log *slog.Logger) error {
 		Log:  log,
 	})
 	queue := newDiscoveryQueue(&scan.Scanner{Mint: minter, Store: st, Log: log}, pool, log)
+	mintAll := sched.NewMintAllQueue(pool)
 
 	api, err := httpapi.New(pool, st, queue, httpapi.Options{
 		ConsumerKey: cfg.ConsumerKey.Reveal(),
@@ -88,6 +89,7 @@ func run(path string, log *slog.Logger) error {
 		// 接了 Live 之后页面现读它，这个只是启动时那一份兜底（见 Server.publicBaseURL）。
 		PublicBaseURL: cfg.PublicBaseURL,
 		Live:          live,
+		MintAll:       mintAll,
 		ProxyStates:   minter.ProxyStates,
 		// 管理页加出口、停用出口：运行中只往末尾加、只改启用标志，sid 绑的下标不会挪。
 		AddProxy:        minter.AddProxy,
@@ -114,7 +116,8 @@ func run(path string, log *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go pool.Run(ctx) // ModeSingle 时立刻返回：单账号模式绝不保温
+	go pool.Run(ctx)    // ModeSingle 时立刻返回：单账号模式绝不保温
+	go mintAll.Run(ctx) // 仅管理员主动入队后才铸票。
 	go queue.run(ctx)
 	go live.Watch(ctx, 0, log)   // 配置文件变了就热重载
 	go refreshLoop(ctx, st, log) // access_token 只活约九天，有 refresh 的号自己续

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/url"
 
+	"gwpool/internal/sched"
 	"gwpool/internal/types"
 )
 
@@ -351,6 +352,11 @@ type sampleRow struct {
 type adminView struct {
 	// Config 是「能改的旋钮」那一节。
 	Config configView
+
+	MintAllAvailable bool
+	MintAll          sched.MintAllStatus
+	MintAllStarted   string
+	MintAllFinished  string
 
 	base
 	Proxies  []proxyRow

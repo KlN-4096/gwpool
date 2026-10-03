@@ -38,6 +38,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 // 保温成本 = 每网关每 65 分钟一发 ping；烧掉的是**扫描账号**的窗口，
 // 消费账号的首次接触不受影响，这正是多账号模式成立的前提。
 func (s *Scheduler) warmOnce(ctx context.Context) {
+	s.backgroundMu.Lock()
+	defer s.backgroundMu.Unlock()
 	// 无需求不扫不续：静默够久就让 pair 自然过期，成本归零（SPEC 第 7 节）。
 	// 更要紧的是速率纪律——没人要还一直续，比业务消耗得更快。
 	if s.idle() {

@@ -45,29 +45,39 @@ func refreshLoop(ctx context.Context, st *store.Store, log *slog.Logger) {
 func refreshDue(ctx context.Context, st *store.Store, log *slog.Logger) {
 	deadline := time.Now().Add(refreshLead)
 	for _, a := range st.Accounts() {
-		if a.Creds.RefreshToken == "" || a.Creds.AccessToken == "" {
-			continue
+		if ctx.Err() != nil {
+			return
 		}
-		cl, err := oauth.Parse(a.Creds.AccessToken)
-		if err != nil {
-			log.Warn("账号的 access_token 读不出声明，跳过续票", "account", a.ID, "err", err)
-			continue
-		}
-		// 零值 = 票里没写 exp。不猜，当它还能用——猜错的代价是每小时白换一次票。
-		if cl.Expires.IsZero() || cl.Expires.After(deadline) {
-			continue
-		}
-		access, refresh, err := oauth.Refresh(ctx, nil, a.Creds.RefreshToken)
-		if err != nil {
-			// 不在这里停用：换票失败可能只是上游抖了一下，下个小时还会再试。
-			// 真的废了的话，第一次打上游就会回 401，那条路会停用它。
-			log.Warn("续票失败", "account", a.ID, "expires", cl.Expires, "err", err)
-			continue
-		}
-		if err := st.SetTokens(a.ID, access, refresh); err != nil {
-			log.Error("续票写回失败", "account", a.ID, "err", err)
-			continue
-		}
-		log.Info("续了票", "account", a.ID, "原到期", cl.Expires, "轮换了refresh", refresh != "")
+		refreshAccount(ctx, st, log, a.ID, deadline)
 	}
+}
+
+func refreshAccount(ctx context.Context, st *store.Store, log *slog.Logger, id int64, deadline time.Time) {
+	// 与铸票共用账号锁：不能在旧 token 的请求飞行中换 token，再让迟到的 401 停掉新凭据。
+	unlock := st.LockAccount(id)
+	defer unlock()
+	a, ok := st.Account(id)
+	if !ok || ctx.Err() != nil || a.Creds.RefreshToken == "" || a.Creds.AccessToken == "" {
+		return
+	}
+	cl, err := oauth.Parse(a.Creds.AccessToken)
+	if err != nil {
+		log.Warn("账号的 access_token 读不出声明，跳过续票", "account", a.ID, "err", err)
+		return
+	}
+	// 零值 = 票里没写 exp。不猜，当它还能用。
+	if cl.Expires.IsZero() || cl.Expires.After(deadline) {
+		return
+	}
+	access, refresh, err := oauth.Refresh(ctx, nil, a.Creds.RefreshToken)
+	if err != nil {
+		// 换票失败可能只是上游抖动，不在这里停用，下个小时重试。
+		log.Warn("续票失败", "account", a.ID, "expires", cl.Expires, "err", err)
+		return
+	}
+	if err := st.SetTokens(a.ID, access, refresh); err != nil {
+		log.Error("续票写回失败", "account", a.ID, "err", err)
+		return
+	}
+	log.Info("续了票", "account", a.ID, "原到期", cl.Expires, "轮换了refresh", refresh != "")
 }

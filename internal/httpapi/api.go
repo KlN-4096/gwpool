@@ -131,6 +131,11 @@ type Scanner interface {
 	EnqueueDiscovery(exclude int64) string
 }
 
+type MintAllQueue interface {
+	Enqueue() sched.MintAllStatus
+	Status() sched.MintAllStatus
+}
+
 // Options 是服务端参数。两个 key 为空时对应路由**全拒**，不是全放。
 type Options struct {
 	// ConsumerKey 有两个身份：管理员兜底凭证，以及**每账号 key 的派生密钥**。
@@ -158,6 +163,9 @@ type Options struct {
 
 	// Live 非 nil 时管理页可以改配置并热重载；为空则那一节只读（测试走这条路）。
 	Live *config.Live
+
+	// 管理员全量打票；未接入时页面不展示可执行按钮。
+	MintAll MintAllQueue
 
 	// Model 是铸票那一发用的模型，照 config.Model 传进来。
 	// 上传者视图要向托管者如实交代用了他的凭据打什么，所以不能写死。
@@ -269,6 +277,7 @@ func (s *Server) Handler() http.Handler {
 	// 这个 realm 的凭据，**跨站请求照样会自动带上**——和 cookie 一样是「环境凭证」。
 	// 不罩的话一个第三方页面就能让管理员的浏览器替他删号或改配置。
 	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
+	mux.Handle("POST /admin/mint-all", s.sameOrigin(http.HandlerFunc(s.handleAdminMintAll)))
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
 	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
@@ -1873,6 +1882,16 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode()}}
+	if s.opt.MintAll != nil {
+		v.MintAllAvailable = true
+		v.MintAll = s.opt.MintAll.Status()
+		if !v.MintAll.Started.IsZero() {
+			v.MintAllStarted = v.MintAll.Started.UTC().Format(time.DateTime)
+		}
+		if !v.MintAll.Finished.IsZero() {
+			v.MintAllFinished = v.MintAll.Finished.UTC().Format(time.DateTime)
+		}
+	}
 	v.Config = buildConfigView(s.opt.Live,
 		r.URL.Query().Get("cfg_note"), r.URL.Query().Get("cfg_err"))
 	v.Rescan = sanitizeLabel(r.URL.Query().Get("rescan"), "")

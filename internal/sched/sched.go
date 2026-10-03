@@ -272,8 +272,9 @@ type Scheduler struct {
 	mint Minter
 	opt  Options
 
-	mu      sync.Mutex
-	backoff map[string]time.Duration // 槽位 → 当前指数退避时长；成功归零
+	backgroundMu sync.Mutex // 自动保温与管理员全量队列共享后台并发预算。
+	mu           sync.Mutex
+	backoff      map[string]time.Duration // 槽位 → 当前指数退避时长；成功归零
 	// lastMintedAt 记每个账号最近一次被用作铸票者，用来把铸票摊到各个号上。
 	// 不落盘：重启后重新摊平没有坏处，而落盘就多一份要维护的状态。
 	// 「总共铸过几发」刻意**不**自己记：那个读数在 mint 的速率窗口里，

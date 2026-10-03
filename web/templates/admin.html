@@ -18,6 +18,44 @@
 </nav>
 
 <section id="tab-overview">
+  {{if .MintAllAvailable}}
+  <div class="card">
+    <header class="card-head"><div><h2>全量打票</h2>
+      <p>为所有启用且有凭据的账号，在每个可铸票区域各打一张，不受当前目标深度限制。优先借同区活 <code>__cflb</code>，没有种子时走住宅；仍遵守单账号间隔与每小时配额。</p>
+      <p>会消耗真实上游额度。配额已满的组合跳过并记原因；短暂的账号间隔会等待。重复提交不会叠加当前批次，服务重启后本轮队列清空。</p>
+    </div></header>
+    <div class="card-body">
+      <form method="post" action="/admin/mint-all">
+        <div class="actions">
+          <button type="submit" class="primary" {{if .MintAll.Active}}disabled{{end}}>{{if .MintAll.Active}}全量打票进行中{{else}}全量打票{{end}}</button>
+          <a href="/admin/#overview">刷新进度</a>
+        </div>
+      </form>
+      {{if .MintAllStarted}}
+      <p>本轮共 {{.MintAll.Total}} 个组合 · 排队 {{.MintAll.Queued}} · 执行中 {{.MintAll.Running}} · 成功 {{.MintAll.Succeeded}} · 失败 {{.MintAll.Failed}} · 跳过 {{.MintAll.Skipped}}</p>
+      <p class="muted">开始 {{.MintAllStarted}} UTC{{if .MintAllFinished}} · 结束 {{.MintAllFinished}} UTC{{end}}</p>
+      {{range $reason, $n := .MintAll.SkipReasons}}<p class="muted">跳过 {{$n}} 个：{{$reason}}</p>{{end}}
+      {{else}}<p class="muted">尚未执行全量打票。</p>{{end}}
+      {{if .MintAll.Problems}}
+      <details><summary>本轮跳过/失败明细（最多保留前 200 条，共 {{.MintAll.Skipped}} 个跳过、{{.MintAll.Failed}} 个失败）</summary>
+        <div class="table-wrap"><table>
+          <thead><tr><th>账号 ID</th><th>区域</th><th>原因</th></tr></thead>
+          <tbody>{{range .MintAll.Problems}}<tr><td>{{.AccountID}}</td><td>{{.Region}}</td><td>{{.Reason}}</td></tr>{{end}}</tbody>
+        </table></div>
+      </details>
+      {{end}}
+    </div>
+    {{if .MintAll.Recent}}
+    <div class="table-wrap"><table>
+      <thead><tr><th>账号 ID</th><th>区域</th><th>实际网关</th><th>结果</th></tr></thead>
+      <tbody>{{range .MintAll.Recent}}<tr>
+        <td>{{.AccountID}}</td><td>{{.Region}}</td><td>{{if .Gateway}}{{.Gateway}}{{else}}—{{end}}</td>
+        <td>{{if eq .Status "succeeded"}}<span class="badge ok">成功</span>{{else if eq .Status "failed"}}<span class="badge bad">失败</span>{{else}}<span class="badge warn">跳过</span>{{end}} {{.Reason}}</td>
+      </tr>{{end}}</tbody>
+    </table></div>
+    {{end}}
+  </div>
+  {{end}}
   <div class="kpis wide">
     <a class="kpi" href="#proxies"><b>{{len .Proxies}}</b><span>出口代理</span><small>系统访问上游时使用的代理出口</small><small class="facets" data-facets-of="t-proxies"></small></a>
     <a class="kpi" href="#owners"><b>{{len .Owners}}</b><span>上传者</span><small>每人名下可以挂好几份凭据</small></a>
