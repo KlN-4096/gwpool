@@ -16,6 +16,22 @@ func renewOn(s *Scheduler) {
 	s.opt.Live = config.NewLive("", c)
 }
 
+// duePair 造一张「该续了」的票：路由 5 分钟后到点（低于 renewPairLead），
+// 而 `__cflb` 还长 —— 它既是续票的目标，也是自己大区里的捐赠者。
+//
+// 两个死期**必须分开给**：实现只认同大区还活着的 `__cflb`，而不是这张票自己带的那张
+// （第一版送自己那张，线上 12 发漂 10 发，见 pairsDueForRenew 的注释）。
+// 两个都写成 5 分钟的话这些用例全都测不到东西。
+func duePair(st *fakeStore, clk *clock, gw string, mintedBy int64, region string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.gws[gw] = types.Gateway{Name: gw, ReachableExits: []types.Exit{{Region: "BR"}}}
+	st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
+		ExpiresAt:     clk.now().Add(5 * time.Minute),
+		CflbExpiresAt: clk.now().Add(50 * time.Minute),
+		MintedBy:      mintedBy, RegionKey: region}
+}
+
 // 续票必须拿**铸出这张票的那个号**去打。
 //
 // 网关 =(大区 × 账号)，而 `__cflb` 只钉大区 ⇒ 换个号去打，落点是那个号在这个大区的网关，
@@ -30,12 +46,7 @@ func TestRenewUsesThePairsOwnMinter(t *testing.T) {
 	landBare(mn, "unified-9")
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	renewOn(s)
-
-	st.gws["unified-9"] = types.Gateway{Name: "unified-9",
-		ReachableExits: []types.Exit{{Region: "BR"}}}
-	// 2 号铸出来的票，还剩 5 分钟（低于 renewPairLead）。
-	st.pairs["unified-9"] = types.Pair{Gateway: "unified-9", Cookie: "__cflb=lb-9",
-		MintedBy: 2, ExpiresAt: clk.now().Add(5 * time.Minute)}
+	duePair(st, clk, "unified-9", 2, "south-america") // 2 号铸出来的
 
 	s.renewExpiring(context.Background())
 
@@ -57,15 +68,64 @@ func TestRenewSkipsPairsWhoseMinterIsGone(t *testing.T) {
 	landBare(mn, "unified-9")
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	renewOn(s)
-
-	st.gws["unified-9"] = types.Gateway{Name: "unified-9",
-		ReachableExits: []types.Exit{{Region: "BR"}}}
-	st.pairs["unified-9"] = types.Pair{Gateway: "unified-9", Cookie: "__cflb=lb-9",
-		MintedBy: 77, ExpiresAt: clk.now().Add(5 * time.Minute)} // 77 号不存在
+	duePair(st, clk, "unified-9", 77, "south-america") // 77 号不存在
 
 	s.renewExpiring(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("来源号没了还续了 %d 发", n)
+	}
+}
+
+// 送出去的 `__cflb` 必须是**同大区还活着的**那张，不是这张票自己带的那张。
+//
+// 线上现象（12 发漂 10 发）的根因：ExpiresAt = min(route, cflb)，而 106 张票里 route
+// 和 cflb 的死期逐秒相等 ⇒「快到点」就等于「cflb 快死了」，送一张死 cflb 钉不住大区、
+// 落点退回随机。借不到活的捐赠者就**一发都不打**，烧的是真实上游额度。
+func TestRenewNeedsALivingCflbDonor(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	landBare(mn, "unified-9")
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
+	renewOn(s)
+	duePair(st, clk, "unified-9", 2, "south-america")
+	// 把 cflb 的死期压到和路由同一刻（线上那 106 张的样子）⇒ 整个大区没有活捐赠者。
+	st.mu.Lock()
+	p := st.pairs["unified-9"]
+	p.CflbExpiresAt = p.ExpiresAt
+	st.pairs["unified-9"] = p
+	st.mu.Unlock()
+
+	s.renewExpiring(context.Background())
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("没有活捐赠者还打了 %d 发（必漂，纯烧额度）", n)
+	}
+
+	// 同大区来一张 cflb 还长的票：捐赠者有了，这一发该打出去。
+	duePair(st, clk, "unified-8", 1, "south-america")
+	s.renewExpiring(context.Background())
+	if n := len(mn.mintedGateways()); n == 0 {
+		t.Fatal("有活捐赠者却一发都没打")
+	}
+}
+
+// 大区为空的老记录续不了：借不到捐赠者（b6c1987 之前发现铸票留下的那批）。
+func TestRenewSkipsPairsWithNoRegion(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	landBare(mn, "unified-9")
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
+	renewOn(s)
+	duePair(st, clk, "unified-9", 2, "")
+
+	s.renewExpiring(context.Background())
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("没大区的老记录续了 %d 发", n)
 	}
 }
 
@@ -78,11 +138,8 @@ func TestRenewOrdersRareGatewaysFirst(t *testing.T) {
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	renewOn(s)
 
-	for _, n := range []string{"unified-rare", "unified-common"} {
-		st.gws[n] = types.Gateway{Name: n, ReachableExits: []types.Exit{{Region: "BR"}}}
-		st.pairs[n] = types.Pair{Gateway: n, Cookie: "__cflb=lb", MintedBy: 1,
-			ExpiresAt: clk.now().Add(5 * time.Minute)}
-	}
+	duePair(st, clk, "unified-rare", 1, "south-america")
+	duePair(st, clk, "unified-common", 1, "us-east")
 	// common 三个号落到过，rare 只有一个。
 	if err := st.NoteRegionMint(1, "south-america", "unified-rare", clk.now()); err != nil {
 		t.Fatal(err)
@@ -113,11 +170,7 @@ func TestRenewIsOffByDefault(t *testing.T) {
 	addAccount(st, 1, "acct-1")
 	landBare(mn, "unified-9")
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
-
-	st.gws["unified-9"] = types.Gateway{Name: "unified-9",
-		ReachableExits: []types.Exit{{Region: "BR"}}}
-	st.pairs["unified-9"] = types.Pair{Gateway: "unified-9", Cookie: "__cflb=lb-9",
-		MintedBy: 1, ExpiresAt: clk.now().Add(5 * time.Minute)}
+	duePair(st, clk, "unified-9", 1, "south-america")
 
 	s.renewExpiring(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
@@ -134,14 +187,34 @@ func TestRenewLeavesHealthyPairsAlone(t *testing.T) {
 	landBare(mn, "unified-9")
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	renewOn(s)
-
-	st.gws["unified-9"] = types.Gateway{Name: "unified-9",
-		ReachableExits: []types.Exit{{Region: "BR"}}}
-	st.pairs["unified-9"] = types.Pair{Gateway: "unified-9", Cookie: "__cflb=lb-9",
-		MintedBy: 1, ExpiresAt: clk.now().Add(renewPairLead + time.Minute)}
+	duePair(st, clk, "unified-9", 1, "south-america")
+	st.mu.Lock()
+	p := st.pairs["unified-9"]
+	p.ExpiresAt = clk.now().Add(renewPairLead + time.Minute)
+	st.pairs["unified-9"] = p
+	st.mu.Unlock()
 
 	s.renewExpiring(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("寿命还够却续了 %d 发", n)
+	}
+}
+
+// 没配种子出口就一发都不续：续票必须只送 `__cflb`，而摘 `__oailb` 只发生在种子那条路上。
+func TestRenewRequiresASeedExit(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	mn.seedSIDErr = types.ErrNoExit
+	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	landBare(mn, "unified-9")
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
+	renewOn(s)
+	duePair(st, clk, "unified-9", 2, "south-america")
+
+	s.renewExpiring(context.Background())
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("没有种子出口却打了 %d 发（送两件上游一个 cookie 都不回）", n)
 	}
 }

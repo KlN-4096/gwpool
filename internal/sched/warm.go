@@ -131,7 +131,7 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		// 锁序恒为「先网关、再账号」，和交付那边一致 ⇒ 不存在 ABBA。
 		relGW := s.lockGateway(t.gateway)
 		unlock := s.st.LockAccount(t.acct.ID)
-		sid, seeded, err := s.renewSID()
+		sid, err := s.renewSID()
 		var got minted
 		if err == nil {
 			// want 和 bias 都填这个网关：这是一发**定向**铸票，落点漂了要被当成漂移处理
@@ -144,7 +144,7 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		case err == nil:
 			done++
 			s.opt.Log.Info("续票", "gateway", t.gateway, "account", t.acct.ID,
-				"reach", t.reach, "seeded", seeded, "landed", got.pair.Gateway)
+				"reach", t.reach, "landed", got.pair.Gateway)
 		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
 			// 整池同病，接着试只是把同一句话重复 N 遍。
 			s.opt.Log.Warn("续票撞上闸门，本轮停", "gateway", t.gateway, "reason", err)
@@ -158,19 +158,27 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 	s.opt.Log.Info("续票一轮结束", "due", len(due), "done", done, "throttled", skipped)
 }
 
-// renewSID 要一条出口。优先种子出口（便宜机房）：续票的路由是 `__cflb` 定的，
-// 出口 IP 无所谓，没必要烧住宅流量。没配就回落住宅。
-func (s *Scheduler) renewSID() (string, bool, error) {
-	if sid, err := s.mint.NewSeedSID(); err == nil {
-		return sid, true, nil
-	}
-	sid, err := s.mint.NewSID(true)
-	return sid, false, err
+// renewSID 只走种子出口（便宜机房），**没配就不续**。
+//
+// 不回落住宅不是为了省流量，是因为续票必须**只送 `__cflb`**：两件齐送上游一个 cookie
+// 都不回（10-02 实测）⇒ 落点读不出来，这一发白打。摘 `__oailb` 这个动作钉在
+// mint.Mint 的 SeedBound 分支里（见那儿的注释），走住宅那条就不摘 ——
+// 而等着续的票手上那个 `__oailb` 多半已经死了，送出去纯粹是毒。
+func (s *Scheduler) renewSID() (string, error) {
+	return s.mint.NewSeedSID()
 }
 
 // pairsDueForRenew 列出该续的票，难到的排前面。
+//
+// **送出去的 `__cflb` 必须是同大区还活着的那张，不是这张票自己带的那张。**
+// 第一版送自己那张，实测 12 发漂 10 发 —— 因为 ExpiresAt = min(route, cflb)，而线上
+// 106 张票里 route 和 cflb 的死期**逐秒相等**（cflb 才是短的那件）⇒「快到点」等价于
+// 「cflb 快死了」，送一张死的 cflb 钉不住任何大区，落点退回随机。
+// 换成同大区最长寿的那张：cflb 钉大区、来源账号钉大区里的那一个 ⇒ 落点就是手上这张。
 func (s *Scheduler) pairsDueForRenew() []renewTarget {
 	now := s.now()
+	// 捐赠者池子：按大区挑最长寿的 `__cflb`（换盆用的同一份）。
+	best := s.bestCflb()
 	// 台账里每个网关被几个**不同的号**落到过。只数「上次落点」是因为台账就只记这个
 	// （types.RegionMint.Gateway），它是现有数据里离「这个网关好不好摸」最近的量。
 	reach := map[string]map[int64]bool{}
@@ -194,6 +202,18 @@ func (s *Scheduler) pairsDueForRenew() []renewTarget {
 		if !ok {
 			continue
 		}
+		// 借一张同大区还活着的 `__cflb`（见函数头）。大区为空的老记录借不到 ——
+		// 那是 b6c1987 之前发现铸票留下的，续不了，等它自然过期。
+		// 门槛沿用 seedCflbFloor：剩不到 10 分钟的捐赠者铸出来的票生下来就发不出去。
+		donor, ok := best[p.RegionKey]
+		if !ok || donor.Exp.Sub(now) < seedCflbFloor {
+			continue
+		}
+		swapped := mint.SwapCflb(p.Cookie, donor.Cflb)
+		if swapped == p.Cookie && mint.CflbOf(p.Cookie) != donor.Cflb {
+			continue // 这张票连 __oailb 都没有，SwapCflb 换不动
+		}
+		p.Cookie, p.CflbExpiresAt = swapped, donor.Exp
 		exit, ok := pickExit(gw)
 		if !ok {
 			continue
