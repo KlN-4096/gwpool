@@ -33,6 +33,9 @@ func (stubMinter) NewSID(bool) (string, error) { return "sid", nil }
 
 func (stubMinter) NewSeedSID() (string, error) { return "", errors.New("没配种子出口") }
 
+// 没配种子出口 ⇒ 任何 sid 都不可能绑在它上面。
+func (stubMinter) SeedBound(string) bool { return false }
+
 func (stubMinter) Rate(string) (map[string]int, int) { return map[string]int{}, 6 }
 
 func newTestQueue(t *testing.T, st *store.Store) *discoveryQueue {

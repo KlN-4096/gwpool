@@ -556,6 +556,12 @@ func (m *fakeMinter) NewSeedSID() (string, error) {
 	return fmt.Sprintf("seed%05d", m.sidSeq), nil
 }
 
+// SeedBound 照真实 mint 的语义：问绑定表「这个 sid 走的是不是种子出口」。
+// 假 minter 把这件事编码进了 sid 前缀（见 NewSeedSID），所以这里按前缀答。
+func (m *fakeMinter) SeedBound(sid string) bool {
+	return strings.HasPrefix(sid, "seed")
+}
+
 func (m *fakeMinter) Geo(ctx context.Context, e types.Exit, sid string) (types.Observed, error) {
 	m.mu.Lock()
 	country := m.geoCountry
@@ -2596,6 +2602,53 @@ func TestGatewaysFromMatchesTheWholeExitNotJustTheCountry(t *testing.T) {
 		sort.Strings(got)
 		if !slices.Equal(got, tc.want) {
 			t.Fatalf("%s: 得到 %v，要 %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// 种子铸票的「出口国家不符」是常态，**不许**连大区台账一起吞掉。
+//
+// 种子按构造就是从便宜机房出去、靠 `__cflb` 把路由钉到目标大区 ⇒ 观测到的国家必然是
+// 机房那个，九个大区里八个都对不上。两本账的问题不一样：
+//   - ReachableExits 问「从哪个**出口 IP** 能摸到这个网关」——种子什么都没证明，照旧不记
+//   - (账号 × 大区) 台账问「这个号在这个大区落到过哪」——种子正好证明了（cflb 钉大区、
+//     网关 =(大区 × 账号)）
+//
+// 现场代价（2026-10-03 一小时）：360 发裸铸里 264 发被这道闸吞掉台账 ⇒ premintPick 的
+// 落点预测学不到东西、盲挑 ⇒ 293 发落回已有活票的网关 = 81% 白打。
+func TestSeededMintStillChargesTheRegionDespiteCountryMismatch(t *testing.T) {
+	clk := newClock()
+	st := newStore(clk)
+	mn := newMinter(clk)
+	addAccount(st, 1, "acct-1")
+	// 要巴西，而种子出口在新加坡（便宜机房固定一个国家）。
+	mn.geoCountry = "SG"
+	landBare(mn, "unified-9")
+	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
+
+	acct, _ := s.account(1)
+	// sid 前缀 seed ⇒ fakeMinter.SeedBound 回 true，和真实 mint 查绑定表同口径。
+	seed := types.Pair{Gateway: "unified-3", Cookie: "__cflb=seed-lb"}
+	got, err := s.mintOnce(context.Background(), acct, types.Exit{Region: "BR"}, "seed00001",
+		seed, "", "")
+	if err != nil {
+		t.Fatalf("种子铸票不该失败: %v", err)
+	}
+	if got.pair.Gateway != "unified-9" {
+		t.Fatalf("落点不对: %+v", got.pair)
+	}
+	// 出口仍然不记：路由是 cookie 定的，这一发没证明「从新加坡的 IP 能摸到它」。
+	if ex := st.gws["unified-9"].ReachableExits; len(ex) != 0 {
+		t.Fatalf("种子铸票把机房出口记成了「可达出口」: %+v", ex)
+	}
+	// 台账必须记 —— 这是修这个 bug 的全部意义。
+	ms := st.RegionMints()
+	if len(ms) != 1 {
+		t.Fatalf("种子铸票该记一笔大区台账，得到 %+v", ms)
+	}
+	for _, m := range ms {
+		if m.RegionKey != "south-america" || m.AccountID != 1 || m.Gateway != "unified-9" {
+			t.Fatalf("台账那一笔不对: %+v", m)
 		}
 	}
 }

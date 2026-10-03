@@ -254,13 +254,13 @@ func (c *Client) NewSeedSID() (string, error) {
 	return "", fmt.Errorf("%w（没有启用着的 kind=%q 出口）", ErrNoProxy, config.KindSeed)
 }
 
-// seedBound 报这个 sid 是不是绑在种子出口上。
+// SeedBound 报这个 sid 是不是绑在种子出口上。
 //
 // 直接查绑定表、**不走 resolve**：resolve 对没绑过的 sid 会顺手挑一条绑上，而这里
 // 只是问一句「要不要摘 __oailb」，不该有副作用——那会让一个还没出手的 sid 被钉在
 // 轮询游标当时指着的那条出口上。下标越界的判法照抄 resolve 里那一句（配置热加过
 // 代理时旧绑定可能指向已经不存在的下标）。
-func (c *Client) seedBound(sid string) bool {
+func (c *Client) SeedBound(sid string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b, ok := c.sids[sid]
@@ -339,7 +339,7 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 	// 违反它不报错，只会静默白打一发（两件齐送上游一个 cookie 都不回 ⇒ 落点读不出
 	// ⇒ 这条路唯一想要的那个读数没了），这种错误没人会发现。
 	cookie := sentPair
-	if c.seedBound(sid) {
+	if c.SeedBound(sid) {
 		cookie = CflbOnly(sentPair)
 	}
 	body, header := buildWire(c.fingerprint(), c.model(), cr, cookie, "")

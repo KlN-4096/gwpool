@@ -99,6 +99,14 @@ type Minter interface {
 	// 没配这条出口就回错，调用方据此回落到住宅出口。
 	NewSeedSID() (string, error)
 
+	// SeedBound 报这个 sid 是不是绑在种子出口上。
+	//
+	// mintOnce 要它来分辨「出口国家不符」是真漂移还是种子铸票的常态：种子按构造就是
+	// 从便宜机房出去、靠 `__cflb` 把路由钉到目标大区 ⇒ 观测到的国家必然不是目标大区。
+	// **问绑定表而不是看调用方传了什么**：`cur` 这个参数在定向铸票那条路上也非空
+	// （带着现有 pair 回去），拿它当种子判据会把定向铸票误判成种子。
+	SeedBound(sid string) bool
+
 	// Rate 报这个上游账号本小时**各区域**各打了几发，以及每区的上限。
 	// 挑铸票者要据此跳过「九个区域全打满」的号——不先问一声的话，
 	// 那一发会一路走到速率闸才被拒，而那时候要票的人已经等了一个往返。
@@ -1414,11 +1422,27 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	//
 	// obs 查不到地理时 Country 是空串 ⇒ 不判，照旧按请求的出口记：那是没有观测，
 	// 不是观测到不符。
+	// 种子铸票的「出口国家不符」是**常态不是漂移**：它故意从便宜机房出去，靠 `__cflb`
+	// 把路由钉到目标大区（见 warm.premintSID）⇒ 观测到的国家必然是机房那个，九个大区里
+	// 八个都对不上。两本账要拆开看：
+	//
+	//   - ReachableExits 问的是「从哪个**出口 IP** 能摸到这个网关」—— 种子什么都没证明
+	//     （路由是 cookie 定的，不是 IP 定的），照旧不记。
+	//   - (账号 × 大区) 台账问的是「这个号在这个大区落到过哪」—— 种子正好证明了这件事：
+	//     `__cflb` 钉大区、网关 =(大区 × 账号)，拿到落点就说明这个号在那个大区落在这儿。
+	//
+	// 不拆开的后果是实测出来的（2026-10-03 一小时：360 发裸铸里 264 发被这道闸吞掉台账，
+	// 于是 premintPick 的落点预测学不到东西、盲挑，293 发落回已有活票的网关 = 81% 白打）。
+	seeded := s.mint.SeedBound(sid)
 	reached := e
 	if obs.Country != "" && obs.Country != e.Region {
 		reached = types.Exit{}
-		s.opt.Log.Info("出口国家不符，这一发不记可达出口、不记大区台账",
-			"account", a.ID, "want", e.Region, "got", obs.Country, "gateway", res.Gateway)
+		if !seeded {
+			// 种子那条不打这行：它每轮都成立，打出来是 264 行/小时的噪声，
+			// 而且「不符」这个词对它是误导。
+			s.opt.Log.Info("出口国家不符，这一发不记可达出口、不记大区台账",
+				"account", a.ID, "want", e.Region, "got", obs.Country, "gateway", res.Gateway)
+		}
 	}
 	// 落点入网关表。裸铸（预铸、发现）**必须**有这一步：Gateways() 是候选清单的
 	// 唯一来源，不在表上的网关哪怕有票也永远不会被挑中。定向铸票走到这儿是幂等的，
@@ -1430,7 +1454,8 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	// 以及「再派这个组合会落到哪」全靠它。
 	//
 	// 区域 key 一定非空：pickExit 只给九个大区的代表出口，裸铸和扫描直接用 types.Regions。
-	if reached != (types.Exit{}) {
+	// 种子铸票照记（见上面那段）：它的出口国家对不上是常态，但大区是 `__cflb` 钉死的。
+	if seeded || reached != (types.Exit{}) {
 		if err := s.st.NoteRegionMint(a.ID, types.RegionKeyOf(e), res.Gateway, at); err != nil {
 			s.opt.Log.Warn("记区域台账失败", "account", a.ID, "err", err)
 		}
