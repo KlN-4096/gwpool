@@ -2,12 +2,60 @@ package sched
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"gwpool/internal/config"
 	"gwpool/internal/coverage"
 	"gwpool/internal/types"
 )
+
+type explorationBindingFailure struct {
+	*fakeMinter
+	seen []string
+}
+
+func (m *explorationBindingFailure) NewSIDFor(exit types.Exit, _ bool) (string, error) {
+	m.seen = append(m.seen, exitKey(exit))
+	return "", types.ErrNoExit
+}
+
+func TestExploreRotatesGlobalCountriesEvenWhenEveryAttemptFails(t *testing.T) {
+	for _, bindingFailure := range []bool{false, true} {
+		t.Run(map[bool]string{false: "mint-failure", true: "binding-failure"}[bindingFailure], func(t *testing.T) {
+			s, _, mn, clk := rig(t, types.ModePool)
+			cfg, err := config.GlobalCountryRegions(config.Defaults())
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.opt.Live = config.NewLive("", cfg)
+			mn.mintErr = errors.New("offline country inventory unavailable")
+			binding := &explorationBindingFailure{fakeMinter: mn}
+			if bindingFailure {
+				s.mint = binding
+			}
+			for range len(cfg.Regions) {
+				s.exploreNewGateway(context.Background())
+				// New budget window must not restart country choice from the front.
+				clk.add(time.Hour)
+			}
+			seen := map[string]bool{}
+			if bindingFailure {
+				for _, region := range binding.seen {
+					seen[region] = true
+				}
+			} else {
+				for _, shot := range mn.mints {
+					seen[shot.RegionKey] = true
+				}
+			}
+			if len(seen) != len(cfg.Regions) {
+				t.Fatalf("only attempted %d/%d country exits; failures starved later candidates", len(seen), len(cfg.Regions))
+			}
+		})
+	}
+}
 
 func TestExploreWithFullInventoryPrefersIncompleteAndNeverExceedsOneShot(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModePool)

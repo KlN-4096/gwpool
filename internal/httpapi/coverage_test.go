@@ -91,12 +91,35 @@ func TestCoverageAdminAuthCSRFSizeAndRendering(t *testing.T) {
 	w := do(h, authed(httptest.NewRequest(http.MethodGet, "/admin/coverage?error=%3Cscript%3Ebad%3C%2Fscript%3E", nil), "akey"))
 	body := w.Body.String()
 	if w.Code != http.StatusOK || !strings.Contains(body, "201 个域名") ||
-		!strings.Contains(body, "范围未确认") || !strings.Contains(body, "新增实际探索出口") {
+		!strings.Contains(body, "范围未确认") || !strings.Contains(body, "新增实际探索出口") ||
+		!strings.Contains(body, `id="t-datacenter-coverage"`) || !strings.Contains(body, "San Antonio") ||
+		!strings.Contains(body, "加入全球国家候选（249") {
 		t.Fatalf("coverage page missing its core states: %d", w.Code)
 	}
 	if strings.Contains(body, "<script>bad") || strings.Contains(body, "p-secret") ||
 		strings.Contains(body, secretToken) || strings.Contains(body, "OAILB-SECRET") {
 		t.Fatal("coverage page leaked unsafe content")
+	}
+}
+
+func TestCoverageGlobalCountriesSaveOnceWithoutProbing(t *testing.T) {
+	h, srv, path, calls := proxyRig(t)
+	form := url.Values{"action": {"global-countries"}}
+	for range 2 {
+		w := coveragePost(h, form)
+		if w.Code != http.StatusSeeOther || !strings.Contains(w.Header().Get("Location"), "note=") {
+			t.Fatal("global countries rejected")
+		}
+	}
+	loaded, err := config.Load(path)
+	if err != nil || len(loaded.RegionDefinitions()) != 250 || len(srv.opt.Live.Get().RegionDefinitions()) != 250 {
+		t.Fatalf("global country definitions missing after reload: %v", err)
+	}
+	if len(calls.probed) != 0 || len(calls.added) != 0 {
+		t.Fatal("config expansion started proxy probes")
+	}
+	if !strings.Contains(fileText(t, path), "p-secret") {
+		t.Fatal("config expansion destroyed existing secrets")
 	}
 }
 

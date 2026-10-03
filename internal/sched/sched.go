@@ -273,11 +273,12 @@ type Scheduler struct {
 	mint Minter
 	opt  Options
 
-	backgroundMu     sync.Mutex // 自动保温与管理员全量队列共享后台并发预算。
-	maintenanceFirst bool       // backgroundMu 保护；交替优先，探索与续票互不长期挤掉机会。
-	mu               sync.Mutex
-	backoff          map[string]time.Duration // 槽位 → 当前指数退避时长；成功归零
-	workRetries      map[string]workRetry     // 按任务+账号+目标退避；不改变消费冷却。
+	backgroundMu        sync.Mutex // 自动保温与管理员全量队列共享后台并发预算。
+	maintenanceFirst    bool       // backgroundMu 保护；交替优先，探索与续票互不长期挤掉机会。
+	exploreRegionCursor int        // mu保护；按尝试轮转，不因失败或小时配额重置而回到首国。
+	mu                  sync.Mutex
+	backoff             map[string]time.Duration // 槽位 → 当前指数退避时长；成功归零
+	workRetries         map[string]workRetry     // 按任务+账号+目标退避；不改变消费冷却。
 	// lastMintedAt 记每个账号最近一次被用作铸票者，用来把铸票摊到各个号上。
 	// 不落盘：重启后重新摊平没有坏处，而落盘就多一份要维护的状态。
 	// 「总共铸过几发」刻意**不**自己记：那个读数在 mint 的速率窗口里，

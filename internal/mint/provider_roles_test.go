@@ -44,6 +44,17 @@ func TestDynamicSelectionNeverUsesStaticExit(t *testing.T) {
 	}
 }
 
+func TestCountrySelectionRespectsEachProviderDirectory(t *testing.T) {
+	c := &Client{Proxies: []config.Proxy{novProxy, wsProxy}}
+	sid, err := c.NewSIDFor(types.Exit{Region: "CN"}, true)
+	if err != nil || c.Provider(sid) != string(config.KindWebshare) {
+		t.Fatalf("CN should select Webshare, not the Novproxy catalogue: %v", err)
+	}
+	if _, err := (&Client{Proxies: []config.Proxy{novProxy}}).NewSIDFor(types.Exit{Region: "CN"}, true); err == nil {
+		t.Fatal("unsupported Novproxy country was silently sent")
+	}
+}
+
 func TestCapabilityUsesTheActualSIDLengthAtUsernameLimit(t *testing.T) {
 	p := novProxy
 	p.User = "base"

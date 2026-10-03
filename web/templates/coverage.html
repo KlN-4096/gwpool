@@ -4,11 +4,26 @@
   <p><a href="/admin/">← 管理后台</a></p>
   <p>先看是否发现过，再看现在能否交付。机房 IP 所在地不等于探索出口，不自动按地理归类。</p>
   <p>候选来源：2026-10-01 枚举 unified-1…220，{{.Snapshot.DNSCount}} 个域名当时可解析；这不是可铸票保证，也不是上游全集。</p>
-  <p>合并目录 {{len .Snapshot.Candidates}} 个 · 历史已发现 {{.Snapshot.Found}} 个 · 当前寿命可交付 {{.Snapshot.Ready}} 个 · 未分组 {{len .Snapshot.Unassigned}} 个</p>
+  <p>合并目录 {{len .Snapshot.Candidates}} 个 · 历史已发现 {{.Snapshot.Found}} 个 · 当前寿命可交付 {{.Snapshot.Ready}} 个 · 未设人工目标 {{len .Snapshot.Unassigned}} 个 · 已发现但机房归属未知 {{.Snapshot.UnknownDatacenters}} 个</p>
   {{if .Note}}<p class="badge ok">{{.Note}}</p>{{end}}
   {{if .Error}}<p class="badge bad">{{.Error}}</p>{{end}}
   {{if not .Writable}}<p>当前为只读展示，未接入可写配置文件。</p>{{end}}
 </div>
+
+<section class="card">
+  <header class="card-head"><div><h2>201 历史目录：机房区域覆盖</h2>
+    <p>按 2026-10-01 DNS/IP 表中的机房国家、城市分组。分母来自当时可解析的目录，不是永久不变的上游全集；发现途径不限出口。</p>
+    <p>“历史目录已齐”只表示此区域目录中的网关都曾被本池发现；票过期不会抹掉发现记录。机房区域不等于代理出口，不据此自动停用同名国家的探索。</p>
+  </div></header>
+  <div class="table-wrap"><table id="t-datacenter-coverage">
+    <thead><tr><th>机房国家</th><th>城市/区域</th><th>历史已发现 / 目录总数</th><th>当前有票可交付</th><th>目录状态</th><th>缺失网关</th></tr></thead>
+    <tbody>{{range .Snapshot.Datacenters}}<tr>
+      <td>{{.Country}}</td><td>{{.City}}</td><td>{{.Found}} / {{.Total}}</td><td>{{.Ready}}</td>
+      <td>{{if .Complete}}历史目录已齐{{else}}尚有缺失{{end}}</td>
+      <td>{{range .Missing}}<code>{{.}}</code> {{else}}无缺项{{end}}</td>
+    </tr>{{end}}</tbody>
+  </table></div>
+</section>
 
 <section class="card">
   <header class="card-head"><div><h2>覆盖目标</h2>
@@ -60,6 +75,13 @@
     <p>只选择支持目标的动态供应商：webshare 仅国家；novproxy 支持国家/城市 token；Cliproxy 支持国家/州；Ipipgo 支持国家/州/城市。城市不被静默忽略；实际地理未确认匹配时，仍保留发现的网关，但不把它记成该出口的覆盖或区域种子。</p>
   </div></header>
   <div class="card-body">
+  {{if .Writable}}
+    <form method="post" action="/admin/coverage">
+      <input type="hidden" name="action" value="global-countries">
+      <button type="submit">加入全球国家候选（{{.GlobalCountryCount}} 个目录代码）</button>
+      <p class="muted">追加缺失的国家级出口，已有出口及启停状态不变；重复操作不会增加重复定义。四家动态代理按定向能力共同承担，库存与专门探索在自然轮次轮流选择，不立即全扫、不提高总配额或并发。目录不保证各家此刻都有库存；落地不匹配不会算该出口发现。</p>
+    </form>
+  {{end}}
   {{range .Regions}}
     {{if $.Writable}}<form method="post" action="/admin/coverage">
       <input type="hidden" name="action" value="region"><input type="hidden" name="key" value="{{.Key}}">
@@ -88,7 +110,7 @@
   {{end}}
     <datalist id="cliproxy-countries">{{range .CliproxyCountries}}<option value="{{.Code}}">{{.Label}} / {{.Name}}</option>{{end}}</datalist>
     {{range .CliproxyCountries}}<datalist id="cliproxy-states-{{.Code}}">{{range .States}}<option value="{{.}}"></option>{{end}}</datalist>{{end}}
-    <p class="muted">补全来自本次提供的 Cliproxy 目录（204 个国家/地区，不含全球随机），不是启用清单或可达保证。州名不跨供应商推断；Ipipgo 请核对其<a href="https://www.ipipgo.com/zh-CN/countriesAndRegions" target="_blank" rel="noopener noreferrer">官方地区代码</a>。</p>
+    <p class="muted">全球候选合并了本次提供的 Webshare（249）、Novproxy（207）与 Cliproxy（{{len .CliproxyCountries}}）国家代码，共 {{.GlobalCountryCount}} 个去重国家/地区；不是所有供应商库存或可达保证。州补全来自 Cliproxy，不跨供应商推断；Ipipgo 请核对其<a href="https://www.ipipgo.com/zh-CN/countriesAndRegions" target="_blank" rel="noopener noreferrer">官方地区代码</a>。</p>
   </div>
 </section>
 
@@ -97,9 +119,9 @@
     <p>“历史发现”来自实际拿到的路由，不等于 DNS 可解析。“可交付”仅是有效票据寿命足够，仍可能受使用账号的冷却和配额限制。</p>
   </div></header>
   <div class="table-wrap"><table>
-    <thead><tr><th>候选网关</th><th>来源</th><th>状态</th><th>观察到的探索出口</th><th>人工目标分组</th></tr></thead>
+    <thead><tr><th>候选网关</th><th>历史机房区域</th><th>来源</th><th>状态</th><th>观察到的探索出口</th><th>人工目标分组</th></tr></thead>
     <tbody>{{range .Snapshot.Candidates}}<tr>
-      <td><code>{{.Name}}</code></td><td>{{if .InDNS}}10-01 DNS{{else}}后续发现/手填{{end}}</td>
+      <td><code>{{.Name}}</code></td><td>{{if .Country}}{{.Country}} · {{.City}}{{else}}未知{{end}}</td><td>{{if .InDNS}}10-01 DNS{{else}}后续发现/手填{{end}}</td>
       <td>{{if .Ready}}当前可交付{{else if .Found}}历史发现{{else}}未发现{{end}}</td>
       <td>{{range .ExitKeys}}<code>{{.}}</code> {{else}}未知{{end}}</td>
       <td>{{range .GroupNames}}{{.}} {{else}}未分组{{end}}</td>

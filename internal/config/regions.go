@@ -7,11 +7,12 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"gwpool/internal/proxycatalog"
 	"gwpool/internal/types"
 )
 
 const (
-	MaxExplorationRegions = 64
+	MaxExplorationRegions = 256
 	MaxCoverageTargets    = 512
 )
 
@@ -181,4 +182,40 @@ func ValidateRegionTransition(old, next Config) error {
 		}
 	}
 	return nil
+}
+
+// GlobalCountryRegions adds known provider-directory countries without duplicating
+// an existing country-only exit or changing its enabled state. It changes neither
+// the account's original total mint budget nor concurrent request limits.
+func GlobalCountryRegions(current Config) (Config, error) {
+	next := current
+	next.Regions = append([]ExplorationRegion(nil), current.RegionDefinitions()...)
+	next.CoverageGroups = append([]CoverageGroup{}, current.Groups()...)
+	countries, keys := map[string]bool{}, map[string]bool{}
+	for _, region := range next.Regions {
+		keys[region.Key] = true
+		if region.State == "" && region.City == "" {
+			countries[region.Country] = true
+		}
+	}
+	for _, country := range proxycatalog.GlobalCountries() {
+		if countries[country.Code] {
+			continue
+		}
+		key := "country-" + strings.ToLower(country.Code)
+		if keys[key] {
+			return Config{}, fmt.Errorf("全球候选ID %s 已被其它定义使用；未保存任何改动", key)
+		}
+		name := strings.TrimSpace(country.Label) + " (" + country.Code + ")"
+		next.Regions = append(next.Regions, ExplorationRegion{
+			Key: key, Name: name, Country: country.Code, Enabled: true,
+		})
+		// Leave unassigned coverage unknown, instead of manufacturing 249 empty
+		// target groups (and a quadratic group×exit editor).
+		countries[country.Code], keys[key] = true, true
+	}
+	if err := ValidateRegionTransition(current, next); err != nil {
+		return Config{}, err
+	}
+	return next, nil
 }

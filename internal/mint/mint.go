@@ -817,6 +817,9 @@ func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, erro
 	}
 	switch p.Kind {
 	case config.KindNovproxy:
+		if !proxycatalog.NovproxySupports(e.Region) {
+			return "", errors.New("novproxy 目录中没有此国家代码")
+		}
 		if e.State != "" || (e.City != "" && !isProxyToken(e.City)) {
 			return "", errors.New("novproxy 不支持州参数，城市必须使用面板的 ASCII token")
 		}
@@ -835,8 +838,8 @@ func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, erro
 		fmt.Fprintf(&b, "-sid-%s-t-%d", sid, mins)
 		return checkedProxyUser(b.String())
 	case config.KindWebshare:
-		if e.Region == "" {
-			return "", errors.New("webshare 必须指定国家")
+		if !proxycatalog.WebshareSupports(e.Region) {
+			return "", errors.New("webshare 必须指定目录中的国家代码")
 		}
 		if e.State != "" || e.City != "" {
 			return "", errors.New("webshare 只支持国家定向，不能指定州或城市")

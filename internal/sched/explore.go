@@ -15,48 +15,62 @@ func (s *Scheduler) exploreNewGateway(ctx context.Context) {
 	}
 	before := s.st.Gateways()
 	incomplete := coverage.IncompleteRegions(s.cfg(), before)
-	landed, tried := s.lastLandings(), map[string]bool{}
-	// 先找从未成功走过的账号×出口；都不可用才重新尝试已走过的未满区。
-	for _, onlyUnseen := range []bool{true, false} {
-		policy := &premintPolicy{skip: func(id int64, key string) bool {
-			combo := comboKey(id, key)
-			return !incomplete[key] || tried[combo] || s.workDeferred("explore|"+combo) || (onlyUnseen && landed[combo] != "")
-		}}
-		for try := 0; try < premintPickTries && ctx.Err() == nil; try++ {
-			account, region, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap, policy)
-			if !ok {
+	landed := s.lastLandings()
+	regions := s.dynamicRegions(types.Exit{})
+	for try := 0; try < len(regions) && try < premintPickTries && ctx.Err() == nil; try++ {
+		// Advance before binding/sending. Failed countries must not monopolize
+		// the original nine-region-sized total budget on every reset.
+		s.mu.Lock()
+		target := regions[s.exploreRegionCursor%len(regions)]
+		s.exploreRegionCursor = (s.exploreRegionCursor + 1) % len(regions)
+		s.mu.Unlock()
+		if !incomplete[target.Key] {
+			continue
+		}
+		var account types.Account
+		var region types.Region
+		var ok bool
+		// Within the next country's turn, prefer an unseen account combination.
+		for _, onlyUnseen := range []bool{true, false} {
+			policy := &premintPolicy{skip: func(id int64, key string) bool {
+				combo := comboKey(id, key)
+				return s.workDeferred("explore|"+combo) || (onlyUnseen && landed[combo] != "")
+			}}
+			account, region, ok = s.minterFor(target.Exit, 0, s.opt.RenewGap, policy)
+			if ok {
 				break
 			}
-			tried[comboKey(account.ID, region.Key)] = true
-			release, free := s.claimRegion(account.ID, region.Key)
-			if !free {
-				continue
-			}
-			if !s.claimAccount(account.ID, s.opt.RenewGap) {
-				release()
-				continue
-			}
-			// 专门探索必须经过配置的实际出口，不能借种子把路由钉回已知大区。
-			// 库存补铸/续票仍按原有种子策略；这一发用住宅/支持定向的粘性出口。
-			sid, err := s.mint.NewSIDFor(region.Exit, true)
-			if err != nil {
-				release()
-				return
-			}
-			unlock := s.st.LockAccount(account.ID)
-			got, err := s.mintOnceFor(ctx, account, region.Exit, sid, types.Pair{}, "", "", types.PurposeExplore)
-			unlock()
-			release()
-			isNew, gateway := false, ""
-			if err == nil {
-				gateway = got.pair.Gateway
-				_, existed := before[gateway]
-				isNew = !existed
-				s.noteWorkYield("explore|"+comboKey(account.ID, region.Key), isNew)
-			}
-			s.opt.Log.Info("新网关探索一发", "account", account.ID, "region", region.Key,
-				"gateway", gateway, "new_gateway", isNew, "succeeded", err == nil)
-			return // 成功、重复、失败都不在同轮追加第二发。
 		}
+		if !ok {
+			continue
+		}
+		release, free := s.claimRegion(account.ID, region.Key)
+		if !free {
+			continue
+		}
+		if !s.claimAccount(account.ID, s.opt.RenewGap) {
+			release()
+			continue
+		}
+		// Dedicated discovery never borrows a seed route.
+		sid, err := s.mint.NewSIDFor(region.Exit, true)
+		if err != nil {
+			release()
+			return
+		}
+		unlock := s.st.LockAccount(account.ID)
+		got, err := s.mintOnceFor(ctx, account, region.Exit, sid, types.Pair{}, "", "", types.PurposeExplore)
+		unlock()
+		release()
+		isNew, gateway := false, ""
+		if err == nil {
+			gateway = got.pair.Gateway
+			_, existed := before[gateway]
+			isNew = !existed
+		}
+		s.noteWorkYield("explore|"+comboKey(account.ID, region.Key), isNew)
+		s.opt.Log.Info("新网关探索一发", "account", account.ID, "region", region.Key,
+			"gateway", gateway, "new_gateway", isNew, "succeeded", err == nil)
+		return // At most one upstream attempt, on success or failure.
 	}
 }

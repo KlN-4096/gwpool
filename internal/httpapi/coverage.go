@@ -27,14 +27,15 @@ type coverageGroupForm struct {
 
 type coverageView struct {
 	base
-	Snapshot          coverage.Snapshot
-	Regions           []config.ExplorationRegion
-	Groups            []coverageGroupForm
-	Exits             []coverageExitOption
-	Writable          bool
-	Note              string
-	Error             string
-	CliproxyCountries []proxycatalog.Country
+	Snapshot           coverage.Snapshot
+	Regions            []config.ExplorationRegion
+	Groups             []coverageGroupForm
+	Exits              []coverageExitOption
+	Writable           bool
+	Note               string
+	Error              string
+	CliproxyCountries  []proxycatalog.Country
+	GlobalCountryCount int
 }
 
 func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +49,8 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		Snapshot: coverage.Build(cfg, s.st.Gateways(), s.effectivePairs(now), now),
 		Regions:  cfg.RegionDefinitions(), Writable: s.opt.Live != nil && s.opt.Live.Path() != "",
 		Note: r.URL.Query().Get("note"), Error: r.URL.Query().Get("error"),
-		CliproxyCountries: proxycatalog.CliproxyCountries(),
+		CliproxyCountries:  proxycatalog.CliproxyCountries(),
+		GlobalCountryCount: len(proxycatalog.GlobalCountries()),
 	}
 	for _, region := range view.Regions {
 		view.Exits = append(view.Exits, coverageExitOption{Key: region.Key, Name: region.Name})
@@ -103,6 +105,12 @@ func coverageChanges(r *http.Request, current config.Config) (map[string]any, er
 	next := current
 	key, name := strings.TrimSpace(r.FormValue("key")), strings.TrimSpace(r.FormValue("name"))
 	switch r.FormValue("action") {
+	case "global-countries":
+		expanded, err := config.GlobalCountryRegions(current)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"regions": expanded.Regions, "coverage_groups": expanded.CoverageGroups}, nil
 	case "region":
 		next.Regions = append([]config.ExplorationRegion(nil), current.RegionDefinitions()...)
 		region := config.ExplorationRegion{Key: key, Name: name, Country: strings.TrimSpace(r.FormValue("country")),

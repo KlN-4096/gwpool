@@ -1,4 +1,5 @@
-// Package coverage reports candidate coverage from observed routing, never from IP geography.
+// Package coverage keeps observed proxy-exit coverage separate from the
+// historical DNS/IP datacenter inventory.
 package coverage
 
 import (
@@ -24,12 +25,13 @@ const dnsCandidateNumbers = `
 204 205 206 207 208 209 210 211 212 213 214 215`
 
 type Candidate struct {
-	Name       string
-	InDNS      bool
-	Found      bool
-	Ready      bool
-	ExitKeys   []string
-	GroupNames []string
+	Name          string
+	InDNS         bool
+	Found         bool
+	Ready         bool
+	ExitKeys      []string
+	GroupNames    []string
+	Country, City string
 }
 
 type Group struct {
@@ -41,12 +43,14 @@ type Group struct {
 }
 
 type Snapshot struct {
-	Candidates []Candidate
-	Groups     []Group
-	Unassigned []string
-	DNSCount   int
-	Found      int
-	Ready      int
+	Candidates         []Candidate
+	Groups             []Group
+	Unassigned         []string
+	DNSCount           int
+	Found              int
+	Ready              int
+	Datacenters        []DatacenterGroup
+	UnknownDatacenters int
 }
 
 func Build(cfg config.Config, gateways map[string]types.Gateway, pairs map[string]types.Pair, now time.Time) Snapshot {
@@ -73,6 +77,7 @@ func Build(cfg config.Config, gateways map[string]types.Gateway, pairs map[strin
 		pair, ok := pairs[name]
 		return ok && pair.Cookie != "" && pair.ExpiresAt.Sub(now) >= types.DeliverFloor
 	}
+	out.Datacenters = datacenterGroups(func(name string) bool { _, ok := gateways[name]; return ok }, ready)
 	assigned := map[string][]string{}
 	for _, definition := range cfg.Groups() {
 		group := Group{CoverageGroup: definition}
@@ -108,6 +113,11 @@ func Build(cfg config.Config, gateways map[string]types.Gateway, pairs map[strin
 	for name := range names {
 		_, found := gateways[name]
 		row := Candidate{Name: name, InDNS: directory[name], Found: found, Ready: found && ready(name), GroupNames: assigned[name]}
+		location, known := datacenterDirectory[name]
+		row.Country, row.City = location.Country, location.City
+		if found && !known {
+			out.UnknownDatacenters++
+		}
 		for key := range exits[name] {
 			row.ExitKeys = append(row.ExitKeys, key)
 		}
