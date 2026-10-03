@@ -125,7 +125,7 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		}
 		return
 	}
-	attempted, renewed, failed, skipped := 0, 0, 0, 0
+	attempted, renewed, unchanged, failed, skipped := 0, 0, 0, 0, 0
 	for _, t := range due {
 		if ctx.Err() != nil || attempted >= renewBudgetPerRound {
 			break
@@ -165,6 +165,10 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		unlock()
 		relGW()
 		switch {
+		case err == nil && !got.pair.ExpiresAt.After(t.source.ExpiresAt):
+			unchanged++
+			s.opt.Log.Info("续票未延长", "gateway", t.gateway, "account", t.acct.ID,
+				"region", t.pair.RegionKey, "remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()))
 		case err == nil:
 			renewed++
 			s.opt.Log.Info("续票", "gateway", t.gateway, "account", t.acct.ID,
@@ -183,7 +187,7 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 				"region", t.pair.RegionKey, "reach", t.reach, "reason", err)
 		}
 	}
-	s.opt.Log.Info("续票一轮结束", "due", len(due), "attempted", attempted, "renewed", renewed, "failed", failed,
+	s.opt.Log.Info("续票一轮结束", "due", len(due), "attempted", attempted, "renewed", renewed, "unchanged", unchanged, "failed", failed,
 		"throttled", skipped, "no_donor", noDonor)
 }
 
@@ -199,11 +203,10 @@ func (s *Scheduler) renewSID() (string, error) {
 
 // pairsDueForRenew 列出该续的票，难到的排前面。
 //
-// **送出去的 `__cflb` 必须是同大区还活着的那张，不是这张票自己带的那张。**
-// 第一版送自己那张，实测 12 发漂 10 发 —— 因为 ExpiresAt = min(route, cflb)，而线上
-// 106 张票里 route 和 cflb 的死期**逐秒相等**（cflb 才是短的那件）⇒「快到点」等价于
-// 「cflb 快死了」，送一张死的 cflb 钉不住任何大区，落点退回随机。
-// 换成同大区最长寿的那张：cflb 钉大区、来源账号钉大区里的那一个 ⇒ 落点就是手上这张。
+// 采用同大区最长寿的活 `__cflb`：上游若只补发 __oailb，新票仍受这张 cflb 的死期约束，
+// 借长寿 cflb 才能让池内新票的 TTL 一并延长（用户确认保留这条换盆语义）。
+// “同区 + 来源账号”只预测落点，不保证命中原网关；临期不等于已经过期，也不能仅凭
+// 历史漂移比例认定原因。每次仍核对响应落点，且只有实际 TTL 延长才计入 renewed。
 // 第二个返回值 = 到期了但借不到活捐赠者的张数，只用来打日志（见调用方）。
 func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 	now := s.now()

@@ -1,15 +1,43 @@
 package sched
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"gwpool/internal/config"
 	"gwpool/internal/types"
 )
+
+func TestRenewDoesNotReportSuccessWithoutExtendingTTL(t *testing.T) {
+	for _, noNewPair := range []bool{true, false} {
+		t.Run(map[bool]string{true: "no new pair", false: "same deadline"}[noNewPair], func(t *testing.T) {
+			clk := newClock()
+			st := newStore(clk)
+			mn := newMinter(clk)
+			mn.noNewPair, mn.pairLife = noNewPair, 5*time.Minute
+			addAccount(st, 1, "acct-1")
+			landBare(mn, "unified-9")
+			duePair(st, clk, "unified-9", 1, "south-america")
+			var output bytes.Buffer
+			s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
+				Log: slog.New(slog.NewJSONHandler(&output, nil))})
+			renewOn(s)
+			s.renewExpiring(context.Background())
+			if len(mn.mintedGateways()) != 1 {
+				t.Fatal("没有真正执行续票尝试")
+			}
+			if strings.Contains(output.String(), `"msg":"续票"`) || !strings.Contains(output.String(), `"unchanged":1`) {
+				t.Fatal("TTL未延长却计成续成功")
+			}
+		})
+	}
+}
 
 type renewTestMinter struct {
 	*fakeMinter

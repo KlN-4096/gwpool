@@ -1377,9 +1377,11 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 		}
 	}
 
-	if err != nil {
+	if err != nil && (res.Status == 0 || res.Status == 200) {
 		// 包一层 ErrMintFailed 但不改这句话：底下可能还裹着速率闸 / 出口熔断，
 		// 调用方按**更靠内**的那几个先分流，剩下的才算「铸票没成」。
+		// 已有非200响应时优先走下面的状态分类：401/429没有__oailb时同样会报
+		// ErrNoLanding，不能因此跳过停用/Retry-After，下一轮继续白打。
 		return minted{}, fmt.Errorf("%w: %w", ErrMintFailed, err)
 	}
 	if res.Status != 200 {
