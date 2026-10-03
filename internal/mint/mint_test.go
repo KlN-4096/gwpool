@@ -452,7 +452,7 @@ func TestGeoParsesIpinfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := types.Observed{IP: "126.109.254.208", Country: "JP", City: "Kyoto",
+	want := types.Observed{IP: "126.109.254.208", Country: "JP", State: "Kyoto", City: "Kyoto",
 		ASN: "AS2516", ISP: "KDDI CORPORATION"}
 	if obs != want {
 		t.Errorf("得到 %+v，要 %+v", obs, want)
@@ -491,7 +491,7 @@ func TestProxyUserPerKind(t *testing.T) {
 	}
 	// webshare 没有城市段，只能按国家定向；尾段是会话号，**必须纯数字**
 	// （2026-10-01 实测字母数字的会话号在 SOCKS5 认证就被拒）。
-	got, err = proxyUser(wsProxy, types.Exit{Region: "DE", City: "Berlin"}, "ab12cd34", 5)
+	got, err = proxyUser(wsProxy, types.Exit{Region: "DE"}, "ab12cd34", 5)
 	if err != nil {
 		t.Fatalf("webshare: %v", err)
 	}

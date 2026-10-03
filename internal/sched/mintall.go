@@ -67,16 +67,19 @@ func (q *MintAllQueue) Enqueue() MintAllStatus {
 	q.jobs = nil
 	q.stat = MintAllStatus{Started: q.pool.now(), SkipReasons: map[string]int{}}
 	accounts := q.pool.usable()
+	regions := q.pool.cfg().CandidateRegions(types.Exit{})
 	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
 	allowed := make(map[int64]map[string]bool, len(accounts))
 	for _, a := range accounts {
 		used, limit := q.pool.mint.Rate(a.Creds.AccountID)
 		held := q.pool.accountHeldFor(a.ID) > 0
 		allowed[a.ID] = map[string]bool{}
-		for _, r := range types.Regions {
+		for _, r := range regions {
 			q.stat.Total++
 			reason := ""
 			switch {
+			case !q.pool.mint.SupportsDynamicExit(r.Exit):
+				reason = "供应商不支持此出口"
 			case held:
 				reason = "上游限流"
 			case limit > 0 && used[r.Key] >= limit:
@@ -89,7 +92,7 @@ func (q *MintAllQueue) Enqueue() MintAllStatus {
 			}
 		}
 	}
-	for _, r := range types.Regions {
+	for _, r := range regions {
 		for _, a := range accounts {
 			if allowed[a.ID][r.Key] {
 				q.jobs = append(q.jobs, mintAllJob{accountID: a.ID, region: r})
@@ -204,6 +207,14 @@ func (q *MintAllQueue) execute(ctx context.Context, job mintAllJob) (MintAllResu
 		result.Reason = "服务停止"
 		return result, false
 	}
+	if !s.RegionEnabled(job.region) {
+		result.Reason = "区域已停用或定义已变更"
+		return result, false
+	}
+	if !s.mint.SupportsDynamicExit(job.region.Exit) {
+		result.Reason = "供应商不支持此出口"
+		return result, false
+	}
 	release, free := s.claimRegion(job.accountID, job.region.Key)
 	if !free {
 		return result, true
@@ -221,8 +232,8 @@ func (q *MintAllQueue) execute(ctx context.Context, job mintAllJob) (MintAllResu
 		return result, false
 	}
 	used, limit := s.mint.Rate(a.Creds.AccountID)
-	if limit > 0 && used[job.region.Key] >= limit {
-		result.Reason = "区域配额已满"
+	if types.MintBudgetFull(used, limit, job.region.Key) {
+		result.Reason = "账号总配额或区域配额已满"
 		return result, false
 	}
 	if !s.claimAccount(a.ID, s.opt.RenewGap) {
@@ -236,7 +247,7 @@ func (q *MintAllQueue) execute(ctx context.Context, job mintAllJob) (MintAllResu
 	ctx, cancel := context.WithTimeout(ctx, mintAllJobTimeout)
 	defer cancel()
 	result.attempted = true
-	got, err := s.mintOnce(ctx, a, job.region.Exit, sid, seed, "", "")
+	got, err := s.mintOnceFor(ctx, a, job.region.Exit, sid, seed, "", "", types.PurposeMintAll)
 	switch {
 	case err == nil:
 		result.Status, result.Gateway = "succeeded", got.pair.Gateway

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"gwpool/internal/config"
 	"gwpool/internal/mint"
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
@@ -187,6 +188,7 @@ type fakeStore struct {
 	slots    map[string]types.Slot
 	samples  []types.Sample
 	reports  []types.CooldownReport
+	contacts []types.ContactReport
 	added    []types.Account
 	deleted  []int64
 	// addedOwners 留住每一次 AddOwner：「贴了一份已经属于别人的凭据」那条路上**不许**
@@ -315,6 +317,7 @@ func (f *fakeStore) AddAccount(a types.Account) (types.Account, error) {
 		}
 		a.ViewToken = base64.RawURLEncoding.EncodeToString(b)
 	}
+	a.LegacyConsumerKey = false
 	f.accounts = append(f.accounts, a)
 	f.added = append(f.added, a)
 	return a, nil
@@ -381,7 +384,7 @@ func rig(t *testing.T, mode types.Mode) (*Server, http.Handler, *fakePool, *fake
 		accounts: []types.Account{
 			{
 				ID: 1, Label: "pro1", PlanType: "pro", Enabled: true,
-				ViewToken: "vt-1", CreatedAt: now.Add(-time.Hour), OwnerID: 1,
+				ViewToken: "vt-1", CreatedAt: now.Add(-time.Hour), OwnerID: 1, LegacyConsumerKey: true,
 				// refresh_token 也塞 secretToken 前缀：泄漏断言用 Contains 查它，
 				// 顺手覆盖「refresh_token 不许出现在任何页面上」（审查 N8，原先只有
 				// access_token 这一个哨兵，refresh 漏了也测不出来）。
@@ -389,7 +392,7 @@ func rig(t *testing.T, mode types.Mode) (*Server, http.Handler, *fakePool, *fake
 			},
 			{
 				ID: 2, Label: "朋友的号", PlanType: "plus", Enabled: true,
-				ViewToken: "vt-2", CreatedAt: now.Add(-time.Minute), OwnerID: 2,
+				ViewToken: "vt-2", CreatedAt: now.Add(-time.Minute), OwnerID: 2, LegacyConsumerKey: true,
 				Creds: types.Creds{AccessToken: secretToken + "-b", RefreshToken: secretToken + "-b-rt", AccountID: "acct-b"},
 			},
 		},
@@ -706,18 +709,16 @@ func TestUpload(t *testing.T) {
 	if resp["view_token"] != fresh.ViewToken || resp["url"] != "/a/"+fresh.ViewToken {
 		t.Fatalf("返回的 view_token 对不上: %v", resp)
 	}
-	if resp["consumer_key"] == "" || resp["consumer_key"] != srv2.ConsumerKeyFor(fresh) {
-		t.Fatalf("没把 key 交给上传者: %v", resp)
-	}
-	if resp["consumer_key"] == resp["view_token"] {
-		t.Fatal("key 和 view_token 不该是同一个值")
+	if _, hasKey := resp["consumer_key"]; hasKey || srv2.ConsumerKeyFor(fresh) != "" {
+		t.Fatal("new upload must not generate or distribute a credential key")
 	}
 	if fresh.ViewToken == a.ViewToken {
 		t.Fatal("两次上传拿到了同一个 view_token")
 	}
-	// 拿到手就能用。
-	if w := do(h2, authed(httptest.NewRequest("GET", "/cookie", nil), resp["consumer_key"])); w.Code != 200 {
-		t.Fatalf("刚发的 key 用不了: %d %s", w.Code, w.Body.String())
+	// 新账号改从总览页领取稳定的账号 key。
+	newOwner, _ := st2.OwnerByToken(resp["owner_token"])
+	if w := do(h2, authed(httptest.NewRequest("GET", "/cookie", nil), srv2.OwnerKeyFor(newOwner))); w.Code != 200 {
+		t.Fatalf("账号 key 用不了: %d %s", w.Code, w.Body.String())
 	}
 
 	for _, bad := range []string{`{}`, `{"access_token":"short"}`, `nope`,
@@ -756,14 +757,16 @@ func TestAccountView(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, want := range []string{"1 次请求", "0 token", "gpt-6-luna",
-		"reasoning.effort=low", "1 个新网关", "IT/Milan", "unified-142",
-		srv.ConsumerKeyFor(st.accounts[0])} {
+		"reasoning.effort=low", "1 个新网关", "IT/Milan", "unified-142", "凭证级 key 已隐藏"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("信任视图缺了 %q", want)
 		}
 	}
 	if strings.Contains(body, secretToken) || strings.Contains(body, "OAILB-SECRET") {
 		t.Fatal("信任视图漏了凭据或 cookie")
+	}
+	if strings.Contains(body, srv.ConsumerKeyFor(st.accounts[0])) || strings.Contains(body, srv.OwnerKeyFor(st.owners[0])) {
+		t.Fatal("credential detail must not disclose machine keys")
 	}
 	// 别人的 key 不能出现在我的页面上。
 	if strings.Contains(body, srv.ConsumerKeyFor(st.accounts[1])) {
@@ -783,7 +786,7 @@ func ownerCookieOf(r *http.Request, tok string) *http.Request {
 // 而且 A 的令牌一个字都看不到 B 的东西（那一页上有每个账号的接入 key）。
 func TestOwnerPageIsScopedToItsOwnAccounts(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModePool)
-	k1, k2 := srv.ConsumerKeyFor(st.accounts[0]), srv.ConsumerKeyFor(st.accounts[1])
+	k1, k2 := srv.OwnerKeyFor(st.owners[0]), srv.OwnerKeyFor(st.owners[1])
 
 	// 认不出的令牌：不存在的、空的、别人的 view_token、乱填的，全是 404/非 200。
 	for _, bad := range []string{"/u/nope", "/u/vt-1", "/u/", "/u"} {
@@ -1126,7 +1129,7 @@ func TestUploadWiredToRealStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := srv.Handler()
-	vk := srv.ConsumerKeyFor(victim)
+	vk := srv.OwnerKeyFor(oB)
 
 	// 攻击者带着 A 的身份，用一张自制的、account_id 填受害者的 JWT 上传（oauth 不验签）。
 	form := url.Values{"creds": {`{"access_token":"` +
@@ -1332,8 +1335,8 @@ func TestAdminView(t *testing.T) {
 			t.Fatalf("管理页漏了 %q", leak)
 		}
 	}
-	// 账号的 key 只藏在账号卡片「复制 key」按钮背后那一处，页面上不显示。
-	if n := strings.Count(body, srv.ConsumerKeyFor(st.accounts[0])); n != 1 {
+	// Hidden means absent from HTML too, not merely a hidden DOM element.
+	if n := strings.Count(body, srv.ConsumerKeyFor(st.accounts[0])); n != 0 {
 		t.Fatalf("1 号的 key 在管理页出现了 %d 次", n)
 	}
 	if w := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")); w.Code != 200 {
@@ -2809,7 +2812,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 		t.Fatalf("账号页没有九区域格子：\n%s", body)
 	}
 	for _, r := range types.Regions {
-		if !strings.Contains(body, regionLabel(r.Key)) {
+		if !strings.Contains(body, config.Defaults().RegionLabel(r.Key)) {
 			t.Fatalf("缺了区域 %s 的格子", r.Key)
 		}
 	}
@@ -2827,7 +2830,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 
 	// 同一个网关在更晚的区域再出现 ⇒ 重复。
-	if us := regionCellOf(t, body, "美国东部"); !strings.Contains(us, "unified-142 重复") {
+	if us := regionCellOf(t, body, "美国默认出口"); !strings.Contains(us, "unified-142 重复") {
 		t.Fatalf("美东那一格没把重复网关标出来：%s", us)
 	}
 	// 别人先发现的 ⇒ 重复。
@@ -2845,7 +2848,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 
 	// 终身绿不算绿：台账上最近一次已经在窗口外的格子必须是灰的，终身次数退到悬停。
-	uw := regionCellOf(t, body, "美国西部")
+	uw := regionCellOf(t, body, "美国西雅图出口")
 	if strings.Contains(uw, "region on") {
 		t.Fatalf("最近一次在窗口外，格子不该是绿的：%s", uw)
 	}
@@ -2884,7 +2887,7 @@ func TestPoolRegionCells(t *testing.T) {
 		// 一个出口都没记过的也要有地方落。
 		"unified-404": {},
 	}
-	cells := poolRegionCells(rows, gws)
+	cells := poolRegionCells(config.Defaults(), rows, gws)
 
 	byKey := map[string]poolRegionCell{}
 	for _, c := range cells {
@@ -2925,7 +2928,7 @@ func TestPoolRegionCells(t *testing.T) {
 	}
 
 	// 全都不可交付的区域不许标绿。
-	cells = poolRegionCells([]gatewayRow{{Name: "unified-73"}}, map[string]types.Gateway{
+	cells = poolRegionCells(config.Defaults(), []gatewayRow{{Name: "unified-73"}}, map[string]types.Gateway{
 		"unified-73": {ReachableExits: []types.Exit{{Region: "IT"}}},
 	})
 	for _, c := range cells {
@@ -2998,7 +3001,7 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 		t.Fatalf("欧洲那一格没收下 unified-142：%s", cell)
 	}
 	for _, r := range types.Regions {
-		if !strings.Contains(body, regionLabel(r.Key)) {
+		if !strings.Contains(body, config.Defaults().RegionLabel(r.Key)) {
 			t.Fatalf("号池页缺了区域 %s 的格子", r.Key)
 		}
 	}
@@ -3103,11 +3106,10 @@ func TestAdminAccountCards(t *testing.T) {
 	if n := strings.Count(tab, `class="rg-legend"`); n != 1 {
 		t.Fatalf("图例出现了 %d 次", n)
 	}
-	// 接入 key 不占版面：藏在复制按钮背后（也能拿来搜索）。
+	// 旧凭证 key 继续可鉴权，但管理页也不再重新分发，包括隐藏 DOM。
 	key := srv.ConsumerKeyFor(st.accounts[0])
-	if key == "" || !strings.Contains(tab, `<span id="akey-1" hidden>`+key+`</span>`) ||
-		!strings.Contains(tab, `data-copy="#akey-1"`) {
-		t.Fatal("卡片上没有 1 号的接入 key 复制按钮")
+	if key == "" || strings.Contains(tab, key) || strings.Contains(tab, `data-copy="#akey-1"`) {
+		t.Fatal("卡片重新分发了旧凭证 key")
 	}
 	// 凭据一个字都不许出现（和其他页面同一条哨兵）。
 	if strings.Contains(body, secretToken) {

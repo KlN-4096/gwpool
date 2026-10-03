@@ -64,14 +64,26 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 	// 续票在补深度**之前**：保住已经摸到的网关比再摸一个新的值钱 —— 难到的那几个
 	// 一过期就等于丢了（裸铸再碰到它的概率 = 那几个号在那个大区被挑中的概率），
 	// 而深度不够下一轮还能接着补。
-	s.renewExpiring(ctx)
-
-	live, target := s.livePairs(), s.PairTarget()
-	if live >= target {
-		return
+	// 交替先行，既防维护吃光探索机会，也避免少账号时探索长期占住续票账号。
+	// 每轮仍最多一发探索，共用全部原配额；这不是新增独立速率额度。
+	if s.maintenanceFirst {
+		s.maintainInventory(ctx)
+		s.exploreNewGateway(ctx)
+	} else {
+		s.exploreNewGateway(ctx)
+		s.maintainInventory(ctx)
 	}
-	s.opt.Log.Info("预铸：补到目标深度", "live", live, "target", target)
-	s.premintBare(ctx, target-live)
+	s.maintenanceFirst = !s.maintenanceFirst
+}
+
+// maintainInventory 只负责续票和补深度；探索有独立的一发预算，不算库存失手预算。
+func (s *Scheduler) maintainInventory(ctx context.Context) {
+	s.renewExpiring(ctx)
+	live, target := s.livePairs(), s.PairTarget()
+	if live < target {
+		s.opt.Log.Info("预铸：补到目标深度", "live", live, "target", target)
+		s.premintBare(ctx, target-live)
+	}
 }
 
 // renewPairLead 是「剩这么多就该续了」。
@@ -125,13 +137,18 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		}
 		return
 	}
-	attempted, renewed, unchanged, failed, skipped := 0, 0, 0, 0, 0
+	attempted, renewed, unchanged, failed, skipped, deferred := 0, 0, 0, 0, 0, 0
 	for _, t := range due {
 		if ctx.Err() != nil || attempted >= renewBudgetPerRound {
 			break
 		}
+		retryKey := "renew|" + comboKey(t.acct.ID, t.pair.RegionKey) + "|" + t.gateway
+		if s.workDeferred(retryKey) {
+			deferred++
+			continue
+		}
 		used, limit := s.mint.Rate(t.acct.Creds.AccountID)
-		if s.accountHeldFor(t.acct.ID) > 0 || (limit > 0 && used[t.pair.RegionKey] >= limit) {
+		if s.accountHeldFor(t.acct.ID) > 0 || types.MintBudgetFull(used, limit, t.pair.RegionKey) {
 			skipped++
 			continue
 		}
@@ -159,7 +176,7 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		if err == nil {
 			// want 和 bias 都填这个网关：这是一发**定向**铸票，落点漂了要被当成漂移处理
 			// （mintOnce 自己判），别静悄悄把别的网关的票记成这一张续好了。
-			got, err = s.mintOnce(ctx, acct, t.exit, sid, t.pair, t.gateway, t.gateway)
+			got, err = s.mintOnceFor(ctx, acct, t.exit, sid, t.pair, t.gateway, t.gateway, types.PurposeRenew)
 			attempted++ // 失败也吃预算，避免一轮系统性故障烧上百发。
 		}
 		unlock()
@@ -167,10 +184,13 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		switch {
 		case err == nil && !got.pair.ExpiresAt.After(t.source.ExpiresAt):
 			unchanged++
+			retry := s.noteWorkYield(retryKey, false)
 			s.opt.Log.Info("续票未延长", "gateway", t.gateway, "account", t.acct.ID,
-				"region", t.pair.RegionKey, "remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()))
+				"region", t.pair.RegionKey, "remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()),
+				"retry_in_s", int(retry.Seconds()))
 		case err == nil:
 			renewed++
+			s.noteWorkYield(retryKey, true)
 			s.opt.Log.Info("续票", "gateway", t.gateway, "account", t.acct.ID,
 				"region", t.pair.RegionKey, "reach", t.reach, "landed", got.pair.Gateway,
 				"remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()))
@@ -183,12 +203,16 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 			return
 		default:
 			failed++
+			retry := time.Duration(0)
+			if errors.Is(err, errLandingDrift) {
+				retry = s.noteWorkYield(retryKey, false)
+			}
 			s.opt.Log.Info("续票失败", "gateway", t.gateway, "account", t.acct.ID,
-				"region", t.pair.RegionKey, "reach", t.reach, "reason", err)
+				"region", t.pair.RegionKey, "reach", t.reach, "reason", err, "retry_in_s", int(retry.Seconds()))
 		}
 	}
 	s.opt.Log.Info("续票一轮结束", "due", len(due), "attempted", attempted, "renewed", renewed, "unchanged", unchanged, "failed", failed,
-		"throttled", skipped, "no_donor", noDonor)
+		"throttled", skipped, "deferred", deferred, "no_donor", noDonor)
 }
 
 // renewSID 只走种子出口（便宜机房），**没配就不续**。
@@ -234,7 +258,7 @@ func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 		source := p
 		// 种子出口靠 cookie 路由；e 仅用于速率桶、样本和新票的区域标签。
 		// 不要求存在住宅历史出口，更不能从 ReachableExits 随机挑另一区。
-		exit, ok := renewalExit(p.RegionKey)
+		exit, ok := s.renewalExit(p.RegionKey)
 		if !ok {
 			continue
 		}
@@ -272,11 +296,9 @@ func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 	return out, noDonor
 }
 
-func renewalExit(regionKey string) (types.Exit, bool) {
-	for _, r := range types.Regions {
-		if r.Key == regionKey {
-			return r.Exit, true
-		}
+func (s *Scheduler) renewalExit(regionKey string) (types.Exit, bool) {
+	if r, ok := s.cfg().RegionByKey(regionKey); ok {
+		return r.Exit(), true
 	}
 	return types.Exit{}, false
 }
@@ -452,7 +474,7 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 		unlock := s.st.LockAccount(plan.acct.ID)
 		// want 留空：裸铸就是去看它能落到哪，谈不上「落点漂移」。带种子也一样——
 		// 种子只钉大区，具体网关是这个号自己的，出手前并不知道是哪个。
-		got, err := s.mintOnce(ctx, plan.acct, plan.region.Exit, sid, seed, "", "")
+		got, err := s.mintOnceFor(ctx, plan.acct, plan.region.Exit, sid, seed, "", "", types.PurposeInventory)
 		unlock()
 		plan.release()
 		if !s.premintNote(r, plan, got, err, seed.Cookie != "") {
@@ -553,14 +575,15 @@ func (s *Scheduler) premintNote(r *premintRound, plan premintPlan,
 			"account", plan.acct.ID, "region", plan.region.Key, "gateway", got.pair.Gateway,
 			"missed", missed, "budget", budget)
 		return true
-	case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
-		// 闸门和出口故障都不是这个号的错，也不是重试能解决的，而且**整池同病**：
-		// 别的 worker 接着挑只是把同一句话重复 N 遍，本轮直接停。
-		s.opt.Log.Warn("预铸撞上闸门，本轮停",
+	case errors.Is(err, types.ErrNoExit):
+		// 无可用出口是全池故障。账号/区域限流不是，不能连带停止其它组合。
+		s.opt.Log.Warn("预铸无可用出口，本轮停",
 			"account", plan.acct.ID, "region", plan.region.Key, "reason", err)
 		r.stop()
 		return false
 	default:
+		// ErrRateLimited 也到这里：可能已打到上游并收到429，因此保留失手预算，
+		// 但不设置全局 halt。tried/账号退避确保下一次选择别的可用组合。
 		// 失败也吃失手预算。不吃的话「本轮总发数封顶 2n」就是空话：失败既不加 got
 		// 也不加 missed ⇒ 循环只被候选集（账号数 × 9）兜住，一次系统性故障
 		// （比如模型名下架、全员 400）就是一轮上百发真实上游请求。
@@ -585,19 +608,13 @@ func waitGap(ctx context.Context, gap time.Duration) bool {
 	}
 }
 
-// premintSID 给这一发预铸挑出口：该大区有活种子票就走我们自己的普通机房出口，
-// 否则回落到住宅。返回的 pair 是要送出去的种子（零值 = 裸打）。
-//
-// 种子出口要不到时**也回落**而不是报错：它只是省钱的那条路，少了它池子照样能铸票。
+// premintSID 的新铸一律走实际动态出口。静态出口只续已有票，不占用新铸/探索任务。
 func (s *Scheduler) premintSID(regionKey string) (string, types.Pair, error) {
-	if seed, ok := s.seedPairFor(regionKey); ok {
-		sid, err := s.mint.NewSeedSID()
-		if err == nil {
-			return sid, seed, nil
-		}
-		s.opt.Log.Debug("没有种子出口，这一发回落住宅", "region", regionKey, "err", err)
+	region, ok := s.cfg().RegionByKey(regionKey)
+	if !ok || !region.Enabled {
+		return "", types.Pair{}, types.ErrNoExit
 	}
-	sid, err := s.mint.NewSID(true)
+	sid, err := s.mint.NewSIDFor(region.Exit(), true)
 	return sid, types.Pair{}, err
 }
 
@@ -617,8 +634,9 @@ func (s *Scheduler) lastLandings() map[string]string {
 // 闭包里现算就是「账号数 × 9 遍全表扫描」（113 个号时十万次 store.Pair），
 // 而且整段在 r.mu 里。提出来是 9 遍。
 func (s *Scheduler) seedlessRegions() map[string]bool {
-	out := make(map[string]bool, len(types.Regions))
-	for _, r := range types.Regions {
+	regions := s.cfg().CandidateRegions(types.Exit{})
+	out := make(map[string]bool, len(regions))
+	for _, r := range regions {
 		if _, ok := s.seedPairFor(r.Key); !ok {
 			out[r.Key] = true
 		}

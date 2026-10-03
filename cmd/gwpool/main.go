@@ -236,6 +236,10 @@ func (q *discoveryQueue) run(ctx context.Context) {
 }
 
 func (q *discoveryQueue) discover(ctx context.Context, j job) {
+	if !q.pool.RegionEnabled(j.r) {
+		q.log.Info("发现任务跳过已停用出口", "account", j.acct.ID, "region", j.r.Key)
+		return
+	}
 	landed, err := q.sc.ScanRegion(ctx, j.acct, j.r)
 	// 日志只记账号 ID、备注和落点，凭据一个字不进（SPEC 红线 1）。
 	q.log.Info("发现铸票结束", "account", j.acct.ID, "label", j.acct.Label, "region", j.r.Key,

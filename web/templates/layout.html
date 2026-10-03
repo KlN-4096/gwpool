@@ -405,6 +405,7 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
 </div></header>
 <main class="wrap">{{template "content" .}}</main>
 <footer class="wrap foot-note">gwpool 只分发路由 Cookie（<code>__cflb</code> / <code>__oailb</code>），业务请求不经过本服务。</footer>
+{{template "upload-parser" .}}
 <script>
 (function () {
   'use strict';
@@ -723,31 +724,11 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
     const file = document.getElementById('creds-file');
     const box = form.elements.creds;
     const idle = btn.textContent;
-    const MAX_ITEMS = 100;
-    // 一段文本拆成若干份凭据。auth.json 是多行的，不能按行切：花括号配平把每个 JSON 对象
-    // 整个抠出来（跳过字符串里的括号），对象之外的按空白、逗号、方括号、引号切成单个 token。
-    // 没配平的半截对象原样交上去，让服务端报「不是合法 JSON」。
-    function split(text) {
-      const items = [];
-      let rest = '', depth = 0, start = 0, str = false, esc = false;
-      // 逐个 push 不用展开：一个大文本文件切出十几万段时，push(...arr) 会爆调用栈
-      const flush = function () { for (const t of rest.split(/[\s,[\]"']+/)) if (t) items.push(t); rest = ''; };
-      for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        if (!depth) {
-          if (c === '{') { flush(); depth = 1; start = i; } else rest += c;
-        } else if (str) {
-          if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') str = false;
-        } else if (c === '"') str = true;
-        else if (c === '{') depth++;
-        else if (c === '}' && !--depth) items.push(text.slice(start, i + 1));
-      }
-      if (depth) items.push(text.slice(start)); else flush();
-      return items;
-    }
+    let retryState = null;
     function count() {
-      const n = split(box.value).length;
-      btn.textContent = n > 1 ? idle + ' ' + n + ' 份' : idle;
+      const parsed = gatewayPoolUpload.parse(box.value);
+      btn.textContent = parsed.items.length > 1 ? idle + ' ' + parsed.items.length + ' 份' : idle;
+      if (parsed.skipped.length) btn.textContent += '（跳过 ' + parsed.skipped.length + ' 项）';
     }
     async function addFiles(files) {
       if (box.readOnly) return; // 正在上传：结束时框会被改写成「失败的那几份」，这时塞进来的会丢
@@ -804,29 +785,44 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
       e.preventDefault();
       // 防止重复点击创建出多个账号
       if (btn.disabled) return;
-      const items = split(box.value);
-      if (!items.length) return;
-      // 有上限：拖错一个大文本文件会切出成千上万段，每段都是一发 POST（像 refresh_token 的还会被拿去换票）
-      if (items.length > MAX_ITEMS) {
-        err.textContent = '识别出 ' + items.length + ' 份，一次最多 ' + MAX_ITEMS + ' 份，请分几批上传。';
+      const isRetry = retryState && retryState.items.length && box.value === retryState.text;
+      const parsed = isRetry
+        ? { items: retryState.items, skipped: [], fromSub2api: retryState.fromSub2api, error: '' }
+        : gatewayPoolUpload.parse(box.value);
+      const items = parsed.items;
+      if (parsed.error) {
+        err.textContent = parsed.error;
         err.hidden = false;
         return;
       }
+      if (!items.length && !parsed.skipped.length) return;
       const body = new FormData(form);
-      if (items.length > 1) body.delete('label'); // 备注只给单份；多份各自用 token 里的邮箱
+      if (isRetry && retryState.ownerToken && !form.elements.page_owner && !body.get('owner_token')) {
+        body.set('owner_token', retryState.ownerToken);
+      }
+      const manualLabel = items.length === 1 && !parsed.fromSub2api ? body.get('label') : '';
       btn.disabled = true;
       pick.disabled = true; // 上传中选进来的文件没处放（框是只读的），干脆别让选
       box.readOnly = true;
       err.hidden = true;
-      out.hidden = true;
-      out.replaceChildren();
+      if (!isRetry) {
+        out.hidden = true;
+        out.replaceChildren();
+      } else {
+        row('more', '重试', '仅重新提交上次失败的项目，保留原编号和历史结果。');
+      }
+      for (const entry of parsed.skipped) {
+        row('bad', '— 已跳过第 ' + entry.index + ' 项' + (entry.label ? ' · ' + entry.label : ''), entry.reason);
+      }
       const failed = [];
-      let owner = '';
+      let owner = isRetry ? retryState.ownerURL : '';
       // 逐份串行：并发的话，没带身份来的头几份会各建一个总览页（身份 cookie 是第一份回来才种上的），
       // 也别一下子把上游换票打满。
       for (let i = 0; i < items.length; i++) {
         btn.textContent = items.length > 1 ? '正在上传 ' + (i + 1) + ' / ' + items.length + '…' : '正在提交…';
-        body.set('creds', items[i]);
+        const item = items[i];
+        body.set('creds', item.raw);
+        body.set('label', item.label || manualLabel || '');
         let msg;
         try {
           const r = await fetch(form.action, { method: 'POST', headers: { Accept: 'application/json' },
@@ -843,12 +839,12 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
         } catch (e2) {
           msg = '网络错误，没有提交成功，请稍后重试。';
         }
-        failed.push(items[i]);
-        if (items.length === 1) {
+        failed.push(item);
+        if (items.length === 1 && !parsed.fromSub2api) {
           err.textContent = msg;
           err.hidden = false;
         } else {
-          row('bad', '✗ 第 ' + (i + 1) + ' 份', msg);
+          row('bad', '✗ 第 ' + item.index + ' 项' + (item.label ? ' · ' + item.label : ''), msg);
         }
       }
       // 全部成功就回账号总览页看全貌（不是钻进某一个号的 /a/）；就在那一页的话，
@@ -858,13 +854,17 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
         history.replaceState(null, '', '#accounts');
         location.reload();
       }
-      if (owner && !failed.length) {
+      if (owner && !failed.length && !parsed.fromSub2api) {
         form.reset();
         goOwner();
         return;
       }
       // 有失败的就留在这儿：失败的留在框里，改好再点一次；成功的拿掉，免得重传。
-      box.value = failed.join('\n\n');
+      box.value = failed.map(item => item.retry).join('\n\n');
+      retryState = {
+        text: box.value, items: failed, fromSub2api: parsed.fromSub2api,
+        ownerURL: owner, ownerToken: body.get('owner_token') || ''
+      };
       box.readOnly = false;
       pick.disabled = false;
       btn.disabled = false;
@@ -888,9 +888,10 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
      认出身份时只给链接、认不出才给输入框。两页共用一份，免得改一处漏一处。 */}}
 {{define "upload" -}}
 <form id="upload" method="post" action="/upload">
-  <label>账号凭据 <span class="hint">可一次贴多份：auth.json 全文（几个连着贴也行）、含 access_token / refresh_token 的 JSON，或单个 token（每行一个）；文件可以直接拖进来</span>
+  <label>账号凭据 <span class="hint">支持直接导入 sub2api 导出的账号 JSON，也支持 auth.json、凭据 JSON 或每行一个 token；可选择文件或拖入，单文件上限 1 MB、展开后每批最多 100 项</span>
     <textarea name="creds" required spellcheck="false" placeholder="在此粘贴 JSON 或 token"></textarea></label>
-  <label>备注名称 <span class="hint">选填，只有一份时生效；不填就用 token 里的邮箱</span>
+  <p class="note info">sub2api 文件只导入标准 OpenAI OAuth 账号，保留账号名称；不迁移代理或其它配置。新账号导入后启用，同归属的重复账号更新凭据并重新启用；不支持的类型会逐项显示跳过原因。凭据仍由服务端校验，过期且有刷新令牌时尝试刷新。</p>
+  <label>备注名称 <span class="hint">选填，仅单份普通凭据生效；sub2api 导入使用各账号原名称，不填则使用 token 邮箱</span>
     <input name="label" maxlength="64" autocomplete="off"></label>
   <fieldset>
     <legend>凭据类型 <span class="hint">只对单独贴的 token 生效；JSON 自动识别</span></legend>

@@ -120,9 +120,7 @@ func TestAdminAddProxyProbeFails(t *testing.T) {
 	}
 }
 
-// 种子出口这一类能从页面上加，但只许留一条：SeedProxy 只取第一条启用着的，
-// 加第二条是静默无效的，必须当场说出来。
-func TestAdminAddSeedProxyOnlyOnce(t *testing.T) {
+func TestAdminAddStaticProxiesCanCoexist(t *testing.T) {
 	h, srv, _, calls := proxyRig(t)
 
 	f := addForm("bv-seed")
@@ -134,7 +132,7 @@ func TestAdminAddSeedProxyOnlyOnce(t *testing.T) {
 	if len(calls.added) != 1 || calls.added[0].Kind != config.KindSeed {
 		t.Fatalf("没把种子出口加进运行中的清单：%+v", calls.added)
 	}
-	// 热重载之后 SeedProxy 要能找到它 —— 这才是预铸真正读的那条路。
+	// 热重载保留静态出口，运行时由独立静态轮询选择。
 	if p, ok := srv.opt.Live.Get().SeedProxy(); !ok || p.Name != "bv-seed" {
 		t.Fatalf("热重载后 SeedProxy 没找到它：%+v ok=%v", p, ok)
 	}
@@ -142,11 +140,11 @@ func TestAdminAddSeedProxyOnlyOnce(t *testing.T) {
 	f2 := addForm("bv-seed-2")
 	f2.Set("kind", "seed")
 	f2.Set("host", "127.0.0.1:35445")
-	if loc := postForm(h, "/admin/proxies", f2).Header().Get("Location"); !strings.Contains(loc, "proxy_err=") {
-		t.Fatalf("第二条种子出口该被拒，跳到了 %q", loc)
+	if loc := postForm(h, "/admin/proxies", f2).Header().Get("Location"); !strings.Contains(loc, "proxy_note=") {
+		t.Fatalf("第二条静态出口应能共存，跳到了 %q", loc)
 	}
-	if len(calls.added) != 1 {
-		t.Fatalf("第二条被拒了却还是加进了运行中的清单：%+v", calls.added)
+	if len(calls.added) != 2 {
+		t.Fatalf("静态出口没有全部加入运行中：%+v", calls.added)
 	}
 }
 
@@ -278,6 +276,12 @@ func TestAdminPageProxyControls(t *testing.T) {
 	h, _, _, _ := proxyRig(t)
 	body := do(h, authed(httptest.NewRequest("GET", "/admin/?proxy_note="+url.QueryEscape("已添加 nov3"), nil), "akey")).Body.String()
 	for _, want := range []string{
+		`动态探索与新铸出口`,
+		`静态续票出口`,
+		`id="t-proxies-dynamic"`,
+		`<input type="hidden" name="kind" value="seed">`,
+		`<option value="cliproxy">`,
+		`<option value="ipipgo">`,
 		`action="/admin/proxies"`,
 		`name="pass" type="password" required autocomplete="new-password"`,
 		`<input type="hidden" name="name" value="nov"><input type="hidden" name="enabled" value="0">`,
@@ -290,5 +294,22 @@ func TestAdminPageProxyControls(t *testing.T) {
 	}
 	if strings.Contains(body, "p-secret") || strings.Contains(body, "w-secret") {
 		t.Fatal("代理口令上了页面")
+	}
+}
+
+func TestAdminProxyPoolsStaySeparate(t *testing.T) {
+	h, srv, _, _ := proxyRig(t)
+	old := srv.opt.ProxyStates
+	srv.opt.ProxyStates = func() []mint.ProxyState {
+		return append(old(), mint.ProxyState{Name: "static-only", Kind: "seed", Host: "127.0.0.1:9",
+			UserMask: "***", Enabled: true})
+	}
+	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
+	dynamic := strings.Index(body, `id="t-proxies-dynamic"`)
+	renew := strings.Index(body, `id="t-proxies-renew"`)
+	staticRow := strings.Index(body, `<td>static-only</td>`)
+	if dynamic < 0 || renew <= dynamic || staticRow <= renew ||
+		strings.Contains(body[dynamic:renew], `<td>static-only</td>`) {
+		t.Fatal("动态和静态出口没有分成独立列表")
 	}
 }

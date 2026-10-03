@@ -52,8 +52,10 @@ const (
 
 // State 是 state.json 的全量内容。
 type State struct {
-	CooldownReports []types.CooldownReport `json:"cooldown_reports,omitempty"`
-	Accounts        []types.Account        `json:"accounts"`
+	OwnerKeysMigrated bool                   `json:"owner_keys_migrated"`
+	ContactReports    []types.ContactReport  `json:"contact_reports,omitempty"`
+	CooldownReports   []types.CooldownReport `json:"cooldown_reports,omitempty"`
+	Accounts          []types.Account        `json:"accounts"`
 	// Owners 是上传者。老文件里没这个键 ⇒ nil ⇒ Open 的一次性迁移给已有的托管行
 	// 补一个（见 migrateOwners）。
 	Owners   []types.Owner            `json:"owners"`
@@ -169,6 +171,9 @@ func Open(dir string) (*Store, error) {
 	if err := s.migrateOwners(); err != nil {
 		return nil, err
 	}
+	if err := s.migrateOwnerKeys(); err != nil {
+		return nil, err
+	}
 	// 清掉历史遗留的孤儿 owner（上一次运行里 AddAccount 失败或并发竞争留下的）。
 	// store 层不打日志（它只把错误往上抛），清理数量无人关心就不返了。
 	if _, err := s.PruneEmptyOwners(); err != nil {
@@ -185,6 +190,26 @@ func Open(dir string) (*Store, error) {
 	_ = os.Chmod(samplesPath, filePerm)
 	s.samples = f
 	return s, nil
+}
+
+// Preserve only keys that could have been distributed before this migration.
+// Persist even on an empty store so a later restart cannot grandfather new rows.
+func (s *Store) migrateOwnerKeys() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.st.OwnerKeysMigrated {
+		return nil
+	}
+	previous := append([]types.Account(nil), s.st.Accounts...)
+	for i := range s.st.Accounts {
+		s.st.Accounts[i].LegacyConsumerKey = s.st.Accounts[i].Creds.AccessToken != ""
+	}
+	s.st.OwnerKeysMigrated = true
+	if err := s.save(); err != nil {
+		s.st.Accounts, s.st.OwnerKeysMigrated = previous, false
+		return fmt.Errorf("迁移账号 key: %w", err)
+	}
+	return nil
 }
 
 // LockAccount 取这个账号的独占锁，返回解锁函数。
@@ -588,6 +613,7 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 	// **刻意不在这儿兜底铸一个**：那样调用方就分不清回来的 a.OwnerID 是「刚为我铸的」
 	// 还是「去重命中了一个已经属于别人的账号」，而那两件事的处置完全相反
 	// （后者的令牌一个字都不许查——那一页上有对方每个账号的 consumer key）。
+	a.LegacyConsumerKey = false // new imports never obtain a credential-level machine key
 	s.st.Accounts = append(s.st.Accounts, a)
 	if err := s.save(); err != nil {
 		s.st.Accounts = s.st.Accounts[:len(s.st.Accounts)-1] // 没落盘就别留在内存里

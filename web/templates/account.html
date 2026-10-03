@@ -14,7 +14,7 @@
 
 <nav class="tabs" data-tabs hidden data-js>
   <a href="#overview">概览</a>
-  {{if .ConsumerKey}}<a href="#usage">接入说明</a>{{end}}
+  <a href="#usage">接入说明</a>
   <a href="#records">请求记录 <span class="n">{{len .Rows}}</span></a>
   <a href="#settings">账号状态</a>
 </nav>
@@ -26,18 +26,14 @@
   </div>
   <div class="grid-2">
     <div class="card">
-      <header class="card-head"><div><h2>接入 key</h2><p>调用 <code>/cookie</code> 时放在 Authorization 头里，别外泄。</p></div></header>
+      <header class="card-head"><div><h2>账号 key</h2><p>统一在“我的账号”总览页查看，调用接口时放在 Authorization 请求头里。</p></div></header>
       <div class="card-body">
-        {{if .ConsumerKey}}
-        {{if not .Enabled}}<p class="err">账号已停用，该 key 暂时无法使用；重新启用后恢复。</p>{{end}}
-        <div class="copy"><pre class="mono" id="key">{{.ConsumerKey}}</pre><button type="button" data-copy="#key" hidden data-js>复制</button></div>
-        {{else}}
-        <p class="muted">没有接入 key：服务未配置 consumer_key，或这个账号没有 access_token。</p>
-        {{end}}
+        <p>凭证级 key 已隐藏、不再新分发。此前保存的旧 key 仍兼容，但只在这份凭据启用时有效。</p>
+        <p>账号 key 只需名下至少一份有效凭据；仅持有本凭据详情链接不能查看整个账号的 key。</p>
       </div>
     </div>
     <div class="card">
-      <header class="card-head"><div><h2>本页地址</h2><p>查看账号状态{{if .ConsumerKey}}与接入 key{{end}}的唯一入口。</p></div></header>
+      <header class="card-head"><div><h2>本页地址</h2><p>查看本凭据状态的入口。</p></div></header>
       <div class="card-body">
         <div class="copy" hidden data-js><pre class="mono" id="page-url"></pre><button type="button" data-copy="#page-url">复制</button></div>
         {{if .OwnerToken}}
@@ -52,7 +48,6 @@
   </div>
 </section>
 
-{{if .ConsumerKey}}
 <section id="tab-usage">
   <div class="card">
     <header class="card-head"><div><h2>接口说明</h2><p>先通过 <code>/cookie</code> 获取路由 Cookie，再携带它向上游发起请求。</p></div></header>
@@ -70,6 +65,7 @@
         <tbody>
           <tr><td class="mono">gateway</td><td>可选。指定网关名称，例如 <code>unified-142</code>；不指定时由系统选择。</td></tr>
           <tr><td class="mono">force</td><td>可选。设为 <code>1</code> 时跳过你正在用的网关，换一个。</td></tr>
+          <tr><td class="mono">account</td><td>建议始终填写实际消费的上游 account_id；不同消费账号的冷却独立。账号 key 未指定时使用名下编号最小的有效凭据。</td></tr>
         </tbody>
       </table></div>
 
@@ -168,21 +164,22 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
     </div>
   </div>
 </section>
-{{end}}
 
 <section id="tab-records">
   <div class="card">
     <header class="card-head"><div><h2>请求记录</h2><p>按时间倒序。{{if .Truncated}}只显示最近 {{len .Rows}} 条，另有 {{.Truncated}} 条更早的。{{end}}</p></div></header>
     {{if .Rows}}
     <div class="table-wrap"><table data-grid data-facets="ok:成功:ok|err:失败:bad" data-placeholder="搜索时间、地区或网关">
-      <thead><tr><th>时间（UTC）</th><th>出口位置</th><th>网关</th><th class="num">HTTP</th></tr></thead>
+      <thead><tr><th>时间（UTC）</th><th>供应商 / 用途</th><th>请求出口</th><th>实际出口 / 匹配</th><th>网关</th><th class="num">HTTP</th></tr></thead>
       <tbody>
       {{range .Rows}}
         <tr data-facet="{{if eq .Status 200}}ok{{else}}err{{end}}">
           <td class="mono">{{.At}}</td>
-          <td>{{.Where}}</td>
+          <td>{{.Provider}}<div class="sub">{{.Purpose}}</div></td>
+          <td>{{.Requested}}</td>
+          <td>{{.Where}}<div class="sub">{{.Match}}</div></td>
           <td class="mono">{{.Gateway}}</td>
-          <td class="num {{if ne .Status 200}}bad{{end}}">{{if .Status}}{{.Status}}{{else}}<span title="未收到响应（网络错误或超时）">—</span>{{end}}</td>
+          <td class="num {{if ne .Status 200}}bad{{end}}">{{if .Status}}{{.Status}}{{else}}<span title="未收到响应（网络错误或超时）">—</span>{{end}}{{if .DurationMS}}<div class="sub">{{.DurationMS}}ms</div>{{end}}</td>
         </tr>
       {{end}}
       </tbody>

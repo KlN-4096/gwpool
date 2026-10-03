@@ -238,8 +238,10 @@ const sidAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 // randSID 生成 novproxy 的粘性会话标识，8 位 [0-9a-z]（照 geo_sampler.py）。
 // sid 和供应商的绑定记在 Client 里，见 resolve。
+const proxySessionIDLength = 8
+
 func randSID() string {
-	b := randBytes(8)
+	b := randBytes(proxySessionIDLength)
 	for i := range b {
 		b[i] = sidAlphabet[int(b[i])%len(sidAlphabet)]
 	}

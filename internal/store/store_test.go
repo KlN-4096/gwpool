@@ -861,15 +861,21 @@ func TestSaveKeepsBackups(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir)
 
+	// Open persists the one-time owner-key migration marker even for an empty
+	// store. That first save has no predecessor to back up.
+	if _, err := os.Stat(filepath.Join(dir, "state.json.bak")); err == nil {
+		t.Fatal("首次保存不该有 .bak（那时正本还不存在）")
+	}
 	first, err := s.AddAccount(types.Account{Label: "一号",
 		Creds: types.Creds{AccessToken: "tok", AccountID: "acct-1"}, Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 第一次保存时正本还不存在 ⇒ 没有 .bak 可留，但当天那份该在。
+	// Adding the first account now backs up the initialized empty state.
 	daily := filepath.Join(dir, "state.json.daily-"+time.Now().UTC().Format("20060102"))
-	if _, err := os.Stat(filepath.Join(dir, "state.json.bak")); err == nil {
-		t.Fatal("首次保存不该有 .bak（那时正本还不存在）")
+	initial, err := os.ReadFile(filepath.Join(dir, "state.json.bak"))
+	if err != nil || strings.Contains(string(initial), "一号") || !strings.Contains(string(initial), `"owner_keys_migrated": true`) {
+		t.Fatalf("没有备份初始化状态: %v", err)
 	}
 
 	if _, err := s.AddAccount(types.Account{Label: "二号",

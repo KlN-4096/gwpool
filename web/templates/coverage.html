@@ -1,0 +1,109 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>区域覆盖与探索出口</h1>
+  <p><a href="/admin/">← 管理后台</a></p>
+  <p>先看是否发现过，再看现在能否交付。机房 IP 所在地不等于探索出口，不自动按地理归类。</p>
+  <p>候选来源：2026-10-01 枚举 unified-1…220，{{.Snapshot.DNSCount}} 个域名当时可解析；这不是可铸票保证，也不是上游全集。</p>
+  <p>合并目录 {{len .Snapshot.Candidates}} 个 · 历史已发现 {{.Snapshot.Found}} 个 · 当前寿命可交付 {{.Snapshot.Ready}} 个 · 未分组 {{len .Snapshot.Unassigned}} 个</p>
+  {{if .Note}}<p class="badge ok">{{.Note}}</p>{{end}}
+  {{if .Error}}<p class="badge bad">{{.Error}}</p>{{end}}
+  {{if not .Writable}}<p>当前为只读展示，未接入可写配置文件。</p>{{end}}
+</div>
+
+<section class="card">
+  <header class="card-head"><div><h2>覆盖目标</h2>
+    <p>只有目标清单非空、管理员确认清单完整，且每个目标都曾通过本组关联出口取得，才标为“已找满此清单”。票过期不抹掉发现历史；在其它区域找到同名网关不算本组完成。</p>
+    <p>有近期业务需求时，先续票/补库存，每轮再最多探索一发。专门探索走实际定向出口、不借种子，优先未完成区域里没走过的账号×出口组合，仍守原配额和单账号间隔；全部明确目标完成后停止这部分探索。未分组候选仍不等于已覆盖。</p>
+  </div></header>
+  <div class="card-body">
+  {{range .Groups}}
+    <details>
+      <summary><strong>{{.Name}}</strong> · 目标 {{.Found}}/{{len .Targets}} · 目标中当前可交付 {{.Ready}} ·
+        {{if .Done}}已找满此清单{{else if .Complete}}尚未找满{{else}}范围未确认{{end}}
+      </summary>
+      <p>关联出口：{{range .ExitKeys}}<code>{{.}}</code> {{end}}</p>
+      <p>这些出口历史共发现 {{len .Observed}} 个：{{range .Observed}}<code>{{.}}</code> {{else}}尚无记录{{end}}</p>
+      <p>清单内尚未找到：{{range .Missing}}<code>{{.}}</code> {{else}}无缺项{{end}}</p>
+      {{if $.Writable}}
+      <form method="post" action="/admin/coverage">
+        <input type="hidden" name="action" value="group"><input type="hidden" name="key" value="{{.Key}}">
+        <p><label>分组名称 <input name="name" value="{{.Name}}" required maxlength="120"></label> <code>{{.Key}}</code></p>
+        <p>关联的实际探索出口：</p>
+        <p>{{range .Exits}}<label><input type="checkbox" name="exit_keys" value="{{.Key}}" {{if .Selected}}checked{{end}}> {{.Name}} ({{.Key}})</label> {{end}}</p>
+        <p><label>目标网关（一行一个 unified-N，可用空格或逗号分隔）<br><textarea name="targets" rows="4" style="width:100%">{{.TargetText}}</textarea></label></p>
+        <p><label><input type="checkbox" name="complete" {{if .Complete}}checked{{end}}> 我确认此目标清单完整（不是“暂时没发现更多”）</label></p>
+        <button type="submit">保存此分组</button>
+      </form>
+      {{end}}
+    </details>
+  {{end}}
+  {{if .Writable}}
+    <details><summary>新增覆盖分组</summary>
+      <form method="post" action="/admin/coverage">
+        <input type="hidden" name="action" value="group">
+        <p><label>分组 ID <input name="key" required pattern="[a-z][a-z0-9-]{0,47}"></label>
+        <label>名称 <input name="name" required maxlength="120"></label></p>
+        <p>{{range .Exits}}<label><input type="checkbox" name="exit_keys" value="{{.Key}}"> {{.Name}} ({{.Key}})</label> {{end}}</p>
+        <p><label>目标网关<br><textarea name="targets" rows="4" style="width:100%"></textarea></label></p>
+        <p><label><input type="checkbox" name="complete"> 已确认目标清单完整</label></p>
+        <button type="submit">新增分组</button>
+      </form>
+    </details>
+  {{end}}
+  </div>
+</section>
+
+<section class="card">
+  <header class="card-head"><div><h2>实际探索出口</h2>
+    <p>ID、国家、州、城市一经创建不可改，不可复用 ID 重置历史/配额。要换出口，停用旧项并新增 ID；仅改显示名称不会改变真实出口。</p>
+    <p>停用后不再新选此出口，队列执行前也复查；已开始的请求不强断。现成票仍可直接交付。扩区不提高并发或账号总预算：每账号总上限仍为原九区×每区小时限额。</p>
+    <p>只选择支持目标的动态供应商：webshare 仅国家；novproxy 支持国家/城市 token；Cliproxy 支持国家/州；Ipipgo 支持国家/州/城市。城市不被静默忽略；实际地理未确认匹配时，仍保留发现的网关，但不把它记成该出口的覆盖或区域种子。</p>
+  </div></header>
+  <div class="card-body">
+  {{range .Regions}}
+    {{if $.Writable}}<form method="post" action="/admin/coverage">
+      <input type="hidden" name="action" value="region"><input type="hidden" name="key" value="{{.Key}}">
+      <input type="hidden" name="country" value="{{.Country}}"><input type="hidden" name="state" value="{{.State}}"><input type="hidden" name="city" value="{{.City}}">
+      <p><code>{{.Key}}</code> · {{.Country}} {{.State}} {{.City}} ·
+        <label>名称 <input name="name" value="{{.Name}}" required maxlength="120"></label>
+        <label><input type="checkbox" name="enabled" {{if .Enabled}}checked{{end}}> 启用</label>
+        <button type="submit">保存</button>
+      </p>
+    </form>{{else}}<p>{{.Name}} ({{.Key}}) · {{.Country}} {{.State}} {{.City}} · {{if .Enabled}}启用{{else}}停用{{end}}</p>{{end}}
+  {{end}}
+  {{if .Writable}}
+    <details><summary>新增实际探索出口</summary>
+      <form method="post" action="/admin/coverage">
+        <input type="hidden" name="action" value="region">
+        <p><label>稳定 ID <input name="key" required pattern="[a-z][a-z0-9-]{0,47}" placeholder="africa-south"></label>
+        <label>名称 <input name="name" required maxlength="120" placeholder="南非"></label></p>
+        <p><label>国家代码 <input name="country" required pattern="[A-Z]{2}" maxlength="2" placeholder="ZA" list="cliproxy-countries" oninput="this.form.elements.state.setAttribute('list','cliproxy-states-'+this.value)"></label>
+        <label>州/省（可空，使用供应商目录代码）<input name="state" maxlength="96" placeholder="Indiana"></label>
+        <label>城市（可空，Ipipgo 需同时填州）<input name="city" maxlength="96" placeholder="Hammond"></label>
+        <label><input type="checkbox" name="enabled" checked> 启用</label></p>
+        <button type="submit">新增出口</button>
+        <p class="muted">只保存配置，不立即打票；有业务的池子会在后续自然轮次尝试，不保证供应商库存或新落点。</p>
+      </form>
+    </details>
+  {{end}}
+    <datalist id="cliproxy-countries">{{range .CliproxyCountries}}<option value="{{.Code}}">{{.Label}} / {{.Name}}</option>{{end}}</datalist>
+    {{range .CliproxyCountries}}<datalist id="cliproxy-states-{{.Code}}">{{range .States}}<option value="{{.}}"></option>{{end}}</datalist>{{end}}
+    <p class="muted">补全来自本次提供的 Cliproxy 目录（204 个国家/地区，不含全球随机），不是启用清单或可达保证。州名不跨供应商推断；Ipipgo 请核对其<a href="https://www.ipipgo.com/zh-CN/countriesAndRegions" target="_blank" rel="noopener noreferrer">官方地区代码</a>。</p>
+  </div>
+</section>
+
+<section class="card">
+  <header class="card-head"><div><h2>候选目录与未知归属</h2>
+    <p>“历史发现”来自实际拿到的路由，不等于 DNS 可解析。“可交付”仅是有效票据寿命足够，仍可能受使用账号的冷却和配额限制。</p>
+  </div></header>
+  <div class="table-wrap"><table>
+    <thead><tr><th>候选网关</th><th>来源</th><th>状态</th><th>观察到的探索出口</th><th>人工目标分组</th></tr></thead>
+    <tbody>{{range .Snapshot.Candidates}}<tr>
+      <td><code>{{.Name}}</code></td><td>{{if .InDNS}}10-01 DNS{{else}}后续发现/手填{{end}}</td>
+      <td>{{if .Ready}}当前可交付{{else if .Found}}历史发现{{else}}未发现{{end}}</td>
+      <td>{{range .ExitKeys}}<code>{{.}}</code> {{else}}未知{{end}}</td>
+      <td>{{range .GroupNames}}{{.}} {{else}}未分组{{end}}</td>
+    </tr>{{end}}</tbody>
+  </table></div>
+</section>
+{{end}}

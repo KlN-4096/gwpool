@@ -55,6 +55,12 @@ func (f *fakeMinter) NewSID(sticky bool) (string, error) {
 	return "sid" + strconv.Itoa(f.sidN), nil
 }
 
+func (f *fakeMinter) Provider(string) string              { return "test-dynamic" }
+func (f *fakeMinter) SupportsDynamicExit(types.Exit) bool { return true }
+func (f *fakeMinter) NewSIDFor(_ types.Exit, sticky bool) (string, error) {
+	return f.NewSID(sticky)
+}
+
 // Sticky 只在 scan 要求非粘性、而本 fake 被配成「给非粘性出口」时返回 false。
 func (f *fakeMinter) Sticky(string) bool {
 	f.mu.Lock()
@@ -72,7 +78,7 @@ func (f *fakeMinter) Geo(_ context.Context, e types.Exit, sid string) (types.Obs
 	if o, ok := f.observed[e.Region]; ok {
 		return o, nil
 	}
-	return types.Observed{IP: "10.0.0." + e.Region, Country: e.Region, City: e.City}, nil
+	return types.Observed{IP: "10.0.0." + e.Region, Country: e.Region, State: e.State, City: e.City}, nil
 }
 
 func (f *fakeMinter) Mint(_ context.Context, _ types.Creds, e types.Exit, sid, sentPair string,
@@ -218,10 +224,8 @@ func TestScanAllDistinct(t *testing.T) {
 	}
 }
 
-// B5：可达出口记的必须是**请求过的**那个，不是观测到的地理。
-// 观测到的城市是自由文本（"Frankfurt am Main"、"São Paulo"），回灌成代理参数
-// 会认证失败或库存回退到别国 ⇒ 落到别的网关 ⇒ 被误报成「落点漂移」⇒ 永远续不上。
-func TestScanRecordsRequestedExitForReplay(t *testing.T) {
+// 回退到别国的请求仍保留落点和原始样本，但不能冒充指定出口可达或成为该区种子。
+func TestScanDoesNotAttributeFallbackExits(t *testing.T) {
 	f := newFake()
 	// 模拟实测过的那种回退：要 US:Seattle，拿到尼日利亚拉各斯的 IP。
 	f.observed["US"] = types.Observed{IP: "102.0.0.1", Country: "NG", City: "Lagos", ASN: "AS1"}
@@ -229,19 +233,13 @@ func TestScanRecordsRequestedExitForReplay(t *testing.T) {
 	s, st := newScanner(t, f)
 	scanAll(t, s)
 
-	for name, want := range map[string][]types.Exit{
-		"unified-US": {{Region: "US"}, {Region: "US", City: "Seattle"}},
-		"unified-BR": {{Region: "BR"}},
-	} {
+	for _, name := range []string{"unified-US", "unified-BR"} {
 		got := st.Gateways()[name].ReachableExits
-		if len(got) != len(want) {
-			t.Fatalf("%s 的可达出口 %+v，要 %+v", name, got, want)
+		if len(got) != 0 {
+			t.Fatalf("%s 被错误归到请求出口：%+v", name, got)
 		}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Errorf("%s 的第 %d 个可达出口是 %+v，要 %+v（必须能直接当代理参数用）",
-					name, i, got[i], want[i])
-			}
+		if pair, ok := st.Pair(name); ok && pair.RegionKey != "" {
+			t.Fatalf("%s 回退到别国却仍标成 %s 区域种子", name, pair.RegionKey)
 		}
 	}
 
@@ -249,6 +247,9 @@ func TestScanRecordsRequestedExitForReplay(t *testing.T) {
 	rows, _ := st.Samples()
 	if rows[0].Observed.Country != "NG" || rows[0].Requested.Region != "US" {
 		t.Errorf("样本该两列都留: %+v", rows[0])
+	}
+	if rows[0].Provider != "test-dynamic" || rows[0].Purpose != types.PurposeScan || rows[0].TargetMatch != "mismatch" {
+		t.Fatalf("供应商/用途/真实出口证据缺失: %+v", rows[0])
 	}
 }
 

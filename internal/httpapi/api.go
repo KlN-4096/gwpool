@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/contact"
 	"gwpool/internal/cooldown"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
@@ -110,6 +111,8 @@ type Store interface {
 	Samples() ([]types.Sample, error)
 	CooldownReports() []types.CooldownReport
 	AddCooldownReport(types.CooldownReport) (bool, error)
+	ContactReports() []types.ContactReport
+	AddContactReport(types.ContactReport) (bool, error)
 }
 
 // Scanner 排一次「去找新落点」的裸铸。
@@ -199,7 +202,7 @@ type Server struct {
 	// started 写在管理页那张失败表上：失败只存在内存里，重启前的已经没了。
 	started time.Time
 
-	tplPool, tplAccount, tplOwner, tplAdmin, tplGate *template.Template
+	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
 }
 
 // probeEffort 必须跟 mint 包实际发出去的 payload 一致（SPEC 第 2 节）：
@@ -247,11 +250,14 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if s.tplGate, err = parse("gate.html"); err != nil {
 		return nil, err
 	}
+	if s.tplCoverage, err = parse("coverage.html"); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
 func parse(page string) (*template.Template, error) {
-	return template.ParseFS(web.Templates, "templates/layout.html", "templates/"+page)
+	return template.ParseFS(web.Templates, "templates/layout.html", "templates/upload-parser.html", "templates/"+page)
 }
 
 // Handler 建路由。用标准库 ServeMux 的方法+路径模式（Go 1.22 起），不引第三方路由。
@@ -276,6 +282,7 @@ func (s *Server) Handler() http.Handler {
 	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
 	mux.HandleFunc("POST /pair/renew", s.handleRenew)
 	mux.HandleFunc("POST /cooldown/report", s.handleCooldownReport)
+	mux.HandleFunc("POST /contact/report", s.handleContactReport)
 	mux.HandleFunc("GET /gateways", s.handleGateways)
 	// 管理面的 POST 也要罩 sameOrigin：authAdmin 走 HTTP Basic，而浏览器一旦缓存了
 	// 这个 realm 的凭据，**跨站请求照样会自动带上**——和 cookie 一样是「环境凭证」。
@@ -285,6 +292,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
 	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
+	mux.HandleFunc("GET /admin/coverage", s.handleCoverage)
+	mux.Handle("POST /admin/coverage", s.sameOrigin(http.HandlerFunc(s.handleCoverageConfig)))
 	mux.Handle("POST /admin/proxies", s.sameOrigin(http.HandlerFunc(s.handleAdminAddProxy)))
 	mux.Handle("POST /admin/proxies/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminProxyEnabled)))
 	// 原来的「全部账号」卡片页并进了管理页账号页签，旧链接跳过去。
@@ -468,19 +477,10 @@ func keyOK(want, got string) bool {
 	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
 }
 
-// ConsumerKeyFor 为一个账号派生它的机器凭证。
-//
-// 为什么是派生而不是存一份：types.Account 签名冻结、加不了字段，而另起一个
-// 「key → 账号」的文件就是第二份迟早和账本走散的状态。HMAC(配置密钥, 账号身份)
-// 随时能重算，换掉配置里的密钥就等于一次性吊销所有人的 key。
-// 单独吊销某一个人：服务没有这个入口，他自己在 ChatGPT 设备列表里取消登录即可
-// （见 store.AddAccount 上方那段），令牌一失效这把 key 就换不到任何东西。
-//
-// 和 view_token 刻意是两个值：view_token 进 URL、进浏览器历史，是给人看页面的；
-// 这把是机器凭证，只走 Authorization 头。
-// 没有 access_token 的占位账号（只回报、不托管凭据）不发 key：它换不到 pair。
+// ConsumerKeyFor only verifies grandfathered credential keys. Never distribute
+// this value in HTML or upload responses; new credentials have no such key.
 func (s *Server) ConsumerKeyFor(a types.Account) string {
-	if s.opt.ConsumerKey == "" || a.Creds.AccessToken == "" {
+	if s.opt.ConsumerKey == "" || a.Creds.AccessToken == "" || !a.LegacyConsumerKey {
 		return ""
 	}
 	m := hmac.New(sha256.New, []byte(s.opt.ConsumerKey))
@@ -490,8 +490,9 @@ func (s *Server) ConsumerKeyFor(a types.Account) string {
 
 // caller 是认出来的调用方。admin 为真时 acct 是零值，必须由请求显式指明替谁办事。
 type caller struct {
-	acct  types.Account
-	admin bool
+	acct    types.Account
+	admin   bool
+	ownerID int64
 }
 
 // resolveCaller 按 key 认人。管理员密钥先看，再逐个账号比对派生 key。
@@ -503,6 +504,15 @@ func (s *Server) resolveCaller(r *http.Request) (caller, bool) {
 	}
 	if keyOK(s.opt.AdminKey, got) || keyOK(s.opt.ConsumerKey, got) {
 		return caller{admin: true}, true
+	}
+	if strings.HasPrefix(got, "gwp_a_") {
+		for _, owner := range s.st.Owners() {
+			if keyOK(s.OwnerKeyFor(owner), got) {
+				account, active := s.ownerKeyAccount(owner.ID, strings.TrimSpace(r.URL.Query().Get("account")))
+				return caller{acct: account, ownerID: owner.ID}, active
+			}
+		}
+		return caller{}, false
 	}
 	for _, a := range s.st.Accounts() {
 		if !a.Enabled {
@@ -643,7 +653,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 	v.Mints, v.TotalMints = s.poolMintRows(accounts)
 	// 格子先算（它们报的是**整池**的读数，筛选时不许跟着缩水），再按查询串筛表。
-	v.Regions = poolRegionCells(v.Gateways, gws)
+	v.Regions = poolRegionCells(s.opt.Live.Get(), v.Gateways, gws)
 	want := sanitizeLabel(r.URL.Query().Get("region"), "")
 	v.Shown, v.FilterLabel = filterPoolGateways(v.Gateways, v.Regions, want)
 	markPoolRegionLinks(v.Regions, want)
@@ -668,7 +678,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 // 顺带回填每一行的 Regions 那一列，所以它接的是 rows 的**切片**（元素可改）而不是副本。
 // 两处读数必须出自同一次计算：表里写着「欧洲」而九宫格的欧洲格子里没有它，没人查得出
 // 是哪一边错了。
-func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegionCell {
+func poolRegionCells(cfg config.Config, rows []gatewayRow, gws map[string]types.Gateway) []poolRegionCell {
 	byRegion := map[string][]poolRegionGateway{}
 	for i := range rows {
 		item := poolRegionGateway{Name: rows[i].Name, Ready: rows[i].PairReady}
@@ -676,7 +686,7 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 		for _, e := range gws[rows[i].Name].ReachableExits {
 			// 反查不到就归「未归类」（key 为空）：这些出口是代理商给的，不在
 			// types.Regions 那张表里（精确匹配 Region+City，见那边的注释）。
-			k := types.RegionKeyOf(e)
+			k := cfg.RegionKeyOf(e)
 			if seen[k] {
 				continue
 			}
@@ -684,7 +694,7 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 			byRegion[k] = append(byRegion[k], item)
 			rows[i].regionKeys = append(rows[i].regionKeys, k)
 			if k != "" {
-				rows[i].Regions = append(rows[i].Regions, regionLabel(k))
+				rows[i].Regions = append(rows[i].Regions, cfg.RegionLabel(k))
 			}
 		}
 		// 一个出口都没记过的网关也要有地方落，否则它在这一页上凭空消失。
@@ -693,7 +703,7 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 			rows[i].regionKeys = append(rows[i].regionKeys, "")
 		}
 	}
-	out := make([]poolRegionCell, 0, len(types.Regions)+2)
+	out := make([]poolRegionCell, 0, len(cfg.RegionDefinitions())+2)
 	// 「全部」排在最前面：它是默认态，也是从某一格退出来的那条路。
 	all := poolRegionCell{Label: "全部", All: true, Total: len(rows)}
 	for _, r := range rows {
@@ -711,15 +721,15 @@ func poolRegionCells(rows []gatewayRow, gws map[string]types.Gateway) []poolRegi
 	}
 	out = append(out, all)
 
-	keys := make([]string, 0, len(types.Regions)+1)
-	for _, r := range types.Regions {
+	keys := make([]string, 0, len(cfg.RegionDefinitions())+1)
+	for _, r := range cfg.RegionDefinitions() {
 		keys = append(keys, r.Key)
 	}
 	if len(byRegion[""]) > 0 {
 		keys = append(keys, "")
 	}
 	for _, k := range keys {
-		c := poolRegionCell{Key: k, Label: regionLabel(k), Gateways: byRegion[k]}
+		c := poolRegionCell{Key: k, Label: cfg.RegionLabel(k), Gateways: byRegion[k]}
 		if k == "" {
 			c.Label = "未归类"
 		}
@@ -1182,12 +1192,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			status = "updated"
 		}
 		writeJSON(w, http.StatusOK, map[string]string{
-			"status":       status,
-			"label":        a.Label,
-			"plan":         a.PlanType,
-			"view_token":   a.ViewToken,
-			"url":          "/a/" + a.ViewToken,
-			"consumer_key": s.ConsumerKeyFor(a),
+			"status":     status,
+			"label":      a.Label,
+			"plan":       a.PlanType,
+			"view_token": a.ViewToken,
+			"url":        "/a/" + a.ViewToken,
 			// 换设备时靠这个令牌回来，所以要给得出来。
 			"owner_token": owner.Token,
 			"owner_url":   "/u/" + owner.Token,
@@ -1225,8 +1234,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		DisabledReason: a.DisabledReason,
 		Since:          a.CreatedAt.Format(time.DateTime),
 		Model:          s.probeModel(), Effort: probeEffort,
-		ConsumerKey: s.ConsumerKeyFor(a),
-		BaseURL:     s.publicBaseURL(),
+		BaseURL: s.publicBaseURL(),
 	}
 	// owner 令牌**只在浏览器已经带着它**时才回显。这一页的地址是转发得出去的
 	// （页面上写着「不要分享」，人还是会分享），而 owner 令牌能打开这个人**所有**
@@ -1237,7 +1245,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.OwnerToken = o.Token
 	}
 	v.NewGateways = s.foundBy(a.ID)
-	v.Regions = regionCells(a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
+	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
 	for _, sm := range samples {
 		if sm.AccountID != a.ID {
 			continue
@@ -1246,6 +1254,8 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.Rows = append(v.Rows, sampleRow{
 			At: sm.At.Format(time.DateTime), Where: geoLabel(sm),
 			Gateway: dash(sm.Gateway), Status: sm.Status,
+			Provider: dash(sm.Provider), Purpose: samplePurpose(sm.Purpose),
+			Requested: dash(exitLabel(sm.Requested)), Match: sampleMatch(sm.TargetMatch), DurationMS: sm.DurationMS,
 		})
 	}
 	// Detail 不给上传者：里面是出口名、上游状态码这类内部读数。
@@ -1322,6 +1332,8 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 		CanLogout: had && cur.ID == o.ID,
 		Upload:    uploadForm{PageToken: tok},
 	}
+	v.AccountKey = s.OwnerKeyFor(o)
+	_, v.KeyActive = s.ownerKeyAccount(o.ID, "")
 	v.Accounts, v.LastFetch = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
 	for _, row := range v.Accounts {
 		v.Requests += row.Requests
@@ -1375,10 +1387,9 @@ func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) 
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
 			Since:       a.CreatedAt.Format(time.DateTime),
 			ViewToken:   a.ViewToken,
-			ConsumerKey: s.ConsumerKeyFor(a),
 			Requests:    reqs[a.ID],
 			NewGateways: s.foundBy(a.ID),
-			Regions:     regionCells(a.ID, mints, samples, gws, window),
+			Regions:     regionCells(s.opt.Live.Get(), a.ID, mints, samples, gws, window),
 			Fails:       s.fails.failRows(a.ID, 20, false),
 		}
 		if t := lastFetch[a.ID]; !t.IsZero() {
@@ -1419,7 +1430,7 @@ func ago(now, t time.Time) string {
 //
 // 网关名只在样本里（台账只记计数），所以 samples/gws 一起传进来：gws 用来判
 // 「这个网关是不是记在别人名下」。两者为 nil 时格子照画，只是列不出名字。
-func regionCells(accountID int64, mints map[string]types.RegionMint,
+func regionCells(cfg config.Config, accountID int64, mints map[string]types.RegionMint,
 	samples []types.Sample, gws map[string]types.Gateway, window time.Duration) regionGrid {
 	byRegion := map[string]types.RegionMint{}
 	for _, m := range mints {
@@ -1435,8 +1446,8 @@ func regionCells(accountID int64, mints map[string]types.RegionMint,
 	//
 	// 也正因为样本那一列会是国家码，**绿/灰不能按样本数**——那等于把一部分真实铸票
 	// 判成没发生。绿按铸票台账（NoteRegionMint 只记成功、而且只用真区域 key）。
-	known := make(map[string]bool, len(types.Regions))
-	for _, r := range types.Regions {
+	known := make(map[string]bool, len(cfg.RegionDefinitions()))
+	for _, r := range cfg.RegionDefinitions() {
 		known[r.Key] = true
 	}
 	firstRegion := map[string]string{}
@@ -1456,9 +1467,9 @@ func regionCells(accountID int64, mints map[string]types.RegionMint,
 		inRegion[sm.RegionKey][sm.Gateway] = true
 	}
 	now := time.Now()
-	grid := regionGrid{Window: shortDur(window), Cells: make([]regionCell, 0, len(types.Regions))}
-	for _, r := range types.Regions {
-		c := regionCell{Key: r.Key, Label: regionLabel(r.Key)}
+	grid := regionGrid{Window: shortDur(window), Cells: make([]regionCell, 0, len(cfg.RegionDefinitions()))}
+	for _, r := range cfg.RegionDefinitions() {
+		c := regionCell{Key: r.Key, Label: r.Name}
 		m, had := byRegion[r.Key]
 		c.Fresh = had && m.Count > 0 && !m.LastAt.IsZero() && now.Sub(m.LastAt) < window
 		if c.Fresh {
@@ -1887,6 +1898,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode()}}
 	v.CooldownStats = cooldown.Summarize(s.st.CooldownReports(), now)
+	v.ContactStats = contact.Summarize(s.st.ContactReports(), now)
 	if s.opt.MintAll != nil {
 		v.MintAllAvailable = true
 		v.MintAll = s.opt.MintAll.Status()
@@ -1916,6 +1928,19 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			v.Proxies = append(v.Proxies, row)
 		}
 	}
+	v.ProxyPools = []proxyPoolRow{
+		{ID: "dynamic", Title: "动态探索与新铸出口",
+			Description: "用于新铸、探索和补种；新会话轮换供应商，一轮内固定出口。不会被静态续票出口替代。"},
+		{ID: "renew", Title: "静态续票出口", RenewOnly: true,
+			Description: "仅用于已有票续期；独立轮询和故障退避，可同时启用多条，不参与新铸与探索。"},
+	}
+	for _, p := range v.Proxies {
+		idx := 0
+		if p.Kind == string(config.KindSeed) {
+			idx = 1
+		}
+		v.ProxyPools[idx].Rows = append(v.ProxyPools[idx].Rows, p)
+	}
 
 	reqs := map[int64]int{}
 	for _, sm := range samples {
@@ -1941,7 +1966,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	for _, o := range owners {
 		ownerName[o.ID] = fmt.Sprintf("#%d %s", o.ID, ownerLabels[o.ID])
 	}
-	covered := regionsCovered(s.st.RegionMints())
+	cfg := s.opt.Live.Get()
+	covered := regionsCovered(cfg, s.st.RegionMints())
 	slots := s.st.Slots()
 	delivered, lastDeliver := map[int64]int{}, map[int64]time.Time{}
 	for _, sl := range slots {
@@ -1973,8 +1999,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 				row.Owner = fmt.Sprintf("#%d", a.OwnerID)
 			}
 			n := covered[a.ID]
-			row.Covered = fmt.Sprintf("%d/%d", n, len(types.Regions))
-			row.Facet = accountFacet(a, n)
+			row.Covered = fmt.Sprintf("%d/%d", n, len(cfg.RegionDefinitions()))
+			row.Facet = accountFacet(a, n, len(cfg.RegionDefinitions()))
 			v.Accounts = append(v.Accounts, row)
 			continue
 		}
@@ -2051,6 +2077,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		v.Samples = append(v.Samples, adminSampleRow{
 			At: sm.At.Format(time.DateTime), AccountID: sm.AccountID, Region: dash(sm.RegionKey),
 			Where: geoLabel(sm), ASN: dash(sm.Observed.ASN), Gateway: dash(sm.Gateway), Status: sm.Status,
+			Provider: dash(sm.Provider), Purpose: samplePurpose(sm.Purpose),
+			Requested: dash(exitLabel(sm.Requested)), Match: sampleMatch(sm.TargetMatch), DurationMS: sm.DurationMS,
 		})
 	}
 	reverse(v.Samples)
@@ -2090,9 +2118,9 @@ func acctName(byID map[int64]types.Account, id int64) string {
 
 // regionsCovered 数每个账号铸出过票的区域：只数 types.Regions 那九个，和九宫格同一张台账
 // （NoteRegionMint 只记成功的铸票）。
-func regionsCovered(mints map[string]types.RegionMint) map[int64]int {
-	known := make(map[string]bool, len(types.Regions))
-	for _, r := range types.Regions {
+func regionsCovered(cfg config.Config, mints map[string]types.RegionMint) map[int64]int {
+	known := make(map[string]bool, len(cfg.RegionDefinitions()))
+	for _, r := range cfg.RegionDefinitions() {
 		known[r.Key] = true
 	}
 	out := map[int64]int{}
@@ -2106,7 +2134,7 @@ func regionsCovered(mints map[string]types.RegionMint) map[int64]int {
 
 // accountFacet 是账号表一行的筛选标签，一组一个、空格分隔：状态、套餐、区域覆盖、上传者。
 // 和 accountFacets 拼出来的按钮一一对应，改一边要改另一边。
-func accountFacet(a types.Account, covered int) string {
+func accountFacet(a types.Account, covered, regionCount int) string {
 	state := "on"
 	if !a.Enabled {
 		state = "off"
@@ -2115,7 +2143,7 @@ func accountFacet(a types.Account, covered int) string {
 	switch {
 	case covered == 0:
 		cover = "cov-none"
-	case covered >= len(types.Regions):
+	case covered >= regionCount:
 		cover = "cov-all"
 	}
 	return fmt.Sprintf("%s %s %s o%d", state, planFacet(a.PlanType), cover, a.OwnerID)
@@ -2428,22 +2456,51 @@ const labelMaxRunes = 64
 // geoLabel 按**观测到的**地理显示，不按请求的 region：城市库存不足时上游会
 // 回退到别的国家，按请求显示就是假账（SPEC 红线 6）。
 func geoLabel(sm types.Sample) string {
-	cc, city := sm.Observed.Country, sm.Observed.City
-	switch {
-	case cc == "" && city == "":
-		return "—"
-	case city == "":
-		return cc
-	default:
-		return cc + "/" + city
+	parts := []string{}
+	for _, part := range []string{sm.Observed.Country, sm.Observed.State, sm.Observed.City} {
+		if part != "" {
+			parts = append(parts, part)
+		}
 	}
+	return dash(strings.Join(parts, "/"))
 }
 
 func exitLabel(e types.Exit) string {
-	if e.City == "" {
-		return e.Region
+	return e.Label()
+}
+
+func samplePurpose(value string) string {
+	switch value {
+	case types.PurposeScan:
+		return "发现扫描"
+	case types.PurposeExplore:
+		return "专门探索"
+	case types.PurposeRenew:
+		return "定向续票"
+	case types.PurposeInventory:
+		return "库存补铸"
+	case types.PurposeMintAll:
+		return "全量打票"
+	case types.PurposeVerify:
+		return "交付验证"
+	case types.PurposeDelivery:
+		return "按需铸票"
+	default:
+		return "旧记录/未知"
 	}
-	return e.Region + ":" + e.City
+}
+
+func sampleMatch(value string) string {
+	switch value {
+	case "matched":
+		return "已匹配"
+	case "mismatch":
+		return "出口不符"
+	case "seed-route":
+		return "种子路由（不作地理证据）"
+	default:
+		return "未确认"
+	}
 }
 
 // poolMintMaxRows 是公开页上列几行铸票记录。

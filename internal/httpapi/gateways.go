@@ -25,6 +25,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	recommendations := s.cooldownRecommendations(r, now)
+	contactStats := s.contactStats(r, now)
 	pairs := s.effectivePairs(now)
 	// 按网关名收一份这个账号自己的槽位：槽位表的键格式归 store 所有，
 	// 这里只认 Slot 自己带的两个字段，免得为一个拼键函数把 store 拖进来。
@@ -47,6 +48,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		UsedByYou  bool                          `json:"used_by_you"`
 		LastUsedAt string                        `json:"last_used_at,omitempty"`
 		Cooldown   *types.CooldownRecommendation `json:"cooldown,omitempty"`
+		Contacts   []types.ContactStats          `json:"contacts,omitempty"`
 	}
 	out := struct {
 		Account string `json:"account"`
@@ -77,7 +79,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out.Live++
-		it := row{Name: name, PairReady: true, ValidForS: int(left.Seconds())}
+		it := row{Name: name, PairReady: true, ValidForS: int(left.Seconds()), Contacts: contactStats[name]}
 		if recommendation, ok := recommendations[name]; ok {
 			it.Cooldown = &recommendation
 		}

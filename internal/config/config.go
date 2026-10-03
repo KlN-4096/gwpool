@@ -45,6 +45,8 @@ const (
 	KindNovproxy ProxyKind = "novproxy"
 	// KindWebshare 机房代理，每连接换 IP：<user>-<CC>-rotate
 	KindWebshare ProxyKind = "webshare"
+	KindCliproxy ProxyKind = "cliproxy"
+	KindIpipgo   ProxyKind = "ipipgo"
 	// KindSeed 是我们自己的普通机房代理，用户名里不带任何定向段，原样送出去。
 	//
 	// 它**选不了地理**，所以只做一件事：带着某个大区的种子 `__cflb` 去摸这个账号
@@ -83,7 +85,15 @@ type Proxy struct {
 //
 // 这件事不是锦上添花：只有一家粘性供应商时，它一熔断整池立刻停摆
 // （2026-10-01 现网两次全池 502 都是这么来的）。
-func (p Proxy) Sticky() bool { return p.Kind == KindNovproxy || p.Kind == KindWebshare }
+func (p Proxy) Sticky() bool {
+	return p.Kind == KindNovproxy || p.Kind == KindWebshare ||
+		p.Kind == KindCliproxy || p.Kind == KindIpipgo
+}
+
+func (k ProxyKind) Valid() bool {
+	return k == KindNovproxy || k == KindWebshare || k == KindCliproxy ||
+		k == KindIpipgo || k == KindSeed
+}
 
 // Fingerprint 选出站报文形状。见 internal/mint。
 type Fingerprint string
@@ -118,8 +128,10 @@ type Config struct {
 	// 页面上要拼 "<base>/cookie"，多一个斜杠就是个 404。
 	PublicBaseURL string `json:"public_base_url"`
 
-	Proxies     []Proxy     `json:"proxies"`
-	Fingerprint Fingerprint `json:"fingerprint"`
+	Proxies        []Proxy             `json:"proxies"`
+	Fingerprint    Fingerprint         `json:"fingerprint"`
+	Regions        []ExplorationRegion `json:"regions,omitempty"`
+	CoverageGroups []CoverageGroup     `json:"coverage_groups,omitempty"`
 
 	PublicWhenSurplus PublicWhenSurplus `json:"public_when_surplus"`
 
@@ -372,6 +384,9 @@ func Load(path string) (Config, error) {
 	if cfg.PublicBaseURL, err = normalizeBaseURL(cfg.PublicBaseURL); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.validateExploration(); err != nil {
+		return Config{}, err
+	}
 	// 负数会让速率闸变成「一发都不许打」，而那看起来和「上游全挂了」一模一样。
 	// 0 是合法的「用默认值」。
 	if cfg.UpstreamPerRegionHour < 0 {
@@ -484,9 +499,8 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("proxies[%d] 缺 name", i)
 		case seen[p.Name]:
 			return Config{}, fmt.Errorf("proxies 里 name %q 重复", p.Name)
-		case p.Kind != KindNovproxy && p.Kind != KindWebshare && p.Kind != KindSeed:
-			return Config{}, fmt.Errorf("proxies[%s] 的 kind %q 不认，只有 %q、%q 和 %q",
-				p.Name, p.Kind, KindNovproxy, KindWebshare, KindSeed)
+		case !p.Kind.Valid():
+			return Config{}, fmt.Errorf("proxies[%s] 的 kind %q 不认", p.Name, p.Kind)
 		case p.Host == "" || p.User == "" || p.Pass == "":
 			return Config{}, fmt.Errorf("proxies[%s] 的 host/user/pass 都必填", p.Name)
 		}
@@ -495,8 +509,8 @@ func Load(path string) (Config, error) {
 	// 一个粘性供应商都没有时，铸票和 state-echo 配不成对，整个交付路径是坏的。
 	// 启动即拒，别等到第一次交付才发现（SPEC 第 5 节）。
 	if len(cfg.StickyProxies()) == 0 {
-		return Config{}, fmt.Errorf("至少要有一个启用着的粘性代理（kind=%q 或 %q），"+
-			"否则铸票与 state-echo 配不成同一个出口 IP", KindNovproxy, KindWebshare)
+		return Config{}, fmt.Errorf("至少要有一个启用着的动态粘性代理（novproxy、webshare、cliproxy 或 ipipgo），" +
+			"否则新铸与探索没有可用出口")
 	}
 	return cfg, nil
 }
@@ -638,6 +652,18 @@ func Patch(path string, changes map[string]any) error {
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
+	}
+	if _, changed := changes["regions"]; changed {
+		old, next := Defaults(), Defaults()
+		if err := json.Unmarshal(orig, &old); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(out, &next); err != nil {
+			return err
+		}
+		if err := ValidateRegionTransition(old, next); err != nil {
+			return err
+		}
 	}
 	if err := writeFileAtomic(path, out); err != nil {
 		return err

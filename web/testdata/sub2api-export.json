@@ -1,0 +1,39 @@
+{
+  "exported_at": "2026-10-03T00:00:00Z",
+  "proxies": [],
+  "accounts": [
+    {
+      "name": "offline-oauth-fixture",
+      "platform": "openai",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0In0.c2ln",
+        "refresh_token": "rt.offline-fixture-not-a-secret",
+        "chatgpt_account_id": "fixture-account",
+        "expires_at": "2026-10-04T00:00:00Z",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann"
+      },
+      "extra": { "openai_gwpool": true },
+      "concurrency": 4,
+      "priority": 1,
+      "rate_multiplier": 1,
+      "expires_at": 1791072000,
+      "auto_pause_on_expired": true
+    },
+    {
+      "name": "offline-pat-fixture",
+      "platform": "openai",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "offline-pat-not-a-secret",
+        "auth_mode": "personalAccessToken",
+        "openai_auth_mode": "personal_access_token",
+        "token_type": "Bearer"
+      },
+      "concurrency": 1,
+      "priority": 1,
+      "auto_pause_on_expired": false
+    }
+  ],
+  "skipped_shadows": 1
+}

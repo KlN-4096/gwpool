@@ -195,7 +195,6 @@ type accountView struct {
 	// DisabledReason 是被自动停用的原因（上游原话）。手动停用时为空。
 	DisabledReason string
 	Since          string
-	ConsumerKey    string // 机器凭证；为空说明服务端没配 consumer_key
 	Requests       int
 	NewGateways    int
 	Model          string
@@ -219,7 +218,9 @@ type accountView struct {
 
 type ownerView struct {
 	base
-	Upload uploadForm
+	AccountKey string
+	KeyActive  bool
+	Upload     uploadForm
 	// Token 是这一页自己的地址令牌，用来拼页内链接。
 	Token string
 	Label string
@@ -249,7 +250,6 @@ type ownerAccountRow struct {
 	// ViewToken 用来拼进这个账号详情页的链接。同一个 owner 名下的账号，这一页
 	// 本来就都看得见，不是额外的泄漏面。
 	ViewToken   string
-	ConsumerKey string
 	Requests    int
 	NewGateways int
 	// LastFetch 是最近一次拿这个号的接入 key 取到票（人读的「12 分钟前」），空 = 还没取到过。
@@ -303,31 +303,6 @@ type regionGateway struct {
 	Dup   bool
 }
 
-// regionLabels 把区域 key 翻成人话。
-//
-// 只放在视图层：types.Regions 是**扫描清单**（区域划分本身随 cohort 变，见那边的
-// 注释），给它挂一列中文名会让人以为那是数据模型的一部分。
-var regionLabels = map[string]string{
-	"us-east":       "美国东部",
-	"us-west":       "美国西部",
-	"south-america": "南美",
-	"west-europe":   "西欧",
-	"europe":        "欧洲",
-	"east-asia":     "东亚",
-	"oceania":       "大洋洲",
-	"south-asia":    "南亚",
-	"middle-east":   "中东",
-}
-
-// regionLabel 查不到就回 key 本身：往 types.Regions 里加一个区域不该让页面出现空格子。
-// 空 key（出口反查不到区域）由调用方自己起名，这里不兜底——那不是一个区域。
-func regionLabel(key string) string {
-	if v, ok := regionLabels[key]; ok {
-		return v
-	}
-	return key
-}
-
 // failRow 是「为什么没给票」。Detail 只在管理页填。
 type failRow struct {
 	At        string
@@ -341,10 +316,12 @@ type failRow struct {
 }
 
 type sampleRow struct {
-	At      string
-	Where   string // 观测到的国家/城市
-	Gateway string
-	Status  int
+	At                                  string
+	Where                               string // 观测到的国家/城市
+	Gateway                             string
+	Status                              int
+	Provider, Purpose, Requested, Match string
+	DurationMS                          int64
 }
 
 // ---------- 管理页 ----------
@@ -358,11 +335,13 @@ type adminView struct {
 	MintAllStarted   string
 	MintAllFinished  string
 	CooldownStats    []types.CooldownStats
+	ContactStats     []types.ContactStats
 
 	base
-	Proxies  []proxyRow
-	Owners   []ownerRow
-	Accounts []accountRow // 托管着凭据的
+	Proxies    []proxyRow
+	ProxyPools []proxyPoolRow
+	Owners     []ownerRow
+	Accounts   []accountRow // 托管着凭据的
 	// AccountFacets 是账号表的几组筛选（状态 / 套餐 / 区域覆盖 / 上传者），组之间用 ";" 隔开，
 	// 格式见 layout.html 里的 grid()。服务端拼好：上传者名字里的 ":" "|" ";" 会把它拆坏。
 	AccountFacets string
@@ -444,6 +423,12 @@ type proxyRow struct {
 	BoundSIDs int
 }
 
+type proxyPoolRow struct {
+	ID, Title, Description string
+	RenewOnly              bool
+	Rows                   []proxyRow
+}
+
 type adminGatewayRow struct {
 	Name        string
 	FirstSeenBy string // 「#2 xxx」
@@ -479,14 +464,16 @@ type slotAccountRow struct {
 }
 
 type adminSampleRow struct {
-	At        string
-	AccountID int64
-	Account   string // 「#3 xxx」
-	Region    string
-	Where     string
-	ASN       string
-	Gateway   string
-	Status    int
+	At                                  string
+	AccountID                           int64
+	Account                             string // 「#3 xxx」
+	Region                              string
+	Where                               string
+	ASN                                 string
+	Gateway                             string
+	Status                              int
+	Provider, Purpose, Requested, Match string
+	DurationMS                          int64
 }
 
 // parseForm 解表单体。自己解而不用 r.ParseForm：请求体已经被 MaxBytesReader 读走了。

@@ -544,6 +544,10 @@ func (m *fakeMinter) NewSID(sticky bool) (string, error) {
 	return fmt.Sprintf("sid%05d", m.sidSeq), nil
 }
 
+func (m *fakeMinter) NewSIDFor(_ types.Exit, sticky bool) (string, error) {
+	return m.NewSID(sticky)
+}
+
 // NewSeedSID 照真实 mint 的语义：绑在普通机房出口上的 sid，没配那条出口就报错。
 // sid 前缀和 NewSID 分开，用例据此断言这一发走的是哪条出口。
 func (m *fakeMinter) NewSeedSID() (string, error) {
@@ -562,6 +566,8 @@ func (m *fakeMinter) SeedBound(sid string) bool {
 	return strings.HasPrefix(sid, "seed")
 }
 
+func (m *fakeMinter) Provider(string) string              { return "test-dynamic" }
+func (m *fakeMinter) SupportsDynamicExit(types.Exit) bool { return true }
 func (m *fakeMinter) Geo(ctx context.Context, e types.Exit, sid string) (types.Observed, error) {
 	m.mu.Lock()
 	country := m.geoCountry
@@ -569,7 +575,7 @@ func (m *fakeMinter) Geo(ctx context.Context, e types.Exit, sid string) (types.O
 	if country == "" {
 		country = e.Region
 	}
-	return types.Observed{IP: "203.0.113.1", Country: country, City: e.City}, nil
+	return types.Observed{IP: "203.0.113.1", Country: country, State: e.State, City: e.City}, nil
 }
 
 // Rate 照真实 mint 的语义：按区域报本小时用量，外加每区上限。
@@ -870,6 +876,7 @@ func TestSingleModeNeverWarms(t *testing.T) {
 func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
+	landEachRegionSomewhereNew(mn)
 	s.opt.IdleAfter = 10 * time.Minute
 
 	s.warmOnce(context.Background())
@@ -882,17 +889,18 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	// 那是 premintBare 的正常行为，写死发数会让这个用例变成在测别的东西。
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := s.FreeGateways(); n != types.SpareTarget {
-		t.Fatalf("有需求时补到了 %d 张活票，目标深度是 %d（发数 %d）",
+	if n := s.FreeGateways(); n < types.SpareTarget || n > types.SpareTarget+1 {
+		t.Fatalf("有需求时补到了 %d 张活票，库存目标是 %d，另允许一发探索（发数 %d）",
 			n, types.SpareTarget, len(mn.mintedGateways()))
 	}
 
-	// 够数了就不再打：pair 还新鲜，而且目标也没涨。
+	// 库存够数仍有独立的一发发现预算，不能无限追加。
 	spent := len(mn.mintedGateways())
 	s.warmOnce(context.Background())
-	if n := len(mn.mintedGateways()); n != spent {
-		t.Fatalf("够数了却又打了 %d 发", n-spent)
+	if n := len(mn.mintedGateways()); n-spent > 1 {
+		t.Fatalf("库存够数后的专门探索超过一发：%d", n-spent)
 	}
+	spent = len(mn.mintedGateways())
 
 	// 需求停了：即便 pair 快过期也一发不打。
 	// 按 DeliverFloor 算：livePairs 数的是「还够不够交付」的票。
@@ -903,8 +911,8 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	}
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := s.FreeGateways(); n != types.SpareTarget {
-		t.Fatalf("需求回来后该把深度补回 %d，实际 %d 张活票", types.SpareTarget, n)
+	if n := s.FreeGateways(); n < types.SpareTarget || n > types.SpareTarget+1 {
+		t.Fatalf("需求回来后该补库存 %d 加至多一发探索，实际 %d 张活票", types.SpareTarget, n)
 	}
 }
 
@@ -1747,7 +1755,7 @@ func TestBestRegionPrefersSeedlessOverUnseen(t *testing.T) {
 		lifetime[r.Key] = 50
 	}
 
-	got, count, preferred, ok := bestRegion(types.Exit{}, nil, 6, lifetime, nil, prefer)
+	got, count, preferred, ok := bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, lifetime, nil, prefer)
 	if !ok {
 		t.Fatal("配额没打满，不该说挑不出来")
 	}
@@ -1759,7 +1767,7 @@ func TestBestRegionPrefersSeedlessOverUnseen(t *testing.T) {
 	}
 
 	// 种子都齐了（prefer 恒 false）⇒ 退到第二档：挑终身没铸过的那个。
-	got, _, preferred, ok = bestRegion(types.Exit{}, nil, 6, lifetime, nil,
+	got, _, preferred, ok = bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, lifetime, nil,
 		func(string) bool { return false })
 	if !ok || got.Key != unseen.Key || preferred {
 		t.Fatalf("种子齐了该挑终身没铸过的 %s，得到 %s（preferred=%v, ok=%v）",
@@ -2056,7 +2064,7 @@ func TestMinPairsDoesNotReopenPremintWhenSpareStopsIt(t *testing.T) {
 	if got := s.PairTarget(); got != 0 {
 		t.Fatalf("富余关掉预铸时下界不该把目标顶回 %d", got)
 	}
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("富余关掉预铸、下界却让它打了 %d 发", n)
 	}
@@ -2073,7 +2081,7 @@ func TestSpareOverCeilingStopsPremint(t *testing.T) {
 	if got := s.PairTarget(); got != 0 {
 		t.Fatalf("富余张数超过上限时目标应是 0（停止预铸），实为 %d", got)
 	}
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("富余张数超过上限还预铸了 %d 发", n)
 	}
@@ -2561,15 +2569,16 @@ func TestClaimRegionIsPerAccountAndRegion(t *testing.T) {
 // 而那个空串会一路带进速率闸的分桶键（acct|""，九个大区的定向铸票挤一个桶互相饿死）
 // 和 (账号 × 大区) 台账。
 func TestPickExitOnlyReturnsStandardRegionExits(t *testing.T) {
+	s := &Scheduler{mint: newMinter(newClock())}
 	wild := types.Exit{Region: "US", City: "Chicago"}
 	if types.RegionKeyOf(wild) != "" {
 		t.Fatalf("这条用例的前提坏了：%+v 居然反查到了大区", wild)
 	}
 	// 混着放：野出口在前，防「取第一条」式的实现碰巧蒙对。
 	mixed := types.Gateway{Name: "unified-1", ReachableExits: []types.Exit{
-		wild, {Region: "US", City: "Dallas"}, {Region: "JP"}}}
+		{}, wild, {Region: "US", City: "Dallas"}, {Region: "JP"}}}
 	for i := 0; i < 20; i++ { // pickExit 是随机取，多转几圈
-		got, ok := pickExit(mixed)
+		got, ok := s.pickExit(mixed)
 		if !ok {
 			t.Fatal("有一条 JP 代表出口，不该说没有可达出口")
 		}
@@ -2579,7 +2588,7 @@ func TestPickExitOnlyReturnsStandardRegionExits(t *testing.T) {
 	}
 	// 一条标准出口都没有 ⇒ 认「没有已知可达出口」，而不是拿野出口去定向铸：
 	// 那一发的配额会记进空串桶，落点也不会进任何一个大区的台账。
-	if _, ok := pickExit(types.Gateway{Name: "unified-2",
+	if _, ok := s.pickExit(types.Gateway{Name: "unified-2",
 		ReachableExits: []types.Exit{wild}}); ok {
 		t.Fatal("只有野出口时仍然挑了一条出来")
 	}
@@ -2782,11 +2791,8 @@ func TestPremintBareDoesNotRenew(t *testing.T) {
 // 种子票：这个大区手上有活 __cflb 时，预铸走我们自己的普通机房出口、把那张票送出去，
 // 而落点是**执行这一发的号自己**在那个大区的网关，不是种子那张票的网关。
 //
-// 这一条是整条种子路的要害。2026-10-03 实测：3 个 free 号带同一张 east-asia 票从同一个
-// 机房出口打，分别落 unified-88 / 94 / 75（裸打基线 146 / 120 / 128）⇒ __cflb 只钉大区。
-// 实现里摘 __oailb 的动作在 mint.Mint（见 TestSeedBoundSIDSendsOnlyTheCflb），
-// sched 这一层送的是完整那张票。
-func TestPremintUsesASeedTicketWhenTheRegionHasOne(t *testing.T) {
+// 静态续票与动态新铸分工：即使有充足种子，新铸也必须走实际动态出口。
+func TestPremintUsesDynamicExitEvenWhenSeedsExist(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)
 	mn := newMinter(clk)
@@ -2813,21 +2819,16 @@ func TestPremintUsesASeedTicketWhenTheRegionHasOne(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) + 1 })})
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
+	if exits := st.gws["unified-9"].ReachableExits; len(exits) != 1 || exits[0] != us.Exit {
+		t.Fatalf("实际动态出口没有留下可达证据：%+v", exits)
+	}
 	if got := mn.mintedGateways(); len(got) != 1 || got[0] != "unified-9" {
 		t.Fatalf("该落到这个号自己在 us-east 的网关 unified-9，实际 %v", got)
 	}
 	sent := mn.seedShots()
-	if len(sent) != 1 {
-		t.Fatalf("该走种子出口打一发，实际走了 %d 发", len(sent))
-	}
-	for sid, cookie := range sent {
-		if !strings.HasPrefix(sid, "seed") {
-			t.Fatalf("sid %q 不是种子出口的", sid)
-		}
-		if cookie != cookiePrefix+"unified-s0" {
-			t.Fatalf("送出去的不是 us-east 那张种子票：%q", cookie)
-		}
+	if len(sent) != 0 {
+		t.Fatalf("新铸仍借用了静态种子出口：%d 发", len(sent))
 	}
 }
 
@@ -2903,7 +2904,7 @@ func TestPremintRefillsSeedlessRegionsFirst(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) })})
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	want := fmt.Sprintf("unified-n%d", len(types.Regions)-1)
 	if got := mn.mintedGateways(); len(got) != 1 || got[0] != want {
 		t.Fatalf("该先补没种子的 %s（落点 %s），实际打了 %v", seedless.Key, want, got)
@@ -2936,7 +2937,7 @@ func TestPremintFallsBackToResidentialWhenTheRegionHasNoSeed(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 2 })})
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	if got := mn.mintedGateways(); len(got) != 1 || got[0] != "unified-9" {
 		t.Fatalf("该照旧裸铸到 unified-9，实际 %v", got)
 	}
@@ -3003,7 +3004,7 @@ func TestPremintCapsWastedShotsAtTheGap(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 3 })})
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	if n := len(mn.mintedGateways()); n != 2 {
 		t.Fatalf("裸铸打了 %d 发，失手预算是缺口 2 发就该收手（候选组合 18 个）", n)
 	}
@@ -3037,7 +3038,7 @@ func TestPremintSkipsCombosWhosePredictedGatewayStillHasAPair(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 9 })})
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("预测落点全都还有活票，一发都不该打，实际打了 %d 发", n)
 	}
@@ -3081,7 +3082,7 @@ func TestPremintRefillsCombosWhosePairExpired(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 9 })})
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	got := mn.mintedGateways()
 	sort.Strings(got)
 	want := []string{"unified-7", "unified-8"}
@@ -3097,7 +3098,7 @@ func TestSpareTargetZeroDisablesPremint(t *testing.T) {
 	s.opt.Live = liveCfg(func(c *config.Config) { c.SpareTarget = 0 })
 	s.markDemand()
 
-	s.warmOnce(context.Background())
+	s.maintainInventory(context.Background())
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("spare_target=0 还预铸了 %d 发", n)
 	}

@@ -52,6 +52,7 @@ func (c Creds) LogValue() slog.Value { return slog.StringValue(c.String()) }
 // 实际落在哪要看 Observed。
 type Exit struct {
 	Region string // ISO-2，如 "US"
+	State  string // 供应商的州/省代码；与 City 分开，不能互相冒充。
 	City   string // 可空，如 "Seattle"
 }
 
@@ -60,6 +61,7 @@ type Exit struct {
 type Observed struct {
 	IP      string
 	Country string
+	State   string
 	City    string
 	ASN     string
 	ISP     string
@@ -207,6 +209,9 @@ type Minter interface {
 
 	// Geo 查这个 sid 当前的出口地理。与 Mint 复用同一 sid 才有意义。
 	Geo(ctx context.Context, e Exit, sid string) (Observed, error)
+	// Provider returns only the bound provider kind, never its URL or credentials.
+	Provider(sid string) string
+	SupportsDynamicExit(Exit) bool
 }
 
 // Owner 是一个上传者。一个人可能先后交上来好几份凭据，owner 把它们归到一页
@@ -229,8 +234,11 @@ type Account struct {
 	PlanType  string // "plus" / "pro" / ...，取自 access_token 的声明
 	Creds     Creds
 	ViewToken string
-	Enabled   bool
-	CreatedAt time.Time
+	// LegacyConsumerKey marks credentials present before owner-level keys.
+	// Their existing machine keys remain valid, but are never displayed again.
+	LegacyConsumerKey bool `json:",omitempty"`
+	Enabled           bool
+	CreatedAt         time.Time
 	// OwnerID 是这份凭据挂在哪个 Owner 名下。
 	//
 	// 0 = 没有归属。两种情形：匿名占位行（没凭据、不是谁托管的）**永远**是 0；
@@ -267,13 +275,17 @@ func RejectedByUpstream(status int) bool {
 
 // Sample 是一次扫描的落点记录。
 type Sample struct {
-	AccountID int64
-	RegionKey string // SPEC.md 第 4 节的区域 key
-	Requested Exit
-	Observed  Observed
-	Gateway   string
-	Status    int
-	At        time.Time
+	AccountID   int64
+	RegionKey   string // SPEC.md 第 4 节的区域 key
+	Requested   Exit
+	Observed    Observed
+	Gateway     string
+	Status      int
+	At          time.Time
+	Provider    string `json:",omitempty"`
+	Purpose     string `json:",omitempty"`
+	TargetMatch string `json:",omitempty"`
+	DurationMS  int64  `json:",omitempty"`
 	// Err 是这一发失败的具体原因（上游那段 JSON，或本地的错误文本），成功时为空。
 	// 没有它的话 samples.jsonl 里一行 status=400 什么都不告诉人：2026-10-01 首扫
 	// 二十发全 400，真正的原因（账号清单里没有 gpt-6-astra）要单独打一发才看得见。

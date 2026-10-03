@@ -1,0 +1,108 @@
+{{define "upload-parser"}}
+<script>
+// 只整理上传表单，不在浏览器验证账号归属/过期时间；最终校验仍由 /upload 完成。
+const gatewayPoolUpload = (function () {
+  'use strict';
+  const MAX_ITEMS = 100;
+  // 公开的 OAuth client ID，不是密钥；必须与 internal/oauth/oauth.go 一致。
+  const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+  const text = value => typeof value === 'string' ? value.trim() : '';
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+  // auth.json 可跨行、连贴；对象外保留原来的逐 token 解析方式。
+  function split(input) {
+    const parts = [];
+    let rest = '', depth = 0, start = 0, str = false, esc = false;
+    const flush = function () {
+      for (const token of rest.split(/[\s,[\]"']+/)) if (token) parts.push(token);
+      rest = '';
+    };
+    for (let i = 0; i < input.length; i++) {
+      const c = input[i];
+      if (!depth) {
+        if (c === '{') { flush(); depth = 1; start = i; } else rest += c;
+      } else if (str) {
+        if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') str = false;
+      } else if (c === '"') str = true;
+      else if (c === '{') depth++;
+      else if (c === '}' && !--depth) parts.push(input.slice(start, i + 1));
+    }
+    if (depth) parts.push(input.slice(start)); else flush();
+    return parts;
+  }
+
+  function sub2apiAccount(account, index) {
+    const label = object(account) ? Array.from(text(account.name).replace(/[\x00-\x1f\x7f]/g, '')).slice(0, 64).join('') : '';
+    const skip = reason => ({ index, label, reason });
+    if (!object(account)) return skip('账号项不是对象。');
+    if (account.platform !== 'openai') return skip('不是 OpenAI 账号。');
+    if (account.type !== 'oauth') return skip('仅支持标准 OAuth；API Key、setup-token 和 CPR 不导入。');
+    const c = account.credentials;
+    if (!object(c)) return skip('缺少账号凭据。');
+    // 两个键都查，防止新旧键互相遮蔽。PAT / Agent Identity 不能当普通 OAuth 用。
+    for (const key of ['auth_mode', 'openai_auth_mode']) {
+      if (c[key] != null && c[key] !== '' && !['oauth', 'chatgpt'].includes(text(c[key]))) {
+        return skip('不支持此授权方式（包括 PAT / Agent Identity）。');
+      }
+    }
+    if (c.client_id != null && c.client_id !== '' && text(c.client_id) !== CODEX_CLIENT_ID) {
+      return skip('OAuth client_id 与 gwpool 使用的 Codex 客户端不一致。');
+    }
+    for (const key of ['access_token', 'refresh_token', 'chatgpt_account_id']) {
+      if (c[key] != null && typeof c[key] !== 'string') return skip('凭据字段类型不正确。');
+    }
+    const access = text(c.access_token), refresh = text(c.refresh_token);
+    if (!access && !refresh) return skip('缺少 access_token / refresh_token。');
+    if (access && !/^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(access)) {
+      return skip('access_token 不是可识别的 JWT；最终有效性由服务端校验。');
+    }
+    if (refresh && (refresh.length < 20 || /\s/.test(refresh))) return skip('refresh_token 形状不正确。');
+    const credentials = {};
+    if (access) credentials.access_token = access;
+    if (refresh) credentials.refresh_token = refresh;
+    if (text(c.chatgpt_account_id)) credentials.account_id = text(c.chatgpt_account_id);
+    // expires_at、extra、代理和调度设置都不迁移；到期时刻只信服务端读取的 token 声明。
+    const raw = JSON.stringify(credentials);
+    const retryCredentials = { ...credentials };
+    if (credentials.account_id) {
+      retryCredentials.chatgpt_account_id = credentials.account_id;
+      delete retryCredentials.account_id;
+    }
+    const retry = JSON.stringify({ accounts: [{ name: label, platform: 'openai', type: 'oauth', credentials: retryCredentials }] });
+    return { index, label, raw, retry };
+  }
+
+  function parse(input) {
+    const items = [], skipped = [];
+    let total = 0, fromSub2api = false;
+    for (const part of split(input)) {
+      let payload;
+      try { payload = JSON.parse(part); } catch (_) { /* 原格式交给服务端校验。 */ }
+      if (object(payload) && Object.hasOwn(payload, 'accounts')) {
+        fromSub2api = true;
+        if (!Array.isArray(payload.accounts) || payload.accounts.length === 0) {
+          skipped.push({ index: ++total, label: '', reason: 'accounts 必须是非空账号数组。' });
+        } else {
+          const offset = total;
+          total += payload.accounts.length;
+          if (total <= MAX_ITEMS) {
+            payload.accounts.forEach((account, i) => {
+              const entry = sub2apiAccount(account, offset + i + 1);
+              (entry.reason ? skipped : items).push(entry);
+            });
+          }
+        }
+      } else {
+        items.push({ index: ++total, label: '', raw: part, retry: part });
+      }
+      // 按展开后的总项数限流，包括跳过项；超限整批不发送，不静默截断。
+      if (total > MAX_ITEMS) {
+        return { items: [], skipped: [], fromSub2api, error: '展开后超过 ' + MAX_ITEMS + ' 项，请分批导出或上传。' };
+      }
+    }
+    return { items, skipped, fromSub2api, error: '' };
+  }
+  return { parse, clientID: CODEX_CLIENT_ID };
+})();
+</script>
+{{end}}

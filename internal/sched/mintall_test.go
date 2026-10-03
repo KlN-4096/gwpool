@@ -206,7 +206,7 @@ func TestMintAllKeepsBoundedProblemDetailsAfterSuccesses(t *testing.T) {
 	}
 }
 
-func TestMintAllUsesSeedAndResidentialFallback(t *testing.T) {
+func TestMintAllUsesDynamicExitsEvenWhenSeedsExist(t *testing.T) {
 	q, st, mn, clk := mintAllFixture()
 	duePair(st, clk, "unified-seed", 1, "east-asia")
 	q.Enqueue()
@@ -222,8 +222,8 @@ func TestMintAllUsesSeedAndResidentialFallback(t *testing.T) {
 			seeded++
 		}
 	}
-	if bare == 0 || seeded == 0 || len(mn.seedShots()) == 0 {
-		t.Fatalf("没有覆盖种子/住宅两条路：seeded=%d bare=%d", seeded, bare)
+	if bare != 18 || seeded != 0 || len(mn.seedShots()) != 0 {
+		t.Fatalf("全量新铸混入了静态续票出口：seeded=%d bare=%d", seeded, bare)
 	}
 }
 

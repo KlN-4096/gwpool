@@ -61,7 +61,7 @@ func (s *Server) handleCooldownReport(w http.ResponseWriter, r *http.Request) {
 	report := types.CooldownReport{
 		ID: in.ID, AccountTag: in.AccountTag, Gateway: in.Gateway,
 		WindowSeconds: in.WindowSeconds, ElapsedSeconds: in.ElapsedSeconds, Result: in.Result,
-		ReporterID: caller.acct.ID, ReceivedAt: time.Now().UTC(),
+		ReporterID: caller.reporterID(), ReceivedAt: time.Now().UTC(),
 	}
 	added, err := s.st.AddCooldownReport(report)
 	if errors.Is(err, types.ErrCooldownReportConflict) {
@@ -76,7 +76,7 @@ func (s *Server) handleCooldownReport(w http.ResponseWriter, r *http.Request) {
 	var recommendation *types.CooldownRecommendation
 	for _, stats := range cooldown.Summarize(s.st.CooldownReports(), time.Now()) {
 		if stats.Gateway == in.Gateway {
-			if rec := cooldown.ForAccount(stats, caller.acct.ID, in.AccountTag); rec.Seconds > 0 {
+			if rec := cooldown.ForAccount(stats, caller.reporterID(), in.AccountTag); rec.Seconds > 0 {
 				recommendation = &rec
 			}
 			break
@@ -100,7 +100,7 @@ func (s *Server) cooldownRecommendations(r *http.Request, now time.Time) map[str
 	}
 	out := map[string]types.CooldownRecommendation{}
 	for _, stats := range cooldown.Summarize(s.st.CooldownReports(), now) {
-		if rec := cooldown.ForAccount(stats, caller.acct.ID, tag); rec.Seconds > 0 {
+		if rec := cooldown.ForAccount(stats, caller.reporterID(), tag); rec.Seconds > 0 {
 			out[stats.Gateway] = rec
 		}
 	}

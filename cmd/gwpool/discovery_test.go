@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"gwpool/internal/config"
+	"gwpool/internal/scan"
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
 	"gwpool/internal/types"
@@ -25,11 +30,14 @@ func (stubMinter) VerifyFull(context.Context, types.Creds, types.Exit, string, s
 	return nil, nil
 }
 
+func (stubMinter) Provider(string) string              { return "test-dynamic" }
+func (stubMinter) SupportsDynamicExit(types.Exit) bool { return true }
 func (stubMinter) Geo(context.Context, types.Exit, string) (types.Observed, error) {
 	return types.Observed{}, nil
 }
 
-func (stubMinter) NewSID(bool) (string, error) { return "sid", nil }
+func (stubMinter) NewSID(bool) (string, error)                { return "sid", nil }
+func (stubMinter) NewSIDFor(types.Exit, bool) (string, error) { return "sid", nil }
 
 func (stubMinter) NewSeedSID() (string, error) { return "", errors.New("没配种子出口") }
 
@@ -122,5 +130,63 @@ func TestEnqueueDiscoveryNoOpWhenAlone(t *testing.T) {
 	case got := <-q.ch:
 		t.Fatalf("单账号池子不该派任何人去扫，实际派了 %d", got.acct.ID)
 	default:
+	}
+}
+
+type countingDiscoveryMinter struct {
+	stubMinter
+	calls int
+}
+
+func (m *countingDiscoveryMinter) Mint(context.Context, types.Creds, types.Exit, string, string, time.Time) (types.MintResult, error) {
+	m.calls++
+	return types.MintResult{}, errors.New("offline stop")
+}
+
+func (*countingDiscoveryMinter) Sticky(string) bool { return true }
+
+func TestDiscoveryQueuedExitIsRecheckedAfterDisable(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	account, err := st.AddAccount(types.Account{Label: "offline", Creds: types.Creds{AccessToken: "fake", AccountID: "offline"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Regions = cfg.RegionDefinitions()
+	path := filepath.Join(t.TempDir(), "config.json")
+	live := config.NewLive(path, cfg)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	minter := &countingDiscoveryMinter{}
+	pool := sched.New(st, minter, sched.Options{Mode: types.ModePool, Live: live, Log: log})
+	q := newDiscoveryQueue(&scan.Scanner{Mint: minter, Store: st, MaxTries: 1, Log: log}, pool, log)
+	if reason := q.EnqueueDiscovery(0); reason != "" {
+		t.Fatal(reason)
+	}
+	queued := <-q.ch
+	if queued.acct.ID != account.ID {
+		t.Fatal("wrong account queued")
+	}
+	defs := append([]config.ExplorationRegion(nil), cfg.Regions...)
+	for i := range defs {
+		if defs[i].Key == queued.r.Key {
+			defs[i].Enabled = false
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"regions": defs, "proxies": []map[string]any{
+		{"name": "fake", "kind": "novproxy", "host": "127.0.0.1:1", "user": "fake", "pass": "fake", "enabled": true},
+	}})
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	q.discover(context.Background(), queued)
+	if minter.calls != 0 {
+		t.Fatal("queue sent a job whose exit was disabled before it started")
 	}
 }

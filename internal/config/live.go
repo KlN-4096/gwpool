@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -18,6 +19,7 @@ import (
 type Live struct {
 	path string
 	v    atomic.Pointer[Config]
+	mu   sync.Mutex
 }
 
 func NewLive(path string, c Config) *Live {
@@ -38,8 +40,13 @@ func (l *Live) Path() string { return l.path }
 
 // Reload 重读文件。**校验不过就不换**：磁盘上出现一份坏配置时，正在跑的那份照旧有效。
 func (l *Live) Reload() (Config, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	c, err := Load(l.path)
 	if err != nil {
+		return l.Get(), err
+	}
+	if err := ValidateRegionTransition(l.Get(), c); err != nil {
 		return l.Get(), err
 	}
 	l.v.Store(&c)

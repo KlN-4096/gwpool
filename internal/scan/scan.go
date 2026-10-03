@@ -34,7 +34,7 @@ type Minter interface {
 	types.Minter
 
 	// NewSID 挑一条出口并返回绑定到它的 sid。sticky=false 时允许用非粘性出口。
-	NewSID(sticky bool) (string, error)
+	NewSIDFor(exit types.Exit, sticky bool) (string, error)
 	// Sticky 说明这个 sid 的出口能不能钉住同一个 IP。钉不住就别记地理。
 	Sticky(sid string) bool
 }
@@ -139,7 +139,8 @@ var errAnswered = errors.New("上游已经答复，重试换不来别的答案")
 
 // attempt 是一发：同一个 sid 先查地理再铸票，于是两者走的是同一个出口 IP。
 func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Region) (Landing, error) {
-	sid, err := s.Mint.NewSID(!s.Coarse)
+	started := time.Now()
+	sid, err := s.Mint.NewSIDFor(r.Exit, !s.Coarse)
 	if err != nil {
 		return Landing{}, err
 	}
@@ -167,6 +168,8 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 		Status:    res.Status,
 		At:        now,
 		Err:       types.SampleErr(res.ErrBody, mintErr),
+		Provider:  s.Mint.Provider(sid), Purpose: types.PurposeScan,
+		TargetMatch: r.Exit.MatchEvidence(obs, false), DurationMS: time.Since(started).Milliseconds(),
 	}
 	if err := s.Store.AppendSample(sm); err != nil {
 		return Landing{}, fmt.Errorf("落样本: %w", err)
@@ -217,14 +220,20 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 
 	// 记**请求过的**出口：ReachableExits 的用途是「下次想回到这个网关该怎么请求」，
 	// 观测到的地理是自由文本，回灌成代理参数会认证失败或回退到别国（见 store.UpsertGateway）。
-	isNew, err := s.Store.UpsertGateway(res.Gateway, acct.ID, r.Exit)
+	reached, regionKey := types.Exit{}, ""
+	if r.Exit.MatchesObserved(obs) {
+		reached, regionKey = r.Exit, r.Key
+	}
+	isNew, err := s.Store.UpsertGateway(res.Gateway, acct.ID, reached)
 	if err != nil {
 		return Landing{}, fmt.Errorf("记网关: %w", err)
 	}
 	// 记进 (账号 × 区域) 台账：挑下一个铸票者时「这个号哪个区域还没走过」全靠它，
 	// 而没走过的区域才可能有没见过的落点。
-	if err := s.Store.NoteRegionMint(acct.ID, r.Key, res.Gateway, now); err != nil {
-		return Landing{}, fmt.Errorf("记区域台账: %w", err)
+	if regionKey != "" {
+		if err := s.Store.NoteRegionMint(acct.ID, regionKey, res.Gateway, now); err != nil {
+			return Landing{}, fmt.Errorf("记区域台账: %w", err)
+		}
 	}
 	// 这一发本身就是这个账号对这个网关的一次接触，满血窗口已经开始烧了，记上。
 	// 用 UpdateSlot 而不是 PutSlot：别把调度器刚写上的退避和判定覆盖掉。
@@ -255,7 +264,7 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 			// 用 r.Key 而不是 sched 那边的 sampleRegion(e)：那个兜底是给续期型铸票的
 			// —— 它的出口取自 ReachableExits，不保证正好是 Regions 里那九个代表出口。
 			// 扫描恒从 r.Exit 出去，r.Key 本来就是那九个之一，不需要兜底。
-			RegionKey: r.Key,
+			RegionKey: regionKey,
 		}); err != nil {
 			return Landing{}, fmt.Errorf("记 pair: %w", err)
 		}

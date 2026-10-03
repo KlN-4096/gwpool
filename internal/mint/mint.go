@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/proxycatalog"
 	"gwpool/internal/types"
 )
 
@@ -112,20 +113,21 @@ type Client struct {
 	// （2026-10-01 的一次全池 503 就是这么丢掉现场的）。
 	Log *slog.Logger
 
-	mu        sync.Mutex
-	cursor    int                    // 轮询游标
-	fails     map[string]int         // 供应商 -> 连续失败次数
-	skipUntil map[string]time.Time   // 供应商 -> 跳到什么时候
-	sids      map[string]sidBind     // sid -> 绑定的供应商
-	sent      map[string][]time.Time // 账号|区域 -> 过去一小时每一发请求的时刻
+	mu         sync.Mutex
+	cursor     int                    // 动态出口轮询游标
+	seedCursor int                    // 静态续票出口独立轮询游标
+	fails      map[string]int         // 供应商 -> 连续失败次数
+	skipUntil  map[string]time.Time   // 供应商 -> 跳到什么时候
+	sids       map[string]sidBind     // sid -> 绑定的供应商
+	sent       map[string][]time.Time // 账号|区域 -> 过去一小时每一发请求的时刻
 }
 
 // rateKey 是速率闸的分桶键：(上游账号 × 区域)。
 //
 // 区域反查不到（出口不在 types.Regions 里，只可能来自手改的 state.json）时
 // 整批挤进同一个空桶：宁可让它们互相挤，也不要每个野出口凭空多出一整份配额。
-func rateKey(acct string, e types.Exit) string {
-	return acct + "|" + types.RegionKeyOf(e)
+func (c *Client) rateKey(acct string, e types.Exit) string {
+	return acct + "|" + c.Live.Get().RegionKeyOf(e)
 }
 
 // spend 过速率闸。满了就回 types.ErrRateLimited，一发都不发。
@@ -139,12 +141,31 @@ func (c *Client) spend(acct string, e types.Exit) error {
 	lim := c.perRegionHour()
 	now := time.Now()
 	cut := now.Add(-time.Hour)
-	key := rateKey(acct, e)
+	key := c.rateKey(acct, e)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.sent == nil {
 		c.sent = map[string][]time.Time{}
+	}
+	total, oldest := 0, time.Time{}
+	for bucket, times := range c.sent {
+		separator := strings.LastIndex(bucket, "|")
+		if separator < 0 || bucket[:separator] != acct {
+			continue
+		}
+		for _, at := range times {
+			if at.After(cut) {
+				total++
+				if oldest.IsZero() || at.Before(oldest) {
+					oldest = at
+				}
+			}
+		}
+	}
+	if total >= types.AccountHourLimit(lim) {
+		return &RateLimited{Region: "all", Limit: types.AccountHourLimit(lim),
+			Wait: oldest.Add(time.Hour).Sub(now).Round(time.Second)}
 	}
 	win := c.sent[key]
 	kept := win[:0]
@@ -156,7 +177,7 @@ func (c *Client) spend(acct string, e types.Exit) error {
 	if len(kept) >= lim {
 		c.sent[key] = kept
 		// 说出「还要等多久」：没有它的话调用方只知道被拒，不知道该等 3 秒还是 50 分钟。
-		return &RateLimited{Region: types.RegionKeyOf(e), Limit: lim,
+		return &RateLimited{Region: c.Live.Get().RegionKeyOf(e), Limit: lim,
 			Wait: kept[0].Add(time.Hour).Sub(now).Round(time.Second)}
 	}
 	c.sent[key] = append(kept, now)
@@ -174,7 +195,7 @@ func (c *Client) spend(acct string, e types.Exit) error {
 // 它就是我们刚加的那一发；真撞上了也只是让窗口里某个时间戳差几百毫秒，而这个闸
 // 看的是发数不是时刻。
 func (c *Client) refund(acct string, e types.Exit) {
-	key := rateKey(acct, e)
+	key := c.rateKey(acct, e)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if w := c.sent[key]; len(w) > 0 {
@@ -234,7 +255,16 @@ func (c *Client) NewSID(sticky bool) (string, error) {
 	return sid, nil
 }
 
-// NewSeedSID 开一个绑在普通机房代理（config.KindSeed）上的 sid，给「带种子 cflb 铸票」用。
+// NewSIDFor 只选择能按指定出口定向的动态供应商，不能把城市要求静默降成国家。
+func (c *Client) NewSIDFor(exit types.Exit, sticky bool) (string, error) {
+	sid := randSID()
+	if _, err := c.resolveFor(sid, sticky, &exit); err != nil {
+		return "", err
+	}
+	return sid, nil
+}
+
+// NewSeedSID 开一个绑在静态代理（config.KindSeed）上的 sid，仅给已有票续期用。
 //
 // 为什么能复用整条铸票路径：do 里那句 resolve(sid, true) 是**绑定优先**的——
 // 已经绑过的 sid 直接返回它绑的那条，不再过 Sticky 闸。所以这里先把绑定种下，
@@ -244,10 +274,14 @@ func (c *Client) NewSID(sticky bool) (string, error) {
 func (c *Client) NewSeedSID() (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for i, p := range c.Proxies {
-		if p.Enabled && p.Kind == config.KindSeed {
+	now := time.Now()
+	for i := 0; i < len(c.Proxies); i++ {
+		idx := (c.seedCursor + i) % len(c.Proxies)
+		p := c.Proxies[idx]
+		if p.Enabled && p.Kind == config.KindSeed && !now.Before(c.skipUntil[p.Name]) {
 			sid := randSID()
-			c.bindLocked(sid, i, time.Now())
+			c.seedCursor = (idx + 1) % len(c.Proxies)
+			c.bindLocked(sid, idx, now)
 			return sid, nil
 		}
 	}
@@ -265,6 +299,32 @@ func (c *Client) SeedBound(sid string) bool {
 	defer c.mu.Unlock()
 	b, ok := c.sids[sid]
 	return ok && b.idx < len(c.Proxies) && c.Proxies[b.idx].Kind == config.KindSeed
+}
+
+func (c *Client) Provider(sid string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, ok := c.sids[sid]
+	if !ok || b.idx < 0 || b.idx >= len(c.Proxies) {
+		return ""
+	}
+	return string(c.Proxies[b.idx].Kind)
+}
+
+// SupportsDynamicExit checks capabilities without binding a SID or consuming
+// rotation/budget. Temporary proxy backoff is still handled by NewSIDFor.
+func (c *Client) SupportsDynamicExit(exit types.Exit) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range c.Proxies {
+		if !p.Enabled || p.Kind == config.KindSeed {
+			continue
+		}
+		if _, err := proxyUser(p, exit, strings.Repeat("0", proxySessionIDLength), c.stickyMin()); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Sticky 说明这个 sid 绑定的出口能不能钉住同一个 IP。
@@ -285,18 +345,34 @@ func (c *Client) proxyName(sid string) string {
 
 // resolve 取 sid 绑定的出口；没绑过就现在挑一条绑上。
 func (c *Client) resolve(sid string, sticky bool) (config.Proxy, error) {
+	return c.resolveFor(sid, sticky, nil)
+}
+
+func (c *Client) resolveFor(sid string, sticky bool, exit *types.Exit) (config.Proxy, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if b, ok := c.sids[sid]; ok && b.idx < len(c.Proxies) {
-		return c.Proxies[b.idx], nil
+		p := c.Proxies[b.idx]
+		if exit != nil {
+			if _, err := proxyUser(p, *exit, sid, c.stickyMin()); err != nil {
+				return config.Proxy{}, err
+			}
+		}
+		return p, nil
 	}
 	now := time.Now()
 	n := len(c.Proxies)
 	for i := 0; i < n; i++ {
 		idx := (c.cursor + i) % n
 		p := c.Proxies[idx]
-		if !p.Enabled || (sticky && !p.Sticky()) || now.Before(c.skipUntil[p.Name]) {
+		if !p.Enabled || p.Kind == config.KindSeed ||
+			(sticky && !p.Sticky()) || now.Before(c.skipUntil[p.Name]) {
 			continue
+		}
+		if exit != nil {
+			if _, err := proxyUser(p, *exit, sid, c.stickyMin()); err != nil {
+				continue
+			}
 		}
 		c.cursor = (idx + 1) % n
 		c.bindLocked(sid, idx, now)
@@ -513,6 +589,7 @@ func readGeo(resp *http.Response) (types.Observed, error) {
 	var body struct {
 		IP      string `json:"ip"`
 		Country string `json:"country"`
+		State   string `json:"region"`
 		City    string `json:"city"`
 		Org     string `json:"org"`
 	}
@@ -522,7 +599,7 @@ func readGeo(resp *http.Response) (types.Observed, error) {
 	if body.IP == "" {
 		return types.Observed{}, errors.New("geo 响应里没有 ip")
 	}
-	obs := types.Observed{IP: body.IP, Country: body.Country, City: body.City}
+	obs := types.Observed{IP: body.IP, Country: body.Country, State: body.State, City: body.City}
 	// ipinfo 的 org 是 "AS12345 Some ISP Name"，首段是 ASN。
 	if asn, isp, ok := strings.Cut(body.Org, " "); ok {
 		obs.ASN, obs.ISP = asn, truncate(isp, 40)
@@ -602,7 +679,7 @@ func (c *Client) do(req *http.Request, e types.Exit, sid, acct string) (*http.Re
 		}
 		return resp, nil
 	}
-	p, err := c.resolve(sid, true)
+	p, err := c.resolveFor(sid, true, &e)
 	if err != nil {
 		return nil, err
 	}
@@ -740,6 +817,9 @@ func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, erro
 	}
 	switch p.Kind {
 	case config.KindNovproxy:
+		if e.State != "" || (e.City != "" && !isProxyToken(e.City)) {
+			return "", errors.New("novproxy 不支持州参数，城市必须使用面板的 ASCII token")
+		}
 		var b strings.Builder
 		b.WriteString(p.User)
 		if e.Region != "" {
@@ -753,15 +833,63 @@ func proxyUser(p config.Proxy, e types.Exit, sid string, mins int) (string, erro
 		// 整串 sid 都进去：它只影响「哪些请求共享同一个出口 IP」，而同一个 sid
 		// 永远绑在同一条供应商上（见 resolve），语义正好。
 		fmt.Fprintf(&b, "-sid-%s-t-%d", sid, mins)
-		return b.String(), nil
+		return checkedProxyUser(b.String())
 	case config.KindWebshare:
 		if e.Region == "" {
 			return "", errors.New("webshare 必须指定国家")
 		}
+		if e.State != "" || e.City != "" {
+			return "", errors.New("webshare 只支持国家定向，不能指定州或城市")
+		}
 		// 没有城市段可用，只能按国家定向（ASN 也能挑，但那要在面板里配，不走用户名）。
-		return p.User + "-" + e.Region + "-" + webshareSession(sid), nil
+		return checkedProxyUser(p.User + "-" + e.Region + "-" + webshareSession(sid))
+	case config.KindCliproxy:
+		if e.City != "" {
+			return "", errors.New("cliproxy 尚无已确认的城市参数，不能静默忽略城市")
+		}
+		if !proxycatalog.CliproxySupports(e.Region, e.State) {
+			return "", errors.New("cliproxy 目录中没有此国家/州组合")
+		}
+		country := e.Region
+		if country == "" {
+			country = "Rand"
+		}
+		location := "-region-" + country
+		if e.State != "" {
+			location += "-st-" + e.State
+		}
+		return checkedProxyUser(fmt.Sprintf("%s%s-sid-%s-t-%d", p.User, location, sid, mins))
+	case config.KindIpipgo:
+		var b strings.Builder
+		b.WriteString(p.User)
+		if e.Region != "" {
+			b.WriteString("-country-")
+			b.WriteString(e.Region)
+		}
+		if e.State != "" {
+			b.WriteString("-region-")
+			b.WriteString(e.State)
+		}
+		if e.City != "" {
+			if e.State == "" {
+				return "", errors.New("ipipgo 城市定向必须同时指定州/省")
+			}
+			b.WriteString("-city-")
+			b.WriteString(e.City)
+		}
+		fmt.Fprintf(&b, "-session-%s-time-%d", sid, mins)
+		return checkedProxyUser(b.String())
 	}
 	return "", fmt.Errorf("不认识的代理 kind %q", p.Kind)
+}
+
+const maxProxyUsernameBytes = 255
+
+func checkedProxyUser(user string) (string, error) {
+	if len(user) > maxProxyUsernameBytes {
+		return "", errors.New("地区与会话参数拼接后的代理用户名超过 255 字节")
+	}
+	return user, nil
 }
 
 // webshareSession 把 sid 映成 webshare 要的会话号。
@@ -786,13 +914,18 @@ func validateExit(e types.Exit) error {
 	if e.Region != "" && !isISOCountry(e.Region) {
 		return fmt.Errorf("出口国家 %q 不是 ISO-2 代码", e.Region)
 	}
+	if e.State != "" {
+		if e.Region == "" || !types.ValidLocationName(e.State) {
+			return errors.New("州/省定向必须带国家，且使用合法的供应商目录值")
+		}
+	}
 	if e.City != "" {
 		if e.Region == "" {
 			// 只有城市没有国家时 novproxy 的 city 段会被整段吞掉，等于悄悄取消定向。
 			return fmt.Errorf("出口只给了城市 %q 没给国家，定向会被静默取消", e.City)
 		}
-		if !isProxyToken(e.City) {
-			return fmt.Errorf("出口城市 %q 不是代理面板的 token（只允许字母数字和 -_）", e.City)
+		if !types.ValidLocationName(e.City) {
+			return errors.New("出口城市不是合法的供应商目录值")
 		}
 	}
 	return nil
