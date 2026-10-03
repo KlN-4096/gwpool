@@ -609,6 +609,16 @@ func (m *fakeMinter) mintedGateways() []string {
 	return out
 }
 
+// lastAccount 是最后一发用的账号序号（没打过回 0）。
+func (m *fakeMinter) lastAccount() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.mints) == 0 {
+		return 0
+	}
+	return m.mints[len(m.mints)-1].AccountID
+}
+
 // ---------- 场景搭建 ----------
 
 // rig 搭一个三网关、单账号（既扫又用）的池子。

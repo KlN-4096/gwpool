@@ -448,19 +448,24 @@ func TestRenamedUpstreamPerHourIsRejected(t *testing.T) {
 	}
 }
 
-// 功能删掉的键同理要明着拒，而且两种取值都要拒：留着 false 的那一行，下一个人
-// 迟早会把它改成 true，然后花半天查「为什么拨了没反应」。
+// renew_pairs 曾经是「功能删掉了、键要明着拒」那一类（2026-10-03 上午）。
+// 当天下午换了实现重新回来：续票改成拿**铸出这张票的那个号**和它自己的 `__cflb` 去打
+// （见 sched.renewExpiring），旧版栽在「挑本小时打得最少的号」上。
 //
-// 代价是**部署时必须先把这一行从 config.json 里删掉**，否则起不来。这条用例就是
-// 那个代价的记录：看见它红了就知道线上配置还带着这个键。
-func TestRemovedRenewPairsIsRejected(t *testing.T) {
-	for _, v := range []string{"true", "false"} {
-		_, err := Load(writeCfg(t, `{"renew_pairs":`+v+`,`+okProxies+`}`))
-		if err == nil {
-			t.Fatalf("renew_pairs:%s 被静默忽略了", v)
-		}
-		if !strings.Contains(err.Error(), "renew_pairs") || !strings.Contains(err.Error(), "删掉") {
-			t.Fatalf("报错没说清该把它删掉: %v", err)
-		}
+// 这条钉住「拨了有反应」：默认关、拨开真的读进来。拒键那条用例连同 removedKeys 里的
+// 那一行一起删了 —— 留着它等于一边拒一边又认同一个键。
+func TestRenewPairsIsReadBack(t *testing.T) {
+	cfg, err := Load(writeCfg(t, `{`+okProxies+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RenewPairs {
+		t.Fatal("续票该默认关：它会在没人要票的时候自己花上游额度")
+	}
+	if cfg, err = Load(writeCfg(t, `{"renew_pairs":true,`+okProxies+`}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RenewPairs {
+		t.Fatal("renew_pairs:true 被静默忽略了")
 	}
 }

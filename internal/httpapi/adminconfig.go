@@ -23,6 +23,7 @@ type configView struct {
 	MaxTriesPerDeliver    int
 	SpareTarget           int
 	MinPairs              int
+	RenewPairs            bool
 	PublicEnabled         bool
 	MinAccounts           int
 	// PublicBaseURL 是页面上要告诉人「填进 sub2api 的那个根地址」。
@@ -66,6 +67,7 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
 	v.SpareTarget = c.SpareTarget
 	v.MinPairs = c.MinPairs
+	v.RenewPairs = c.RenewPairs
 	v.PublicEnabled = c.PublicWhenSurplus.Enabled
 	v.MinAccounts = c.PublicWhenSurplus.MinAccounts
 	v.PublicBaseURL = c.PublicBaseURL
@@ -193,6 +195,7 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 		// 换一个读数」）。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
 		// 不能靠「缺键不动」。
 		"verify_full_at_deliver": truthy(r.FormValue("verify_full_at_deliver")),
+		"renew_pairs":            truthy(r.FormValue("renew_pairs")),
 		"slot_cooldown_minutes":  cooldown,
 		"max_tries_per_deliver":  tries,
 		"spare_target":           spare,

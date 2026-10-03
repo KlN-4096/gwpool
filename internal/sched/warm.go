@@ -3,6 +3,7 @@ package sched
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -58,12 +59,158 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 	//
 	// 目标活 pair 数 = 最忙那个号用过的 pair 数 + SpareTarget。够了就一发不打：
 	// 铸票不是免费的，每一发都在烧执行者的窗口、吃它那个区域的速率预算。
+	// 续票在补深度**之前**：保住已经摸到的网关比再摸一个新的值钱 —— 难到的那几个
+	// 一过期就等于丢了（裸铸再碰到它的概率 = 那几个号在那个大区被挑中的概率），
+	// 而深度不够下一轮还能接着补。
+	s.renewExpiring(ctx)
+
 	live, target := s.livePairs(), s.PairTarget()
 	if live >= target {
 		return
 	}
 	s.opt.Log.Info("预铸：补到目标深度", "live", live, "target", target)
 	s.premintBare(ctx, target-live)
+}
+
+// renewPairLead 是「剩这么多就该续了」。
+//
+// 10 分钟：保温一分钟一轮，而续一张要走完抢号 → 拿两把锁 → 一发上游（几秒到几十秒），
+// 还得留出「撞上 RenewGap 被跳过、下一轮再来」的余量。给太短票在排队时就死了，
+// 给太长等于提前把还能用的寿命烧掉。
+const renewPairLead = 10 * time.Minute
+
+// renewBudgetPerRound 是一轮最多续几张。
+//
+// 它不是性能旋钮是**供给闸**：每张续票都是一发真实上游请求，吃的是那个号那个区域的
+// 小时预算（和裸铸、state-echo 共用）。一轮封顶之后，剩下的下一轮接着续 ——
+// 而排序把难到的放在最前面，所以被推到下一轮的永远是「好摸的那些」。
+const renewBudgetPerRound = 12
+
+// renewTarget 是一张等着续的票，连同续它要用的那个号。
+type renewTarget struct {
+	gateway string
+	acct    types.Account
+	exit    types.Exit
+	pair    types.Pair
+	// reach 是台账里有几个**不同的号**最近落到过这个网关。越小越难再摸到。
+	reach int
+}
+
+// renewExpiring 给快到点的 pair 续命：拿**铸出它那个号**和**它自己的 `__cflb`** 重打一发。
+//
+// 为什么非得是来源账号：网关 =(大区 × 账号)，而 `__cflb` 只钉大区。换个号去打，落点是
+// *那个号*在这个大区的网关，不是手上这一张。2026-10-03 删掉的那版续期正是栽在这儿 ——
+// 它用 minterFor 挑「本小时打得最少的号」（见 git 里 renewStalePairs），实测 51 发漂 44 发，
+// 于是结论被记成「定向续期在这个上游不成立」。**真正不成立的是「拿别的号去续别人的网关」。**
+//
+// **先续难到的。** 一个网关只有少数几个号能落上去，它的票一过期就等于丢了：裸铸再碰到它
+// 的概率就是那几个号在那个大区被挑中的概率。按台账里「有几个号落到过它」升序排，
+// 一样稀有就先救快死的那张。
+//
+// 和换盆（mint.Rehome）不重复：换盆是零成本地借同大区最长寿的那张 `__cflb`，整个大区都老了
+// 就借不到 —— 那时每个大区至少要有一发真续，而这就是它。
+func (s *Scheduler) renewExpiring(ctx context.Context) {
+	if !s.cfg().RenewPairs {
+		return
+	}
+	due := s.pairsDueForRenew()
+	if len(due) == 0 {
+		return
+	}
+	done, skipped := 0, 0
+	for _, t := range due {
+		if ctx.Err() != nil || done >= renewBudgetPerRound {
+			break
+		}
+		// 防封节奏：同一个号两次铸票至少隔 RenewGap。抢不到就留给下一轮，
+		// 票还有 renewPairLead 的余量。
+		if !s.claimAccount(t.acct.ID, s.opt.RenewGap) {
+			skipped++
+			continue
+		}
+		// 锁序恒为「先网关、再账号」，和交付那边一致 ⇒ 不存在 ABBA。
+		relGW := s.lockGateway(t.gateway)
+		unlock := s.st.LockAccount(t.acct.ID)
+		sid, seeded, err := s.renewSID()
+		var got minted
+		if err == nil {
+			// want 和 bias 都填这个网关：这是一发**定向**铸票，落点漂了要被当成漂移处理
+			// （mintOnce 自己判），别静悄悄把别的网关的票记成这一张续好了。
+			got, err = s.mintOnce(ctx, t.acct, t.exit, sid, t.pair, t.gateway, t.gateway)
+		}
+		unlock()
+		relGW()
+		switch {
+		case err == nil:
+			done++
+			s.opt.Log.Info("续票", "gateway", t.gateway, "account", t.acct.ID,
+				"reach", t.reach, "seeded", seeded, "landed", got.pair.Gateway)
+		case errors.Is(err, types.ErrRateLimited), errors.Is(err, types.ErrNoExit):
+			// 整池同病，接着试只是把同一句话重复 N 遍。
+			s.opt.Log.Warn("续票撞上闸门，本轮停", "gateway", t.gateway, "reason", err)
+			return
+		default:
+			done++ // 失败也吃预算：否则一次系统性故障就是一轮上百发真实上游请求
+			s.opt.Log.Info("续票失败", "gateway", t.gateway, "account", t.acct.ID,
+				"reach", t.reach, "reason", err)
+		}
+	}
+	s.opt.Log.Info("续票一轮结束", "due", len(due), "done", done, "throttled", skipped)
+}
+
+// renewSID 要一条出口。优先种子出口（便宜机房）：续票的路由是 `__cflb` 定的，
+// 出口 IP 无所谓，没必要烧住宅流量。没配就回落住宅。
+func (s *Scheduler) renewSID() (string, bool, error) {
+	if sid, err := s.mint.NewSeedSID(); err == nil {
+		return sid, true, nil
+	}
+	sid, err := s.mint.NewSID(true)
+	return sid, false, err
+}
+
+// pairsDueForRenew 列出该续的票，难到的排前面。
+func (s *Scheduler) pairsDueForRenew() []renewTarget {
+	now := s.now()
+	// 台账里每个网关被几个**不同的号**落到过。只数「上次落点」是因为台账就只记这个
+	// （types.RegionMint.Gateway），它是现有数据里离「这个网关好不好摸」最近的量。
+	reach := map[string]map[int64]bool{}
+	for _, m := range s.st.RegionMints() {
+		if m.Gateway == "" {
+			continue
+		}
+		if reach[m.Gateway] == nil {
+			reach[m.Gateway] = map[int64]bool{}
+		}
+		reach[m.Gateway][m.AccountID] = true
+	}
+	var out []renewTarget
+	for name, gw := range s.st.Gateways() {
+		p, ok := s.st.Pair(name)
+		if !ok || p.ExpiresAt.Sub(now) > renewPairLead {
+			continue
+		}
+		// 来源号被停用/删了就续不了这一张：换个号去打落的是别的网关（见函数头）。
+		acct, ok := s.account(p.MintedBy)
+		if !ok {
+			continue
+		}
+		exit, ok := pickExit(gw)
+		if !ok {
+			continue
+		}
+		out = append(out, renewTarget{gateway: name, acct: acct, exit: exit,
+			pair: p, reach: len(reach[name])})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].reach != out[j].reach {
+			return out[i].reach < out[j].reach // 难到的先续
+		}
+		if !out[i].pair.ExpiresAt.Equal(out[j].pair.ExpiresAt) {
+			return out[i].pair.ExpiresAt.Before(out[j].pair.ExpiresAt) // 一样稀有就先救快死的
+		}
+		return out[i].gateway < out[j].gateway // 稳定可复现
+	})
+	return out
 }
 
 // seedCflbFloor 是一张票还能当「大区种子」用的最低 `__cflb` 剩余寿命。

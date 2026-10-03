@@ -360,6 +360,8 @@
         </div>
         <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
           <span>票富裕时允许没上传凭据的人取</span></label>
+        <label class="choice"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}>
+          <span>给快到点的票续命 <span class="hint">拿<strong>铸出这张票的那个号</strong>和票自己的 <code>__cflb</code> 重打一发，落点确定（网关 =(大区 × 账号)）。先续难摸到的——只有少数几个号能落到的网关，票一过期就等于丢了。每张一发真实上游请求，一轮最多 12 张；每个号在一个大区只有一个网关，所以每号每小时约一发。<strong>和删掉的那版不是一回事</strong>：那版挑「本小时打得最少的号」去续别人的网关，必然漂移</span></span></label>
         <label class="choice"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}>
           <span>交付前用 state-echo 验一次满血 <span class="hint">每次交付多花两发上游（和铸票共用每区每小时那份预算）。不会烧掉窗口，只是让窗口提前开始计时</span></span></label>
         <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>

@@ -207,6 +207,20 @@ type Config struct {
 	// 把「要得太多」解释成「一张都不要」正好反过来。
 	MinPairs int `json:"min_pairs"`
 
+	// RenewPairs 打开「给快到点的票续命」（见 sched.renewExpiring）。
+	//
+	// **这个键 2026-10-03 删过又加回来，不是同一个东西。** 删掉的那版用 minterFor 挑
+	// 「本小时打得最少的号」去续别人的网关 —— 而网关 =(大区 × 账号)、`__cflb` 只钉大区
+	// ⇒ 落点是那个号自己的网关，实测 51 发漂 44 发，于是保温失败刷屏、把裸铸挤掉。
+	// 现在这版拿的是**铸出这张票的那个号**和**票自己的 `__cflb`**，落点确定。
+	//
+	// 买的东西：难摸到的网关不会因为票过期而丢 —— 裸铸再碰到它的概率只是「那几个能落到
+	// 它的号恰好被挑中」。花的钱：每张续票一发真实上游请求，吃那个号那个区域的小时预算。
+	// 每个号在一个大区只有一个网关 ⇒ 每号每小时约一发，离 upstream_per_region_hour 很远。
+	//
+	// 默认关：它会在没人要票时自己花额度，开之前先看一眼 `续票一轮结束` 那行日志。
+	RenewPairs bool `json:"renew_pairs"`
+
 	// MintConcurrency 是预铸同时派几个**不同账号**去铸票，0 时按 Defaults（1 = 串行）。
 	//
 	// 并发是**跨账号**的：同一个号仍然串行（store.LockAccount，SPEC 红线 2），而且同一个号
@@ -508,12 +522,7 @@ type renamedKey struct{ old, now, why string }
 //
 // 代价是**部署时必须先把这些键从 config.json 里删掉**，否则 gwpool 起不来。这是刻意的：
 // 留着一个没人读的开关，下一个人迟早会去拨它，然后花半天查「为什么拨了没反应」。
-var removedKeys = []removedKey{
-	{key: "renew_pairs",
-		why: "带着旧 pair 去续同一个网关这件事整个删了（2026-10-03）：实测上游不接受" +
-			"定向续期（`__cflb` 钉大区不钉网关、两件齐送不回 cookie），打开它只会让保温" +
-			"失败刷屏、把裸铸挤掉。现在保温只做裸铸，票一律靠 ExpiresAt 自然过期退场"},
-}
+var removedKeys = []removedKey{}
 
 type removedKey struct{ key, why string }
 
