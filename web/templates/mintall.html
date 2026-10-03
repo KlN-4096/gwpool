@@ -1,0 +1,38 @@
+{{define "content"}}
+<div class="page-head"><h1>按范围打票</h1><p><a href="/admin/#overview">← 返回管理页</a></p></div>
+<div class="card"><div class="card-body">
+<p>默认勾选原9个基线出口，不会默认扫描全部国家。每个账号×所选出口最多尝试一次；仍共用动态出口、单区和账号总小时额度。</p>
+<p>预览不发上游请求。确认后才执行，最多保留本批15分钟，过期跳过；不会为等下一小时额度而不断排队。</p>
+{{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
+{{with .Preview}}
+<h2>预览</h2>
+<p>{{.Accounts}} 个账号 × {{.Regions}} 个出口 = {{.Total}} 个组合；预计排队 {{.Queued}}，跳过 {{.Skipped}}。</p>
+<p>每账号总上限 {{.AccountHourLimit}} 发/小时（原9区总预算，不随出口数增加）。预计请求至多 {{.Queued}} 发；并发任务、限流或出口变化可能使实际执行更少。</p>
+{{range $reason, $n := .SkipReasons}}<p>{{$reason}}：{{$n}}</p>{{end}}
+{{end}}
+{{if .Preview}}
+<form method="post" action="/admin/mint-all">
+  <input type="hidden" name="action" value="start">
+  <input type="hidden" name="total" value="{{.Preview.Total}}">
+  <input type="hidden" name="queued" value="{{.Preview.Queued}}">
+  {{range .Keys}}<input type="hidden" name="region" value="{{.}}">{{end}}
+  <button class="primary" type="submit" {{if not .Preview.Queued}}disabled{{end}}>确认执行本范围（消耗真实额度）</button>
+</form>
+{{end}}
+<form method="post" action="/admin/mint-all">
+  <input type="hidden" name="action" value="preview">
+  <label><input type="checkbox" name="all" value="yes">明确选择全部启用出口（非默认）</label>
+  {{range .Groups}}
+  <details><summary>{{.Label}}</summary>
+    <label><input type="checkbox" name="area" value="{{.Label}}">选择本大区全部出口</label>
+    {{range .Countries}}
+    <fieldset><legend>{{.Country}}</legend>
+    {{range .Cells}}<label style="display:block"><input type="checkbox" name="region" value="{{.Key}}" {{if .Selected}}checked{{end}}>{{.Name}} <small>{{.Key}}</small></label>{{end}}
+    </fieldset>
+    {{end}}
+  </details>
+  {{end}}
+  <button type="submit">预览所选范围</button>
+</form>
+</div></div>
+{{end}}

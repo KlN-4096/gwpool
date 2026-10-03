@@ -64,10 +64,16 @@
     </div>
   </div>
   <div class="card">
-    <header class="card-head"><div><h2>各区域的落点</h2><p>各出口区域此刻可交付 / 已发现的网关数。<strong>点一格</strong>把下面的表收窄到该区域，悬停看网关名。</p></div></header>
+    <header class="card-head"><div><h2>各区域的落点</h2><p>按大区和国家展开出口。数字为该出口可交付 / 历史发现，同一网关可属于多个出口，不能相加当总数。</p></div></header>
     <div class="card-body">
+      {{with index .Regions 0}}<a href="{{.Href}}" class="badge{{if .Active}} ok{{end}}">全部 · {{.Ready}} / {{.Total}}</a>{{end}}
+      <a class="foot" href="/?{{if not .ShowEmptyRegions}}regions=all{{end}}#tab-gateways">{{if .ShowEmptyRegions}}只看有记录出口{{else}}查看未探索出口{{end}} →</a>
+      {{range .RegionGroups}}
+      <details class="region-group"><summary>{{.Label}} · {{len .Countries}} 个国家/地区</summary>
+      {{range .Countries}}
+      <p class="foot">{{.Country}}</p>
       <div class="kpis region-kpis">
-      {{range .Regions}}
+      {{range .Cells}}
         <a class="kpi{{if .Ready}} ok{{else}} off{{end}}{{if .Active}} sel{{end}}" href="{{.Href}}"
            title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}{{if .Active}}　（正在只看这一格）{{end}}{{range $i, $g := .Gateways}}{{if $i}}、{{else}}&#10;{{end}}{{$g.Name}}{{if not $g.Ready}}（暂不可交付）{{end}}{{end}}">
           <b>{{if .Total}}{{.Ready}}<small> / {{.Total}}</small>{{else}}—{{end}}</b><span>{{.Label}}</span>
@@ -75,6 +81,9 @@
         </a>
       {{end}}
       </div>
+      {{end}}
+      </details>
+      {{end}}
     </div>
   </div>
   <div class="card">

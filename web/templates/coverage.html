@@ -82,7 +82,11 @@
       <p class="muted">追加缺失的国家级出口，已有出口及启停状态不变；重复操作不会增加重复定义。四家动态代理按定向能力共同承担，库存与专门探索在自然轮次轮流选择，不立即全扫、不提高总配额或并发。目录不保证各家此刻都有库存；落地不匹配不会算该出口发现。</p>
     </form>
   {{end}}
-  {{range .Regions}}
+  {{range .RegionGroups}}
+  <details><summary>{{.Label}} · {{len .Countries}} 个国家/地区</summary>
+  {{range .Countries}}
+  <details><summary>{{.Country}} · {{len .Cells}} 个出口</summary>
+  {{range .Cells}}
     {{if $.Writable}}<form method="post" action="/admin/coverage">
       <input type="hidden" name="action" value="region"><input type="hidden" name="key" value="{{.Key}}">
       <input type="hidden" name="country" value="{{.Country}}"><input type="hidden" name="state" value="{{.State}}"><input type="hidden" name="city" value="{{.City}}">
@@ -92,6 +96,10 @@
         <button type="submit">保存</button>
       </p>
     </form>{{else}}<p>{{.Name}} ({{.Key}}) · {{.Country}} {{.State}} {{.City}} · {{if .Enabled}}启用{{else}}停用{{end}}</p>{{end}}
+  {{end}}
+  </details>
+  {{end}}
+  </details>
   {{end}}
   {{if .Writable}}
     <details><summary>新增实际探索出口</summary>

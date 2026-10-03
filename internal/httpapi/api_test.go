@@ -827,15 +827,15 @@ func TestOwnerPageIsScopedToItsOwnAccounts(t *testing.T) {
 // 九宫格恒为 types.Regions 那九个：铸过的绿、没铸过的灰，而台账里「出口反查不到
 // 区域」那种行（RegionKeyOf 回空串）**不许**画成第十个格子。
 // 另外：纯靠颜色对色盲不友好，所以格子里必须有文字。
-func TestOwnerPageDrawsNineRegionCells(t *testing.T) {
+func TestOwnerPageDrawsOnlyRecordedRegionCells(t *testing.T) {
 	_, h, _, _, _ := rig(t, types.ModePool)
 	body := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String()
 
 	// 九个格子，一个不多一个不少（owner 1 名下只有一个账号）。
 	// 带引号精确数，别把外面那个 class="regions" 容器也数进来。
 	n := strings.Count(body, `class="region"`) + strings.Count(body, `class="region on"`)
-	if n != len(types.Regions) {
-		t.Fatalf("画了 %d 个格子，该是 %d 个：台账里那条空 RegionKey 画成了第十个？", n, len(types.Regions))
+	if n != 1 {
+		t.Fatalf("应只画1个有记录出口，而非全部空格，实际%d", n)
 	}
 	// europe 的最近一次在窗口内 ⇒ 绿 + 文字（✓ 多久前）+ 带时间的 title；别的区域是灰的。
 	if eu := regionCellOf(t, body, "欧洲"); !strings.Contains(eu, `class="region on"`) ||
@@ -845,8 +845,8 @@ func TestOwnerPageDrawsNineRegionCells(t *testing.T) {
 	if !strings.Contains(body, "累计 3 次，最近一次 ") {
 		t.Fatal("格子的 title 里没有累计次数和最近一次时间")
 	}
-	if !strings.Contains(body, "可铸票") {
-		t.Fatal("窗口内没取过的区域该有文字说明，不能只靠颜色")
+	if strings.Contains(body, ">可铸票<") || !strings.Contains(body, "有记录 1 / 9") {
+		t.Fatal("空记录不能承诺可铸，必须显示汇总")
 	}
 	// 2 号的那一格（oceania）不许串到 1 号的页面上。
 	if strings.Count(body, `class="region on"`) != 1 {
@@ -1937,7 +1937,7 @@ func TestAdminAccountFacets(t *testing.T) {
 		`data-facet="on plan-unknown cov-none o2"`,
 		`状态=on:启用:ok|off:已停用:bad;`,
 		`;套餐=plan-plus:plus|plan-pro:pro|plan-unknown:未知;`,
-		`;区域=cov-all:九区都铸过:ok|cov-part:没覆盖全:warn|cov-none:从没铸出过票:bad;`,
+		`;区域=cov-all:启用出口都铸过:ok|cov-part:启用出口未覆盖全:warn|cov-none:启用出口无成功记录:bad;`,
 		`;上传者=o1:#1 我|o2:#2 朋友"`,
 		">1/9<", ">9/9<", ">0/9<",
 	} {
@@ -2807,7 +2807,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 		// 取不到路由的那几发 Gateway 为空，不许把格子染绿。
 		types.Sample{AccountID: 1, RegionKey: "oceania", Gateway: "", Status: 429, At: now.Add(-time.Minute)},
 	)
-	body := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String()
+	body := do(h, httptest.NewRequest("GET", "/a/vt-1?regions=all", nil)).Body.String()
 	if !strings.Contains(body, "各区域探测情况") {
 		t.Fatalf("账号页没有九区域格子：\n%s", body)
 	}
@@ -2843,7 +2843,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	if strings.Contains(me, "region on") {
 		t.Fatalf("窗口外的格子不该是绿的：%s", me)
 	}
-	if !strings.Contains(me, "unified-900") || !strings.Contains(me, win+"内未在此区域取得路由 Cookie，可安排铸票") {
+	if !strings.Contains(me, "unified-900") || !strings.Contains(me, win+"内未在此区域取得路由 Cookie；是否可铸仍受额度和出口可用性限制") {
 		t.Fatalf("中东那一格丢了终身网关名或没说可以去铸：%s", me)
 	}
 
@@ -2862,7 +2862,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 
 	// 2 号没在 europe 取过票，不许把 1 号的数算到它头上。
-	b2 := do(h, httptest.NewRequest("GET", "/a/vt-2", nil)).Body.String()
+	b2 := do(h, httptest.NewRequest("GET", "/a/vt-2?regions=all", nil)).Body.String()
 	if eu2 := regionCellOf(t, b2, "欧洲"); strings.Contains(eu2, "region on") || strings.Contains(eu2, "unified-142") {
 		t.Fatalf("1 号的格子串到 2 号页面上了：%s", eu2)
 	}
@@ -3000,6 +3000,7 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 	if !strings.Contains(cell, `class="kpi ok"`) || !strings.Contains(cell, "unified-142") {
 		t.Fatalf("欧洲那一格没收下 unified-142：%s", cell)
 	}
+	body = do(h, httptest.NewRequest("GET", "/?regions=all", nil)).Body.String()
 	for _, r := range types.Regions {
 		if !strings.Contains(body, config.Defaults().RegionLabel(r.Key)) {
 			t.Fatalf("号池页缺了区域 %s 的格子", r.Key)

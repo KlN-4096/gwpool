@@ -67,7 +67,9 @@ type poolView struct {
 	//
 	// 每一格都是个链接（筛选走查询串、服务端过滤）：**不写 JS**，关掉 JS 也能用，
 	// 而且表格那套 data-grid 的搜索/分面/计数全都照常工作——它只是拿到了更少的行。
-	Regions []poolRegionCell
+	Regions          []poolRegionCell
+	RegionGroups     []displayRegionGroup[poolRegionCell]
+	ShowEmptyRegions bool
 	// Mints 是最近几发铸票，新的在前（见 poolMintRows）。
 	//
 	// 做成**历史**而不是「此刻在铸的」：一发铸票只有几秒，而这一页是服务端渲染的
@@ -268,13 +270,17 @@ type ownerAccountRow struct {
 // regionGrid 是九宫格整块。窗口文案在格子外面说一次，不在九个格子里各写一遍。
 type regionGrid struct {
 	// Window 是「最近多久」的人读文案（跟着 slot_cooldown 走，默认 4 小时）。
-	Window string
-	Cells  []regionCell
+	Window                   string
+	Cells                    []regionCell
+	Groups                   []displayRegionGroup[regionCell]
+	Total, Recorded, Enabled int
+	ShowEmpty                bool
 }
 
 type regionCell struct {
-	Key   string
-	Label string
+	Key     string
+	Label   string
+	Enabled bool
 	// Fresh = **窗口内**在这个区域取到过路由 Cookie。
 	//
 	// 刻意不是终身计数：这张卡要回答的是「此刻这个号还能去哪个区域铸票」，而终身绿

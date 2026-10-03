@@ -21,17 +21,15 @@
 <section id="tab-overview">
   {{if .MintAllAvailable}}
   <div class="card">
-    <header class="card-head"><div><h2>全量打票</h2>
-      <p>为所有启用且有凭据的账号，在每个可铸票区域各打一张，不受当前目标深度限制。优先借同区活 <code>__cflb</code>，没有种子时走住宅；仍遵守单账号间隔与每小时配额。</p>
-      <p>会消耗真实上游额度。配额已满的组合跳过并记原因；短暂的账号间隔会等待。重复提交不会叠加当前批次，服务重启后本轮队列清空。</p>
+    <header class="card-head"><div><h2>按范围打票</h2>
+      <p>先选大区或具体出口，再预览账号×出口组合与额度过滤；确认后才执行。默认原9个基线出口，全部国家必须显式选择。</p>
+      <p>新铸只用动态出口，仍遵守单区额度与不随扩区增长的账号总额度。重复提交不叠加，排队最多15分钟，重启清空；自然探索不受范围选择影响。</p>
     </div></header>
     <div class="card-body">
-      <form method="post" action="/admin/mint-all">
-        <div class="actions">
-          <button type="submit" class="primary" {{if .MintAll.Active}}disabled{{end}}>{{if .MintAll.Active}}全量打票进行中{{else}}全量打票{{end}}</button>
-          <a href="/admin/#overview">刷新进度</a>
-        </div>
-      </form>
+      <div class="actions">
+        {{if .MintAll.Active}}<span>按范围打票进行中</span>{{else}}<a class="button primary" href="/admin/mint-all">选择范围与预览</a>{{end}}
+        <a href="/admin/#overview">刷新进度</a>
+      </div>
       {{if .MintAllStarted}}
       <p>本轮共 {{.MintAll.Total}} 个组合 · 排队 {{.MintAll.Queued}} · 执行中 {{.MintAll.Running}} · 成功 {{.MintAll.Succeeded}} · 失败 {{.MintAll.Failed}} · 跳过 {{.MintAll.Skipped}}</p>
       <p class="muted">开始 {{.MintAllStarted}} UTC{{if .MintAllFinished}} · 结束 {{.MintAllFinished}} UTC{{end}}</p>
@@ -193,7 +191,7 @@
     <div class="table-wrap"><table id="t-accounts" class="acards" data-grid data-size="500" data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、上游账号 ID、上传者或接入 key">
       <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>最近取票</th><th data-nosort>操作</th>
         <th data-nosort>上游账号 ID</th><th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间</th>
-        <th data-nosort>停用原因</th><th data-nosort>九区域</th></tr></thead>
+        <th data-nosort>停用原因</th><th data-nosort>出口记录</th></tr></thead>
       <tbody>
       {{range .Accounts}}
         <tr data-facet="{{.Facet}}">
@@ -215,10 +213,10 @@
           <td class="l2 a-owner"><span class="clip short" title="{{.Owner}}">{{.Owner}}</span></td>
           <td class="l2 a-req">{{.Requests}}</td>
           <td class="l2 a-found">{{.Found}}</td>
-          <td class="l2 a-cov" title="九个区域里铸出过票的有几个">{{.Covered}}</td>
+          <td class="l2 a-cov" title="启用出口中有成功铸票记录的数量；不是网关全集完成率">{{.Covered}}</td>
           <td class="l2 a-since" title="UTC">{{.Since}}</td>
           <td class="l2 a-why">{{if and (not .Enabled) .DisabledReason}}停用原因：{{.DisabledReason}}{{end}}</td>
-          <td class="a-rg">{{template "region-cells" .Card.Regions}}</td>
+          <td class="a-rg">{{template "region-cells" .Card.Regions}}<a class="foot" href="/a/{{.ViewToken}}?regions=all#tab-overview">查看全部出口 →</a></td>
         </tr>
       {{end}}
       </tbody>
@@ -419,7 +417,7 @@
             <input name="public_base_url" inputmode="url" autocomplete="off" spellcheck="false" value="{{.PublicBaseURL}}"></label>
           <label>别的模型名 <span class="hint">上面没列的手打，逗号或换行分隔</span>
             <input name="models_extra" autocomplete="off" spellcheck="false"></label>
-          <label>每账号每区域每小时上限 <span class="hint">0 = 用默认值 6（九个区域合起来 54）。安全阀，不是吞吐量目标</span>
+          <label>每账号单出口每小时上限 <span class="hint">0 = 默认6。同账号全部出口共享总上限：当前 {{.UpstreamPerAccountHour}} 发/小时（原9×单区限额），不是出口数×限额。铸票、续票和交付验证共用，扩区不扩额</span>
             <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
           <label>账号×网关冷却（分钟） <span class="hint">0 = 用默认值 240。<strong>只管读数与统计窗口，不再拦交付</strong>（2026-10-03 起消费冷却交给客户端账本）：九区格子的「最近多久取过」和上面那张接触记录都按它算。实测真实恢复时长 30 分钟到 3 小时都见过</span>
             <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
@@ -435,7 +433,7 @@
         <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
           <span>票富裕时允许没上传凭据的人取</span></label>
         <label class="choice"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}>
-          <span>给快到点的票续命 <span class="hint">拿<strong>铸出这张票的那个号</strong>和票自己的 <code>__cflb</code> 重打一发，落点确定（网关 =(大区 × 账号)）。先续难摸到的——只有少数几个号能落到的网关，票一过期就等于丢了。每张一发真实上游请求，一轮最多 12 张；每个号在一个大区只有一个网关，所以每号每小时约一发。<strong>和删掉的那版不是一回事</strong>：那版挑「本小时打得最少的号」去续别人的网关，必然漂移</span></span></label>
+          <span>给快到点的票续命 <span class="hint">用原铸票账号和票的 <code>__cflb</code> 经静态出口续票，优先稀有网关；落点可能漂移，不保证长期续住。每张消耗一发真实请求，与探索共享账号总预算；连续漂移会退避</span></span></label>
         <label class="choice"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}>
           <span>交付前用 state-echo 验一次满血 <span class="hint">每次交付多花两发上游（和铸票共用每区每小时那份预算）。不会烧掉窗口，只是让窗口提前开始计时</span></span></label>
         <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>

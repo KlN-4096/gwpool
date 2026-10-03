@@ -928,11 +928,17 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
 {{- end}}
 
 {{define "region-cells" -}}
+<p class="foot">有记录 {{.Recorded}} / {{.Total}} 个出口 · 启用 {{.Enabled}}</p>
+{{range .Groups}}
+<details class="region-group">
+<summary>{{.Label}} · {{len .Countries}} 个国家/地区</summary>
+{{range .Countries}}
+<p class="foot">{{.Country}}</p>
 <div class="regions">
 {{range .Cells}}
   <div class="region{{if .Fresh}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
     <span class="rg-name">{{.Label}}</span>
-    <b>{{if .Fresh}}✓ {{.Ago}}前{{else}}可铸票{{end}}</b>
+    <b>{{if not .Enabled}}已停用{{else if .Fresh}}✓ {{.Ago}}前{{else if .Gateways}}历史记录{{else}}未有近期成功{{end}}</b>
     {{- if .Gateways}}<span class="gws">
       {{- range .Gateways}}
       {{- if .Dup}}<code class="dup" title="{{.Name}} 重复：池中已有此网关">{{.Short}}<sup>重</sup></code>
@@ -942,8 +948,11 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
   </div>
 {{end}}
 </div>
+{{end}}
+</details>
+{{end}}
 {{- end}}
 
 {{define "region-legend" -}}
-<p class="rg-legend"><span><i class="on"></i>最近 {{.Window}}内在此区域取得过路由 Cookie</span><span><i></i>窗口内未取得，<strong>可安排去此区域铸票</strong></span><span>数字是网关编号，<sup>重</sup> = 池中已有；悬停看全名与累计次数</span></p>
+<p class="rg-legend"><span><i class="on"></i>最近 {{.Window}}内成功取得过路由 Cookie</span><span><i></i>无近期成功不代表可铸：仍受总额度、单区额度与出口能力限制</span><span>数字是网关编号，<sup>重</sup> = 池中已有；悬停看全名与累计次数</span></p>
 {{- end}}

@@ -6,8 +6,75 @@ import (
 	"testing"
 	"time"
 
+	"gwpool/internal/config"
 	"gwpool/internal/types"
 )
+
+func TestMintAllGlobalExpansionDoesNotExpandDefaultScope(t *testing.T) {
+	q, _, _, _ := mintAllFixture()
+	cfg, err := config.GlobalCountryRegions(config.Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.pool.opt.Live = config.NewLive("", cfg)
+	stat := q.Enqueue()
+	if stat.Total != 18 {
+		t.Fatalf("default action expanded from 9 exits to all countries: %d combinations", stat.Total)
+	}
+}
+
+func TestMintAllSkipsAccountTotalAtEnqueue(t *testing.T) {
+	q, _, mn, _ := mintAllFixture()
+	mn.rateLimit = 4
+	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"other-history": 36}}
+	stat := q.Enqueue()
+	if stat.Queued != 9 {
+		t.Fatalf("full account total still entered queue: %d", stat.Queued)
+	}
+}
+
+func TestMintAllPreviewCapsProjectedTotalAndExpiresPending(t *testing.T) {
+	q, _, mn, clk := mintAllFixture()
+	cfg, err := config.GlobalCountryRegions(config.Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.pool.opt.Live = config.NewLive("", cfg)
+	mn.rateLimit = 4
+	var keys []string
+	for _, region := range cfg.Regions {
+		keys = append(keys, region.Key)
+	}
+	preview := q.Preview(keys...)
+	if preview.Total != 500 || preview.Queued != 72 || q.Status().Active || len(mn.mints) != 0 {
+		t.Fatalf("preview must cap each account at 36 with zero side effects: %+v", preview)
+	}
+	q.Enqueue(keys...)
+	clk.add(mintAllBatchLifetime)
+	_, ready, wait := q.next()
+	if ready || wait != 0 || q.Status().Active || q.Status().Queued != 0 || len(mn.mints) != 0 {
+		t.Fatal("expired batch must not trickle into later budgets")
+	}
+}
+
+func TestMintAllConfirmDoesNotExpandAfterBudgetExpiry(t *testing.T) {
+	q, _, mn, _ := mintAllFixture()
+	mn.rateLimit = 4
+	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"other": 36}}
+	preview := q.Preview()
+	if preview.Queued != 9 {
+		t.Fatal("fixture must initially have only one eligible account")
+	}
+	delete(mn.ratePerAcct, "acct-1") // old requests expired before confirmation
+	next, accepted := q.Confirm(preview.Total, preview.Queued)
+	if accepted || next.Queued != 18 || q.Status().Active {
+		t.Fatal("increased capacity must require a new confirmation")
+	}
+	stat, accepted := q.Confirm(next.Total, next.Queued)
+	if !accepted || stat.Queued != 18 {
+		t.Fatal("confirmed plan was not committed")
+	}
+}
 
 func mintAllFixture() (*MintAllQueue, *fakeStore, *fakeMinter, *clock) {
 	clk := newClock()

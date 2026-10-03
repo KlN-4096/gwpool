@@ -26,7 +26,7 @@ func TestRegionsCustomExitFlowsThroughMintLedgerAndQueue(t *testing.T) {
 		t.Fatal("custom exit was not chosen")
 	}
 	q := NewMintAllQueue(s)
-	if status := q.Enqueue(); status.Total != 2 {
+	if status := q.Enqueue(custom.Key); status.Total != 2 {
 		t.Fatalf("should enqueue only two enabled-region combinations: %+v", status)
 	}
 	status := finishMintAll(t, q)

@@ -17,15 +17,16 @@ type configView struct {
 	// AllModels 是页面上给勾选的全集：候选清单 ∪ 几个常见的。
 	AllModels []modelOpt
 
-	UpstreamPerRegionHour int
-	VerifyFullAtDeliver   bool
-	SlotCooldownMinutes   int
-	MaxTriesPerDeliver    int
-	SpareTarget           int
-	MinPairs              int
-	RenewPairs            bool
-	PublicEnabled         bool
-	MinAccounts           int
+	UpstreamPerRegionHour  int
+	UpstreamPerAccountHour int
+	VerifyFullAtDeliver    bool
+	SlotCooldownMinutes    int
+	MaxTriesPerDeliver     int
+	SpareTarget            int
+	MinPairs               int
+	RenewPairs             bool
+	PublicEnabled          bool
+	MinAccounts            int
 	// PublicBaseURL 是页面上要告诉人「填进 sub2api 的那个根地址」。
 	// 做成配置项而不是从 Host 头推：那个头是调用方可控的输入（见 config 里的注释）。
 	PublicBaseURL string
@@ -62,6 +63,11 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	c := live.Get()
 	v.Models = c.Models
 	v.UpstreamPerRegionHour = c.UpstreamPerRegionHour
+	effectiveLimit := c.UpstreamPerRegionHour
+	if effectiveLimit <= 0 {
+		effectiveLimit = config.Defaults().UpstreamPerRegionHour
+	}
+	v.UpstreamPerAccountHour = types.AccountHourLimit(effectiveLimit)
 	v.VerifyFullAtDeliver = c.VerifyFullAtDeliver
 	v.SlotCooldownMinutes = c.SlotCooldownMinutes
 	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver

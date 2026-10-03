@@ -21,8 +21,10 @@
 
 <section id="tab-overview">
   <div class="card">
-    <header class="card-head"><div><h2>各区域探测情况</h2><p>该账号在九个出口区域的取票状态，以及在各区域打过的网关。</p></div></header>
-    <div class="card-body">{{template "regions" .Regions}}</div>
+    <header class="card-head"><div><h2>各区域探测情况</h2><p>默认仅列有成功记录的出口。历史记录不是当前库存或可铸额度。</p></div></header>
+    <div class="card-body">{{template "regions" .Regions}}
+      <a href="?{{if not .Regions.ShowEmpty}}regions=all{{end}}#tab-overview">{{if .Regions.ShowEmpty}}只看有记录出口{{else}}查看全部出口（含未探索）{{end}} →</a>
+    </div>
   </div>
   <div class="grid-2">
     <div class="card">

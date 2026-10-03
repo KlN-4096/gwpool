@@ -11,10 +11,11 @@ import (
 )
 
 const (
-	mintAllJobTimeout = time.Minute
-	mintAllRetryGap   = time.Second
-	mintAllRecent     = 20
-	mintAllProblems   = 200
+	mintAllJobTimeout    = time.Minute
+	mintAllRetryGap      = time.Second
+	mintAllRecent        = 20
+	mintAllProblems      = 200
+	mintAllBatchLifetime = 15 * time.Minute
 )
 
 // MintAllResult 是管理员可见的白名单结果，不含凭据、cookie 或上游原始错误。
@@ -28,18 +29,21 @@ type MintAllResult struct {
 }
 
 type MintAllStatus struct {
-	Active                     bool
-	Total, Queued, Running     int
-	Succeeded, Failed, Skipped int
-	Started, Finished          time.Time
-	SkipReasons                map[string]int
-	Recent                     []MintAllResult
-	Problems                   []MintAllResult // 本轮前 200 个异常，成功不会挤掉入队时的跳过原因。
+	Active                              bool
+	Total, Queued, Running              int
+	Succeeded, Failed, Skipped          int
+	Started, Finished                   time.Time
+	Expires                             time.Time
+	Accounts, Regions, AccountHourLimit int
+	SkipReasons                         map[string]int
+	Recent                              []MintAllResult
+	Problems                            []MintAllResult // 本轮前 200 个异常，成功不会挤掉入队时的跳过原因。
 }
 
 type mintAllJob struct {
 	accountID int64
 	region    types.Region
+	expires   time.Time
 }
 
 // MintAllQueue 只存本轮的账号 ID 和区域，不保存凭据快照。
@@ -58,49 +62,33 @@ func NewMintAllQueue(pool *Scheduler) *MintAllQueue {
 
 // Enqueue 同轮幂等。按区域交错账号，避免连续九发都排给同一个号。
 // 配额已经用完/上游按住的组合当场跳过；不挂到下一个小时等配额。
-func (q *MintAllQueue) Enqueue() MintAllStatus {
+func (q *MintAllQueue) Enqueue(regionKeys ...string) MintAllStatus {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.stat.Active {
 		return q.snapshot()
 	}
-	q.jobs = nil
-	q.stat = MintAllStatus{Started: q.pool.now(), SkipReasons: map[string]int{}}
-	accounts := q.pool.usable()
-	regions := q.pool.cfg().CandidateRegions(types.Exit{})
-	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
-	allowed := make(map[int64]map[string]bool, len(accounts))
-	for _, a := range accounts {
-		used, limit := q.pool.mint.Rate(a.Creds.AccountID)
-		held := q.pool.accountHeldFor(a.ID) > 0
-		allowed[a.ID] = map[string]bool{}
-		for _, r := range regions {
-			q.stat.Total++
-			reason := ""
-			switch {
-			case !q.pool.mint.SupportsDynamicExit(r.Exit):
-				reason = "供应商不支持此出口"
-			case held:
-				reason = "上游限流"
-			case limit > 0 && used[r.Key] >= limit:
-				reason = "区域配额已满"
-			default:
-				allowed[a.ID][r.Key] = true
-			}
-			if reason != "" {
-				q.recordResult(MintAllResult{AccountID: a.ID, Region: r.Key, Status: "skipped", Reason: reason})
-			}
-		}
+	q.jobs, q.stat = q.plan(regionKeys)
+	return q.startPlanned()
+}
+
+// Confirm plans once under the queue lock and commits exactly that checked
+// plan. A sliding-rate expiry cannot grow the queue after approval.
+func (q *MintAllQueue) Confirm(total, queued int, regionKeys ...string) (MintAllStatus, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stat.Active {
+		return q.snapshot(), true
 	}
-	for _, r := range regions {
-		for _, a := range accounts {
-			if allowed[a.ID][r.Key] {
-				q.jobs = append(q.jobs, mintAllJob{accountID: a.ID, region: r})
-			}
-		}
+	jobs, stat := q.plan(regionKeys)
+	if stat.Total != total || stat.Queued != queued {
+		return stat, false
 	}
-	q.stat.Queued = len(q.jobs)
-	q.stat.Active = len(q.jobs) > 0
+	q.jobs, q.stat = jobs, stat
+	return q.startPlanned(), true
+}
+
+func (q *MintAllQueue) startPlanned() MintAllStatus {
 	if !q.stat.Active {
 		q.stat.Finished = q.pool.now()
 	} else {
@@ -110,6 +98,83 @@ func (q *MintAllQueue) Enqueue() MintAllStatus {
 		}
 	}
 	return q.snapshot()
+}
+
+// Preview is read-only: no quota reservation, queue mutation or upstream call.
+func (q *MintAllQueue) Preview(regionKeys ...string) MintAllStatus {
+	_, stat := q.plan(regionKeys)
+	return stat
+}
+
+func (q *MintAllQueue) plan(regionKeys []string) ([]mintAllJob, MintAllStatus) {
+	now := q.pool.now()
+	plan := &MintAllQueue{stat: MintAllStatus{Started: now, Expires: now.Add(mintAllBatchLifetime), SkipReasons: map[string]int{}}}
+	accounts := q.pool.usable()
+	// Omission keeps the original nine-exit scope, never all configured countries.
+	wanted := map[string]bool{}
+	if len(regionKeys) == 0 {
+		for _, region := range types.Regions {
+			wanted[region.Key] = true
+		}
+	} else {
+		for _, key := range regionKeys {
+			wanted[key] = true
+		}
+	}
+	var regions []types.Region
+	for _, region := range q.pool.cfg().CandidateRegions(types.Exit{}) {
+		if wanted[region.Key] {
+			regions = append(regions, region)
+		}
+	}
+	plan.stat.Accounts, plan.stat.Regions = len(accounts), len(regions)
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
+	allowed := make(map[int64]map[string]bool, len(accounts))
+	projected := map[string]map[string]int{}
+	for _, a := range accounts {
+		used, limit := q.pool.mint.Rate(a.Creds.AccountID)
+		if _, ok := projected[a.Creds.AccountID]; !ok {
+			copyUsed := make(map[string]int, len(used))
+			for key, count := range used {
+				copyUsed[key] = count
+			}
+			projected[a.Creds.AccountID] = copyUsed
+		}
+		used = projected[a.Creds.AccountID]
+		plan.stat.AccountHourLimit = types.AccountHourLimit(limit)
+		held := q.pool.accountHeldFor(a.ID) > 0
+		allowed[a.ID] = map[string]bool{}
+		for _, r := range regions {
+			plan.stat.Total++
+			reason := ""
+			switch {
+			case !q.pool.mint.SupportsDynamicExit(r.Exit):
+				reason = "供应商不支持此出口"
+			case held:
+				reason = "上游限流"
+			case limit > 0 && used[r.Key] >= limit:
+				reason = "区域配额已满"
+			case types.MintBudgetFull(used, limit, r.Key):
+				reason = "账号总配额已满（含本批预估）"
+			default:
+				allowed[a.ID][r.Key] = true
+				used[r.Key]++
+			}
+			if reason != "" {
+				plan.recordResult(MintAllResult{AccountID: a.ID, Region: r.Key, Status: "skipped", Reason: reason})
+			}
+		}
+	}
+	for _, r := range regions {
+		for _, a := range accounts {
+			if allowed[a.ID][r.Key] {
+				plan.jobs = append(plan.jobs, mintAllJob{accountID: a.ID, region: r, expires: plan.stat.Expires})
+			}
+		}
+	}
+	plan.stat.Queued = len(plan.jobs)
+	plan.stat.Active = len(plan.jobs) > 0
+	return plan.jobs, plan.stat
 }
 
 func (q *MintAllQueue) Status() MintAllStatus {
@@ -178,6 +243,14 @@ func (q *MintAllQueue) next() (mintAllJob, bool, time.Duration) {
 		return mintAllJob{}, false, 0
 	}
 	now := q.pool.now()
+	if !q.stat.Expires.IsZero() && !now.Before(q.stat.Expires) {
+		for _, job := range q.jobs {
+			q.recordResult(MintAllResult{AccountID: job.accountID, Region: job.region.Key, Status: "skipped", Reason: "本批已超过15分钟"})
+		}
+		q.jobs = nil
+		q.stat.Queued, q.stat.Active, q.stat.Finished = 0, false, now
+		return mintAllJob{}, false, 0
+	}
 	q.pool.mu.Lock()
 	defer q.pool.mu.Unlock()
 	var earliest time.Duration
@@ -205,6 +278,10 @@ func (q *MintAllQueue) execute(ctx context.Context, job mintAllJob) (MintAllResu
 	result := MintAllResult{AccountID: job.accountID, Region: job.region.Key, Status: "skipped"}
 	if ctx.Err() != nil {
 		result.Reason = "服务停止"
+		return result, false
+	}
+	if !job.expires.IsZero() && !s.now().Before(job.expires) {
+		result.Reason = "本批已超过15分钟"
 		return result, false
 	}
 	if !s.RegionEnabled(job.region) {

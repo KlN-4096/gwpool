@@ -29,6 +29,7 @@ type coverageView struct {
 	base
 	Snapshot           coverage.Snapshot
 	Regions            []config.ExplorationRegion
+	RegionGroups       []displayRegionGroup[config.ExplorationRegion]
 	Groups             []coverageGroupForm
 	Exits              []coverageExitOption
 	Writable           bool
@@ -55,6 +56,7 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	for _, region := range view.Regions {
 		view.Exits = append(view.Exits, coverageExitOption{Key: region.Key, Name: region.Name})
 	}
+	view.RegionGroups = groupDisplayRegions(cfg, view.Regions, func(region config.ExplorationRegion) string { return region.Key })
 	for _, group := range view.Snapshot.Groups {
 		form := coverageGroupForm{Group: group, TargetText: strings.Join(group.Targets, "\n")}
 		for _, region := range view.Regions {

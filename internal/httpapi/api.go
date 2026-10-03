@@ -138,7 +138,9 @@ type Scanner interface {
 }
 
 type MintAllQueue interface {
-	Enqueue() sched.MintAllStatus
+	Enqueue(...string) sched.MintAllStatus
+	Preview(...string) sched.MintAllStatus
+	Confirm(int, int, ...string) (sched.MintAllStatus, bool)
 	Status() sched.MintAllStatus
 }
 
@@ -203,6 +205,7 @@ type Server struct {
 	started time.Time
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
+	tplMintAll                                                    *template.Template
 }
 
 // probeEffort 必须跟 mint 包实际发出去的 payload 一致（SPEC 第 2 节）：
@@ -253,6 +256,9 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if s.tplCoverage, err = parse("coverage.html"); err != nil {
 		return nil, err
 	}
+	if s.tplMintAll, err = parse("mintall.html"); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -289,6 +295,7 @@ func (s *Server) Handler() http.Handler {
 	// 不罩的话一个第三方页面就能让管理员的浏览器替他删号或改配置。
 	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
 	mux.Handle("POST /admin/mint-all", s.sameOrigin(http.HandlerFunc(s.handleAdminMintAll)))
+	mux.HandleFunc("GET /admin/mint-all", s.handleAdminMintAll)
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
 	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
@@ -657,6 +664,8 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	want := sanitizeLabel(r.URL.Query().Get("region"), "")
 	v.Shown, v.FilterLabel = filterPoolGateways(v.Gateways, v.Regions, want)
 	markPoolRegionLinks(v.Regions, want)
+	v.ShowEmptyRegions = r.URL.Query().Get("regions") == "all"
+	v.RegionGroups = poolDisplayGroups(s.opt.Live.Get(), v.Regions, v.ShowEmptyRegions)
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
@@ -774,7 +783,8 @@ func markPoolRegionLinks(cells []poolRegionCell, want string) {
 		default:
 			c.Href = "/?region=" + url.QueryEscape(c.Key) + "#tab-gateways"
 		}
-		if !c.All && (c.Key == want || (c.Key == "" && want == poolRegionQuery)) {
+		if !c.All && ((want != "" && want != poolRegionQuery && c.Key == want) ||
+			(c.Key == "" && want == poolRegionQuery)) {
 			c.Active, hit = true, true
 		}
 	}
@@ -1245,7 +1255,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.OwnerToken = o.Token
 	}
 	v.NewGateways = s.foundBy(a.ID)
-	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
+	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown(), r.URL.Query().Get("regions") == "all")
 	for _, sm := range samples {
 		if sm.AccountID != a.ID {
 			continue
@@ -1431,7 +1441,7 @@ func ago(now, t time.Time) string {
 // 网关名只在样本里（台账只记计数），所以 samples/gws 一起传进来：gws 用来判
 // 「这个网关是不是记在别人名下」。两者为 nil 时格子照画，只是列不出名字。
 func regionCells(cfg config.Config, accountID int64, mints map[string]types.RegionMint,
-	samples []types.Sample, gws map[string]types.Gateway, window time.Duration) regionGrid {
+	samples []types.Sample, gws map[string]types.Gateway, window time.Duration, showEmpty ...bool) regionGrid {
 	byRegion := map[string]types.RegionMint{}
 	for _, m := range mints {
 		if m.AccountID == accountID && m.RegionKey != "" {
@@ -1455,7 +1465,7 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 	for _, sm := range samples {
 		// Gateway 非空就是「这一发真取到了路由」——照 types.MintResult 的语义，
 		// 取不到的那几发 Gateway 为空。
-		if sm.AccountID != accountID || sm.Gateway == "" || !known[sm.RegionKey] {
+		if sm.AccountID != accountID || sm.Status != http.StatusOK || sm.Gateway == "" || !known[sm.RegionKey] {
 			continue
 		}
 		if _, ok := firstRegion[sm.Gateway]; !ok {
@@ -1467,16 +1477,27 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 		inRegion[sm.RegionKey][sm.Gateway] = true
 	}
 	now := time.Now()
-	grid := regionGrid{Window: shortDur(window), Cells: make([]regionCell, 0, len(cfg.RegionDefinitions()))}
+	grid := regionGrid{Window: shortDur(window), Total: len(cfg.RegionDefinitions()),
+		ShowEmpty: len(showEmpty) > 0 && showEmpty[0]}
 	for _, r := range cfg.RegionDefinitions() {
-		c := regionCell{Key: r.Key, Label: r.Name}
+		if r.Enabled {
+			grid.Enabled++
+		}
 		m, had := byRegion[r.Key]
+		recorded := (had && m.Count > 0) || len(inRegion[r.Key]) > 0
+		if recorded {
+			grid.Recorded++
+		}
+		if !recorded && !grid.ShowEmpty {
+			continue
+		}
+		c := regionCell{Key: r.Key, Label: r.Name, Enabled: r.Enabled}
 		c.Fresh = had && m.Count > 0 && !m.LastAt.IsZero() && now.Sub(m.LastAt) < window
 		if c.Fresh {
 			c.Ago = shortDur(now.Sub(m.LastAt))
 			c.Note = c.Ago + "前在此区域取得路由 Cookie"
 		} else {
-			c.Note = grid.Window + "内未在此区域取得路由 Cookie，可安排铸票"
+			c.Note = grid.Window + "内未在此区域取得路由 Cookie；是否可铸仍受额度和出口可用性限制"
 		}
 		// 终身读数退到悬停：窗口是「现在能不能去」，终身是「以前去过没有」。
 		if had && m.Count > 0 {
@@ -1506,6 +1527,7 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 		})
 		grid.Cells = append(grid.Cells, c)
 	}
+	grid.Groups = groupDisplayRegions(cfg, grid.Cells, func(cell regionCell) string { return cell.Key })
 	return grid
 }
 
@@ -1999,8 +2021,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 				row.Owner = fmt.Sprintf("#%d", a.OwnerID)
 			}
 			n := covered[a.ID]
-			row.Covered = fmt.Sprintf("%d/%d", n, len(cfg.RegionDefinitions()))
-			row.Facet = accountFacet(a, n, len(cfg.RegionDefinitions()))
+			total := len(cfg.CandidateRegions(types.Exit{}))
+			row.Covered = fmt.Sprintf("%d/%d", n, total)
+			row.Facet = accountFacet(a, n, total)
 			v.Accounts = append(v.Accounts, row)
 			continue
 		}
@@ -2121,7 +2144,7 @@ func acctName(byID map[int64]types.Account, id int64) string {
 func regionsCovered(cfg config.Config, mints map[string]types.RegionMint) map[int64]int {
 	known := make(map[string]bool, len(cfg.RegionDefinitions()))
 	for _, r := range cfg.RegionDefinitions() {
-		known[r.Key] = true
+		known[r.Key] = r.Enabled
 	}
 	out := map[int64]int{}
 	for _, m := range mints {
@@ -2223,7 +2246,7 @@ func accountFacets(rows []accountRow, owners []types.Owner, ownerName map[int64]
 	return strings.Join([]string{
 		"状态=on:启用:ok|off:已停用:bad",
 		"套餐=" + strings.Join(planGroup, "|"),
-		"区域=cov-all:九区都铸过:ok|cov-part:没覆盖全:warn|cov-none:从没铸出过票:bad",
+		"区域=cov-all:启用出口都铸过:ok|cov-part:启用出口未覆盖全:warn|cov-none:启用出口无成功记录:bad",
 		"上传者=" + strings.Join(ownerGroup, "|"),
 	}, ";")
 }
