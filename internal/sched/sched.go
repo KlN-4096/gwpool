@@ -1477,6 +1477,18 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 			// 正好等于 Regions 里那九个代表出口，RegionKeyOf 会回空串 ⇒ 消费端整片
 			// 画成「未归类」。退回「国家[:城市]」比空着能认。
 			RegionKey: sampleRegion(e)}
+		// **换盆之后再写：新票替换旧票，TTL 按能拿到的最长 `__cflb` 重算。**
+		//
+		// 不换盆就直接写会丢寿命：这一发很可能是带种子打的，而上游不补发 `__cflb` 时
+		// （常态）新票原样留着**种子那张**，种子的门槛只有 seedCflbFloor（10 分钟）
+		// ⇒ 一张还剩 50 分钟的旧票被一张只剩 10 分钟的新票顶掉，池子凭空少 40 分钟。
+		//
+		// 换盆比「短命就不覆盖」对：新票的 `__oailb` 是新鲜的 65 分钟，拖后腿的只有借来的
+		// `__cflb`，而 `__cflb` 是可以换的（mint.SwapCflb）⇒ 换完的新票 ≥ 两张里任何一张。
+		// best 取**整个大区**最长寿的那张，不只是这个网关的旧票，所以比两两相比还好。
+		//
+		// best 必须在 PutPair **之前**算：旧的 161 那张自己就是候选捐赠者，先写就把它挤掉了。
+		p = s.rehome(p, s.bestCflb())
 		if err := s.st.PutPair(p); err != nil {
 			s.opt.Log.Warn("写 pair 失败", "gateway", p.Gateway, "err", err)
 		}
