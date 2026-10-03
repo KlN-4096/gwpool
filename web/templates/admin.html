@@ -353,6 +353,8 @@
             <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>
           <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2。目标张数 = 最忙的号用过的张数 + 这个数，最多 190（上游网关总共约 190–201 个）。填超过 190 = 停止预铸</span>
             <input name="spare_target" inputmode="numeric" value="{{.SpareTarget}}"></label>
+          <label>最低活票数 <span class="hint">0 = 不设下界（默认）。目标张数取「最忙的号用过的张数 + 富余」和这个数的<strong>较大者</strong>，所以池子空闲时也不会塌下去、下一个人来不用现等铸票。富余是相对量，这个是绝对底线；填超过 190 按 190 算，<strong>不会</strong>像富余那样变成「停止预铸」</span>
+            <input name="min_pairs" inputmode="numeric" value="{{.MinPairs}}"></label>
           <label>对外开放门槛（托管账号数） <span class="hint">托管账号少于这个数就只服务上传者。按账号数而不按活 pair 数：按需铸票的池子不囤票。默认 2（冗余底线）——实测单个账号就能摸到整张网关表（105/105），触达面不是瓶颈，只有「一个号被停用或被 429 按住就整池停摆」才是</span>
             <input name="min_accounts" inputmode="numeric" value="{{.MinAccounts}}"></label>
         </div>

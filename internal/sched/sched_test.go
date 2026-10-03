@@ -1991,6 +1991,61 @@ func TestPairTargetCappedAtGatewayCeiling(t *testing.T) {
 	}
 }
 
+// min_pairs 是**下界**：池子空闲（没人用过票）时目标不塌到 SpareTarget，而是托在这个数上。
+// 和富余的区别就是这一格 —— 富余是相对量，跟着负载走。
+func TestMinPairsFloorsTheTarget(t *testing.T) {
+	s, st, _, clk := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	c := s.opt.Live.Get()
+	c.MinPairs = 12
+	s.opt.Live = config.NewLive("", c)
+
+	// 没人用过票 ⇒ busiest=0 ⇒ 相对目标是 SpareTarget，下界把它顶到 12。
+	if got := s.PairTarget(); got != 12 {
+		t.Fatalf("空闲时目标应被下界托到 12，实为 %d", got)
+	}
+	// 负载超过下界之后下界就不再起作用（取较大者，不是取下界）。
+	for i := 1; i <= 20; i++ {
+		gw := fmt.Sprintf("unified-%d", i)
+		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw,
+			LastTouch: clk.now(), LastDeliver: clk.now()}
+	}
+	if got, want := s.PairTarget(), 20+types.SpareTarget; got != want {
+		t.Fatalf("负载高于下界时应按 busiest+富余 = %d，实为 %d", want, got)
+	}
+}
+
+// 下界填得比网关总数还大就按上限算 —— **不能**走富余那条「超了就停止预铸」的路：
+// 「至少 N 张」解释成「一张都不要」正好反过来。
+func TestMinPairsOverCeilingCapsInsteadOfStopping(t *testing.T) {
+	s, st, _, _ := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	c := s.opt.Live.Get()
+	c.MinPairs = types.GatewayCeiling + 50
+	s.opt.Live = config.NewLive("", c)
+	if got := s.PairTarget(); got != types.GatewayCeiling {
+		t.Fatalf("下界超过网关总数时应封顶在 %d，实为 %d", types.GatewayCeiling, got)
+	}
+}
+
+// 富余显式关掉预铸时，下界不许把它打开：那是运营方的显式决定。
+func TestMinPairsDoesNotReopenPremintWhenSpareStopsIt(t *testing.T) {
+	s, st, mn, _ := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	s.markDemand()
+	c := s.opt.Live.Get()
+	c.SpareTarget = types.GatewayCeiling + 1
+	c.MinPairs = 20
+	s.opt.Live = config.NewLive("", c)
+	if got := s.PairTarget(); got != 0 {
+		t.Fatalf("富余关掉预铸时下界不该把目标顶回 %d", got)
+	}
+	s.warmOnce(context.Background())
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("富余关掉预铸、下界却让它打了 %d 发", n)
+	}
+}
+
 // 富余张数填超过网关总数上限 = 停止预铸（不报错）：目标归零，保温一发都不打。
 func TestSpareOverCeilingStopsPremint(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModePool)

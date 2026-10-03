@@ -477,7 +477,9 @@ func (s *Scheduler) PairTarget() int {
 	if spare > types.GatewayCeiling {
 		return 0
 	}
-	return min(busiest+spare, types.GatewayCeiling)
+	// 下界：不管有没有人在用，手上至少备这么多张（见 config.Config.MinPairs）。
+	// 在 spare 那条「停止预铸」的早返回**之后**：那是运营方显式关掉预铸，下界不该把它打开。
+	return min(max(busiest+spare, s.cfg().MinPairs), types.GatewayCeiling)
 }
 
 // 「挑谁去铸」只有 minterFor 一份了。

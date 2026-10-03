@@ -67,6 +67,14 @@ type poolView struct {
 	// 每一格都是个链接（筛选走查询串、服务端过滤）：**不写 JS**，关掉 JS 也能用，
 	// 而且表格那套 data-grid 的搜索/分面/计数全都照常工作——它只是拿到了更少的行。
 	Regions []poolRegionCell
+	// Mints 是最近几发铸票，新的在前（见 poolMintRows）。
+	//
+	// 做成**历史**而不是「此刻在铸的」：一发铸票只有几秒，而这一页是服务端渲染的
+	// ⇒ 在飞快照大概率恒为空，看不出池子到底在不在干活。
+	Mints []poolMintRow
+	// TotalMints 是账本里一共多少发（页签上那个计数），不是 Mints 的长度 —— 表里只列最近几十行。
+	TotalMints int
+
 	// ReadyCount 在服务端算好。原来这张卡片靠 JS 数表格行，关掉 JS 就只剩「—」。
 	ReadyCount int
 	Accounts   int
@@ -112,6 +120,22 @@ type supplyLedger struct {
 	LifeMin  int
 	FloorMin int
 	ReadyMin int
+}
+
+// poolMintRow 是公开页「铸票记录」里的一行。
+//
+// 字段是**白名单**，不是「把 adminSampleRow 抄过来删几个」：采样行里带出口国家/城市
+// （geoLabel）、ASN 和上游原始错误正文，三样都不许上这一页 —— 前两样用户定过只给管理员看，
+// 错误正文是上游回的 JSON，里面可能带账号信息。
+type poolMintRow struct {
+	At      string
+	Account string // 遮过的备注，见 maskLabel
+	Region  string
+	Gateway string // 落点；裸铸读不出来时是「—」
+	OK      bool
+	// Status 是上游 HTTP 状态码。0 = 一发都没出站（传输失败/本地拦下），
+	// 模板据此显示「失败」而不是「HTTP 0」。
+	Status int
 }
 
 type gatewayRow struct {
