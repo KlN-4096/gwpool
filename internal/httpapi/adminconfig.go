@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"gwpool/internal/config"
+	"gwpool/internal/types"
 )
 
 // configView 是管理页上「能改的旋钮」那一节。
@@ -21,6 +22,7 @@ type configView struct {
 	SlotCooldownMinutes   int
 	MaxTriesPerDeliver    int
 	SpareTarget           int
+	MinPairs              int
 	PublicEnabled         bool
 	MinAccounts           int
 	// PublicBaseURL 是页面上要告诉人「填进 sub2api 的那个根地址」。
@@ -63,6 +65,7 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	v.SlotCooldownMinutes = c.SlotCooldownMinutes
 	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
 	v.SpareTarget = c.SpareTarget
+	v.MinPairs = c.MinPairs
 	v.PublicEnabled = c.PublicWhenSurplus.Enabled
 	v.MinAccounts = c.PublicWhenSurplus.MinAccounts
 	v.PublicBaseURL = c.PublicBaseURL
@@ -169,6 +172,12 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 上限用 GatewayCeiling 而不是 spare 那个 100：这是绝对张数，而活 pair 一个网关一张
+	// ⇒ 比网关总数大就没意义。0 = 不设下界（见 config.Config.MinPairs）。
+	minPairs, err := atoiField(r, "min_pairs", 0, types.GatewayCeiling)
+	if err != nil {
+		return nil, err
+	}
 
 	pub := cur.PublicWhenSurplus
 	pub.Enabled = truthy(r.FormValue("public_enabled"))
@@ -187,6 +196,7 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 		"slot_cooldown_minutes":  cooldown,
 		"max_tries_per_deliver":  tries,
 		"spare_target":           spare,
+		"min_pairs":              minPairs,
 		"public_when_surplus":    pub,
 	}, nil
 }

@@ -195,6 +195,18 @@ type Config struct {
 	// 想把上游请求压到最低就调 0。
 	SpareTarget int `json:"spare_target"`
 
+	// MinPairs 是活 pair 数的**下界**：目标深度取 max(最忙那个号用过的张数 + SpareTarget, MinPairs)。
+	//
+	// 和 SpareTarget 的区别是它**不跟着负载走**。SpareTarget 是相对量（比最忙那个号多留几张），
+	// 所以池子空闲下来时目标会跟着塌到 SpareTarget 本身；真有人来的第一发就要现等铸票
+	// （一发上游几秒到几十秒）。MinPairs 回答的是「不管有没有人用，手上至少备着这么多张」。
+	//
+	// 0 = 不设下界（默认，行为与接这个键之前逐字一致）。
+	// 填得比 GatewayCeiling 大按 GatewayCeiling 算 —— 那个数本来就铸不出来，而这里
+	// **不走 SpareTarget 那条「超了就停止预铸」的路**：下界的语义是「至少」，
+	// 把「要得太多」解释成「一张都不要」正好反过来。
+	MinPairs int `json:"min_pairs"`
+
 	// MintConcurrency 是预铸同时派几个**不同账号**去铸票，0 时按 Defaults（1 = 串行）。
 	//
 	// 并发是**跨账号**的：同一个号仍然串行（store.LockAccount，SPEC 红线 2），而且同一个号
@@ -377,6 +389,11 @@ func Load(path string) (Config, error) {
 	// 「不预铸」而是「连已经有人在用的那几张也不补」。
 	if cfg.SpareTarget < 0 {
 		return Config{}, fmt.Errorf("spare_target 不能为负（0 = 不预铸、全按需）")
+	}
+	// min_pairs 的 0 是「不设下界」。只拦负数：负数对 max() 恒无效，填出来一定是手滑或
+	// 以为它是别的意思，静默忽略会让人以为下界生效了。
+	if cfg.MinPairs < 0 {
+		return Config{}, fmt.Errorf("min_pairs 不能为负（0 = 不设下界，目标深度只看 spare_target）")
 	}
 	// 文件里到底显式写了哪些键——两处要用：折 model 时要分清「真写了 models」和
 	// 「这是 Defaults 填的」，以及下面拦改过名的旧键。
