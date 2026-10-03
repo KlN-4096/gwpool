@@ -150,7 +150,7 @@ func TestRenewOrdersRareGatewaysFirst(t *testing.T) {
 		}
 	}
 
-	due := s.pairsDueForRenew()
+	due, _ := s.pairsDueForRenew()
 	if len(due) != 2 {
 		t.Fatalf("该有两张等着续，实到 %d", len(due))
 	}

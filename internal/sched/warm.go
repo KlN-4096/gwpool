@@ -113,8 +113,13 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 	if !s.cfg().RenewPairs {
 		return
 	}
-	due := s.pairsDueForRenew()
+	due, noDonor := s.pairsDueForRenew()
 	if len(due) == 0 {
+		if noDonor > 0 {
+			// 不打这一行的话「整池 30 张等着续但一张活 cflb 都借不到」和「没票到期」
+			// 在日志里长得一模一样，而前者要人去看大区分布、后者什么都不用做。
+			s.opt.Log.Info("续票：到期的票一张都借不到活 __cflb，本轮跳过", "no_donor", noDonor)
+		}
 		return
 	}
 	done, skipped := 0, 0
@@ -155,7 +160,8 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 				"reach", t.reach, "reason", err)
 		}
 	}
-	s.opt.Log.Info("续票一轮结束", "due", len(due), "done", done, "throttled", skipped)
+	s.opt.Log.Info("续票一轮结束", "due", len(due), "done", done,
+		"throttled", skipped, "no_donor", noDonor)
 }
 
 // renewSID 只走种子出口（便宜机房），**没配就不续**。
@@ -175,7 +181,8 @@ func (s *Scheduler) renewSID() (string, error) {
 // 106 张票里 route 和 cflb 的死期**逐秒相等**（cflb 才是短的那件）⇒「快到点」等价于
 // 「cflb 快死了」，送一张死的 cflb 钉不住任何大区，落点退回随机。
 // 换成同大区最长寿的那张：cflb 钉大区、来源账号钉大区里的那一个 ⇒ 落点就是手上这张。
-func (s *Scheduler) pairsDueForRenew() []renewTarget {
+// 第二个返回值 = 到期了但借不到活捐赠者的张数，只用来打日志（见调用方）。
+func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 	now := s.now()
 	// 捐赠者池子：按大区挑最长寿的 `__cflb`（换盆用的同一份）。
 	best := s.bestCflb()
@@ -192,6 +199,7 @@ func (s *Scheduler) pairsDueForRenew() []renewTarget {
 		reach[m.Gateway][m.AccountID] = true
 	}
 	var out []renewTarget
+	noDonor := 0
 	for name, gw := range s.st.Gateways() {
 		p, ok := s.st.Pair(name)
 		if !ok || p.ExpiresAt.Sub(now) > renewPairLead {
@@ -207,11 +215,13 @@ func (s *Scheduler) pairsDueForRenew() []renewTarget {
 		// 门槛沿用 seedCflbFloor：剩不到 10 分钟的捐赠者铸出来的票生下来就发不出去。
 		donor, ok := best[p.RegionKey]
 		if !ok || donor.Exp.Sub(now) < seedCflbFloor {
+			noDonor++
 			continue
 		}
 		swapped := mint.SwapCflb(p.Cookie, donor.Cflb)
 		if swapped == p.Cookie && mint.CflbOf(p.Cookie) != donor.Cflb {
-			continue // 这张票连 __oailb 都没有，SwapCflb 换不动
+			noDonor++ // 这张票连 __oailb 都没有，SwapCflb 换不动
+			continue
 		}
 		p.Cookie, p.CflbExpiresAt = swapped, donor.Exp
 		exit, ok := pickExit(gw)
@@ -230,7 +240,7 @@ func (s *Scheduler) pairsDueForRenew() []renewTarget {
 		}
 		return out[i].gateway < out[j].gateway // 稳定可复现
 	})
-	return out
+	return out, noDonor
 }
 
 // seedCflbFloor 是一张票还能当「大区种子」用的最低 `__cflb` 剩余寿命。
