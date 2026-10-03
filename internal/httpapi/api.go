@@ -593,6 +593,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			v.ReadyCount++
 		}
 	}
+	v.Mints, v.TotalMints = s.poolMintRows(accounts)
 	// 格子先算（它们报的是**整池**的读数，筛选时不许跟着缩水），再按查询串筛表。
 	v.Regions = poolRegionCells(v.Gateways, gws)
 	want := sanitizeLabel(r.URL.Query().Get("region"), "")
@@ -2383,6 +2384,74 @@ func exitLabel(e types.Exit) string {
 		return e.Region
 	}
 	return e.Region + ":" + e.City
+}
+
+// poolMintMaxRows 是公开页上列几行铸票记录。
+//
+// 比管理页那张（300 行）短得多：这一页回答的是「池子此刻在不在干活、在替谁铸」，
+// 翻历史是管理页的事，而每一行都带账号与落点，列得越多越像一份活动清单。
+const poolMintMaxRows = 40
+
+// poolMintRows 读采样账本，摊成公开页的铸票记录（新的在前）。
+//
+// 用采样账本而不是另记一份：mintOnce 是所有真实铸票的唯一出口，而它每发都写一条 Sample
+// ⇒ 这本账已经**就是**铸票历史，再加一份内存状态只会多一个会和它对不上的读数。
+//
+// 读不出来就返回空：这一页的主体是网关表，一条账本读失败不该让整页 500。
+func (s *Server) poolMintRows(accounts []types.Account) ([]poolMintRow, int) {
+	samples, err := s.st.Samples()
+	if err != nil {
+		s.opt.Log.Warn("公开页读采样账本失败", "err", err)
+		return nil, 0
+	}
+	label := make(map[int64]string, len(accounts))
+	for _, a := range accounts {
+		label[a.ID] = a.Label
+	}
+	// **按时间排，不靠追加序。** 账本是追加写的，正常情况下尾部就是最近的，但那是
+	// 「正常情况下」—— 回灌、并发写、或者哪天换个写法，顺序就不再等于时间，而这张表的
+	// 全部意义就是时间序。排一遍是 O(n log n) 的廉价保险。
+	recent := append([]types.Sample(nil), samples...)
+	sort.Slice(recent, func(i, j int) bool { return recent[i].At.After(recent[j].At) })
+	if len(recent) > poolMintMaxRows {
+		recent = recent[:poolMintMaxRows]
+	}
+	rows := make([]poolMintRow, 0, len(recent))
+	for _, sm := range recent {
+		rows = append(rows, poolMintRow{
+			At:      sm.At.Format(time.DateTime),
+			Account: maskLabel(label[sm.AccountID]),
+			Region:  dash(sm.RegionKey),
+			Gateway: dash(sm.Gateway),
+			// 成功的判据是「拿到落点」而不是「状态码 200」：铸票的产物就是那张票，
+			// 读不出落点的 200 对池子没有价值（它补不上任何一个格子）。
+			OK:     sm.Status == http.StatusOK && sm.Gateway != "",
+			Status: sm.Status,
+		})
+	}
+	return rows, len(samples)
+}
+
+// maskLabel 把账号备注遮成「前 2 个字符 + *** + @域名」。
+//
+// 备注现在是账号邮箱（2026-10-02 批量改的），整串贴到这一页上等于公布一份账号清单。
+// 域名留着：它只说明是哪家邮箱，而「这一发是谁在铸」要能区分得开才有意义。
+// 按**字符**切，别把一个汉字劈成半个坏字节贴到页面上（同 mint.maskUser）。
+func maskLabel(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "***" // 匿名占位行没有备注；它也铸不了票，正常走不到这里
+	}
+	local, domain, isMail := strings.Cut(s, "@")
+	head := []rune(local)
+	if len(head) > 2 {
+		head = head[:2]
+	}
+	out := string(head) + "***"
+	if isMail && domain != "" {
+		out += "@" + domain
+	}
+	return out
 }
 
 func dash(s string) string {

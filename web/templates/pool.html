@@ -91,6 +91,40 @@
     <p class="empty">{{if .FilterLabel}}{{.FilterLabel}}还没有已知网关。{{else}}尚未发现网关。账号接入后会自动探测。{{end}}</p>
     {{end}}
   </div>
+
+  <div class="card">
+    <header class="card-head"><div><h2>铸票记录</h2><p>最近 {{len .Mints}} 发铸票，新的在前（账本共 {{.TotalMints}} 发）。账号备注只显示前两个字符。</p></div></header>
+    {{if .Mints}}
+    {{/* 刻意**不带** data-facet-first：那个属性会把成功的整块提到失败之前，而这张表的
+         全部意义是时间序。分面筛选（上面那排小标签）照常可用，只是不再重排。 */}}
+    {{/* 普通表格，**不是** tiles：卡片版式塞不下完整时间戳（实测截成「2026-10-03 …」），
+         而时间正是这张表的全部意义。管理页那张同类表也是普通表格。 */}}
+    <div class="table-wrap"><table data-grid
+        data-facets="ok:成功:ok|fail:失败" data-placeholder="搜索账号或网关">
+      <thead><tr><th>时间（UTC）</th><th>账号</th><th>出口区域</th><th>落点</th><th>结果</th></tr></thead>
+      <tbody>
+      {{range .Mints}}
+        <tr data-facet="{{if .OK}}ok{{else}}fail{{end}}">
+          <td class="mono">{{.At}}</td>
+          <td>{{.Account}}</td>
+          <td>{{.Region}}</td>
+          {{/* mint-gw 这个类名不是装饰：网关表的筛选断言钉的是 `<td class="mono">网关名</td>`，
+               两张表用一样的标记就分不出「表里列着它」和「铸票记录提到过它」。 */}}
+          <td class="mono mint-gw">{{.Gateway}}</td>
+          <td>{{if .OK}}<span class="badge ok">成功</span>{{else if .Status}}<span class="badge">HTTP {{.Status}}</span>{{else}}<span class="badge">失败</span>{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    <div class="legend">
+      <span><i class="sw ok"></i>成功：这一发拿到了落点，池子多一张票</span>
+      <span><i class="sw"></i>失败：上游拒了（带状态码）或一发都没出站</span>
+      <span><b>落点</b>这一发实际落在哪个网关；按区域裸铸读不出来时为「—」</span>
+    </div>
+    {{else}}
+    <p class="empty">还没有铸票记录。</p>
+    {{end}}
+  </div>
 </section>
 
 <section id="tab-usage">
