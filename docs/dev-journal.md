@@ -1,5 +1,10 @@
 # 开发日志
 
+## 2026-10-04 — 用户授权清理历史部署残留
+- 两台sub2api正式版上线验收后，按用户指定范围清理sub2api/gwpool部署残留；bytevirt共144项移入回收站，包含本服务旧binary/config/state部署副本、上传包与隔离预演目录。
+- 当前gwpool SHA40c2fafd…8d7c96f、配置SHA515ddc57…7832c保持，服务active；正式数据、自动每日快照、未确认用途的实验材料保留，不新增上游请求。
+- 旧before-7c22a39等回滚路径已移入回收站，不再声称原位置保留；未将回收站移动计为磁盘释放。
+
 ## 2026-10-04 — 动态排名部署验收
 - `7c22a39`已推main并于20:10（UTC+8）部署bytevirt；生产二进制SHA40c2fafd…8d7c96f，保留before-7c22a39的binary/config/state回滚。
 - 隔离启动及root/admin/范围页200；只读清单Luna模型返回106网关，106均有国家与≥5样本priority；未调用取票或额外上游探针。

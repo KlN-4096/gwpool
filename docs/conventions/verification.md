@@ -10,4 +10,5 @@
 - Linux 产物采用 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0`，`-trimpath -ldflags="-s -w"`。
 - bytevirt 的服务和二进制是 `gwpool`、`/opt/gwpool/gwpool`；配置在 `/opt/gwpool/data/config.json`。
 - 切换前比对旧二进制 SHA256，保留回滚文件，避免覆盖其他会话的部署。
+- 旧部署备份/上传包/预演目录经用户明确清理授权后才处理，且先完成新版本验收；优先trash-put，不把移入回收站算成释放磁盘。正式config/state、自动每日快照与未确认用途的实验材料不当部署残留。
 - 上线验收同时看服务健康、自然续票的真实成功/失败、预铸补货和 TTL；仅“测试绿/进程 active”不算业务验收。
