@@ -413,10 +413,19 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		res.RetryAfter = retryAfterOf(resp.Header.Get("Retry-After"), at)
 	}
 	fresh := newCookies(resp)
+	for _, ck := range fresh {
+		deadline := cookieDeadline(ck, at)
+		if ck.Value == "" || (!deadline.IsZero() && !deadline.After(at)) {
+			return res, fmt.Errorf("%w（上游删除了路由 cookie）", ErrNoLanding)
+		}
+	}
 	if oailb := fresh[cookieOailb]; oailb != nil {
 		gw, exp, err := parseOailb(oailb.Value)
 		if err != nil {
 			return res, fmt.Errorf("解 __oailb: %w", err)
+		}
+		if !exp.After(at) {
+			return res, fmt.Errorf("%w（新 __oailb 已过期）", ErrNoLanding)
 		}
 		res.Gateway = gw
 		res.PairExpires = exp
@@ -432,6 +441,12 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		res.NewPair = mergePair(cookie, fresh)
 		return res, nil
 	}
+	if fresh[cookieCflb] != nil {
+		// A changed affinity cookie without a fresh gateway binding does not
+		// prove that the old gateway was retained. Do not manufacture renewal
+		// evidence from the request cookie or a synthetic fixture.
+		return res, fmt.Errorf("%w（仅更新 __cflb，无法确认实际网关）", ErrNoLanding)
+	}
 	if cookie != "" {
 		// 「没下发新 cookie」对应两件**相反**的事，判据是送进去那张的 __cflb 还活着没：
 		//
@@ -446,14 +461,15 @@ func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, se
 		// **判据必须「可证」**：要求死期晚于**响应时刻**。响应时刻之后才死 ⇒ 整个
 		// 往返期间它都活着。读不出死期（零值）一律按死了算——猜错的代价不对称。
 		if sentCflbExp.After(at) {
-			res.Gateway = pairGateway(cookie)
-			if res.Gateway == "" {
+			gateway, expiry, err := PairInfo(cookie)
+			if err != nil || !expiry.After(at) {
 				// 种子那条路会落到这儿：只送了 `__cflb`，旧名字根本不在 cookie 里，
 				// 而旧名字本来也是**别人的**网关、不能当自己的落点。上游接受了种子、
 				// 路由钉在那个大区了，但落到哪个网关读不出来 ⇒ 这一发对「摸落点」零产出。
 				// 必须报 ErrNoLanding，不能静默当成功（那会把一张没有落点的票写进账本）。
-				return res, fmt.Errorf("%w（cookie 里没有能读出落点的 __oailb）", ErrNoLanding)
+				return res, fmt.Errorf("%w（cookie 里没有仍有效的 __oailb）", ErrNoLanding)
 			}
+			res.Gateway = gateway
 			return res, nil
 		}
 		return res, fmt.Errorf("%w（送进去那张的 __cflb 已经不保证还活着，旧名字不能当落点）", ErrNoLanding)
@@ -965,9 +981,7 @@ func newCookies(resp *http.Response) map[string]*http.Cookie {
 	for _, ck := range resp.Cookies() {
 		switch ck.Name {
 		case cookieCflb, cookieOailb:
-			if ck.Value != "" {
-				out[ck.Name] = ck
-			}
+			out[ck.Name] = ck // Empty/deleted cookies are explicit invalidation, not absence.
 		}
 	}
 	return out
@@ -1126,15 +1140,6 @@ func parsePair(pair string) map[string]string {
 		}
 	}
 	return out
-}
-
-// pairGateway 从一张完整 cookie 头里读网关名。
-func pairGateway(pair string) string {
-	gw, _, err := PairInfo(pair)
-	if err != nil {
-		return ""
-	}
-	return gw
 }
 
 // PairInfo 读一张**外面交进来的** cookie 头里的两件事实：落点（__oailb 的 host

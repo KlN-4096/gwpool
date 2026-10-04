@@ -457,6 +457,13 @@ func TestWarmRefillsAfterRenewingAccountsRespectTheirGap(t *testing.T) {
 	s.opt.Live = config.NewLive("", cfg)
 	duePair(st, clk, "unified-1", 1, "south-america")
 	duePair(st, clk, "unified-2", 2, "south-america")
+	// Real stored tickets have a successful route ledger; maintenance now
+	// recovers those routes before bootstrapping untried countries.
+	for id, gateway := range map[int64]string{1: "unified-1", 2: "unified-2"} {
+		if err := st.NoteRegionMint(id, "south-america", gateway, clk.now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	s.markDemand()
 	s.warmOnce(context.Background())

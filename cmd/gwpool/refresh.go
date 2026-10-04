@@ -69,15 +69,24 @@ func refreshAccount(ctx context.Context, st *store.Store, log *slog.Logger, id i
 	if cl.Expires.IsZero() || cl.Expires.After(deadline) {
 		return
 	}
-	access, refresh, err := oauth.Refresh(ctx, nil, a.Creds.RefreshToken)
+	tokens, err := oauth.Refresh(ctx, nil, a.Creds.RefreshToken)
 	if err != nil {
 		// 换票失败可能只是上游抖动，不在这里停用，下个小时重试。
 		log.Warn("续票失败", "account", a.ID, "expires", cl.Expires, "err", err)
 		return
 	}
-	if err := st.SetTokens(a.ID, access, refresh); err != nil {
+	fresh, err := oauth.ClaimsFor(tokens, a.Creds.AccountID)
+	if err != nil {
+		log.Warn("刷新凭据身份校验失败，保留原凭据", "account", a.ID, "err", err)
+		return
+	}
+	if !fresh.Expires.IsZero() && !fresh.Expires.After(time.Now()) {
+		log.Warn("刷新返回的 access_token 已过期，保留原凭据", "account", a.ID)
+		return
+	}
+	if err := st.SetTokens(a.ID, tokens.AccessToken, tokens.RefreshToken); err != nil {
 		log.Error("续票写回失败", "account", a.ID, "err", err)
 		return
 	}
-	log.Info("续了票", "account", a.ID, "原到期", cl.Expires, "轮换了refresh", refresh != "")
+	log.Info("续了票", "account", a.ID, "原到期", cl.Expires, "轮换了refresh", tokens.RefreshToken != "")
 }

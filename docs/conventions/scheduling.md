@@ -1,14 +1,15 @@
 # 调度
 
-- `internal/sched/warm.go` 的 `warmOnce` 交替让维护或探索先行；维护先续票、再按 `PairTarget` 补铸，专门探索每轮最多一发。无需求或不足两个可用账号时不执行这些任务。
+- `warmOnce` 交替让维护或探索先行；维护先补缺失已知网关、再续临期票，专门探索每自然轮最多一发。无近期需求或不足两个可用账号不执行。
 - `renew_pairs` 默认关；开启后使用 `Pair.MintedBy`，不是另挑最空闲账号。
 - 种子出口通过 `NewSeedSID` 绑定；`internal/mint/mint.go` 在 `SeedBound` 路径只发送 `__cflb`。
 - 种子铸票的逻辑区域来自所用票据，不是机房实际出口，也不能随机借用网关的历史出口标签。
-- 库存/续票可借种子；专门探索必须 `NewSID(true)`+空票走实际出口，否则不能验证覆盖目标。seeded 请求一律不新增 `ReachableExits`，即使机房恰好同国；RegionMint 仍保留逻辑区域。
+- 新铸/库存/探索必须 `NewSIDFor`+空票走动态实际出口；seed只用于已有票续票。seeded请求不新增 `ReachableExits`，即使机房恰好同国；RegionMint仍保留逻辑标签。
 - `Store.BeginAttempt`持久化原子预留：凭证域×国家滚动1h默认2次，独立账号总50；城市别名共桶，失败/未连通也计次。所有scan/delivery/inventory/renew/explore/manual/Verify入口在绑定前预留，mint兜底幂等消费，一次额外Verify另扣；写失败不出站。
 - `mintOnce` 按响应实际落点保存新票并更新触碰；定向续票漂移仍报失败，不能把意外落点称为目标续成功。
 - `renewed` 还要求新票 `ExpiresAt` 严格晚于原票；同落点但 TTL 不变单列 `unchanged`。借同区长寿 cflb 的换盆与持久化保留，不承诺每次同账号同区必落原网关。
 - `Mint` 同时返回 HTTP 状态与解析错误时，非 200 状态优先；否则 401/429 缺少 __oailb 会掩盖停用/退避，循环白打。回归见 `mint_status_test.go`。
+- 明确删除/清空cookie、新oailb已过期、仅更新cflb均不能沿用旧网关；无新cookie仅在实际发送完整pair且两件都在响应时有效才可沿用，不增TTL。见 `mint/renew_response_test.go`。
 - `mint.Rehome` 只在旧 `__oailb` 尚有效时借同区长寿 `__cflb`；TTL 是两个组件的较早到期时间。
 - 区域与账号对应落点是采样得到的预测，不是上游保证；离线测试不能代替部署后的落点/TTL观察。
 - 管理员范围打票选九大区，预览按凭证域合并国家与独立总预算，确认必须在同一计划下原子校验数量，额度变化要求重新确认。批次15分钟过期、不跨小时等新额度，活动批次不叠加。
@@ -16,4 +17,9 @@
 - `RegionEnabled` 同时检查稳定 key/出口/启用态，两种延迟队列出手前复查；无上游验证的现成票交付不要求出口继续启用。
 - `premintNote` 只有全池 `ErrNoExit` 才停整轮，局部 `ErrRateLimited` 走原失手预算但不设置全局 halt。
 - OAuth 刷新与铸票共用 Store 账号锁，锁后重读凭据；否则刷新后的账号可能被旧 token 的迟到 401 停用。
-- 库存公平性按持久尝试数而非仅成功RegionMints；AQ失败零成功导致反复优先的缺陷由此阻断。未知/不支持Geo（包括seed）不得铸票；地区403只拒该出口、不停整个账号，确切401凭据失效仍停用。
+- 未知国家探索公平性按持久尝试数推进；不能把低次数国家优先套到全部库存恢复。未知/不支持Geo（包括seed）不得铸票；地区403不笼统停号，确切401凭据失效仍停用。
+- `inventoryEvidence` 合并最新RegionMint与旧/过期Pair来源，要求启用有凭据账号、启用动态出口及匹配ReachableExits；按组合＋网关去重，一次漂移不抹掉唯一旧路线。
+- `PairTarget=max(busiest+spare,minPairs,recoverable)`封顶190，busiest包含启用的无凭据消费者占位行；spare>190仍显式关闭补货。缺口按集合计算，其他活票不能抵消某个已知可恢复网关缺失。
+- 普通库存周期先已知缺票路线，只有已知数不足target才最多2个未知bootstrap；总尝试仍≤2×缺口，短票/预测错/失败消耗失手预算，路线5分钟至1小时退避。
+- 取票`markDemand`合并唤醒，最短5秒，走原后台锁/预算；唤醒绝不bootstrap或追加专门探索，匿名仍不在HTTP中自行铸票。
+- 点名恢复优先历史来源账号＋出口整体，优先非消费者；无可用历史路线才回落原单发路径。账号锁后重读启用态/凭据，另一任务已补齐则不重复发。回归见 `sched/inventory_recovery_test.go`。

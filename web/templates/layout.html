@@ -901,7 +901,7 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
       <label class="choice"><input type="radio" name="kind" value="access">
         <span>access_token<small>直接使用；过期后需要重新上传</small></span></label>
       <label class="choice"><input type="radio" name="kind" value="refresh">
-        <span>refresh_token<small>先换取 access_token，之后自动续期</small></span></label>
+        <span>refresh_token<small>先刷新并从 access_token / id_token 读取账号 ID，之后自动续期；两者都缺 ID 时，请改传含真实 account_id 的完整凭据 JSON</small></span></label>
     </div>
   </fieldset>
   {{if .PageToken}}<input type="hidden" name="page_owner" value="{{.PageToken}}">

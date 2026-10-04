@@ -37,6 +37,17 @@ type Claims struct {
 	Expires   time.Time
 }
 
+// Tokens is the token endpoint response. IDToken supplies identity claims when
+// the access token omits them; it is never used as the upstream bearer token.
+type Tokens struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
+}
+
+func (Tokens) String() string   { return "Tokens{***}" }
+func (Tokens) GoString() string { return "Tokens{***}" }
+
 // Parse 读 access_token 的 payload。
 //
 // **不验签**：签名只有上游能验，这里要的不是「这票是真的」而是「这票说它是谁」。
@@ -51,8 +62,9 @@ func Parse(accessToken string) (Claims, error) {
 		return Claims{}, errors.New("access_token 的 payload 解不开")
 	}
 	var c struct {
-		Exp  int64 `json:"exp"`
-		Auth struct {
+		Exp   int64  `json:"exp"`
+		Email string `json:"email"`
+		Auth  struct {
 			AccountID string `json:"chatgpt_account_id"`
 			Plan      string `json:"chatgpt_plan_type"`
 		} `json:"https://api.openai.com/auth"`
@@ -62,16 +74,62 @@ func Parse(accessToken string) (Claims, error) {
 		return Claims{}, errors.New("access_token 的 payload 不是 JSON")
 	}
 	out := Claims{AccountID: c.Auth.AccountID, Plan: c.Auth.Plan}
+	out.Email = c.Email
 	// 邮箱只拿来起名字：profile 长得不对就当没有，别让整张票因此读不出来
 	// （读不出来的票，后台续票会跳过它）。
 	var prof struct {
 		Email string `json:"email"`
 	}
-	if json.Unmarshal(c.Profile, &prof) == nil {
+	if json.Unmarshal(c.Profile, &prof) == nil && prof.Email != "" {
 		out.Email = prof.Email
 	}
 	if c.Exp > 0 {
 		out.Expires = time.Unix(c.Exp, 0)
+	}
+	return out, nil
+}
+
+// ClaimsFor reconciles all available identities. The ID token can supply
+// identity/profile fields, but only the access token supplies Expires.
+// Empty access is supported while an RT-only upload is awaiting refresh.
+func ClaimsFor(tokens Tokens, expectedAccount string) (Claims, error) {
+	out := Claims{AccountID: expectedAccount}
+	mergeID := func(id string) error {
+		if out.AccountID != "" && id != "" && out.AccountID != id {
+			return errors.New("凭据中的 account_id 不一致：请确认各项凭据属于同一账号")
+		}
+		if id != "" {
+			out.AccountID = id
+		}
+		return nil
+	}
+	if tokens.AccessToken != "" {
+		if len(tokens.AccessToken) < 20 || strings.ContainsAny(tokens.AccessToken, " \t\r\n") {
+			return Claims{}, errors.New("access_token 形状不对")
+		}
+		access, err := Parse(tokens.AccessToken)
+		if err != nil {
+			return Claims{}, err
+		}
+		if err := mergeID(access.AccountID); err != nil {
+			return Claims{}, err
+		}
+		out.Expires, out.Plan, out.Email = access.Expires, access.Plan, access.Email
+	}
+	if tokens.IDToken != "" {
+		id, err := Parse(tokens.IDToken)
+		if err != nil {
+			return Claims{}, errors.New("id_token 格式不正确")
+		}
+		if err := mergeID(id.AccountID); err != nil {
+			return Claims{}, err
+		}
+		if out.Plan == "" {
+			out.Plan = id.Plan
+		}
+		if out.Email == "" {
+			out.Email = id.Email
+		}
 	}
 	return out, nil
 }
@@ -82,10 +140,10 @@ func Parse(accessToken string) (Claims, error) {
 // 当「继续用原来那张」，别把它写成空值覆盖掉手里那张（那就再也换不了票了）。
 //
 // hc 为 nil 时用默认客户端直连。
-func Refresh(ctx context.Context, hc *http.Client, refreshToken string) (access, refresh string, err error) {
+func Refresh(ctx context.Context, hc *http.Client, refreshToken string) (Tokens, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
-		return "", "", errors.New("refresh_token 是空的")
+		return Tokens{}, errors.New("refresh_token 是空的")
 	}
 	if hc == nil {
 		hc = &http.Client{Timeout: refreshTimeout}
@@ -101,32 +159,56 @@ func Refresh(ctx context.Context, hc *http.Client, refreshToken string) (access,
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL,
 		strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", "", fmt.Errorf("建换票请求: %w", err)
+		return Tokens{}, fmt.Errorf("建换票请求: %w", err)
 	}
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	req.Header.Set("accept", "application/json")
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("换票请求失败: %w", err)
+		return Tokens{}, fmt.Errorf("换票请求失败: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode/100 != 2 {
-		// 带上上游原话：换票失败最常见的原因是 refresh_token 本身被撤销了，
-		// 而那句话是唯一能把它和「网络抖了一下」分开的东西。
-		return "", "", fmt.Errorf("换票回 HTTP %d：%s",
-			resp.StatusCode, strings.TrimSpace(string(body)))
+		// Never echo the upstream body: error descriptions may contain
+		// credentials or identifying fields, and callers also log this error.
+		return Tokens{}, fmt.Errorf("换票回 HTTP %d：%s",
+			resp.StatusCode, refreshErrorCode(body))
 	}
-	var out struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
+	var out Tokens
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", "", fmt.Errorf("换票响应不是 JSON: %w", err)
+		return Tokens{}, errors.New("换票响应格式不正确")
 	}
 	if out.AccessToken == "" {
-		return "", "", errors.New("换票成功但没给 access_token")
+		return Tokens{}, errors.New("换票成功但没给 access_token")
 	}
-	return out.AccessToken, out.RefreshToken, nil
+	return out, nil
+}
+
+func refreshErrorCode(body []byte) string {
+	var response struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &response) != nil {
+		return "upstream_error"
+	}
+	var code string
+	if json.Unmarshal(response.Error, &code) != nil {
+		var detail struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(response.Error, &detail) == nil {
+			code = detail.Code
+		}
+	}
+	switch code {
+	case "invalid_grant", "invalid_request", "invalid_client", "unauthorized_client",
+		"access_denied", "unsupported_grant_type", "temporarily_unavailable",
+		"server_error", "rate_limit_exceeded", "refresh_token_reused",
+		"refresh_token_expired", "refresh_token_invalid":
+		return code
+	default:
+		return "upstream_error"
+	}
 }

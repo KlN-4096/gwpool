@@ -285,8 +285,9 @@ type Scheduler struct {
 	// 不落盘：重启后重新摊平没有坏处，而落盘就多一份要维护的状态。
 	// 「总共铸过几发」刻意**不**自己记：那个读数在 mint 的速率窗口里，
 	// 而那份是连 scan 那条路的发数一起算的，自己再记一份只会和它分叉。
-	lastMintedAt map[int64]time.Time
-	lastDeliver  time.Time
+	lastMintedAt  map[int64]time.Time
+	lastDeliver   time.Time
+	inventoryWake chan struct{} // 合并真实取票需求；仅唤醒维护，不增加专门探索轮次。
 	// gwLocks 是「同一个网关一次只许有一发在铸」，见 lockGateway。
 	gwLocks map[string]*sync.Mutex
 	// mintingRegions 是「同一个区域一次只许有一发裸铸在打」，见 claimRegion。
@@ -347,7 +348,7 @@ func New(st Store, m Minter, opt Options) *Scheduler {
 	}
 	return &Scheduler{st: st, mint: m, opt: opt,
 		backoff: map[string]time.Duration{}, lastMintedAt: map[int64]time.Time{},
-		acctHold: map[int64]time.Time{}}
+		acctHold: map[int64]time.Time{}, inventoryWake: make(chan struct{}, 1)}
 }
 
 func (s *Scheduler) Mode() types.Mode { return s.opt.Mode }
@@ -919,18 +920,27 @@ func (s *Scheduler) mintToward(ctx context.Context, consumer types.Account, gate
 		d, err := s.finish(ctx, consumer, gateway, types.Exit{}, p, minted{}, floor)
 		return d, gateway, err
 	}
-	exit, ok := s.pickExit(s.st.Gateways()[gateway])
-	if !ok {
-		release()
-		return types.Delivery{}, gateway, fmt.Errorf("网关 %s 没有已知启用出口，没法铸票", gateway)
-	}
 	minter := consumer
+	var exit types.Exit
+	recovery := false
 	if s.opt.Mode == types.ModePool {
-		// 补 pair 那一发交给别人打：它会烧掉铸票者在这个网关上的窗口，
-		// 烧消费者自己的就等于白跑一趟。出口已经由网关定死，所以只要人、不要它挑的区域。
-		// 交付路径不节流：有人在等着拿 pair。
-		if sc, _, ok := s.minterFor(exit, consumer.ID, 0, nil); ok {
-			minter = sc
+		if source, region, ok := s.recoveryMinter(gateway, consumer.ID); ok {
+			minter, exit, recovery = source, region.Exit, true
+		}
+	}
+	if !recovery {
+		var ok bool
+		exit, ok = s.pickExit(s.st.Gateways()[gateway])
+		if !ok {
+			release()
+			return types.Delivery{}, gateway, fmt.Errorf("网关 %s 没有已知启用出口，没法铸票", gateway)
+		}
+		if s.opt.Mode == types.ModePool {
+			// No proven source currently has budget. Retain the original
+			// single-attempt fallback, without presenting it as a guarantee.
+			if source, _, ok := s.minterFor(exit, consumer.ID, 0, nil); ok {
+				minter = source
+			}
 		}
 	}
 	got, err := s.mintPair(ctx, minter, consumer, exit, s.pairFor(gateway, floor), gateway, gateway)
@@ -1229,6 +1239,11 @@ func (s *Scheduler) mintPair(ctx context.Context, minter, consumer types.Account
 	exit types.Exit, cur types.Pair, want, bias string) (pairMint, error) {
 	unlock := s.st.LockAccount(minter.ID)
 	defer unlock()
+	current, enabled := s.account(minter.ID)
+	if !enabled {
+		return pairMint{}, fmt.Errorf("%w：铸票账号已停用", ErrMintFailed)
+	}
+	minter = current
 	ctx, err := s.beginAttempt(ctx, minter, exit)
 	if err != nil {
 		return pairMint{}, err
@@ -2133,6 +2148,12 @@ func (s *Scheduler) markDemand() {
 	s.mu.Lock()
 	s.lastDeliver = s.now()
 	s.mu.Unlock()
+	if s.opt.Mode == types.ModePool {
+		select {
+		case s.inventoryWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // ---------- 小工具 ----------

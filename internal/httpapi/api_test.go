@@ -18,6 +18,7 @@ import (
 	"gwpool/internal/config"
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
+	"gwpool/internal/oauth"
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
 	"gwpool/internal/types"
@@ -2309,9 +2310,9 @@ func TestUploadAcceptsRefreshTokenOnly(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModeSingle)
 	fresh := fakeToken("acct-refreshed", "pro", time.Now().Add(time.Hour))
 	var asked []string
-	srv.opt.Refresh = func(_ context.Context, rt string) (string, string, error) {
+	srv.opt.Refresh = func(_ context.Context, rt string) (oauth.Tokens, error) {
 		asked = append(asked, rt)
-		return fresh, "new-refresh-" + strings.Repeat("r", 30), nil
+		return oauth.Tokens{AccessToken: fresh, RefreshToken: "new-refresh-" + strings.Repeat("r", 30)}, nil
 	}
 	rt := "rt-" + strings.Repeat("x", 40)
 	r := httptest.NewRequest("POST", "/upload", strings.NewReader(`{"refresh_token":"`+rt+`"}`))
@@ -2335,8 +2336,8 @@ func TestUploadAcceptsRefreshTokenOnly(t *testing.T) {
 // 换票失败就不建号。
 func TestUploadRefreshFailureDoesNotCreateAccount(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModeSingle)
-	srv.opt.Refresh = func(context.Context, string) (string, string, error) {
-		return "", "", errors.New("换票回 HTTP 400：invalid_grant")
+	srv.opt.Refresh = func(context.Context, string) (oauth.Tokens, error) {
+		return oauth.Tokens{}, errors.New("换票回 HTTP 400：invalid_grant")
 	}
 	r := httptest.NewRequest("POST", "/upload",
 		strings.NewReader(`{"refresh_token":"rt-`+strings.Repeat("x", 40)+`"}`))
@@ -2358,8 +2359,8 @@ func TestUploadRefreshFailureDoesNotCreateAccount(t *testing.T) {
 func TestUploadRefreshesExpiredAccessToken(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModeSingle)
 	fresh := fakeToken("acct-exp", "pro", time.Now().Add(time.Hour))
-	srv.opt.Refresh = func(context.Context, string) (string, string, error) {
-		return fresh, "", nil
+	srv.opt.Refresh = func(context.Context, string) (oauth.Tokens, error) {
+		return oauth.Tokens{AccessToken: fresh}, nil
 	}
 	stale := fakeToken("acct-exp", "pro", time.Now().Add(-time.Hour))
 	rt := "rt-" + strings.Repeat("x", 40)
@@ -2398,9 +2399,9 @@ func TestUploadRejectsExpiredWithoutRefresh(t *testing.T) {
 func TestUploadAutoDetectsDottedRefreshToken(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModeSingle)
 	var asked []string
-	srv.opt.Refresh = func(_ context.Context, rt string) (string, string, error) {
+	srv.opt.Refresh = func(_ context.Context, rt string) (oauth.Tokens, error) {
 		asked = append(asked, rt)
-		return fakeToken("acct-dotted-rt", "plus", time.Now().Add(time.Hour)), "", nil
+		return oauth.Tokens{AccessToken: fakeToken("acct-dotted-rt", "plus", time.Now().Add(time.Hour))}, nil
 	}
 	rt := "rt." + strings.Repeat("A1b2", 20) + "." + strings.Repeat("c3D4", 20)
 	form := url.Values{"kind": {"auto"}, "creds": {rt}}
@@ -2455,13 +2456,13 @@ func TestUploadAcceptsBareToken(t *testing.T) {
 	// account_id，第二发就会撞上「这份凭据已属于别人」的归属守卫（每发无身份上传各建
 	// 一个 owner），而这条测的是 kind 解析不是归属。首发按 acct-bare-rt 断言。
 	rtN := 0
-	srv.opt.Refresh = func(context.Context, string) (string, string, error) {
+	srv.opt.Refresh = func(context.Context, string) (oauth.Tokens, error) {
 		rtN++
 		acct := "acct-bare-rt"
 		if rtN > 1 {
 			acct = fmt.Sprintf("acct-bare-rt%d", rtN)
 		}
-		return fakeToken(acct, "pro", time.Now().Add(time.Hour)), "", nil
+		return oauth.Tokens{AccessToken: fakeToken(acct, "pro", time.Now().Add(time.Hour))}, nil
 	}
 
 	post := func(kind, creds string) *httptest.ResponseRecorder {

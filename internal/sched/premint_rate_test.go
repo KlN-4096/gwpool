@@ -20,7 +20,8 @@ func TestPremintLocalRateLimitDoesNotHaltOtherAccounts(t *testing.T) {
 			t.Fatal("a local rate limit must not set the global halt flag")
 		}
 		healthy := premintPlan{acct: types.Account{ID: 2}, region: types.Regions[1]}
-		s.premintNote(round, healthy, minted{pair: types.Pair{Gateway: "unified-2"}}, nil, false)
+		s.premintNote(round, healthy, minted{pair: types.Pair{Gateway: "unified-2",
+			ExpiresAt: s.now().Add(types.PairLifetime)}}, nil, false)
 		got, missed, _ := round.result()
 		if got != 1 || missed != 1 {
 			t.Fatalf("healthy account should continue; upstream refusals still spend the failure budget: got=%d missed=%d", got, missed)

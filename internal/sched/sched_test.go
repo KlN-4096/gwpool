@@ -3255,6 +3255,12 @@ func TestPremintRunsDifferentAccountsInParallel(t *testing.T) {
 	mn.delay = 30 * time.Millisecond
 	for id := int64(1); id <= 3; id++ {
 		addAccount(st, id, fmt.Sprintf("acct-%d", id))
+		region := types.Regions[id-1]
+		gateway := fmt.Sprintf("unified-%d", id)
+		st.gws[gateway] = types.Gateway{Name: gateway, ReachableExits: []types.Exit{region.Exit}}
+		if err := st.NoteRegionMint(id, region.Key, gateway, clk.now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	landEachRegionSomewhereNew(mn)
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: time.Hour,

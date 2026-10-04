@@ -168,7 +168,7 @@ type Options struct {
 	// Refresh 换票。nil = 用 oauth.Refresh 直连上游。
 	// 存在的唯一理由是测试：测试绝不打真实上游（SPEC 红线 8），而换票是
 	// parseCreds 里唯一会出网的一步。生产永远不设它。
-	Refresh func(ctx context.Context, refreshToken string) (access, newRefresh string, err error)
+	Refresh func(ctx context.Context, refreshToken string) (oauth.Tokens, error)
 
 	// Live 非 nil 时管理页可以改配置并热重载；为空则那一节只读（测试走这条路）。
 	Live *config.Live
@@ -895,16 +895,18 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 type authUpload struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
 	AccountID    string `json:"account_id"`
 	Tokens       *struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
 		AccountID    string `json:"account_id"`
 	} `json:"tokens"`
 }
 
 // refresh 换票，默认直连上游。
-func (s *Server) refresh(ctx context.Context, refreshToken string) (string, string, error) {
+func (s *Server) refresh(ctx context.Context, refreshToken string) (oauth.Tokens, error) {
 	if s.opt.Refresh != nil {
 		return s.opt.Refresh(ctx, refreshToken)
 	}
@@ -918,8 +920,8 @@ func hasBlank(s string) bool {
 }
 
 // pick 把两层形状压平：顶层优先，缺的到 tokens 里找。
-func (f authUpload) pick() (access, refresh, account string) {
-	access, refresh, account = f.AccessToken, f.RefreshToken, f.AccountID
+func (f authUpload) pick() (access, refresh, account, idToken string) {
+	access, refresh, account, idToken = f.AccessToken, f.RefreshToken, f.AccountID, f.IDToken
 	if f.Tokens != nil {
 		if access == "" {
 			access = f.Tokens.AccessToken
@@ -930,8 +932,11 @@ func (f authUpload) pick() (access, refresh, account string) {
 		if account == "" {
 			account = f.Tokens.AccountID
 		}
+		if idToken == "" {
+			idToken = f.Tokens.IDToken
+		}
 	}
-	return strings.TrimSpace(access), strings.TrimSpace(refresh), strings.TrimSpace(account)
+	return strings.TrimSpace(access), strings.TrimSpace(refresh), strings.TrimSpace(account), strings.TrimSpace(idToken)
 }
 
 // parseCreds 是信任边界：外面贴进来的东西在这里校验完，往后各包直接信。
@@ -942,9 +947,8 @@ func (f authUpload) pick() (access, refresh, account string) {
 //   - 只有 access_token：account_id 从票里的声明读，不用人再贴一遍
 //   - 只有 refresh_token：当场换一张 access_token，其余同上
 //
-// account_id **不再要求人填**：它本来就写在票里，让人另贴一遍只是多一个贴错的机会
-// ——2026-10-01 就这么进来一张标着 pro1 实际是另一个 free 账号的票，两个字段自洽、
-// 上游照收，然后二十个区域全回 400。填了就必须和票里一致。
+// 账号 ID 优先从 AT 读取，缺失时从 ID token 补齐；显式 account_id 和
+// 刷新前后的全部已知身份必须一致。ID token 只补身份，不能替代 AT 的有效期。
 //
 // 返回的第二个值是票里的声明（plan、邮箱……），空字段表示票里没写。
 func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, oauth.Claims, error) {
@@ -952,41 +956,39 @@ func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, oauth
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return types.Creds{}, oauth.Claims{}, errors.New("不是合法 JSON")
 	}
-	access, refresh, account := f.pick()
+	access, refresh, account, idToken := f.pick()
 	if access == "" && refresh == "" {
 		return types.Creds{}, oauth.Claims{}, errors.New("access_token 和 refresh_token 至少要有一个")
 	}
 	if refresh != "" && (len(refresh) < 20 || hasBlank(refresh)) {
 		return types.Creds{}, oauth.Claims{}, errors.New("refresh_token 形状不对")
 	}
-	// 只给了 refresh_token：当场换一张。换不出来就别建号——建了也是个废号，
-	// 第一次扫描才发现，白打一轮。
-	if access == "" {
-		got, newRefresh, err := s.refresh(ctx, refresh)
-		if err != nil {
-			return types.Creds{}, oauth.Claims{}, fmt.Errorf("用 refresh_token 换 access_token 失败：%w", err)
-		}
-		access = got
-		if newRefresh != "" {
-			refresh = newRefresh
-		}
-	}
-	if len(access) < 20 || hasBlank(access) {
-		return types.Creds{}, oauth.Claims{}, errors.New("access_token 形状不对")
-	}
-	cl, err := oauth.Parse(access)
+	cl, err := oauth.ClaimsFor(oauth.Tokens{AccessToken: access, IDToken: idToken}, account)
 	if err != nil {
 		return types.Creds{}, oauth.Claims{}, err
 	}
-	switch {
-	case account == "" && cl.AccountID == "":
-		return types.Creds{}, oauth.Claims{}, errors.New("票里没有 chatgpt_account_id，得自己贴一个 account_id")
-	case account == "":
+	account = cl.AccountID
+	expired := !cl.Expires.IsZero() && time.Now().After(cl.Expires)
+	if access == "" || expired || (account == "" && refresh != "") {
+		if refresh == "" {
+			return types.Creds{}, oauth.Claims{}, errors.New("access_token 已经过期了，换一张新的（或者贴 refresh_token）")
+		}
+		tokens, refreshErr := s.refresh(ctx, refresh)
+		if refreshErr != nil {
+			return types.Creds{}, oauth.Claims{}, fmt.Errorf("用 refresh_token 换 access_token 失败：%w", refreshErr)
+		}
+		access = tokens.AccessToken
+		if tokens.RefreshToken != "" {
+			refresh = tokens.RefreshToken
+		}
+		cl, err = oauth.ClaimsFor(tokens, account)
+		if err != nil {
+			return types.Creds{}, oauth.Claims{}, err
+		}
 		account = cl.AccountID
-	case cl.AccountID != "" && cl.AccountID != account:
-		return types.Creds{}, oauth.Claims{}, fmt.Errorf(
-			"account_id 和 access_token 里写的不是同一个账号（票里是 %s）——八成是两处凭据贴串了",
-			cl.AccountID)
+	}
+	if account == "" {
+		return types.Creds{}, oauth.Claims{}, errors.New("access_token 和 id_token 都没有账号 ID；请上传同账号完整 auth.json，或在凭据 JSON 中提供真实 account_id（不是备注名称）")
 	}
 	// 放在这儿而不是读票之前：票里读出来的那个同样是外面送进来的（票不验签）。
 	// 「anon:」开头的是匿名占位行的命名空间（types.AnonPrefix），真账号是 UUID 不会这样；
@@ -995,21 +997,7 @@ func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, oauth
 		return types.Creds{}, oauth.Claims{}, errors.New("account_id 形状不对")
 	}
 	if !cl.Expires.IsZero() && time.Now().After(cl.Expires) {
-		if refresh == "" {
-			return types.Creds{}, oauth.Claims{}, errors.New("access_token 已经过期了，换一张新的（或者贴 refresh_token）")
-		}
-		// 有 refresh 就自己续，不必让人回去重新导出。
-		got, newRefresh, rerr := s.refresh(ctx, refresh)
-		if rerr != nil {
-			return types.Creds{}, oauth.Claims{}, fmt.Errorf("access_token 过期且换票失败：%w", rerr)
-		}
-		access = got
-		if newRefresh != "" {
-			refresh = newRefresh
-		}
-		if cl, err = oauth.Parse(access); err != nil {
-			return types.Creds{}, oauth.Claims{}, err
-		}
+		return types.Creds{}, oauth.Claims{}, errors.New("刷新返回的 access_token 已经过期")
 	}
 	return types.Creds{AccessToken: access, AccountID: account, RefreshToken: refresh}, cl, nil
 }

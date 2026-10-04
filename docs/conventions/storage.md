@@ -13,3 +13,5 @@
 - sub2api 文件仅在上传页展开为现有单账号上传，身份校验/去重仍由 `/upload` 和 Store 负责。批量重试保留结果、原序号与 owner，不能依赖浏览器 cookie；代理/extra 不迁移。
 - Owner key由根密钥与Owner稳定身份派生，名下至少一份有效凭据才可用；旧credential key仅启动迁移时grandfather，继续鉴权但UI/上传回执不再分发。空库也保存迁移标记，后建账号不得因重启获得旧key资格。
 - 接触报告的Owner ReporterID与旧credential ReporterID分域；admin/root不能作为独立消费者上报。7天/8192总/每reporter1024，unknown不计有结论分母，窗口结束补报不得改初始身份/结论。
+- OAuth用`Tokens`保留AT/轮换RT/ID，`ClaimsFor`统一输入/刷新前后身份一致性；AT缺ID可由ID token或显式真实ID补齐，缺AT的RT输入也适用。ID token只补身份/plan/email，不能提供AT寿命。
+- 上传最多刷新一次，后台刷新写回前同样校验身份和AT有效期；OAuth错误仅固定类别/HTTP状态，原响应body/description不得进入日志或页面，Tokens格式化打码。回归见oauth/upload_identity/refresh测试。
