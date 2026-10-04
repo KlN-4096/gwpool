@@ -112,7 +112,7 @@ func TestCoverageGlobalCountriesSaveOnceWithoutProbing(t *testing.T) {
 		}
 	}
 	loaded, err := config.Load(path)
-	if err != nil || len(loaded.RegionDefinitions()) != 250 || len(srv.opt.Live.Get().RegionDefinitions()) != 250 {
+	if err != nil || len(loaded.RegionDefinitions()) != 209 || len(srv.opt.Live.Get().RegionDefinitions()) != 209 {
 		t.Fatalf("global country definitions missing after reload: %v", err)
 	}
 	if len(calls.probed) != 0 || len(calls.added) != 0 {

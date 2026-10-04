@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/types"
 )
@@ -52,6 +53,7 @@ type Store interface {
 	// RegionMints 是 (账号 × 区域) 的终身铸票台账，key 的格式归 store 所有
 	// （这里只认 RegionMint 自带的 AccountID / RegionKey 两个字段）。
 	RegionMints() map[string]types.RegionMint
+	CountryAttempts(account string) map[string]types.CountryAttempt
 
 	// NoteRegionMint 记一次成功的铸票：挑下一个铸票者就看这本账。
 	NoteRegionMint(accountID int64, regionKey, gateway string, at time.Time) error
@@ -1125,8 +1127,14 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	unlock := s.st.LockAccount(consumer.ID)
 	defer unlock()
 	if m.ticket == "" {
+		var err error
+		ctx, err = s.beginAttempt(ctx, consumer, exit)
+		if err != nil {
+			return types.Delivery{}, err
+		}
 		sid, err := s.mint.NewSIDFor(exit, true)
 		if err != nil {
+			s.sampleAttemptFailure(consumer, exit, "", types.PurposeDelivery, types.Observed{}, err)
 			return types.Delivery{}, fmt.Errorf("要不到粘性出口: %w", err)
 		}
 		got, err := s.mintOnce(ctx, consumer, exit, sid, pair, gateway, gateway)
@@ -1219,13 +1227,18 @@ type pairMint struct {
 // ⇒ 传空串，由 mintOnce 按出口所在国家把能到的网关各记一次。
 func (s *Scheduler) mintPair(ctx context.Context, minter, consumer types.Account,
 	exit types.Exit, cur types.Pair, want, bias string) (pairMint, error) {
+	unlock := s.st.LockAccount(minter.ID)
+	defer unlock()
+	ctx, err := s.beginAttempt(ctx, minter, exit)
+	if err != nil {
+		return pairMint{}, err
+	}
 	sid, err := s.mint.NewSIDFor(exit, true)
 	if err != nil {
+		s.sampleAttemptFailure(minter, exit, "", types.PurposeDelivery, types.Observed{}, err)
 		return pairMint{}, fmt.Errorf("要不到粘性出口: %w", err)
 	}
-	unlock := s.st.LockAccount(minter.ID)
 	got, err := s.mintOnce(ctx, minter, exit, sid, cur, want, bias)
-	unlock()
 	if err != nil {
 		return pairMint{}, err
 	}
@@ -1343,11 +1356,22 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 			types.ErrRateLimited, left.Round(time.Second))
 	}
 
-	// 地理只用来给上传者看账本，查不到不影响铸票（同 sid ⇒ 同出口 IP）。
+	// Direct callers also reserve, while pre-bound callers reuse their reservation.
+	var err error
+	ctx, err = s.beginAttempt(ctx, a, e)
+	if err != nil {
+		return minted{}, err
+	}
 	sampleStarted := s.now()
 	obs, gerr := s.mint.Geo(ctx, e, sid)
+	// Cookie routing does not prove the physical exit country is supported.
+	// Seed requests retain their logical region for accounting only.
+	if gerr == nil && !geography.Supported(obs.Country) {
+		gerr = types.ErrUnsupportedCountry
+	}
 	if gerr != nil {
-		s.opt.Log.Debug("查出口地理失败", "account", a.ID, "err", gerr)
+		s.sampleAttemptFailure(a, e, sid, purpose, obs, gerr)
+		return minted{}, fmt.Errorf("出口地理检查: %w", gerr)
 	}
 
 	start := s.now()
@@ -1563,7 +1587,7 @@ func (s *Scheduler) PickMinter(exclude int64) (types.Account, types.Region, bool
 // RegionEnabled 供延迟执行的任务复核运行配置，不能只认入队快照。
 func (s *Scheduler) RegionEnabled(region types.Region) bool {
 	current, ok := s.cfg().RegionByKey(region.Key)
-	return ok && current.Enabled && current.Exit() == region.Exit
+	return ok && current.Enabled && geography.Supported(current.Country) && current.Exit() == region.Exit
 }
 
 // mintPlan 给按区域铸定「派谁去、从哪个区域出发」（见 mintByRegion）。
@@ -1585,13 +1609,8 @@ func (s *Scheduler) mintPlan(consumer types.Account) (types.Account, types.Regio
 // 那个。和 minterFor 里的那次 bestRegion 同一把尺子，差别只是这里人已经定了。
 func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
 	perRegion, limit := s.mint.Rate(a.Creds.AccountID)
-	lifetime := map[string]int{}
-	for _, m := range s.st.RegionMints() {
-		if m.AccountID == a.ID {
-			lifetime[m.RegionKey] = m.Count
-		}
-	}
-	r, _, _, ok := bestRegion(s.dynamicRegions(types.Exit{}), perRegion, limit, lifetime, nil, nil)
+	lifetime := s.countryAttemptCounts(a)
+	r, _, _, ok := bestRegion(s.dynamicRegions(types.Exit{}), perRegion, limit, s.cfg().AccountAttemptLimit(), lifetime, nil, nil)
 	return r, ok
 }
 
@@ -1640,15 +1659,6 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 	}
 	s.mu.Unlock()
 
-	// 台账按值重建索引：那张表的键格式归 store 所有（sched 刻意不认识 store 的键）。
-	lifetime := map[int64]map[string]int{}
-	for _, m := range s.st.RegionMints() {
-		if lifetime[m.AccountID] == nil {
-			lifetime[m.AccountID] = map[string]int{}
-		}
-		lifetime[m.AccountID][m.RegionKey] = m.Count
-	}
-
 	type cand struct {
 		a      types.Account
 		r      types.Region
@@ -1682,7 +1692,7 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 			}
 			prefer = pol.prefer
 		}
-		pick, picked, reseed, ok := bestRegion(regions, perRegion, limit, lifetime[a.ID], drop, prefer)
+		pick, picked, reseed, ok := bestRegion(regions, perRegion, limit, s.cfg().AccountAttemptLimit(), s.countryAttemptCounts(a), drop, prefer)
 		if !ok {
 			continue // 九个区域（或点名的那一个）本小时都打满了、或者都被 skip 排掉了
 		}
@@ -1696,11 +1706,11 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		if cs[i].sent != cs[j].sent {
 			return cs[i].sent < cs[j].sent
 		}
-		if cs[i].reseed != cs[j].reseed {
-			return cs[i].reseed
-		}
 		if cs[i].unseen != cs[j].unseen {
 			return cs[i].unseen
+		}
+		if cs[i].reseed != cs[j].reseed {
+			return cs[i].reseed
 		}
 		if !cs[i].used.Equal(cs[j].used) {
 			return cs[i].used.Before(cs[j].used)
@@ -1718,26 +1728,28 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 // mint.perRegionHour 永远回正数。
 //
 // drop / prefer 非 nil 时分别排掉和优先某些区域（预铸用，见 premintPolicy）。
-func bestRegion(regions []types.Region, perRegion map[string]int, limit int, lifetime map[string]int,
-	drop, prefer func(regionKey string) bool) (types.Region, int, bool, bool) {
-	if types.MintBudgetFull(perRegion, limit, "") {
+func bestRegion(regions []types.Region, perRegion map[string]int, limit, accountLimit int, lifetime map[string]int64,
+	drop, prefer func(regionKey string) bool) (types.Region, int64, bool, bool) {
+	if types.MintBudgetFull(perRegion, limit, accountLimit, "") {
 		return types.Region{}, 0, false, false
 	}
 	var best types.Region
-	bestCount, bestPrefer, found := 0, false, false
+	bestCount, bestPrefer, found := int64(0), false, false
 	for _, r := range regions {
-		if limit > 0 && perRegion[r.Key] >= limit {
+		country := geography.CountryKey(r.Exit.Region)
+		if limit > 0 && perRegion[country] >= limit {
 			continue
 		}
 		if drop != nil && drop(r.Key) {
 			continue
 		}
 		p := prefer != nil && prefer(r.Key)
-		n := lifetime[r.Key]
-		// prefer 那一档整体优先；同档内才比终身计数。
+		n := lifetime[country]
+		// Failed attempts advance the country just like success. Seed preference
+		// only breaks ties, so a persistently failing exit cannot starve new ones.
 		switch {
-		case !found, p && !bestPrefer:
-		case p == bestPrefer && n < bestCount:
+		case !found, n < bestCount:
+		case n == bestCount && p && !bestPrefer:
 		default:
 			continue
 		}

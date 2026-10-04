@@ -50,6 +50,7 @@ func newMinter(cfg config.Config, live *config.Live, log *slog.Logger) *mint.Cli
 		Model:       cfg.Model,
 
 		UpstreamPerRegionHour: cfg.UpstreamPerRegionHour,
+		UpstreamPerAccountHour: cfg.UpstreamPerAccountHour,
 		Live:                  live,
 		Log:                   log, // 只用来记出口熔断的开合
 	}
@@ -65,12 +66,18 @@ func run(path string, log *slog.Logger) error {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	if skipped, err := st.MigrateAttempts(); err != nil {
+		return fmt.Errorf("迁移国家尝试账本: %w", err)
+	} else if skipped > 0 {
+		log.Warn("国家尝试迁移跳过损坏的历史样本", "skipped", skipped)
+	}
 
 	// 配置的活引用：管理页改旋钮、或者有人直接编辑文件，都当场生效，不用重启。
 	// 重启会丢掉进程里的速率窗口、铸票计数、需求时间戳——而调度正依据那些。
 	live := config.NewLive(path, cfg)
 
 	minter := newMinter(cfg, live, log)
+	minter.Attempts = st
 	pool := sched.New(st, minter, sched.Options{
 		Mode: cfg.Mode,
 		// 验满血、续期、槽位冷却、对外开放门槛这几个旋钮由调度**现读** live，

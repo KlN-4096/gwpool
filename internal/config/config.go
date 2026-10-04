@@ -163,14 +163,12 @@ type Config struct {
 	// **不要手写它**——写了也会被 Models[0] 盖掉。Save 也不会把它写回文件。
 	Model string `json:"model,omitempty"`
 
-	// UpstreamPerRegionHour 是**每个上游账号、每个区域**每小时最多打多少发上游。
-	// 0 时按 Defaults。它是安全阀：任何路径上的 bug 导致疯狂重铸，都在这里被兜住，
-	// 而不是在上游变成封号。
-	//
-	// 按区域分桶而不是按账号算总量：九个区域各 6 发合起来正好是原先的 54 发/小时，
-	// 但一个区域打不通时的疯狂重试再也吃不掉另外八个区域的预算了——而那八个区域
-	// 才是发现新网关的地方。
+	// The existing JSON key now counts attempts per upstream account and country,
+	// including binding/Geo failures. Cities share their country's bucket.
 	UpstreamPerRegionHour int `json:"upstream_per_region_hour"`
+	// Independent account cap: adding countries or changing the country cap must
+	// never implicitly change the total hourly budget. 0 uses Defaults.
+	UpstreamPerAccountHour int `json:"upstream_per_account_hour"`
 
 	// VerifyFullAtDeliver 决定交付前要不要用 state-echo 验一次满血。**默认关**。
 	//
@@ -180,7 +178,7 @@ type Config struct {
 	// 消费方少拿几十秒。
 	//
 	// 所以开不开是**成本取舍**，不是「验了就废」：代价是每次交付多 2 发上游请求，
-	// 而 state-echo 和铸票共用「每区每小时 6 发」那个预算（UpstreamPerRegionHour）。
+	// state-echo、铸票与绑定失败共用滚动小时国家预算及独立账号总预算。
 	// 加上 state-echo 有假阴无假阳（SPEC 第 3 节），关掉只损失一个读数、不会把降智的东西
 	// 放出去，所以默认仍然关。
 	VerifyFullAtDeliver bool `json:"verify_full_at_deliver"`
@@ -296,9 +294,8 @@ func Defaults() Config {
 		// 冷却改过的话这个默认值会在 Load 里按**配置里那个冷却**重算。
 		PublicWhenSurplus: PublicWhenSurplus{
 			MinAccounts: types.AccountsForContinuous(types.SlotCooldown)},
-		// 九个区域各 6 发 = 原先按账号算的 54 发/小时，拆开之后一个区域的重试
-		// 吃不掉别的区域的预算。
-		UpstreamPerRegionHour: 6,
+		UpstreamPerRegionHour:  2,
+		UpstreamPerAccountHour: 50,
 		SlotCooldownMinutes:   int(types.SlotCooldown / time.Minute),
 		MaxTriesPerDeliver:    2,
 		SpareTarget:           types.SpareTarget,
@@ -391,6 +388,9 @@ func Load(path string) (Config, error) {
 	// 0 是合法的「用默认值」。
 	if cfg.UpstreamPerRegionHour < 0 {
 		return Config{}, fmt.Errorf("upstream_per_region_hour 不能为负（0 = 用默认值）")
+	}
+	if cfg.UpstreamPerAccountHour < 0 {
+		return Config{}, fmt.Errorf("upstream_per_account_hour 不能为负（0 = 用默认值）")
 	}
 	// 负数冷却会让「出冷却了吗」恒为真，于是刚烧过的槽位立刻又被挑出来发。
 	if cfg.SlotCooldownMinutes < 0 {

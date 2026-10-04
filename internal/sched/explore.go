@@ -53,13 +53,19 @@ func (s *Scheduler) exploreNewGateway(ctx context.Context) {
 			continue
 		}
 		// Dedicated discovery never borrows a seed route.
-		sid, err := s.mint.NewSIDFor(region.Exit, true)
-		if err != nil {
-			release()
-			return
-		}
 		unlock := s.st.LockAccount(account.ID)
-		got, err := s.mintOnceFor(ctx, account, region.Exit, sid, types.Pair{}, "", "", types.PurposeExplore)
+		attemptCtx, err := s.beginAttempt(ctx, account, region.Exit)
+		var sid string
+		var got minted
+		if err == nil {
+			sid, err = s.mint.NewSIDFor(region.Exit, true)
+			if err != nil {
+				s.sampleAttemptFailure(account, region.Exit, "", types.PurposeExplore, types.Observed{}, err)
+			}
+		}
+		if err == nil {
+			got, err = s.mintOnceFor(attemptCtx, account, region.Exit, sid, types.Pair{}, "", "", types.PurposeExplore)
+		}
 		unlock()
 		release()
 		isNew, gateway := false, ""

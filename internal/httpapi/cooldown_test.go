@@ -77,6 +77,60 @@ func TestCooldownReportAuthenticationValidationAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestCooldownBatchAcknowledgesEachItemAndPreservesEventTime(t *testing.T) {
+	_, handler, _, st, _ := rig(t, types.ModePool)
+	st.gws["unified-142"] = types.Gateway{Name: "unified-142"}
+	at := time.Now().UTC().Add(-6 * time.Hour)
+	valid := map[string]any{
+		"id": strings.Repeat("1", 64), "account_tag": strings.Repeat("2", 64), "gateway": "unified-142",
+		"window_seconds": 7200, "elapsed_seconds": 7200, "result": "full", "observed_at": at,
+	}
+	raw, _ := json.Marshal(map[string]any{"reports": []any{valid, map[string]any{"id": "bad"}}})
+	r := authed(httptest.NewRequest(http.MethodPost, "/cooldown/reports", strings.NewReader(string(raw))), "akey")
+	w := do(handler, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch endpoint missing or failed: %d %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Results []struct {
+			ID     string `json:"id"`
+			Status int    `json:"status"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || len(response.Results) != 2 ||
+		response.Results[0].Status != 200 || response.Results[1].Status != 400 || len(st.reports) != 1 {
+		t.Fatalf("partial acknowledgement lost good events: %s", w.Body.String())
+	}
+	stored, _ := json.Marshal(st.reports[0])
+	if !strings.Contains(string(stored), at.Format(time.RFC3339Nano)) {
+		t.Fatalf("batch arrival cannot replace event time: %s", stored)
+	}
+	replay := do(handler, authed(httptest.NewRequest(http.MethodPost, "/cooldown/reports", strings.NewReader(string(raw))), "akey"))
+	if replay.Code != http.StatusOK || len(st.reports) != 1 {
+		t.Fatal("batch retries are not idempotent")
+	}
+	valid["observed_at"] = at.Add(time.Second)
+	changed, _ := json.Marshal(map[string]any{"reports": []any{valid}})
+	conflict := do(handler, authed(httptest.NewRequest(http.MethodPost, "/cooldown/reports", strings.NewReader(string(changed))), "akey"))
+	if !strings.Contains(conflict.Body.String(), `"status":409`) {
+		t.Fatal("event timestamp must stay frozen for one ID")
+	}
+	for _, test := range []struct {
+		body, key string
+		status    int
+	}{
+		{string(raw), "", http.StatusUnauthorized},
+		{`{"reports":[]}`, "akey", http.StatusBadRequest},
+		{`{"reports":[{"token":"must-not-collect"}]}`, "akey", http.StatusBadRequest},
+		{`{"reports":[]} {}`, "akey", http.StatusBadRequest},
+	} {
+		w := do(handler, authed(httptest.NewRequest(http.MethodPost, "/cooldown/reports", strings.NewReader(test.body)), test.key))
+		if w.Code != test.status {
+			t.Fatalf("invalid batch accepted: %d want %d", w.Code, test.status)
+		}
+	}
+}
+
 func TestCooldownRecommendationIsAccountScopedAndAdminVisible(t *testing.T) {
 	_, handler, _, st, _ := rig(t, types.ModePool)
 	tag := strings.Repeat("2", 64)

@@ -63,11 +63,7 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	c := live.Get()
 	v.Models = c.Models
 	v.UpstreamPerRegionHour = c.UpstreamPerRegionHour
-	effectiveLimit := c.UpstreamPerRegionHour
-	if effectiveLimit <= 0 {
-		effectiveLimit = config.Defaults().UpstreamPerRegionHour
-	}
-	v.UpstreamPerAccountHour = types.AccountHourLimit(effectiveLimit)
+	v.UpstreamPerAccountHour = c.AccountAttemptLimit()
 	v.VerifyFullAtDeliver = c.VerifyFullAtDeliver
 	v.SlotCooldownMinutes = c.SlotCooldownMinutes
 	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
@@ -157,6 +153,13 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	perAccountHour := cur.AccountAttemptLimit()
+	if r.Form.Has("upstream_per_account_hour") {
+		perAccountHour, err = atoiField(r, "upstream_per_account_hour", 0, 100000)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// 下限 0 而不是 1：atoiField 对空值回下限，而这一格留空是运营最自然的「让它用默认值」
 	// 动作（同一张表单上另外几格的提示就是「0 = 用默认值」，填 0 在原来的下限 1 下反而报错）。
 	// 回 1 的话门槛变成「有一个号铸过票就对全互联网开放」——空值失败的方向朝着开那一边。
@@ -195,8 +198,9 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 		"models": models,
 		// 形状校验交给 config.Patch 里那遍 Load（normalizeBaseURL）——校验规则只该有
 		// 一份，在这儿重复一遍迟早两边不一致。空串是合法的「没配」。
-		"public_base_url":          strings.TrimSpace(r.FormValue("public_base_url")),
-		"upstream_per_region_hour": perRegionHour,
+		"public_base_url":           strings.TrimSpace(r.FormValue("public_base_url")),
+		"upstream_per_region_hour":  perRegionHour,
+		"upstream_per_account_hour": perAccountHour,
 		// 两个开关默认关，理由见 config.Config 上的字段注释（都是「花一个满血窗口
 		// 换一个读数」）。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
 		// 不能靠「缺键不动」。

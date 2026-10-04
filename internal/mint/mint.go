@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/geography"
 	"gwpool/internal/proxycatalog"
 	"gwpool/internal/types"
 )
@@ -65,18 +66,7 @@ var ErrNoProxy = types.ErrNoExit
 // 为什么要个类型而不只是一句话：HTTP 那头要把「还要等多久」变成 Retry-After，
 // 而原来这个数只活在错误文案里（"%s 后腾出一发"），取出来只能去 parse 中文。
 // Unwrap 回 types.ErrRateLimited ⇒ 所有 errors.Is 的分流照旧成立。
-type RateLimited struct {
-	Region string
-	Limit  int
-	Wait   time.Duration // 腾出一发还要多久
-}
-
-func (e *RateLimited) Error() string {
-	return fmt.Sprintf("%s（区域 %s 每小时上限 %d，%s 后腾出一发）",
-		types.ErrRateLimited, e.Region, e.Limit, e.Wait)
-}
-
-func (e *RateLimited) Unwrap() error { return types.ErrRateLimited }
+type RateLimited = types.AttemptLimit
 
 // Client 实现 types.Minter。
 type Client struct {
@@ -94,10 +84,11 @@ type Client struct {
 	// （SPEC 红线 8：测试不许打真实上游）。
 	HTTP *http.Client
 
-	// UpstreamPerRegionHour 是**每个上游账号、每个区域**每小时最多打多少发上游
-	// （Mint + VerifyFull）。0 时按 config.Defaults。
-	// Geo 不算在内：它打的是 ipinfo，不是上游。
-	UpstreamPerRegionHour int
+	// Country attempt cap; the historical field name is retained in config.
+	UpstreamPerRegionHour  int
+	UpstreamPerAccountHour int
+	// Production uses the Store ledger, preserving failed attempts across restart.
+	Attempts types.AttemptLedger
 
 	// Live 非 nil 时，模型和速率上限每次**现读**它，于是改配置不用重启。
 	// 为空就用上面那两个字段（测试走这条路，不必搭一份配置）。
@@ -122,24 +113,23 @@ type Client struct {
 	sent       map[string][]time.Time // 账号|区域 -> 过去一小时每一发请求的时刻
 }
 
-// rateKey 是速率闸的分桶键：(上游账号 × 区域)。
-//
-// 区域反查不到（出口不在 types.Regions 里，只可能来自手改的 state.json）时
-// 整批挤进同一个空桶：宁可让它们互相挤，也不要每个野出口凭空多出一整份配额。
+// Cities and exit aliases share one upstream-account × ISO-country bucket.
 func (c *Client) rateKey(acct string, e types.Exit) string {
-	return acct + "|" + c.Live.Get().RegionKeyOf(e)
+	return acct + "|" + geography.CountryKey(e.Region)
 }
 
-// spend 过速率闸。满了就回 types.ErrRateLimited，一发都不发。
-//
-// **按 (上游账号 × 区域) 算，不是全局、也不是只按账号**：一个号打太猛不该让别的号
-// 跟着挨饿，而一个区域打不通时的重试更不该吃掉另外八个区域的预算——那八个区域才是
-// 发现新落点的地方。九个区域各 6 发合起来正好是原先按账号算的 54 发/小时。
-//
-// 滑动窗口而不是漏桶：「每小时 6 发」就按字面实现，几十个时间戳扫一遍不值得优化。
+// spend reserves an attempt, not a successful upstream request. There is no
+// refund for binding, Geo or transport failure.
 func (c *Client) spend(acct string, e types.Exit) error {
+	if !geography.Supported(e.Region) {
+		return fmt.Errorf("%w: %s", types.ErrUnsupportedCountry, geography.CountryKey(e.Region))
+	}
 	lim := c.perRegionHour()
+	accountLimit := c.perAccountHour()
 	now := time.Now()
+	if c.Attempts != nil {
+		return c.Attempts.ReserveAttempt(acct, geography.CountryKey(e.Region), lim, accountLimit, now)
+	}
 	cut := now.Add(-time.Hour)
 	key := c.rateKey(acct, e)
 
@@ -163,8 +153,8 @@ func (c *Client) spend(acct string, e types.Exit) error {
 			}
 		}
 	}
-	if total >= types.AccountHourLimit(lim) {
-		return &RateLimited{Region: "all", Limit: types.AccountHourLimit(lim),
+	if total >= accountLimit {
+		return &RateLimited{Region: "all", Limit: accountLimit,
 			Wait: oldest.Add(time.Hour).Sub(now).Round(time.Second)}
 	}
 	win := c.sent[key]
@@ -177,39 +167,19 @@ func (c *Client) spend(acct string, e types.Exit) error {
 	if len(kept) >= lim {
 		c.sent[key] = kept
 		// 说出「还要等多久」：没有它的话调用方只知道被拒，不知道该等 3 秒还是 50 分钟。
-		return &RateLimited{Region: c.Live.Get().RegionKeyOf(e), Limit: lim,
+		return &RateLimited{Region: geography.CountryKey(e.Region), Limit: lim,
 			Wait: kept[0].Add(time.Hour).Sub(now).Round(time.Second)}
 	}
 	c.sent[key] = append(kept, now)
 	return nil
 }
 
-// refund 把刚占下的那个窗口名额退回去。
-//
-// 只给「根本没碰到上游」用（连不上代理、代理认证被拒）：那一发没动账号的任何额度，
-// 扣着它只是让这个区域的配额凭空少一发，而配额本来就只有 6。
-// 谁调用它由 do 决定——那边已经在区分这几类失败了（熔断只记供应商自己的账），
-// 判据只该有一份。
-//
-// 砍掉的是**最后**一个时间戳而不是精确那一个：单账号并发硬性为 1，所以正常情况下
-// 它就是我们刚加的那一发；真撞上了也只是让窗口里某个时间戳差几百毫秒，而这个闸
-// 看的是发数不是时刻。
-func (c *Client) refund(acct string, e types.Exit) {
-	key := c.rateKey(acct, e)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if w := c.sent[key]; len(w) > 0 {
-		c.sent[key] = w[:len(w)-1]
-	}
-}
-
-// Rate 报某个上游账号当前窗口**各区域**各用掉几发，以及每区的上限。
-//
-// 整个账号一次报完，不是一区一问：挑铸票者要同时看九个区域还剩多少配额
-// （见 sched.minterFor），而页面上那张格子也是九个一起画。
-// key 是区域 key；没打过的区域不出现在 map 里。
+// Rate reports country attempt usage, keyed by ISO country rather than exit key.
 func (c *Client) Rate(acct string) (used map[string]int, limit int) {
 	limit = c.perRegionHour()
+	if c.Attempts != nil {
+		return c.Attempts.AttemptUsage(acct, time.Now()), limit
+	}
 	cut := time.Now().Add(-time.Hour)
 	used = map[string]int{}
 	c.mu.Lock()
@@ -408,7 +378,7 @@ func (c *Client) bindLocked(sid string, idx int, now time.Time) {
 // 而猜错是**静默写坏账本**。
 func (c *Client) Mint(ctx context.Context, cr types.Creds, e types.Exit, sid, sentPair string,
 	sentCflbExp time.Time) (types.MintResult, error) {
-	if err := c.spend(cr.AccountID, e); err != nil {
+	if err := c.spendForContext(ctx, cr, e); err != nil {
 		return types.MintResult{}, err
 	}
 	// 种子出口上**必须**只送 `__cflb`，见 CflbOnly。钉在这里而不是交给调用方：
@@ -501,7 +471,7 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 		return nil, errors.New("state-echo 必须带一张活票")
 	}
 	// 和铸票那一发共用同一个 (账号 × 区域) 预算：两条路各算一套就等于把上限翻倍。
-	if err := c.spend(cr.AccountID, e); err != nil {
+	if err := c.spendForContext(ctx, cr, e); err != nil {
 		return nil, err
 	}
 	body, header := buildWire(c.fingerprint(), c.model(), cr, pair, ticket)
@@ -638,14 +608,22 @@ func (c *Client) model() string {
 // 迟早只改一处。
 func (c *Client) perRegionHour() int {
 	if c.Live != nil {
-		if n := c.Live.Get().UpstreamPerRegionHour; n > 0 {
-			return n
-		}
+		return c.Live.Get().CountryAttemptLimit()
 	}
 	if c.UpstreamPerRegionHour > 0 {
 		return c.UpstreamPerRegionHour
 	}
 	return config.Defaults().UpstreamPerRegionHour
+}
+
+func (c *Client) perAccountHour() int {
+	if c.Live != nil {
+		return c.Live.Get().AccountAttemptLimit()
+	}
+	if c.UpstreamPerAccountHour > 0 {
+		return c.UpstreamPerAccountHour
+	}
+	return config.Defaults().UpstreamPerAccountHour
 }
 
 func (c *Client) upstream() string {
@@ -710,10 +688,7 @@ func (c *Client) do(req *http.Request, e types.Exit, sid, acct string) (*http.Re
 		// 连不上代理本身、认证被拒：这才是供应商的账。
 		// err 里会带 URL，代理用户名在 Transport 里，不会被 net/http 带进来。
 		c.noteFailure(p.Name, acct, err)
-		// 这一发**根本没碰到上游**（连接都没建起来），不该花这个账号的配额。
-		// 和它刻意分开的是上面两支：隧道建起来又断、以及调用方取消——那两种
-		// 请求都可能已经落到上游了，退了就是低报，而这个闸是防封号的安全阀。
-		c.refund(acct, e)
+		// The country budget measures attempts, including failed connections.
 		return nil, fmt.Errorf("经 %s 请求失败: %w", p.Name, err)
 	}
 	c.noteSuccess(p.Name)

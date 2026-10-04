@@ -58,16 +58,16 @@
   <div class="card">
     <header class="card-head"><div><h2>消费端冷却统计</h2>
       <p>最近 7 天、最多 8192 个匿名自报样本，每个消费方最多保留 1024 个。个人至少 2 次成功才推荐；池子参考值需至少 3 个有足够样本的独立消费方。推荐参与消费端下一周期，不改正在执行的窗口。</p>
-      <p>失败只指明确降级，网络错误不计。账号差异只是观测差异，不能据此认定账号本身是原因。</p>
+      <p>失败只指明确降级，网络错误不计。最高建议24小时，不保证到点恢复；超过上限的失败会阻止该账号获得更短建议，直到证据过期。这里的推荐不是消费端已学到的固定档位。</p>
     </div></header>
     {{if .CooldownStats}}
     <div class="table-wrap"><table>
-      <thead><tr><th>网关</th><th>账号数</th><th>成功 / 失败</th><th>池子建议</th><th>账号差异与明细</th></tr></thead>
+      <thead><tr><th>网关</th><th>来源×匿名账号数</th><th>成功 / 失败</th><th>池子建议</th><th>账号差异与明细</th></tr></thead>
       <tbody>{{range .CooldownStats}}<tr>
         <td>{{.Gateway}}</td><td>{{len .Accounts}}</td><td>{{.Successes}} / {{.Failures}}</td>
-        <td>{{if .Recommendation.Seconds}}{{.Recommendation.Seconds}} 秒（{{.Recommendation.Samples}} 样本）{{else}}样本不足{{end}}</td>
+        <td>{{if .Recommendation.Seconds}}{{.Recommendation.Seconds}} 秒（{{.Recommendation.Samples}} 样本）{{else}}不足3个具备有效建议的独立消费方{{end}}</td>
         <td>{{if .AccountDifferences}}观察到档位差异{{else}}尚无充分差异证据{{end}}
-          <details><summary>各匿名账号</summary>{{range .Accounts}}<p>来源 {{.ReporterID}} / {{printf "%.10s" .AccountTag}}：{{.Successes}} 成功 / {{.Failures}} 失败；{{if .Recommendation.Seconds}}建议 {{.Recommendation.Seconds}} 秒{{else}}样本不足{{end}}</p>{{end}}</details>
+          <details><summary>各匿名账号</summary>{{range .Accounts}}<p>来源 {{.ReporterID}} / {{printf "%.10s" .AccountTag}}：{{.Successes}} 成功 / {{.Failures}} 失败；{{if .Recommendation.Seconds}}建议 {{.Recommendation.Seconds}} 秒{{else if eq .RecommendationReason "failure_above_limit"}}实际静置达到或超过24小时仍失败，暂无可推荐档位{{else}}最高档以内的有效成功样本不足2次{{end}}</p>{{end}}</details>
         </td>
       </tr>{{end}}</tbody>
     </table></div>
@@ -216,7 +216,7 @@
           <td class="l2 a-cov" title="启用出口中有成功铸票记录的数量；不是网关全集完成率">{{.Covered}}</td>
           <td class="l2 a-since" title="UTC">{{.Since}}</td>
           <td class="l2 a-why">{{if and (not .Enabled) .DisabledReason}}停用原因：{{.DisabledReason}}{{end}}</td>
-          <td class="a-rg">{{template "region-cells" .Card.Regions}}<a class="foot" href="/a/{{.ViewToken}}?regions=all#tab-overview">查看全部出口 →</a></td>
+          <td class="a-rg">{{template "region-cells" .Card.Regions}}</td>
         </tr>
       {{end}}
       </tbody>
@@ -417,8 +417,10 @@
             <input name="public_base_url" inputmode="url" autocomplete="off" spellcheck="false" value="{{.PublicBaseURL}}"></label>
           <label>别的模型名 <span class="hint">上面没列的手打，逗号或换行分隔</span>
             <input name="models_extra" autocomplete="off" spellcheck="false"></label>
-          <label>每账号单出口每小时上限 <span class="hint">0 = 默认6。同账号全部出口共享总上限：当前 {{.UpstreamPerAccountHour}} 发/小时（原9×单区限额），不是出口数×限额。铸票、续票和交付验证共用，扩区不扩额</span>
+          <label>每账号每国家尝试次数 <span class="hint">滚动1小时，0 = 默认2。绑定、查询出口和请求失败也计次；同国不同城市共用。扫描、铸票、续票和交付验证共用此预算</span>
             <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
+          <label>每账号每小时总尝试次数 <span class="hint">0 = 默认50，独立于国家或大区数量；重启不重置已用次数</span>
+            <input name="upstream_per_account_hour" inputmode="numeric" value="{{.UpstreamPerAccountHour}}"></label>
           <label>账号×网关冷却（分钟） <span class="hint">0 = 用默认值 240。<strong>只管读数与统计窗口，不再拦交付</strong>（2026-10-03 起消费冷却交给客户端账本）：九区格子的「最近多久取过」和上面那张接触记录都按它算。实测真实恢复时长 30 分钟到 3 小时都见过</span>
             <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
           <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。<strong>交付前验证开着时</strong>每多试一个就多花一发上游（state-echo），关着时试的都是已有活票的网关、一发都不打</span>

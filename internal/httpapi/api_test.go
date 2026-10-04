@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"gwpool/internal/config"
+	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
@@ -827,15 +828,15 @@ func TestOwnerPageIsScopedToItsOwnAccounts(t *testing.T) {
 // 九宫格恒为 types.Regions 那九个：铸过的绿、没铸过的灰，而台账里「出口反查不到
 // 区域」那种行（RegionKeyOf 回空串）**不许**画成第十个格子。
 // 另外：纯靠颜色对色盲不友好，所以格子里必须有文字。
-func TestOwnerPageDrawsOnlyRecordedRegionCells(t *testing.T) {
+func TestOwnerPageDrawsNineAreaCells(t *testing.T) {
 	_, h, _, _, _ := rig(t, types.ModePool)
 	body := do(h, httptest.NewRequest("GET", "/u/"+ownerTok1, nil)).Body.String()
 
 	// 九个格子，一个不多一个不少（owner 1 名下只有一个账号）。
 	// 带引号精确数，别把外面那个 class="regions" 容器也数进来。
 	n := strings.Count(body, `class="region"`) + strings.Count(body, `class="region on"`)
-	if n != 1 {
-		t.Fatalf("应只画1个有记录出口，而非全部空格，实际%d", n)
+	if n != 9 {
+		t.Fatalf("应画九大区而不是国家格，实际%d", n)
 	}
 	// europe 的最近一次在窗口内 ⇒ 绿 + 文字（✓ 多久前）+ 带时间的 title；别的区域是灰的。
 	if eu := regionCellOf(t, body, "欧洲"); !strings.Contains(eu, `class="region on"`) ||
@@ -1939,7 +1940,7 @@ func TestAdminAccountFacets(t *testing.T) {
 		`;套餐=plan-plus:plus|plan-pro:pro|plan-unknown:未知;`,
 		`;区域=cov-all:启用出口都铸过:ok|cov-part:启用出口未覆盖全:warn|cov-none:启用出口无成功记录:bad;`,
 		`;上传者=o1:#1 我|o2:#2 朋友"`,
-		">1/9<", ">9/9<", ">0/9<",
+		">1/7<", ">7/7<", ">0/7<",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("账号表筛选缺了 %q", want)
@@ -2811,8 +2812,8 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	if !strings.Contains(body, "各区域探测情况") {
 		t.Fatalf("账号页没有九区域格子：\n%s", body)
 	}
-	for _, r := range types.Regions {
-		if !strings.Contains(body, config.Defaults().RegionLabel(r.Key)) {
+	for _, r := range geography.Areas {
+		if !strings.Contains(body, r.Label) {
 			t.Fatalf("缺了区域 %s 的格子", r.Key)
 		}
 	}
@@ -2830,7 +2831,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 
 	// 同一个网关在更晚的区域再出现 ⇒ 重复。
-	if us := regionCellOf(t, body, "美国默认出口"); !strings.Contains(us, "unified-142 重复") {
+	if us := regionCellOf(t, body, "北美"); !strings.Contains(us, "unified-142 重复") {
 		t.Fatalf("美东那一格没把重复网关标出来：%s", us)
 	}
 	// 别人先发现的 ⇒ 重复。
@@ -2848,7 +2849,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 
 	// 终身绿不算绿：台账上最近一次已经在窗口外的格子必须是灰的，终身次数退到悬停。
-	uw := regionCellOf(t, body, "美国西雅图出口")
+	uw := regionCellOf(t, body, "北美")
 	if strings.Contains(uw, "region on") {
 		t.Fatalf("最近一次在窗口外，格子不该是绿的：%s", uw)
 	}
@@ -2913,7 +2914,7 @@ func TestPoolRegionCells(t *testing.T) {
 	if ea := byKey["east-asia"]; ea.Total != 1 || ea.Gateways[0].Name != "unified-142" {
 		t.Fatalf("跨区域的网关没在东亚那一格出现：%+v", ea)
 	}
-	if un := byKey[""]; un.Label != "未归类" || un.Total != 2 {
+	if un := byKey[""]; un.Label != "未归类" || un.Total != 1 {
 		t.Fatalf("未归类那一格该收下反查不到区域的和没有出口的：%+v", un)
 	}
 	if oc := byKey["oceania"]; oc.Total != 0 || !strings.Contains(oc.Note, "还没在这个区域发现过网关") {
@@ -2923,8 +2924,8 @@ func TestPoolRegionCells(t *testing.T) {
 	if got := rows[0].Regions; len(got) != 2 || got[0] != "欧洲" || got[1] != "东亚" {
 		t.Fatalf("网关行的区域列没回填：%v", got)
 	}
-	if got := rows[2].Regions; len(got) != 0 {
-		t.Fatalf("反查不到区域的不该回填区域名：%v", got)
+	if got := rows[2].Regions; len(got) != 1 || got[0] != "北美" {
+		t.Fatalf("known country with a custom city must still map to its area: %v", got)
 	}
 
 	// 全都不可交付的区域不许标绿。
@@ -2943,7 +2944,7 @@ func TestPoolRegionCells(t *testing.T) {
 func TestPoolPageRegionFilter(t *testing.T) {
 	_, h, _, st, _ := rig(t, types.ModePool)
 	st.gws["unified-73"] = types.Gateway{Name: "unified-73", ReachableExits: []types.Exit{{Region: "JP"}}}
-	st.gws["unified-900"] = types.Gateway{Name: "unified-900", ReachableExits: []types.Exit{{Region: "US", City: "Dallas"}}}
+	st.gws["unified-900"] = types.Gateway{Name: "unified-900", ReachableExits: []types.Exit{{Region: "ZZ"}}}
 
 	// 没带参数 ⇒ 整张表，「全部」那一格选中。
 	all := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
@@ -3001,8 +3002,8 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 		t.Fatalf("欧洲那一格没收下 unified-142：%s", cell)
 	}
 	body = do(h, httptest.NewRequest("GET", "/?regions=all", nil)).Body.String()
-	for _, r := range types.Regions {
-		if !strings.Contains(body, config.Defaults().RegionLabel(r.Key)) {
+	for _, r := range geography.Areas {
+		if !strings.Contains(body, r.Label) {
 			t.Fatalf("号池页缺了区域 %s 的格子", r.Key)
 		}
 	}

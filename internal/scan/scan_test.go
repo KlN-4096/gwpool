@@ -47,6 +47,10 @@ func newFake() *fakeMinter {
 	}
 }
 
+func (f *fakeMinter) BeginAttempt(ctx context.Context, _ types.Creds, _ types.Exit) (context.Context, error) {
+	return ctx, ctx.Err()
+}
+
 func (f *fakeMinter) NewSID(sticky bool) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -390,7 +394,7 @@ func TestScanFailureStillRecordsSample(t *testing.T) {
 		t.Errorf("该有 2 个区域彻底失败，得到 %d", fails)
 	}
 	rows, _ := st.Samples()
-	// MaxTries=2：BR 的两次重试都落了样本行；AU 连 geo 都没过，落不了行。
+	// Geo失败也保留尝试证据，但不能伪造地理或上游成功。
 	var br int
 	for _, r := range rows {
 		if r.RegionKey == "south-america" {
@@ -400,7 +404,9 @@ func TestScanFailureStillRecordsSample(t *testing.T) {
 			}
 		}
 		if r.RegionKey == "oceania" {
-			t.Error("geo 都没拿到时没有可信地理，不该落样本")
+			if r.Status != 0 || r.Gateway != "" || r.Observed.Country != "" {
+				t.Error("geo failure became a successful landing")
+			}
 		}
 	}
 	// 1 行而不是 2：上游答了 429 就不再重试（见 TestRetryOnlyForTransportFailures）。

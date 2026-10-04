@@ -301,7 +301,7 @@ table.acards tr.nomatch td { text-align: center; padding: 1.5rem; }
    这一格真正要答的只是「每个区域此刻能交付几个」，名字收进悬停提示——点一格会把下面
    那张表收窄到该区域，名字在那里本来就有。
    类名刻意不叫 .regions：那是账号页九区域格子的容器，共用会把它的 gap/margin 串过来。 */
-.kpis.region-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 0; }
+.kpis.region-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 0; }
 .kpis.region-kpis .kpi { box-shadow: none; background: var(--sunken); padding: .7rem .85rem; }
 .kpis.region-kpis .kpi > b small { font-size: .95rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
 .kpis.region-kpis .kpi.sel { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
@@ -928,17 +928,12 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
 {{- end}}
 
 {{define "region-cells" -}}
-<p class="foot">有记录 {{.Recorded}} / {{.Total}} 个出口 · 启用 {{.Enabled}}</p>
-{{range .Groups}}
-<details class="region-group">
-<summary>{{.Label}} · {{len .Countries}} 个国家/地区</summary>
-{{range .Countries}}
-<p class="foot">{{.Country}}</p>
+<p class="foot">有记录 {{.Recorded}} / {{.Total}} 个大区 · 启用 {{.Enabled}}</p>
 <div class="regions">
 {{range .Cells}}
   <div class="region{{if .Fresh}} on{{end}}" title="{{.Label}}（{{.Key}}）：{{.Note}}">
     <span class="rg-name">{{.Label}}</span>
-    <b>{{if not .Enabled}}已停用{{else if .Fresh}}✓ {{.Ago}}前{{else if .Gateways}}历史记录{{else}}未有近期成功{{end}}</b>
+    <b>{{if .Fresh}}✓ {{.Ago}}前{{else if .Gateways}}历史记录{{else if not .Enabled}}未启用探索{{else}}未有近期成功{{end}}</b>
     {{- if .Gateways}}<span class="gws">
       {{- range .Gateways}}
       {{- if .Dup}}<code class="dup" title="{{.Name}} 重复：池中已有此网关">{{.Short}}<sup>重</sup></code>
@@ -948,11 +943,8 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
   </div>
 {{end}}
 </div>
-{{end}}
-</details>
-{{end}}
 {{- end}}
 
 {{define "region-legend" -}}
-<p class="rg-legend"><span><i class="on"></i>最近 {{.Window}}内成功取得过路由 Cookie</span><span><i></i>无近期成功不代表可铸：仍受总额度、单区额度与出口能力限制</span><span>数字是网关编号，<sup>重</sup> = 池中已有；悬停看全名与累计次数</span></p>
+<p class="rg-legend"><span><i class="on"></i>最近 {{.Window}}内成功取得过路由 Cookie</span><span><i></i>区内国家逐个尝试；无近期成功不代表可铸，仍受每国尝试次数、账号总额度与出口能力限制</span><span>数字是区内去重网关编号，<sup>重</sup> = 池中已有；悬停看全名与累计次数</span></p>
 {{- end}}

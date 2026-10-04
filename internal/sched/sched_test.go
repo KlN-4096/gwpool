@@ -181,6 +181,30 @@ func (f *fakeStore) RegionMints() map[string]types.RegionMint {
 	return out
 }
 
+// Legacy fixtures seed successful attempts through RegionMints. Production
+// uses its separate durable attempt ledger, including failed attempts.
+func (f *fakeStore) CountryAttempts(account string) map[string]types.CountryAttempt {
+	out := map[string]types.CountryAttempt{}
+	for _, a := range f.Accounts() {
+		if a.Creds.AccountID != account {
+			continue
+		}
+		for _, m := range f.RegionMints() {
+			if m.AccountID != a.ID {
+				continue
+			}
+			country := m.RegionKey
+			if r, ok := config.Defaults().RegionByKey(m.RegionKey); ok {
+				country = r.Country
+			}
+			row := out[country]
+			row.Count += int64(m.Count)
+			out[country] = row
+		}
+	}
+	return out
+}
+
 func (f *fakeStore) NoteRegionMint(accountID int64, regionKey, gateway string, at time.Time) error {
 	if regionKey == "" {
 		return nil // 照 store 的语义：画不到九宫格上的格子不记
@@ -548,6 +572,10 @@ func (m *fakeMinter) NewSIDFor(_ types.Exit, sticky bool) (string, error) {
 	return m.NewSID(sticky)
 }
 
+func (m *fakeMinter) BeginAttempt(ctx context.Context, _ types.Creds, _ types.Exit) (context.Context, error) {
+	return ctx, ctx.Err()
+}
+
 // NewSeedSID 照真实 mint 的语义：绑在普通机房出口上的 sid，没配那条出口就报错。
 // sid 前缀和 NewSID 分开，用例据此断言这一发走的是哪条出口。
 func (m *fakeMinter) NewSeedSID() (string, error) {
@@ -588,7 +616,10 @@ func (m *fakeMinter) Rate(acct string) (map[string]int, int) {
 	}
 	out := make(map[string]int, len(src))
 	for k, v := range src {
-		out[k] = v
+		if r, ok := config.Defaults().RegionByKey(k); ok {
+			k = r.Country
+		}
+		out[k] += v
 	}
 	return out, m.rateLimit
 }
@@ -1342,7 +1373,7 @@ func TestClientCancelDoesNotBackoff(t *testing.T) {
 		}
 	}
 	// 而且断了就别再往下试其它槽位了，白烧供给。
-	if n := len(mn.mintedGateways()); n != 1 {
+	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("调用方已断还打了 %d 发", n)
 	}
 }
@@ -1695,13 +1726,13 @@ func TestMinterPicksByRegionLedger(t *testing.T) {
 	mn.rateLimit = 6
 
 	// 规则 3（区域级）：同一个号里，优先它**终身没铸过**的格子——那是唯一可能出新落点的
-	// 地方。给所有号的 us-east 记上终身铸票，清单第一格就该让位给 us-west。
+	// 地方。US默认和Seattle共享国家尝试账，因此下一未尝试国家为BR。
 	for _, id := range []int64{1, 2, 3} {
 		if err := st.NoteRegionMint(id, "us-east", "", clk.now()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, r, ok := s.PickMinter(0); !ok || r.Key != "us-west" {
+	if _, r, ok := s.PickMinter(0); !ok || r.Key != "south-america" {
 		t.Fatalf("us-east 终身铸过了还往那一格派：ok=%v region=%s", ok, r.Key)
 	}
 
@@ -1738,36 +1769,27 @@ func TestMinterPicksByRegionLedger(t *testing.T) {
 	}
 }
 
-// bestRegion 的三档排序，整条钉一遍：没有活种子票 > 没摸过的大区 > 终身铸得最少。
-//
-// 要紧的是**第一档压过第二档**：丢了种子的大区哪怕已经铸过几十发，也排在一个终身
-// 没摸过的大区前面。理由不对称——种子一掉，那个大区的所有账号都回落到住宅出口，
-// 一张票就能把整个大区的便宜路径恢复；而「摸一个新落点」只多一个槽位。
-// 另外两条用例各自只盖一档（TestMinterPicksByRegionLedger 盖第二三档、
-// TestPremintRefillsSeedlessRegionsFirst 盖第一档但那里所有大区终身计数都是 0），
-// 跨档那一格没人盯，而 bestRegion 里正是那个 `p && !bestPrefer` 分支。
-func TestBestRegionPrefersSeedlessOverUnseen(t *testing.T) {
-	seedless, unseen := types.Regions[0], types.Regions[1]
+func TestBestRegionPrefersUnattemptedCountryOverSeedless(t *testing.T) {
+	seedless, unseen := types.Regions[0], types.Regions[2]
 	prefer := func(key string) bool { return key == seedless.Key }
-	// 第一档那个大区铸得最多，第二档那个终身没铸过 —— 排序只能靠档位分开它们。
-	lifetime := map[string]int{seedless.Key: 99}
-	for _, r := range types.Regions[2:] {
-		lifetime[r.Key] = 50
+	lifetime := map[string]int64{seedless.Exit.Region: 99}
+	for _, r := range types.Regions[3:] {
+		lifetime[r.Exit.Region] = 50
 	}
 
-	got, count, preferred, ok := bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, lifetime, nil, prefer)
+	got, count, preferred, ok := bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, 50, lifetime, nil, prefer)
 	if !ok {
 		t.Fatal("配额没打满，不该说挑不出来")
 	}
-	if got.Key != seedless.Key {
-		t.Fatalf("挑了 %s，该挑丢了种子的 %s（它铸过 99 发也要先补）", got.Key, seedless.Key)
+	if got.Key != unseen.Key {
+		t.Fatalf("got %s; unattempted country %s must outrank missing seed", got.Key, unseen.Key)
 	}
-	if !preferred || count != 99 {
+	if preferred || count != 0 {
 		t.Fatalf("回报不对: preferred=%v count=%d", preferred, count)
 	}
 
 	// 种子都齐了（prefer 恒 false）⇒ 退到第二档：挑终身没铸过的那个。
-	got, _, preferred, ok = bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, lifetime, nil,
+	got, _, preferred, ok = bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, 50, lifetime, nil,
 		func(string) bool { return false })
 	if !ok || got.Key != unseen.Key || preferred {
 		t.Fatalf("种子齐了该挑终身没铸过的 %s，得到 %s（preferred=%v, ok=%v）",
@@ -1782,13 +1804,13 @@ func TestMinterSkipsAccountWithAllRegionsSpent(t *testing.T) {
 	mn.rateLimit = 6
 	mn.rateUsed = map[string]int{}
 	for _, r := range types.Regions {
-		mn.rateUsed[r.Key] = 6
+		mn.rateUsed[r.Exit.Region] = 6
 	}
 	if a, r, ok := s.PickMinter(0); ok {
 		t.Fatalf("九个区域都打满了还派了账号 %d 去 %s", a.ID, r.Key)
 	}
 	// 腾出一个区域就该恢复。
-	mn.rateUsed["oceania"] = 5
+	mn.rateUsed["AU"] = 5
 	a, r, ok := s.PickMinter(0)
 	if !ok || r.Key != "oceania" {
 		t.Fatalf("腾出 oceania 后该派它：ok=%v account=%d region=%s", ok, a.ID, r.Key)

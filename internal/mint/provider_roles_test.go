@@ -114,21 +114,18 @@ func TestTargetedSelectionSkipsUnsupportedProviders(t *testing.T) {
 func TestAddedRegionsDoNotExpandAccountBudget(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.UpstreamPerRegionHour = 1
+	cfg.UpstreamPerAccountHour = 3
 	cfg.Regions = append(cfg.RegionDefinitions(), config.ExplorationRegion{
 		Key: "canada-test", Name: "Canada", Country: "CA", Enabled: true,
 	})
 	c := &Client{Live: config.NewLive("", cfg)}
-	for _, region := range types.Regions {
-		if err := c.spend("account", region.Exit); err != nil {
+	for _, country := range []string{"US", "JP", "BR"} {
+		if err := c.spend("account", types.Exit{Region: country}); err != nil {
 			t.Fatalf("baseline budget failed early: %v", err)
 		}
 	}
 	if err := c.spend("account", types.Exit{Region: "CA"}); !errors.Is(err, types.ErrRateLimited) {
 		t.Fatalf("adding an exit expanded the account budget: %v", err)
-	}
-	c.refund("account", types.Regions[0].Exit)
-	if err := c.spend("account", types.Exit{Region: "CA"}); err != nil {
-		t.Fatalf("refunding a definitely-unsent request did not restore total budget: %v", err)
 	}
 }
 

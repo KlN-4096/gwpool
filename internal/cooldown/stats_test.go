@@ -1,12 +1,56 @@
 package cooldown
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
 	"gwpool/internal/types"
 )
+
+func TestStableCooldownEvidenceAllowsSixHourReportingButNewFailureRevokesIt(t *testing.T) {
+	now := time.Now().UTC()
+	var reports []types.CooldownReport
+	for i := range 6 {
+		reports = append(reports, types.CooldownReport{ID: fmt.Sprint(i), ReporterID: 1, AccountTag: "a",
+			Gateway: "g", WindowSeconds: 7200, ElapsedSeconds: 7200, Result: "full",
+			ReceivedAt: now.Add(time.Duration(i-5) * 6 * time.Hour)})
+	}
+	interval := func(reports []types.CooldownReport) float64 {
+		t.Helper()
+		rec := ForAccount(Summarize(reports, now)[0], 1, "a")
+		raw, _ := json.Marshal(rec)
+		var fields map[string]any
+		_ = json.Unmarshal(raw, &fields)
+		value, _ := fields["report_interval_seconds"].(float64)
+		return value
+	}
+	if got := interval(reports); got != 21600 {
+		t.Fatalf("stable samples must permit six-hour reporting; got %v", got)
+	}
+	if got := interval(reports[1:]); got != 0 {
+		t.Fatal("five samples cannot enable batching")
+	}
+	delayed := append([]types.CooldownReport(nil), reports...)
+	for i := range delayed {
+		delayed[i].ObservedAt, delayed[i].ReceivedAt = delayed[i].ReceivedAt, now
+	}
+	if got := interval(delayed); got != 21600 {
+		t.Fatal("batch receipt collapsed the original observation span")
+	}
+	for i := range delayed {
+		delayed[i].ObservedAt = now.Add(time.Duration(i-5) * time.Hour)
+	}
+	if got := interval(delayed); got != 0 {
+		t.Fatal("a five-hour observation span cannot enable stable reporting")
+	}
+	reports = append(reports, types.CooldownReport{ID: "failure", ReporterID: 1, AccountTag: "a",
+		Gateway: "g", WindowSeconds: 3600, ElapsedSeconds: 3600, Result: "degraded", ReceivedAt: now})
+	if got := interval(reports); got != 0 {
+		t.Fatal("a new failure must revoke stable reporting despite three older successes")
+	}
+}
 
 func TestRecommendationsRequireEvidenceAndCompareAccounts(t *testing.T) {
 	now := time.Now()
@@ -56,7 +100,36 @@ func TestRecommendationCannotUndercutActualFailureOrTrustOneReporter(t *testing.
 	stats := Summarize(reports, now)[0]
 	stats.Recommendation = types.CooldownRecommendation{Seconds: 3600, Samples: 6, Source: "pool"}
 	if got := ForAccount(stats, 1, "a").Seconds; got != 0 {
-		t.Fatalf("10h仍失败不能给<=10h推荐，也不能回退全池建议：%d", got)
+		t.Fatalf("最高档仍失败不能给更短推荐，也不能回退全池建议：%d", got)
+	}
+}
+
+func TestCooldownExtendedStepsAndLegacyEvidenceCeiling(t *testing.T) {
+	for _, test := range []struct{ from, want int }{
+		{36000, 43200}, {43200, 57600}, {57600, 72000}, {72000, 86400}, {86400, 86401},
+	} {
+		if got := next(test.from); got != test.want {
+			t.Fatalf("next(%d)=%d want %d", test.from, got, test.want)
+		}
+	}
+	now := time.Now()
+	var reports []types.CooldownReport
+	for _, seconds := range []int{7200, 7200, 86400, 86400} {
+		reports = append(reports, types.CooldownReport{Gateway: "g", AccountTag: "a",
+			WindowSeconds: seconds, ElapsedSeconds: seconds, Result: "full", ReceivedAt: now})
+	}
+	if got := ForAccount(Summarize(reports, now)[0], 0, "a").Seconds; got != 86400 {
+		t.Fatalf("new client did not receive 24h evidence: %d", got)
+	}
+	if got := ForAccount(SummarizeWithin(reports, now, LegacyMaxSeconds)[0], 0, "a").Seconds; got != 7200 {
+		t.Fatalf("legacy evidence was clamped or thrown away: %d", got)
+	}
+	reports = append(reports, types.CooldownReport{Gateway: "g", AccountTag: "a",
+		WindowSeconds: 86400, ElapsedSeconds: 86400, Result: "degraded", ReceivedAt: now})
+	stats := Summarize(reports, now)[0]
+	if stats.Accounts[0].RecommendationReason != "failure_above_limit" ||
+		ForAccount(stats, 0, "a").Seconds != 0 {
+		t.Fatal("at-cap failure must be visible, not labeled insufficient data")
 	}
 }
 

@@ -92,17 +92,12 @@ func (e Exit) MatchesObserved(observed Observed) bool {
 	return matches(e.State, observed.State) && matches(e.City, observed.City)
 }
 
-// AccountHourLimit keeps the original nine-region total budget when operators
-// add candidate exits. Adding aliases must not create extra account capacity.
-func AccountHourLimit(perRegion int) int { return len(Regions) * perRegion }
-
-func MintBudgetFull(used map[string]int, perRegion int, region string) bool {
-	if perRegion <= 0 {
-		return false
-	}
+// Country and account limits are independent. used is keyed by ISO country,
+// never by display area or exit/city alias.
+func MintBudgetFull(used map[string]int, perCountry, accountLimit int, country string) bool {
 	total := 0
 	for _, n := range used {
 		total += n
 	}
-	return total >= AccountHourLimit(perRegion) || (region != "" && used[region] >= perRegion)
+	return (accountLimit > 0 && total >= accountLimit) || (perCountry > 0 && country != "" && used[country] >= perCountry)
 }

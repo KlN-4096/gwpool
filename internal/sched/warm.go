@@ -148,7 +148,7 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 			continue
 		}
 		used, limit := s.mint.Rate(t.acct.Creds.AccountID)
-		if s.accountHeldFor(t.acct.ID) > 0 || types.MintBudgetFull(used, limit, t.pair.RegionKey) {
+		if s.accountHeldFor(t.acct.ID) > 0 || types.MintBudgetFull(used, limit, s.cfg().AccountAttemptLimit(), t.exit.Region) {
 			skipped++
 			continue
 		}
@@ -171,13 +171,20 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 			skipped++
 			continue
 		}
-		sid, err := s.renewSID()
+		attemptCtx, err := s.beginAttempt(ctx, acct, t.exit)
+		sid := ""
+		if err == nil {
+			attempted++
+			sid, err = s.renewSID()
+			if err != nil {
+				s.sampleAttemptFailure(acct, t.exit, "", types.PurposeRenew, types.Observed{}, err)
+			}
+		}
 		var got minted
 		if err == nil {
 			// want 和 bias 都填这个网关：这是一发**定向**铸票，落点漂了要被当成漂移处理
 			// （mintOnce 自己判），别静悄悄把别的网关的票记成这一张续好了。
-			got, err = s.mintOnceFor(ctx, acct, t.exit, sid, t.pair, t.gateway, t.gateway, types.PurposeRenew)
-			attempted++ // 失败也吃预算，避免一轮系统性故障烧上百发。
+			got, err = s.mintOnceFor(attemptCtx, acct, t.exit, sid, t.pair, t.gateway, t.gateway, types.PurposeRenew)
 		}
 		unlock()
 		relGW()
@@ -463,18 +470,22 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 			// 全退休了 wg.Wait 自然收尾，一分钟后的下一轮巡检再来。
 			return
 		}
-		sid, seed, err := s.premintSID(plan.region.Key)
-		if err != nil {
-			plan.release()
-			// 出口要不到是整池同病，别的 worker 接着挑只是把同一句话重复 N 遍。
-			s.opt.Log.Warn("要不到出口，本轮不预铸", "region", plan.region.Key, "err", err)
-			r.stop()
-			return
-		}
 		unlock := s.st.LockAccount(plan.acct.ID)
+		attemptCtx, err := s.beginAttempt(ctx, plan.acct, plan.region.Exit)
+		var sid string
+		var seed types.Pair
+		var got minted
+		if err == nil {
+			sid, seed, err = s.premintSID(plan.region.Key)
+			if err != nil {
+				s.sampleAttemptFailure(plan.acct, plan.region.Exit, "", types.PurposeInventory, types.Observed{}, err)
+			}
+		}
 		// want 留空：裸铸就是去看它能落到哪，谈不上「落点漂移」。带种子也一样——
 		// 种子只钉大区，具体网关是这个号自己的，出手前并不知道是哪个。
-		got, err := s.mintOnceFor(ctx, plan.acct, plan.region.Exit, sid, seed, "", "", types.PurposeInventory)
+		if err == nil {
+			got, err = s.mintOnceFor(attemptCtx, plan.acct, plan.region.Exit, sid, seed, "", "", types.PurposeInventory)
+		}
 		unlock()
 		plan.release()
 		if !s.premintNote(r, plan, got, err, seed.Cookie != "") {

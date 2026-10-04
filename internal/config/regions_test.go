@@ -46,8 +46,8 @@ func TestGlobalCountryExpansionIsIdempotentAndPreservesExistingSettings(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(next.Regions) != 250 || len(next.CoverageGroups) != len(old.Groups()) {
-		t.Fatalf("expected 249 countries plus Seattle, without empty per-country target groups: %d/%d",
+	if len(next.Regions) != 209 || len(next.CoverageGroups) != len(old.Groups()) {
+		t.Fatalf("expected 208 supported countries plus Seattle, without empty per-country target groups: %d/%d",
 			len(next.Regions), len(next.CoverageGroups))
 	}
 	if next.Regions[0].Enabled || next.UpstreamPerRegionHour != old.UpstreamPerRegionHour {

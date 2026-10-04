@@ -7,6 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"gwpool/internal/geography"
 	"gwpool/internal/proxycatalog"
 	"gwpool/internal/types"
 )
@@ -90,7 +91,7 @@ func (c Config) RegionLabel(key string) string {
 func (c Config) CandidateRegions(want types.Exit) []types.Region {
 	var out []types.Region
 	for _, r := range c.RegionDefinitions() {
-		if r.Enabled && (want == (types.Exit{}) || want == r.Exit()) {
+		if r.Enabled && geography.Supported(r.Country) && (want == (types.Exit{}) || want == r.Exit()) {
 			out = append(out, types.Region{Key: r.Key, Exit: r.Exit()})
 		}
 	}
@@ -199,7 +200,7 @@ func GlobalCountryRegions(current Config) (Config, error) {
 		}
 	}
 	for _, country := range proxycatalog.GlobalCountries() {
-		if countries[country.Code] {
+		if countries[country.Code] || !geography.Supported(country.Code) {
 			continue
 		}
 		key := "country-" + strings.ToLower(country.Code)

@@ -26,7 +26,7 @@ func TestMintAllGlobalExpansionDoesNotExpandDefaultScope(t *testing.T) {
 func TestMintAllSkipsAccountTotalAtEnqueue(t *testing.T) {
 	q, _, mn, _ := mintAllFixture()
 	mn.rateLimit = 4
-	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"other-history": 36}}
+	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"other-history": 50}}
 	stat := q.Enqueue()
 	if stat.Queued != 9 {
 		t.Fatalf("full account total still entered queue: %d", stat.Queued)
@@ -46,8 +46,8 @@ func TestMintAllPreviewCapsProjectedTotalAndExpiresPending(t *testing.T) {
 		keys = append(keys, region.Key)
 	}
 	preview := q.Preview(keys...)
-	if preview.Total != 500 || preview.Queued != 72 || q.Status().Active || len(mn.mints) != 0 {
-		t.Fatalf("preview must cap each account at 36 with zero side effects: %+v", preview)
+	if preview.Total != 418 || preview.Queued != 100 || q.Status().Active || len(mn.mints) != 0 {
+		t.Fatalf("preview must cap each account at 50 with zero side effects: %+v", preview)
 	}
 	q.Enqueue(keys...)
 	clk.add(mintAllBatchLifetime)
@@ -60,7 +60,7 @@ func TestMintAllPreviewCapsProjectedTotalAndExpiresPending(t *testing.T) {
 func TestMintAllConfirmDoesNotExpandAfterBudgetExpiry(t *testing.T) {
 	q, _, mn, _ := mintAllFixture()
 	mn.rateLimit = 4
-	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"other": 36}}
+	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"other": 50}}
 	preview := q.Preview()
 	if preview.Queued != 9 {
 		t.Fatal("fixture must initially have only one eligible account")
@@ -156,10 +156,10 @@ func TestMintAllSkipsFullQuotasAndRechecksQueuedAccounts(t *testing.T) {
 	mn.rateLimit = 4
 	mn.ratePerAcct = map[string]map[string]int{"acct-1": {"us-east": 4}}
 	first := q.Enqueue()
-	if first.Skipped != 1 || first.Queued != 17 || first.SkipReasons["区域配额已满"] != 1 {
+	if first.Skipped != 2 || first.Queued != 16 || first.SkipReasons["国家尝试次数已满"] != 2 {
 		t.Fatalf("入队没有跳过已满配额：%+v", first)
 	}
-	if len(first.Recent) != 1 || first.Recent[0].AccountID != 1 || first.Recent[0].Region != "us-east" {
+	if len(first.Recent) != 2 || first.Recent[0].AccountID != 1 || first.Recent[0].Region != "us-west" {
 		t.Fatalf("入队跳过的账号/区域不可见：%+v", first.Recent)
 	}
 	// 入队后停掉一个号；另一个号在出队前又用满一格。
@@ -181,8 +181,8 @@ func TestMintAllClassifiesMissingExitAtExecution(t *testing.T) {
 	mn.mintErr = types.ErrNoExit
 	q.Enqueue()
 	final := finishMintAll(t, q)
-	if final.Skipped != 18 || final.Failed != 0 || final.SkipReasons["无可用出口"] != 18 {
-		t.Fatalf("执行期无出口应明确跳过：%+v", final)
+	if final.Skipped != 0 || final.Failed != 18 {
+		t.Fatalf("执行期绑定失败也算一次尝试：%+v", final)
 	}
 }
 
@@ -258,7 +258,7 @@ func TestMintAllKeepsBoundedProblemDetailsAfterSuccesses(t *testing.T) {
 		q.recordResult(MintAllResult{Status: "succeeded"})
 	}
 	status := q.Status()
-	if len(status.Problems) != 1 || status.Problems[0].AccountID != 1 || status.Problems[0].Region != "us-east" {
+	if len(status.Problems) < 2 || status.Problems[0].AccountID != 1 || status.Problems[0].Region != "us-east" {
 		t.Fatal("后续成功挤掉了入队时的异常组合")
 	}
 	status.Problems[0].Reason = "mutated"

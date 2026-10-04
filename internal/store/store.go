@@ -53,6 +53,8 @@ const (
 // State 是 state.json 的全量内容。
 type State struct {
 	OwnerKeysMigrated bool                   `json:"owner_keys_migrated"`
+	CountryAttempts  map[string]map[string]types.CountryAttempt `json:"country_attempts,omitempty"`
+	AttemptsMigrated bool `json:"attempts_migrated,omitempty"`
 	ContactReports    []types.ContactReport  `json:"contact_reports,omitempty"`
 	CooldownReports   []types.CooldownReport `json:"cooldown_reports,omitempty"`
 	Accounts          []types.Account        `json:"accounts"`

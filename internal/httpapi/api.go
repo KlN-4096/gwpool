@@ -32,6 +32,7 @@ import (
 	"gwpool/internal/config"
 	"gwpool/internal/contact"
 	"gwpool/internal/cooldown"
+	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
 	"gwpool/internal/sched"
@@ -288,6 +289,7 @@ func (s *Server) Handler() http.Handler {
 	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
 	mux.HandleFunc("POST /pair/renew", s.handleRenew)
 	mux.HandleFunc("POST /cooldown/report", s.handleCooldownReport)
+	mux.HandleFunc("POST /cooldown/reports", s.handleCooldownReports)
 	mux.HandleFunc("POST /contact/report", s.handleContactReport)
 	mux.HandleFunc("GET /gateways", s.handleGateways)
 	// 管理面的 POST 也要罩 sameOrigin：authAdmin 走 HTTP Basic，而浏览器一旦缓存了
@@ -664,8 +666,6 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	want := sanitizeLabel(r.URL.Query().Get("region"), "")
 	v.Shown, v.FilterLabel = filterPoolGateways(v.Gateways, v.Regions, want)
 	markPoolRegionLinks(v.Regions, want)
-	v.ShowEmptyRegions = r.URL.Query().Get("regions") == "all"
-	v.RegionGroups = poolDisplayGroups(s.opt.Live.Get(), v.Regions, v.ShowEmptyRegions)
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
@@ -690,12 +690,17 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 func poolRegionCells(cfg config.Config, rows []gatewayRow, gws map[string]types.Gateway) []poolRegionCell {
 	byRegion := map[string][]poolRegionGateway{}
 	for i := range rows {
+		rows[i].regionKeys, rows[i].Regions = nil, nil
 		item := poolRegionGateway{Name: rows[i].Name, Ready: rows[i].PairReady}
 		seen := map[string]bool{}
 		for _, e := range gws[rows[i].Name].ReachableExits {
 			// 反查不到就归「未归类」（key 为空）：这些出口是代理商给的，不在
 			// types.Regions 那张表里（精确匹配 Region+City，见那边的注释）。
-			k := cfg.RegionKeyOf(e)
+			area := geography.AreaOf(e.Region)
+			k := area.Key
+			if k == geography.UnknownArea {
+				k = ""
+			}
 			if seen[k] {
 				continue
 			}
@@ -703,7 +708,7 @@ func poolRegionCells(cfg config.Config, rows []gatewayRow, gws map[string]types.
 			byRegion[k] = append(byRegion[k], item)
 			rows[i].regionKeys = append(rows[i].regionKeys, k)
 			if k != "" {
-				rows[i].Regions = append(rows[i].Regions, cfg.RegionLabel(k))
+				rows[i].Regions = append(rows[i].Regions, area.Label)
 			}
 		}
 		// 一个出口都没记过的网关也要有地方落，否则它在这一页上凭空消失。
@@ -712,7 +717,7 @@ func poolRegionCells(cfg config.Config, rows []gatewayRow, gws map[string]types.
 			rows[i].regionKeys = append(rows[i].regionKeys, "")
 		}
 	}
-	out := make([]poolRegionCell, 0, len(cfg.RegionDefinitions())+2)
+	out := make([]poolRegionCell, 0, len(geography.Areas)+2)
 	// 「全部」排在最前面：它是默认态，也是从某一格退出来的那条路。
 	all := poolRegionCell{Label: "全部", All: true, Total: len(rows)}
 	for _, r := range rows {
@@ -730,15 +735,17 @@ func poolRegionCells(cfg config.Config, rows []gatewayRow, gws map[string]types.
 	}
 	out = append(out, all)
 
-	keys := make([]string, 0, len(cfg.RegionDefinitions())+1)
-	for _, r := range cfg.RegionDefinitions() {
-		keys = append(keys, r.Key)
+	keys := make([]string, 0, len(geography.Areas)+1)
+	labels := map[string]string{"": "未归类"}
+	for _, area := range geography.Areas {
+		keys = append(keys, area.Key)
+		labels[area.Key] = area.Label
 	}
 	if len(byRegion[""]) > 0 {
 		keys = append(keys, "")
 	}
 	for _, k := range keys {
-		c := poolRegionCell{Key: k, Label: cfg.RegionLabel(k), Gateways: byRegion[k]}
+		c := poolRegionCell{Key: k, Label: labels[k], Gateways: byRegion[k]}
 		if k == "" {
 			c.Label = "未归类"
 		}
@@ -1255,7 +1262,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.OwnerToken = o.Token
 	}
 	v.NewGateways = s.foundBy(a.ID)
-	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown(), r.URL.Query().Get("regions") == "all")
+	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
 	for _, sm := range samples {
 		if sm.AccountID != a.ID {
 			continue
@@ -1441,11 +1448,17 @@ func ago(now, t time.Time) string {
 // 网关名只在样本里（台账只记计数），所以 samples/gws 一起传进来：gws 用来判
 // 「这个网关是不是记在别人名下」。两者为 nil 时格子照画，只是列不出名字。
 func regionCells(cfg config.Config, accountID int64, mints map[string]types.RegionMint,
-	samples []types.Sample, gws map[string]types.Gateway, window time.Duration, showEmpty ...bool) regionGrid {
+	samples []types.Sample, gws map[string]types.Gateway, window time.Duration) regionGrid {
 	byRegion := map[string]types.RegionMint{}
 	for _, m := range mints {
 		if m.AccountID == accountID && m.RegionKey != "" {
-			byRegion[m.RegionKey] = m
+			key := displayAreaForKey(cfg, m.RegionKey).Key
+			merged := byRegion[key]
+			merged.Count += m.Count
+			if m.LastAt.After(merged.LastAt) {
+				merged.LastAt = m.LastAt
+			}
+			byRegion[key] = merged
 		}
 	}
 	// 按**样本原序**走（samples.jsonl 就是追加序），于是「这个账号第一次在哪个区域
@@ -1456,42 +1469,40 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 	//
 	// 也正因为样本那一列会是国家码，**绿/灰不能按样本数**——那等于把一部分真实铸票
 	// 判成没发生。绿按铸票台账（NoteRegionMint 只记成功、而且只用真区域 key）。
-	known := make(map[string]bool, len(cfg.RegionDefinitions()))
-	for _, r := range cfg.RegionDefinitions() {
-		known[r.Key] = true
-	}
+	enabled := enabledDisplayAreas(cfg)
 	firstRegion := map[string]string{}
 	inRegion := map[string]map[string]bool{}
 	for _, sm := range samples {
 		// Gateway 非空就是「这一发真取到了路由」——照 types.MintResult 的语义，
 		// 取不到的那几发 Gateway 为空。
-		if sm.AccountID != accountID || sm.Status != http.StatusOK || sm.Gateway == "" || !known[sm.RegionKey] {
+		if sm.AccountID != accountID || sm.Status != http.StatusOK || sm.Gateway == "" {
 			continue
 		}
+		key := displayAreaForKey(cfg, sm.RegionKey).Key
 		if _, ok := firstRegion[sm.Gateway]; !ok {
-			firstRegion[sm.Gateway] = sm.RegionKey
+			firstRegion[sm.Gateway] = key
 		}
-		if inRegion[sm.RegionKey] == nil {
-			inRegion[sm.RegionKey] = map[string]bool{}
+		if inRegion[key] == nil {
+			inRegion[key] = map[string]bool{}
 		}
-		inRegion[sm.RegionKey][sm.Gateway] = true
+		inRegion[key][sm.Gateway] = true
 	}
 	now := time.Now()
-	grid := regionGrid{Window: shortDur(window), Total: len(cfg.RegionDefinitions()),
-		ShowEmpty: len(showEmpty) > 0 && showEmpty[0]}
-	for _, r := range cfg.RegionDefinitions() {
-		if r.Enabled {
+	grid := regionGrid{Window: shortDur(window), Total: len(geography.Areas)}
+	areas := append([]geography.Area(nil), geography.Areas...)
+	if byRegion[geography.UnknownArea].Count > 0 || len(inRegion[geography.UnknownArea]) > 0 {
+		areas = append(areas, geography.AreaOf(""))
+	}
+	for _, r := range areas {
+		if enabled[r.Key] {
 			grid.Enabled++
 		}
 		m, had := byRegion[r.Key]
 		recorded := (had && m.Count > 0) || len(inRegion[r.Key]) > 0
-		if recorded {
+		if recorded && r.Key != geography.UnknownArea {
 			grid.Recorded++
 		}
-		if !recorded && !grid.ShowEmpty {
-			continue
-		}
-		c := regionCell{Key: r.Key, Label: r.Name, Enabled: r.Enabled}
+		c := regionCell{Key: r.Key, Label: r.Label, Enabled: enabled[r.Key]}
 		c.Fresh = had && m.Count > 0 && !m.LastAt.IsZero() && now.Sub(m.LastAt) < window
 		if c.Fresh {
 			c.Ago = shortDur(now.Sub(m.LastAt))
@@ -1527,7 +1538,6 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 		})
 		grid.Cells = append(grid.Cells, c)
 	}
-	grid.Groups = groupDisplayRegions(cfg, grid.Cells, func(cell regionCell) string { return cell.Key })
 	return grid
 }
 
@@ -2021,7 +2031,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 				row.Owner = fmt.Sprintf("#%d", a.OwnerID)
 			}
 			n := covered[a.ID]
-			total := len(cfg.CandidateRegions(types.Exit{}))
+			total := len(enabledDisplayAreas(cfg))
 			row.Covered = fmt.Sprintf("%d/%d", n, total)
 			row.Facet = accountFacet(a, n, total)
 			v.Accounts = append(v.Accounts, row)
@@ -2142,13 +2152,16 @@ func acctName(byID map[int64]types.Account, id int64) string {
 // regionsCovered 数每个账号铸出过票的区域：只数 types.Regions 那九个，和九宫格同一张台账
 // （NoteRegionMint 只记成功的铸票）。
 func regionsCovered(cfg config.Config, mints map[string]types.RegionMint) map[int64]int {
-	known := make(map[string]bool, len(cfg.RegionDefinitions()))
-	for _, r := range cfg.RegionDefinitions() {
-		known[r.Key] = r.Enabled
-	}
+	enabled := enabledDisplayAreas(cfg)
+	seen := map[int64]map[string]bool{}
 	out := map[int64]int{}
 	for _, m := range mints {
-		if m.Count > 0 && known[m.RegionKey] {
+		area := displayAreaForKey(cfg, m.RegionKey).Key
+		if seen[m.AccountID] == nil {
+			seen[m.AccountID] = map[string]bool{}
+		}
+		if m.Count > 0 && enabled[area] && !seen[m.AccountID][area] {
+			seen[m.AccountID][area] = true
 			out[m.AccountID]++
 		}
 	}

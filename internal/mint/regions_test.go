@@ -26,12 +26,7 @@ func TestRegionQuotaForCustomExitUsesStableIndependentBucket(t *testing.T) {
 		t.Fatal("one spent region must not consume another region's budget")
 	}
 	used, _ := c.Rate("test-account")
-	if used["africa-south"] != 1 || used["east-asia"] != 1 || used[""] != 0 {
+	if used["ZA"] != 1 || used["JP"] != 1 || used[""] != 0 {
 		t.Fatalf("custom exit fell into an anonymous bucket: %+v", used)
-	}
-	c.refund("test-account", custom)
-	used, _ = c.Rate("test-account")
-	if used["africa-south"] != 0 || used["east-asia"] != 1 {
-		t.Fatal("refund crossed region boundary")
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"gwpool/internal/config"
+	"gwpool/internal/geography"
 	"gwpool/internal/sched"
 	"gwpool/internal/types"
 )
@@ -15,6 +17,7 @@ import (
 type fakeMintAllQueue struct {
 	calls  int
 	status sched.MintAllStatus
+	keys   []string
 }
 
 func (q *fakeMintAllQueue) Confirm(total, queued int, _ ...string) (sched.MintAllStatus, bool) {
@@ -26,8 +29,11 @@ func (q *fakeMintAllQueue) Confirm(total, queued int, _ ...string) (sched.MintAl
 }
 
 func (q *fakeMintAllQueue) Enqueue(...string) sched.MintAllStatus { q.calls++; return q.status }
-func (q *fakeMintAllQueue) Preview(...string) sched.MintAllStatus { return q.status }
-func (q *fakeMintAllQueue) Status() sched.MintAllStatus           { return q.status }
+func (q *fakeMintAllQueue) Preview(keys ...string) sched.MintAllStatus {
+	q.keys = append([]string(nil), keys...)
+	return q.status
+}
+func (q *fakeMintAllQueue) Status() sched.MintAllStatus { return q.status }
 
 func TestAdminMintAllRequiresAuthenticationAndSameOrigin(t *testing.T) {
 	s, h, _, _, _ := rig(t, types.ModePool)
@@ -112,5 +118,43 @@ func TestAdminMintAllNeedsExplicitScopeAndPreviewConfirmation(t *testing.T) {
 	form.Set("queued", "2")
 	if w := post(form); w.Code != http.StatusSeeOther || q.calls != 1 {
 		t.Fatal("confirmed range was not queued")
+	}
+}
+
+func TestAdminMintAllAreaScopeExpandsSupportedCountriesWithoutCityDuplicates(t *testing.T) {
+	s, h, _, _, _ := rig(t, types.ModePool)
+	cfg, err := config.GlobalCountryRegions(config.Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Regions = append(cfg.Regions, config.ExplorationRegion{Key: "country-hk", Country: "HK", Enabled: true})
+	s.opt.Live = config.NewLive("", cfg)
+	q := &fakeMintAllQueue{}
+	s.opt.MintAll = q
+	body := do(h, authed(httptest.NewRequest(http.MethodGet, "/admin/mint-all", nil), "akey")).Body.String()
+	if strings.Count(body, `name="area"`) != 9 || strings.Contains(body, `name="region"`) ||
+		strings.Contains(body, "country-hk") || strings.Contains(body, " checked") {
+		t.Fatal("scope page must show only nine unselected areas before preview")
+	}
+	form := url.Values{"action": {"preview"}, "area": {"north-america", "east-asia"}}
+	r := authed(httptest.NewRequest(http.MethodPost, "/admin/mint-all", strings.NewReader(form.Encode())), "akey")
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if w := do(h, r); w.Code != http.StatusOK {
+		t.Fatal(w.Code)
+	}
+	seen := map[string]bool{}
+	for _, key := range q.keys {
+		region, ok := cfg.RegionByKey(key)
+		if !ok || !geography.Supported(region.Country) || seen[region.Country] {
+			t.Fatalf("invalid or duplicated country in expanded scope: %s", key)
+		}
+		area := geography.AreaOf(region.Country).Key
+		if area != "north-america" && area != "east-asia" {
+			t.Fatalf("unselected area entered scope: %s", key)
+		}
+		seen[region.Country] = true
+	}
+	if !seen["US"] || !seen["JP"] || !seen["KR"] || seen["HK"] || len(q.keys) < 5 || q.calls != 0 {
+		t.Fatalf("scope expansion did not preserve supported countries: %v", seen)
 	}
 }

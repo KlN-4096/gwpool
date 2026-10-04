@@ -8,7 +8,7 @@ import (
 	"gwpool/internal/types"
 )
 
-func TestRegionCardsOmitEmptyGlobalCandidatesAndFailedSamples(t *testing.T) {
+func TestRegionCardsUseNineAreasAndExcludeFailedSamples(t *testing.T) {
 	cfg, err := config.GlobalCountryRegions(config.Defaults())
 	if err != nil {
 		t.Fatal(err)
@@ -20,36 +20,60 @@ func TestRegionCardsOmitEmptyGlobalCandidatesAndFailedSamples(t *testing.T) {
 		{AccountID: 1, RegionKey: "us-west", Gateway: "unified-42", Status: 401},
 		{AccountID: 1, RegionKey: "us-east", Gateway: "unified-43", Status: 0},
 	}, nil, time.Hour)
-	if len(grid.Cells) != 1 || grid.Cells[0].Key != "europe" {
-		t.Fatalf("account card must contain only successful records, not all %d candidates: %d cells", len(cfg.Regions), len(grid.Cells))
+	if len(grid.Cells) != 9 {
+		t.Fatalf("account card must contain nine areas, not all %d exits: %d cells", len(cfg.Regions), len(grid.Cells))
 	}
-	if grid.Recorded != 1 || grid.Total != 250 || len(grid.Groups) != 1 {
-		t.Fatalf("missing compact summary/groups: %+v", grid)
+	if grid.Recorded != 1 || grid.Total != 9 {
+		t.Fatalf("missing area summary: %+v", grid)
 	}
-	full := regionCells(cfg, 1, nil, nil, nil, time.Hour, true)
-	if len(full.Cells) != 250 {
-		t.Fatal("explicit account-detail request must still expose unvisited exits")
+	for _, cell := range grid.Cells {
+		if cell.Key != "europe" && len(cell.Gateways) != 0 {
+			t.Fatal("failed sample created an area landing")
+		}
 	}
 }
 
-func TestPoolDisplayGroupsAreSparseAndPreserveEmptySelection(t *testing.T) {
+func TestPoolAreaGroupsDeduplicateCountriesAndPreserveEmptySelection(t *testing.T) {
 	cfg, err := config.GlobalCountryRegions(config.Defaults())
 	if err != nil {
 		t.Fatal(err)
 	}
 	cells := poolRegionCells(cfg, []gatewayRow{{Name: "unified-141"}}, map[string]types.Gateway{
-		"unified-141": {ReachableExits: []types.Exit{{Region: "DE"}}},
+		"unified-141": {ReachableExits: []types.Exit{{Region: "DE"}, {Region: "IT"}, {Region: "FR"}}},
 	})
-	markPoolRegionLinks(cells, "country-sg")
-	groups := poolDisplayGroups(cfg, cells, false)
-	count := 0
-	for _, group := range groups {
-		for _, country := range group.Countries {
-			count += len(country.Cells)
+	markPoolRegionLinks(cells, "southeast-asia")
+	if len(cells) != 10 {
+		t.Fatalf("want all + nine areas, got %d", len(cells))
+	}
+	for _, cell := range cells {
+		if cell.Key == "europe" && cell.Total != 1 {
+			t.Fatal("same gateway counted once per country")
+		}
+		if cell.Key == "southeast-asia" && (!cell.Active || cell.Total != 0) {
+			t.Fatal("empty area cannot be selected")
 		}
 	}
-	if count != 2 {
-		t.Fatalf("want one populated exit plus selected empty exit, got %d", count)
+}
+
+func TestAccountAreaGroupsDeduplicateCountryAndCityAliases(t *testing.T) {
+	cfg, err := config.GlobalCountryRegions(config.Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	grid := regionCells(cfg, 1, nil, []types.Sample{
+		{AccountID: 1, RegionKey: "europe", Gateway: "unified-1", Status: 200},
+		{AccountID: 1, RegionKey: "country-de", Gateway: "unified-1", Status: 200},
+		{AccountID: 1, RegionKey: "us-east", Gateway: "unified-2", Status: 200},
+		{AccountID: 1, RegionKey: "us-west", Gateway: "unified-2", Status: 200},
+	}, nil, time.Hour)
+	if len(grid.Cells) != 9 || grid.Recorded != 2 {
+		t.Fatalf("area dedup failed: %+v", grid)
+	}
+	for _, cell := range grid.Cells {
+		if (cell.Key == "europe" || cell.Key == "north-america") &&
+			(len(cell.Gateways) != 1 || cell.Gateways[0].Dup) {
+			t.Fatalf("country alias created a duplicate gateway: %+v", cell)
+		}
 	}
 }
 

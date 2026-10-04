@@ -4,6 +4,8 @@ import (
 	"sort"
 
 	"gwpool/internal/config"
+	"gwpool/internal/geography"
+	"gwpool/internal/types"
 )
 
 type displayRegionGroup[T any] struct {
@@ -50,12 +52,17 @@ func groupDisplayRegions[T any](cfg config.Config, cells []T, keyOf func(T) stri
 	return groups
 }
 
-func poolDisplayGroups(cfg config.Config, cells []poolRegionCell, showEmpty bool) []displayRegionGroup[poolRegionCell] {
-	visible := make([]poolRegionCell, 0, len(cells))
-	for _, cell := range cells {
-		if !cell.All && (cell.Total > 0 || cell.Active || showEmpty) {
-			visible = append(visible, cell)
-		}
+func displayAreaForKey(cfg config.Config, key string) geography.Area {
+	if region, ok := cfg.RegionByKey(key); ok {
+		return geography.AreaOf(region.Country)
 	}
-	return groupDisplayRegions(cfg, visible, func(cell poolRegionCell) string { return cell.Key })
+	return geography.AreaOf(key)
+}
+
+func enabledDisplayAreas(cfg config.Config) map[string]bool {
+	enabled := map[string]bool{}
+	for _, region := range cfg.CandidateRegions(types.Exit{}) {
+		enabled[geography.AreaOf(region.Exit.Region).Key] = true
+	}
+	return enabled
 }

@@ -266,7 +266,7 @@ func TestMintMergesOntoSentPair(t *testing.T) {
 		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-202", time.Now().Add(time.Hour)))
 		w.WriteHeader(200)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent, liveCflb())
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", sent, liveCflb())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestMintNoNewCookieWithSentPairIsSuccess(t *testing.T) {
 		w.Header().Set("x-codex-turn-state", "ticket-xyz")
 		w.WriteHeader(200) // 一个 set-cookie 都不给
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent, liveCflb())
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", sent, liveCflb())
 	if err != nil {
 		t.Fatalf("不下发新 cookie 不是失败: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestMintRefusesStaleCflbAsLanding(t *testing.T) {
 		{"死期读不出（零值）", time.Time{}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			res, err := srv().Mint(context.Background(), testCreds, types.Exit{}, "sid1", sent, c.exp)
+			res, err := srv().Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", sent, c.exp)
 			if !errors.Is(err, ErrNoLanding) {
 				t.Fatalf("err=%v，应为 ErrNoLanding（读不出落点）", err)
 			}
@@ -346,7 +346,7 @@ func TestMintNoNewCookieNoSentPairFails(t *testing.T) {
 		w.Header().Set("x-codex-turn-state", "ticket-xyz")
 		w.WriteHeader(200)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{})
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "", time.Time{})
 	if !errors.Is(err, ErrNoLanding) {
 		t.Fatalf("该是 ErrNoLanding，得到 %v", err)
 	}
@@ -364,7 +364,7 @@ func TestMintUnauthorizedHasNoLanding(t *testing.T) {
 		w.Header().Add("set-cookie", "__cflb=onlythis")
 		w.WriteHeader(401)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{})
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "", time.Time{})
 	if !errors.Is(err, ErrNoLanding) || res.Status != 401 {
 		t.Fatalf("401 该报读不出落点并带回状态码: res=%+v err=%v", res, err)
 	}
@@ -376,7 +376,7 @@ func TestMintRateLimitedStillReportsStatus(t *testing.T) {
 		w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-9", time.Now().Add(time.Hour)))
 		w.WriteHeader(429)
 	})
-	res, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{})
+	res, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "", time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestVerifyFull(t *testing.T) {
 				}
 				w.WriteHeader(tc.status)
 			})
-			v, err := c.VerifyFull(context.Background(), testCreds, types.Exit{},
+			v, err := c.VerifyFull(context.Background(), testCreds, types.Exit{Region: "US"},
 				"sid1", "__cflb=a", "live-ticket")
 			if err != nil {
 				t.Fatal(err)
@@ -799,7 +799,7 @@ func TestMintSendsSelectedFingerprint(t *testing.T) {
 			w.Header().Add("set-cookie", "__oailb="+fakeOailb("unified-1", time.Now().Add(time.Hour)))
 		})
 		c.Fingerprint = fp
-		if _, err := c.Mint(context.Background(), testCreds, types.Exit{}, "sid1", "", time.Time{}); err != nil {
+		if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, "sid1", "", time.Time{}); err != nil {
 			t.Fatal(err)
 		}
 		if got.Get("authorization") != "Bearer tok-SECRET" || got.Get("originator") != "codex-tui" {
@@ -938,6 +938,7 @@ func TestUnreachableProxyTripsBreaker(t *testing.T) {
 	p := novProxy
 	p.Host = addr
 	c := &Client{Proxies: []config.Proxy{p}, StickyMin: 5, Upstream: "http://example.invalid/"}
+	c.UpstreamPerRegionHour = proxyFailThreshold
 	for i := 0; i < proxyFailThreshold; i++ {
 		sid, err := c.NewSID(true)
 		if err != nil {
@@ -950,11 +951,9 @@ func TestUnreachableProxyTripsBreaker(t *testing.T) {
 	if _, err := c.NewSID(true); !errors.Is(err, ErrNoProxy) {
 		t.Fatalf("连不上的代理失败 %d 次还没熔断，拿到 %v", proxyFailThreshold, err)
 	}
-	// **根本没碰到上游的那几发要把配额退回去**：spend 是发之前占的名额，而每个区域
-	// 一小时只有 6 发。不退的话一次代理故障就能把这个区域的预算吃光，而那一发
-	// 连 TCP 都没建起来，上游那边什么都没发生。
-	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 0 {
-		t.Fatalf("连不上代理的 %d 发没退配额: used=%v", proxyFailThreshold, used)
+	// Attempt budget includes failures even before a TCP connection is made.
+	if used, _ := c.Rate(testCreds.AccountID); used["US"] != proxyFailThreshold {
+		t.Fatalf("connection failures must count: used=%v", used)
 	}
 }
 
@@ -988,7 +987,7 @@ func TestDeadExitDoesNotRefundRateWindow(t *testing.T) {
 	if _, err := c.Mint(context.Background(), testCreds, types.Exit{Region: "US"}, sid, "", time.Time{}); err == nil {
 		t.Fatal("这个假代理该在握手之后断开")
 	}
-	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
+	if used, _ := c.Rate(testCreds.AccountID); used["US"] != 1 {
 		t.Fatalf("中途断开的那一发被退了配额（会低报，撞上封号阈值）: used=%v", used)
 	}
 }
@@ -1037,7 +1036,7 @@ func TestCallerCancelDoesNotRefundRateWindow(t *testing.T) {
 	if _, err := c.Mint(ctx, testCreds, types.Exit{Region: "US"}, sid, "", time.Time{}); err == nil {
 		t.Fatal("调用方取消了还成功？")
 	}
-	if used, _ := c.Rate(testCreds.AccountID); used["us-east"] != 1 {
+	if used, _ := c.Rate(testCreds.AccountID); used["US"] != 1 {
 		t.Fatalf("被取消的那一发退了配额（会低报，撞上封号阈值）: used=%v", used)
 	}
 	// 也不该记成供应商的账：客户端的重试风暴会把一条好供应商熔断掉
@@ -1168,26 +1167,17 @@ func TestUpstreamRateGate(t *testing.T) {
 	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "JP"}, "sid-x", "", time.Time{}); err != nil {
 		t.Fatalf("east-asia 被 us-east 的配额拖累了: %v", err)
 	}
-	if used, limit := c.Rate("acc"); used["us-east"] != 3 || used["east-asia"] != 1 || limit != 3 {
+	if used, limit := c.Rate("acc"); used["US"] != 3 || used["JP"] != 1 || limit != 3 {
 		t.Fatalf("读数不对: used=%v limit=%d", used, limit)
 	}
-	// 没在表上的出口（手改 state.json 才会有）**挤同一个空桶**，不凭空多出一份配额。
-	// 要真的往那个桶里花钱才测得到：只用表上的出口时 used[""] 恒为 0，断言恒真。
-	wild := []types.Exit{{Region: "NG"}, {Region: "US", City: "Dallas"}}
-	for i, e := range wild {
-		if _, err := c.Mint(context.Background(), cr, e, "sid-w", "", time.Time{}); err != nil {
-			t.Fatalf("野出口第 %d 发被拦了: %v", i+1, err)
-		}
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "NG"}, "sid-w", "", time.Time{}); err != nil {
+		t.Fatal("a supported new country should have its own bucket", err)
 	}
-	if used, _ := c.Rate("acc"); used[""] != len(wild) {
-		t.Fatalf("两个野出口没挤进同一个空桶（各自多出一份配额）: %v", used)
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "US", City: "Dallas"}, "sid-w", "", time.Time{}); !errors.Is(err, types.ErrRateLimited) {
+		t.Fatal("city alias bypassed country quota", err)
 	}
-	// 挤满了就一起被拦：limit=3，上面已经花了 2 发。
-	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "ZZ"}, "sid-w", "", time.Time{}); err != nil {
-		t.Fatalf("空桶第 3 发就被拦了: %v", err)
-	}
-	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "QQ"}, "sid-w", "", time.Time{}); !errors.Is(err, types.ErrRateLimited) {
-		t.Fatalf("空桶打满了还放行，实为 %v", err)
+	if _, err := c.Mint(context.Background(), cr, types.Exit{Region: "ZZ"}, "sid-w", "", time.Time{}); !errors.Is(err, types.ErrUnsupportedCountry) {
+		t.Fatal("unsupported country gained a new bucket", err)
 	}
 	// 闸是按上游账号算的：另一个号自己有一整份预算，不该被这个号打满而挨饿。
 	other := types.Creds{AccessToken: "tok", AccountID: "acc-2"}

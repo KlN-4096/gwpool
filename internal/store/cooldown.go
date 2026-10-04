@@ -29,7 +29,7 @@ func (s *Store) AddCooldownReport(report types.CooldownReport) (bool, error) {
 	next := make([]types.CooldownReport, 0, len(before)+1)
 	cutoff := time.Now().Add(-cooldown.Retention)
 	for _, prev := range before {
-		if !prev.ReceivedAt.Before(cutoff) {
+		if !prev.EventAt().Before(cutoff) {
 			next = append(next, prev)
 		}
 	}

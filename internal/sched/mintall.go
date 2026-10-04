@@ -141,10 +141,15 @@ func (q *MintAllQueue) plan(regionKeys []string) ([]mintAllJob, MintAllStatus) {
 			projected[a.Creds.AccountID] = copyUsed
 		}
 		used = projected[a.Creds.AccountID]
-		plan.stat.AccountHourLimit = types.AccountHourLimit(limit)
+		plan.stat.AccountHourLimit = q.pool.cfg().AccountAttemptLimit()
 		held := q.pool.accountHeldFor(a.ID) > 0
 		allowed[a.ID] = map[string]bool{}
-		for _, r := range regions {
+		ordered := append([]types.Region(nil), regions...)
+		counts := q.pool.countryAttemptCounts(a)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return counts[ordered[i].Exit.Region] < counts[ordered[j].Exit.Region]
+		})
+		for _, r := range ordered {
 			plan.stat.Total++
 			reason := ""
 			switch {
@@ -152,13 +157,13 @@ func (q *MintAllQueue) plan(regionKeys []string) ([]mintAllJob, MintAllStatus) {
 				reason = "供应商不支持此出口"
 			case held:
 				reason = "上游限流"
-			case limit > 0 && used[r.Key] >= limit:
-				reason = "区域配额已满"
-			case types.MintBudgetFull(used, limit, r.Key):
+			case limit > 0 && used[r.Exit.Region] >= limit:
+				reason = "国家尝试次数已满"
+			case types.MintBudgetFull(used, limit, plan.stat.AccountHourLimit, r.Exit.Region):
 				reason = "账号总配额已满（含本批预估）"
 			default:
 				allowed[a.ID][r.Key] = true
-				used[r.Key]++
+				used[r.Exit.Region]++
 			}
 			if reason != "" {
 				plan.recordResult(MintAllResult{AccountID: a.ID, Region: r.Key, Status: "skipped", Reason: reason})
@@ -309,29 +314,36 @@ func (q *MintAllQueue) execute(ctx context.Context, job mintAllJob) (MintAllResu
 		return result, false
 	}
 	used, limit := s.mint.Rate(a.Creds.AccountID)
-	if types.MintBudgetFull(used, limit, job.region.Key) {
-		result.Reason = "账号总配额或区域配额已满"
+	if types.MintBudgetFull(used, limit, s.cfg().AccountAttemptLimit(), job.region.Exit.Region) {
+		result.Reason = "账号总配额或国家尝试次数已满"
 		return result, false
 	}
 	if !s.claimAccount(a.ID, s.opt.RenewGap) {
 		return result, true
 	}
+	ctx, cancel := context.WithTimeout(ctx, mintAllJobTimeout)
+	defer cancel()
+	ctx, err := s.beginAttempt(ctx, a, job.region.Exit)
+	if err != nil {
+		result.Reason = "无法预留国家尝试次数"
+		return result, false
+	}
+	result.attempted = true
 	sid, seed, err := s.premintSID(job.region.Key)
 	if err != nil {
+		s.sampleAttemptFailure(a, job.region.Exit, "", types.PurposeMintAll, types.Observed{}, err)
+		result.Status = "failed"
 		result.Reason = "无可用出口"
 		return result, false
 	}
-	ctx, cancel := context.WithTimeout(ctx, mintAllJobTimeout)
-	defer cancel()
-	result.attempted = true
 	got, err := s.mintOnceFor(ctx, a, job.region.Exit, sid, seed, "", "", types.PurposeMintAll)
 	switch {
 	case err == nil:
 		result.Status, result.Gateway = "succeeded", got.pair.Gateway
 	case errors.Is(err, types.ErrRateLimited):
-		result.Reason = "区域配额已满或上游限流"
+		result.Reason = "国家尝试次数已满或上游限流"
 	case errors.Is(err, types.ErrNoExit):
-		result.Reason, result.attempted = "无可用出口", false
+		result.Reason, result.Status = "无可用出口", "failed"
 	case errors.Is(err, ErrUpstreamRejected):
 		result.Status, result.Reason = "failed", "上游拒绝账号"
 	default:

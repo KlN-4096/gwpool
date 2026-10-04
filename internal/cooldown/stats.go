@@ -13,15 +13,21 @@ const (
 	MaxReports         = 8192
 	MaxReporterReports = 1024
 	Retention          = 7 * 24 * time.Hour
-	MaxSeconds         = 10 * 60 * 60
+	MaxSeconds         = 24 * 60 * 60
+	LegacyMaxSeconds   = 10 * 60 * 60
 	MinSeconds         = 60 * 60
 	MaxElapsed         = 7 * 24 * 60 * 60
 	MinOwnSuccesses    = 2
 	MinPoolReporters   = 3
 	GraceSeconds       = 60
+	StableMinSamples   = 6
+	StableSuccesses    = 3
+	StableSpan         = 24 * time.Hour
+	ReportInterval     = 6 * time.Hour
+	ReportPolicyTTL    = 24 * time.Hour
 )
 
-var steps = []int{3600, 7200, 14400, 21600, 28800, 36000}
+var steps = []int{3600, 7200, 14400, 21600, 28800, 36000, 43200, 57600, 72000, 86400}
 
 func next(seconds int) int {
 	for _, step := range steps {
@@ -42,7 +48,7 @@ func successBucket(report types.CooldownReport) int {
 			return step
 		}
 	}
-	return 0 // 等过 10 小时才恢复，不能证明 10 小时以内恢复。
+	return 0 // 最高档之后才恢复，不能证明最高档内恢复。
 }
 
 func AccountKey(reporterID int64, tag string) string {
@@ -52,14 +58,22 @@ func AccountKey(reporterID int64, tag string) string {
 type accountBucket struct {
 	stats     types.CooldownAccountStats
 	successes []int
+	reports   []types.CooldownReport
 }
 
 // Summarize 每次在一个快照上聚合。个人至少两次成功，池子推荐至少三个独立 consumer。
 // 采用成功档位的上四分位数，并避开已明确失败的较短档；它不是对恢复概率的保证。
 func Summarize(reports []types.CooldownReport, now time.Time) []types.CooldownStats {
+	return SummarizeWithin(reports, now, MaxSeconds)
+}
+
+// Old clients negotiate no larger than their existing ten-hour protocol.
+// Recompute evidence under their ceiling instead of clamping a larger recommendation.
+func SummarizeWithin(reports []types.CooldownReport, now time.Time, ceiling int) []types.CooldownStats {
+	ceiling = min(MaxSeconds, max(MinSeconds, ceiling))
 	groups := map[string]map[string]*accountBucket{}
 	for _, report := range reports {
-		if report.ReceivedAt.Before(now.Add(-Retention)) || report.ReceivedAt.After(now.Add(time.Minute)) {
+		if report.EventAt().Before(now.Add(-Retention)) || report.EventAt().After(now.Add(time.Minute)) {
 			continue
 		}
 		if groups[report.Gateway] == nil {
@@ -72,9 +86,10 @@ func Summarize(reports []types.CooldownReport, now time.Time) []types.CooldownSt
 			groups[report.Gateway][key] = b
 		}
 		b.stats.Samples++
+		b.reports = append(b.reports, report)
 		if report.Result == "full" {
 			b.stats.Successes++
-			if seconds := successBucket(report); seconds > 0 {
+			if seconds := successBucket(report); seconds > 0 && seconds <= ceiling {
 				b.successes = append(b.successes, seconds)
 			}
 		} else {
@@ -92,10 +107,16 @@ func Summarize(reports []types.CooldownReport, now time.Time) []types.CooldownSt
 			it.Samples += b.stats.Samples
 			it.Successes += b.stats.Successes
 			it.Failures += b.stats.Failures
-			if len(b.successes) >= MinOwnSuccesses && b.stats.FailureFloorSeconds <= MaxSeconds {
+			if b.stats.FailureFloorSeconds > ceiling {
+				b.stats.RecommendationReason = "failure_above_limit"
+			} else if len(b.successes) < MinOwnSuccesses {
+				b.stats.RecommendationReason = "insufficient_successes"
+			}
+			if len(b.successes) >= MinOwnSuccesses && b.stats.FailureFloorSeconds <= ceiling {
 				sort.Ints(b.successes)
 				seconds := max(b.successes[(3*len(b.successes)-1)/4], b.stats.FailureFloorSeconds)
 				b.stats.Recommendation = types.CooldownRecommendation{Seconds: seconds, Samples: b.stats.Samples, Source: "account"}
+				applyStableReporting(&b.stats.Recommendation, b.reports, now)
 				recommendations = append(recommendations, seconds)
 				// 每个 consumer 只占一票，不能靠伪造更多匿名账号增加权重。
 				reporterRecommendations[b.stats.ReporterID] = max(reporterRecommendations[b.stats.ReporterID], seconds)
@@ -123,6 +144,35 @@ func Summarize(reports []types.CooldownReport, now time.Time) []types.CooldownSt
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Gateway < out[j].Gateway })
 	return out
+}
+
+// Cadence is independent from scheduling confidence. Only a personal, recent,
+// consecutive success streak supports delaying reports; failures never get hidden
+// behind an older "last three successes" streak. Use event time, not batch arrival.
+func applyStableReporting(rec *types.CooldownRecommendation, reports []types.CooldownReport, now time.Time) {
+	if len(reports) < StableMinSamples {
+		return
+	}
+	sort.SliceStable(reports, func(i, j int) bool {
+		if reports[i].EventAt().Equal(reports[j].EventAt()) {
+			return reports[i].Result == "full" && reports[j].Result != "full"
+		}
+		return reports[i].EventAt().Before(reports[j].EventAt())
+	})
+	oldest, latest := reports[0].EventAt(), reports[len(reports)-1].EventAt()
+	if latest.Sub(oldest) < StableSpan || now.Sub(latest) > ReportPolicyTTL {
+		return
+	}
+	for _, report := range reports[len(reports)-StableSuccesses:] {
+		if report.Result != "full" || successBucket(report) != rec.Seconds {
+			return
+		}
+	}
+	rec.ReportIntervalSeconds = int(ReportInterval.Seconds())
+	rec.ReportPolicyExpiresAt = now.Add(ReportPolicyTTL)
+	if expires := oldest.Add(Retention); expires.Before(rec.ReportPolicyExpiresAt) {
+		rec.ReportPolicyExpiresAt = expires
+	}
 }
 
 func ForAccount(stats types.CooldownStats, reporterID int64, tag string) types.CooldownRecommendation {

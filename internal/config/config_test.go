@@ -282,8 +282,8 @@ func TestSchedulingKnobDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.UpstreamPerRegionHour != 6 {
-		t.Errorf("每区每小时默认该是 6（九区合起来 54 = 原先按账号算的那个数），得到 %d",
+	if cfg.UpstreamPerRegionHour != 2 || cfg.UpstreamPerAccountHour != 50 {
+		t.Errorf("每国默认2次/小时、每账号总50次；国家限额=%d",
 			cfg.UpstreamPerRegionHour)
 	}
 	// 交付前验满血是「花一个满血窗口换一个读数」，所以默认关。

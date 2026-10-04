@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"time"
 
+	"gwpool/internal/geography"
 	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
@@ -121,7 +122,8 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 		// 恰好是把配额往最没用的地方花。速率闸和出口熔断同理：重试三轮只是把
 		// 同一句话抄三遍。
 		if errors.Is(err, errAnswered) ||
-			errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit) {
+			errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit) ||
+			errors.Is(err, types.ErrUnsupportedCountry) {
 			break
 		}
 	}
@@ -140,15 +142,36 @@ var errAnswered = errors.New("上游已经答复，重试换不来别的答案")
 // attempt 是一发：同一个 sid 先查地理再铸票，于是两者走的是同一个出口 IP。
 func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Region) (Landing, error) {
 	started := time.Now()
-	sid, err := s.Mint.NewSIDFor(r.Exit, !s.Coarse)
+	ctx, err := s.Mint.BeginAttempt(ctx, acct.Creds, r.Exit)
 	if err != nil {
 		return Landing{}, err
+	}
+	recordFailure := func(sid string, obs types.Observed, failure error) (Landing, error) {
+		provider := ""
+		if sid != "" {
+			provider = s.Mint.Provider(sid)
+		}
+		sm := types.Sample{AccountID: acct.ID, RegionKey: r.Key, Requested: r.Exit,
+			Observed: obs, At: time.Now().UTC(), Err: types.SampleErr("", failure),
+			Provider: provider, Purpose: types.PurposeScan,
+			TargetMatch: r.Exit.MatchEvidence(obs, false), DurationMS: time.Since(started).Milliseconds()}
+		if err := s.Store.AppendSample(sm); err != nil {
+			return Landing{}, fmt.Errorf("落失败样本: %w", err)
+		}
+		return Landing{}, failure
+	}
+	sid, err := s.Mint.NewSIDFor(r.Exit, !s.Coarse)
+	if err != nil {
+		return recordFailure("", types.Observed{}, err)
 	}
 	var obs types.Observed
 	// 非粘性出口每连接换 IP，查到的地理不是铸票那一发的，宁可留空也不记一个假的。
 	if s.Mint.Sticky(sid) {
 		if obs, err = s.Mint.Geo(ctx, r.Exit, sid); err != nil {
-			return Landing{}, fmt.Errorf("查 geo: %w", err)
+			return recordFailure(sid, obs, fmt.Errorf("查 geo: %w", err))
+		}
+		if !geography.Supported(obs.Country) {
+			return recordFailure(sid, obs, types.ErrUnsupportedCountry)
 		}
 	}
 

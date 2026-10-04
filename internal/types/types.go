@@ -202,6 +202,10 @@ type Verdict struct {
 //     「上游没下发新 cookie」只有在它**可证还活着**时才意味着「路由没变」，
 //     否则这一发其实是随机路由走的、落点读不出来（见 MintResult.Gateway）
 type Minter interface {
+	// BeginAttempt reserves the country/account budget before binding or Geo.
+	// Mint consumes this context's reservation once; a further VerifyFull costs
+	// another attempt. Direct Mint calls still reserve their own attempt.
+	BeginAttempt(context.Context, Creds, Exit) (context.Context, error)
 	Mint(ctx context.Context, c Creds, e Exit, sid, sentPair string, sentCflbExp time.Time) (MintResult, error)
 
 	// VerifyFull 带一张活票再打一发，只读响应头。必须复用铸票时的 sid 和 pair。
@@ -259,15 +263,16 @@ type Account struct {
 
 // RejectedByUpstream 判断这个状态码是不是「上游说这个账号不行」。
 //
-// 400/401/403 是**对这个账号的否决**，重试多少次都一样：票过期了、被撤销了、
+// 400/401 沿用账号否决处理：票过期了、被撤销了、
 // 或者这个账号没有所配模型的权限（2026-10-01 实测：free 账号打 gpt-6-astra
 // 恒回 400，九个区域每个重试三次，二十七发全废）。遇到就停用，别再轮询。
 //
+// 403 可能来自地区/边缘访问策略，单凭状态码不足以停号。
 // 429 和 5xx **刻意不算**：那是「现在不行」，归退避管，停用一个被限流的号
 // 等于把一次限流变成永久损失。
 func RejectedByUpstream(status int) bool {
 	switch status {
-	case 400, 401, 403:
+	case 400, 401:
 		return true
 	}
 	return false

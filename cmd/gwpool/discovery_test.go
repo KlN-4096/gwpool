@@ -22,6 +22,10 @@ import (
 // （真打那一发在 scan.ScanRegion 里，这些用例只看入队决策）。
 type stubMinter struct{}
 
+func (stubMinter) BeginAttempt(ctx context.Context, _ types.Creds, _ types.Exit) (context.Context, error) {
+	return ctx, ctx.Err()
+}
+
 func (stubMinter) Mint(context.Context, types.Creds, types.Exit, string, string, time.Time) (types.MintResult, error) {
 	return types.MintResult{}, nil
 }
