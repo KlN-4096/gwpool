@@ -1789,7 +1789,7 @@ func TestPublicPageCountsOnlyHostedAccounts(t *testing.T) {
 		})
 	}
 	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
-	if !strings.Contains(body, "<b>2</b><span>托管账号") {
+	if !strings.Contains(body, `<b data-stat="hosted">2</b><span>托管账号`) {
 		t.Fatalf("2 个真上传者 + 3 个匿名占位，托管账号没报 2：\n%s", body)
 	}
 }
@@ -1934,9 +1934,9 @@ func TestAdminAccountFacets(t *testing.T) {
 		ViewToken: "vt-3", Creds: types.Creds{AccessToken: "x", AccountID: "acct-c"}})
 	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
 	for _, want := range []string{
-		`data-facet="on plan-pro cov-part o1"`,
-		`data-facet="off plan-plus cov-all o2"`,
-		`data-facet="on plan-unknown cov-none o2"`,
+		`data-facet="on plan-pro cov-part o1 health-invalid"`,
+		`data-facet="off plan-plus cov-all o2 health-disabled"`,
+		`data-facet="on plan-unknown cov-none o2 health-invalid"`,
 		`状态=on:启用:ok|off:已停用:bad;`,
 		`;套餐=plan-plus:plus|plan-pro:pro|plan-unknown:未知;`,
 		`;区域=cov-all:启用出口都铸过:ok|cov-part:启用出口未覆盖全:warn|cov-none:启用出口无成功记录:bad;`,
@@ -2045,7 +2045,7 @@ func TestAdminGatewaysShowPlacesAndPair(t *testing.T) {
 		// 「城市不明」列在明细里，但不算进几城。
 		"IT（2 城） · SA</summary>", "Milan、Rome", "（城市不明）",
 		`<td>#1 pro1</td>`, `<td>#2 朋友的号</td>`, "#77（已删除）",
-		`data-facet="live"`, `data-facet="expired"`, `data-facet="none"`,
+		`data-facet="ready"`, `data-facet="expired"`, `data-facet="none"`,
 	} {
 		if !strings.Contains(gw, want) {
 			t.Fatalf("网关表缺了 %q：\n%s", want, gw)
@@ -3010,11 +3010,7 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 	}
 }
 
-// 号池页的供给账：可交付网关数接下来会涨还是会降。
-//
-// 这张卡片存在的理由是「可交付网关一天里从 96 滑到 53，页面上只有那一个瞬时数，
-// 看的人只能猜」。所以要钉的不是文案在不在，而是两个数**真的按票的寿命算**：
-// 要掉下去的票算进退场、刚铸的票算进铸入、生命中段的票两边都不算。
+// 临期读数只来自当前有效票；请求记录与库存数量不混成涨跌预测。
 func TestPoolPageSupplyLedger(t *testing.T) {
 	_, h, _, st, _ := rig(t, types.ModePool)
 	now := time.Now().UTC()
@@ -3030,34 +3026,31 @@ func TestPoolPageSupplyLedger(t *testing.T) {
 	// 剩余已经不足门槛 ⇒ 已经退场了，不该再算进「即将退场」。
 	add("unified-dead", time.Minute, time.Minute)
 
-	// rig 自带的 unified-142 是 ExpiresAt/Cflb 都 +1h 的新票 ⇒ 唯一的铸入。
 	body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String()
 	card := supplyCardOf(t, body)
 	for _, want := range []string{
-		`<b>−1</b>`, // 退场：只有 unified-expiring
-		`<b>+1</b>`, // 铸入：只有 unified-142
-		`<span class="badge">持平</span>`,
+		`<b>1</b><span>`, // 临期：只有 unified-expiring
+		`<b>3</b><span>此刻可交付`,
+		`<strong>0 次尝试</strong>`,
 	} {
 		if !strings.Contains(card, want) {
 			t.Fatalf("供给账里找不到 %s：\n%s", want, card)
 		}
 	}
 
-	// 再补一张刚铸的票，方向就该翻成「在涨」。
+	// 再补一张票只改变库存，不凭cflb期限编造近期铸入数。
 	add("unified-fresh", types.PairLifetime, types.PairLifetime)
 	card = supplyCardOf(t, do(h, httptest.NewRequest("GET", "/", nil)).Body.String())
-	if !strings.Contains(card, `<b>+2</b>`) || !strings.Contains(card, `<span class="badge ok">在涨</span>`) {
-		t.Fatalf("补一张新票后方向没翻过来：\n%s", card)
+	if !strings.Contains(card, `<b>4</b><span>此刻可交付`) || !strings.Contains(card, `<strong>0 次尝试</strong>`) {
+		t.Fatalf("库存与真实请求混淆：\n%s", card)
 	}
 
 	// 时长**不许写成字面量**：Go 模板没有算术，常量改了页面会继续说旧数，而读者
 	// 正是照这几个数推算涨落的。
-	life := int(types.PairLifetime / time.Minute)
 	floor := int(types.DeliverFloor / time.Minute)
 	for _, want := range []string{
-		fmt.Sprintf("<strong>%d 分钟</strong>", life),
 		fmt.Sprintf("不足 %d 分钟", floor),
-		fmt.Sprintf("待 %d 分钟", life-floor),
+		"已知可恢复网关数",
 	} {
 		if !strings.Contains(card, want) {
 			t.Fatalf("供给账的说明里缺了 %q（时长被写死了？）：\n%s", want, card)
@@ -3069,7 +3062,7 @@ func TestPoolPageSupplyLedger(t *testing.T) {
 // 在整页里撞上别的文案也算过。
 func supplyCardOf(t *testing.T, body string) string {
 	t.Helper()
-	from := strings.Index(body, "<h2>供给账</h2>")
+	from := strings.Index(body, "<h2>库存与补货</h2>")
 	if from < 0 {
 		t.Fatalf("号池页没有供给账卡片：\n%s", body)
 	}
@@ -3092,7 +3085,7 @@ func TestAdminAccountCards(t *testing.T) {
 		t.Fatalf("/admin/accounts 拿到 %d，跳到 %q", w.Code, w.Header().Get("Location"))
 	}
 	body := do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
-	from, to := strings.Index(body, `<section id="tab-accounts">`), strings.Index(body, `<section id="tab-external">`)
+	from, to := strings.Index(body, `<section id="tab-accounts"`), strings.Index(body, `<section id="tab-external"`)
 	if from < 0 || to < from {
 		t.Fatal("找不到账号页签")
 	}

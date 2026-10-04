@@ -5,13 +5,17 @@
 </div>
 
 <div class="kpis">
-  <div class="kpi"><b>{{len .Gateways}}</b><span>已知网关</span></div>
+  <div class="kpi featured ok"><b data-stat="effective">{{.Health.Effective}}</b><span>有效账号</span><small>其中上游暂限 {{.Health.Held}}</small></div>
   <div class="kpi ok"><b>{{.ReadyCount}}</b><span>可交付网关</span>{{if .Gateways}}<div class="meter" style="--v: {{.ReadyCount}}; --max: {{len .Gateways}}"><i></i></div>{{end}}</div>
-  <div class="kpi"><b>{{.Accounts}}</b><span>托管账号</span></div>
+  <div class="kpi"><b>{{len .Gateways}}</b><span>已知网关</span></div>
+  <div class="kpi"><b data-stat="hosted">{{.Health.Hosted}}</b><span>托管账号</span><small>含待验证、停用及凭据异常</small></div>
   {{if .PublicEnabled}}
   <div class="kpi {{if .PublicOpen}}ok{{else}}off{{end}}"><b>{{if .PublicOpen}}开放中{{else}}已关闭{{end}}</b><span>对外开放</span><small>可用 {{.OpenAccounts}} / 门槛 {{.Threshold}}</small></div>
   {{end}}
 </div>
+<details class="metric-note"><summary>待验证 {{.Health.Pending}} · 已停用 {{.Health.Disabled}} · 凭据异常 {{.Health.Invalid}} <span class="muted">查看有效账号口径</span></summary>
+  <p>有效 = 已启用、凭据本地检查未见过期或身份冲突，且有成功铸票记录；不含外部占位账号。未提供到期时间时只依据已有成功记录，不保证凭据实时有效。429暂限单列但仍计入有效；预算、出口或质量验证仍可能阻止此刻铸票。刷新页面不额外探测。</p>
+</details>
 
 <div class="grid-2 even">
   <div class="card">
@@ -49,18 +53,16 @@
 
 <section id="tab-gateways">
   <div class="card">
-    <header class="card-head"><div><h2>供给账</h2><p>上面那个「可交付网关」接下来会涨还是会降，以及为什么。<strong>现算，不留历史。</strong></p></div>
-      {{if gt .Supply.Minted .Supply.Expiring}}<span class="badge ok">在涨</span>{{else if gt .Supply.Expiring .Supply.Minted}}<span class="badge">在降</span>{{else}}<span class="badge">持平</span>{{end}}</header>
+    <header class="card-head"><div><h2>库存与补货</h2><p>当前快照与近期请求分别统计，不用铸票成功数推断库存净增长。</p></div></header>
     <div class="card-body">
       <div class="kpis">
         <div class="kpi ok"><b>{{.ReadyCount}}</b><span>此刻可交付</span></div>
-        <div class="kpi off"><b>−{{.Supply.Expiring}}</b><span>{{.Supply.WindowMin}} 分钟内退场</span><small>不补就会掉下去</small></div>
-        <div class="kpi{{if gt .Supply.Minted .Supply.Expiring}} ok{{end}}"><b>+{{.Supply.Minted}}</b><span>最近 {{.Supply.WindowMin}} 分钟铸入</span><small>同样长的时间里补了几张</small></div>
-        <div class="kpi"><b>{{.Supply.Target}}</b><span>预铸目标深度</span><small>高于可交付数 = 还在往上补</small></div>
+        <div class="kpi off"><b>{{.Supply.Expiring}}</b><span>{{.Supply.WindowMin}} 分钟内临期</span><small>不更新则跌破交付门槛</small></div>
+        <div class="kpi"><b>{{.Supply.Target}}</b><span>维护目标</span><small>不是可达或完成时间保证</small></div>
+        <div class="kpi"><b>{{.Supply.Gap}}</b><span>数量差额</span><small>缺失已知网关会另行优先恢复</small></div>
       </div>
-      <p class="foot">一张票铸出来活 <strong>{{.Supply.LifeMin}} 分钟</strong>，剩余不足 {{.Supply.FloorMin}} 分钟就不再算可交付 ⇒ 每张票在这个数里待 {{.Supply.ReadyMin}} 分钟，而<strong>到期是唯一的退场途径</strong>。所以可交付网关数 ≈ 铸入速度 × {{.Supply.ReadyMin}} 分钟，中间那两个数就是同一个 {{.Supply.WindowMin}} 分钟窗口的两边：补进来的不少于要掉下去的就在涨，反过来就在降。</p>
-      <p class="foot">铸入慢下来只发生在<strong>补票</strong>这一侧（上游拒了这一发、托管账号被停用、某个出口不通），已经发出去的票不受影响。目标深度 = 最近一小时真有人取过票的网关数 + 富余张数，所以没人用的时候它自己会回落，那不是池子缩水。</p>
-      <p class="foot muted">两个数都从此刻手上的票算出来。刻意没有「过去 N 分钟退场了几张」：一个网关只存一张票，补了新票旧票就被覆盖，那个数会把同一个网关重复计一次。</p>
+      {{if .Supply.Unavailable}}<p class="foot err">近期请求记录读取失败，不能显示活动统计。</p>{{else}}<p class="foot">最近 {{.Supply.WindowMin}} 分钟记录 <strong>{{.Supply.Attempts}} 次尝试</strong>，其中 {{.Supply.Landed}} 次正常返回落点；包含重复网关，不代表新增库存。</p>{{end}}
+      <details class="metric-note"><summary>库存口径与维护条件</summary><p>有效路由剩余不足 {{.Supply.FloorMin}} 分钟不算可交付。目标取近期需求加富余、最低库存和已知可恢复网关数的较大者，受总上限限制。有近期需求且至少两个可用账号才维护；优先恢复缺失已知网关，仍受配额、退避和出口限制。</p></details>
     </div>
   </div>
   <div class="card">
@@ -133,8 +135,8 @@
       </tbody>
     </table></div>
     <div class="legend">
-      <span><i class="sw ok"></i>成功：这一发拿到了落点，池子多一张票</span>
-      <span><i class="sw"></i>失败：上游拒了（带状态码）或一发都没出站</span>
+      <span><i class="sw ok"></i>成功：这一发拿到了落点，不代表库存净增</span>
+      <span><i class="sw"></i>失败：上游拒绝、传输失败或前置拦截</span>
       <span><b>落点</b>这一发实际落在哪个网关；按区域裸铸读不出来时为「—」</span>
     </div>
     {{else}}

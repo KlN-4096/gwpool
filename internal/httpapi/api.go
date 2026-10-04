@@ -618,20 +618,14 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	accounts := s.st.Accounts()
 	now := time.Now().UTC()
 
-	// 只数**托管**账号：匿名调用方的占位行（sched.anonAccount）没有凭据，既铸不了票
-	// 也不是谁托管的。算进来的话这张对外的页面上「托管账号」会虚高一大截。
-	hosted := 0
-	for _, a := range accounts {
-		if a.Creds.AccessToken != "" {
-			hosted++
-		}
-	}
-
 	v := poolView{base: base{Title: "池子", Mode: s.pool.Mode()}}
-	v.Supply.WindowMin = int(supplyWindow / time.Minute)
-	v.Supply.LifeMin = int(types.PairLifetime / time.Minute)
-	v.Supply.FloorMin = int(types.DeliverFloor / time.Minute)
-	v.Supply.ReadyMin = v.Supply.LifeMin - v.Supply.FloorMin
+	v.Health = summarizeAccounts(accounts, accountEvidence(s.st.RegionMints()), s.pool.AccountHolds(), now)
+	samples, sampleErr := s.st.Samples()
+	if sampleErr != nil {
+		s.opt.Log.Warn("公开页读采样账本失败", "err", sampleErr)
+	}
+	v.Supply = supplySnapshot(gws, pairs, samples, now, s.pool.PairTarget())
+	v.Supply.Unavailable = sampleErr != nil
 	for name, g := range gws {
 		row := gatewayRow{Name: name, Exits: len(g.ReachableExits), PairLeft: "—"}
 		if p, ok := pairs[name]; ok {
@@ -640,16 +634,6 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			row.PairReady = left >= types.DeliverFloor
 			if left > 0 {
 				row.PairLeft = shortDur(left)
-			}
-			if row.PairReady && left-types.DeliverFloor < supplyWindow {
-				v.Supply.Expiring++
-			}
-			// 铸出时刻按 __cflb 的死期倒推：它从铸出那一刻起恰好活 PairLifetime，
-			// 而续期**只补发 __oailb**（见 types.Pair.CflbExpiresAt），所以这个倒推
-			// 不会被续期带偏。零值 = 老 state.json 的记录，倒推不出来，不计。
-			if !p.CflbExpiresAt.IsZero() &&
-				p.CflbExpiresAt.After(now.Add(types.PairLifetime-supplyWindow)) {
-				v.Supply.Minted++
 			}
 		}
 		v.Gateways = append(v.Gateways, row)
@@ -660,7 +644,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 			v.ReadyCount++
 		}
 	}
-	v.Mints, v.TotalMints = s.poolMintRows(accounts)
+	v.Mints, v.TotalMints = poolMintRows(accounts, samples)
 	// 格子先算（它们报的是**整池**的读数，筛选时不许跟着缩水），再按查询串筛表。
 	v.Regions = poolRegionCells(s.opt.Live.Get(), v.Gateways, gws)
 	want := sanitizeLabel(r.URL.Query().Get("region"), "")
@@ -669,8 +653,6 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
-	v.Accounts = hosted
-	v.Supply.Target = s.pool.PairTarget()
 	v.Model, v.Effort = s.probeModel(), probeEffort
 	v.BaseURL = s.publicBaseURL()
 	// 带着身份 cookie 来的人直接给按钮；没带的只给一个贴令牌的小表单。
@@ -2000,6 +1982,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	holds := s.pool.AccountHolds()
+	proven := accountEvidence(s.st.RegionMints())
+	v.Health = summarizeAccounts(accounts, proven, holds, now)
 	ownerAccounts := map[int64]int{}
 	for _, a := range accounts {
 		ownerAccounts[a.OwnerID]++
@@ -2009,6 +1993,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			Requests: reqs[a.ID], Found: found[a.ID],
 			ViewToken: a.ViewToken, Since: a.CreatedAt.Format(time.DateTime),
 			Upstream: a.Creds.AccountID, OwnerID: a.OwnerID,
+			Health: accountHealthState(a, proven[a.ID], now),
 		}
 		if d := holds[a.ID]; d > 0 {
 			row.Held = shortDur(d)
@@ -2021,7 +2006,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			n := covered[a.ID]
 			total := len(enabledDisplayAreas(cfg))
 			row.Covered = fmt.Sprintf("%d/%d", n, total)
-			row.Facet = accountFacet(a, n, total)
+			row.Facet = accountFacet(a, n, total) + " health-" + row.Health
 			v.Accounts = append(v.Accounts, row)
 			continue
 		}
@@ -2074,6 +2059,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	// 网关表顺带报它手上那张 pair 的剩余时间和铸它的账号（原来单独一个页签），
 	// cookie 本体一个字都不往页面上放。
 	pairs := s.effectivePairs(time.Now().UTC())
+	v.Supply = supplySnapshot(gws, pairs, samples, now, s.pool.PairTarget())
 	places := gatewayPlaces(samples)
 	for _, g := range gws {
 		exits := make([]string, 0, len(g.ReachableExits))
@@ -2087,12 +2073,16 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		if p, ok := pairs[g.Name]; ok {
 			row.PairState, row.PairLeft, row.MintedBy = "expired", "已过期", name(p.MintedBy)
 			if left := p.ExpiresAt.Sub(now); left > 0 {
-				row.PairState, row.PairLeft = "live", shortDur(left)
+				row.PairState, row.PairLeft = "short", shortDur(left)
+				if left >= types.DeliverFloor {
+					row.PairState = "ready"
+				}
 			}
 		}
 		v.Gateways = append(v.Gateways, row)
 	}
 	sort.Slice(v.Gateways, func(i, j int) bool { return v.Gateways[i].Name < v.Gateways[j].Name })
+	attachGatewayStats(v.Gateways, v.ContactStats, v.CooldownStats)
 
 	for _, sm := range samples {
 		v.Samples = append(v.Samples, adminSampleRow{
@@ -2246,6 +2236,7 @@ func accountFacets(rows []accountRow, owners []types.Owner, ownerName map[int64]
 	}
 	return strings.Join([]string{
 		"状态=on:启用:ok|off:已停用:bad",
+		"有效性=health-effective:有效:ok|health-pending:待验证:warn|health-invalid:凭据异常:bad|health-disabled:已停用",
 		"套餐=" + strings.Join(planGroup, "|"),
 		"区域=cov-all:启用出口都铸过:ok|cov-part:启用出口未覆盖全:warn|cov-none:启用出口无成功记录:bad",
 		"上传者=" + strings.Join(ownerGroup, "|"),
@@ -2539,12 +2530,7 @@ const poolMintMaxRows = 40
 // ⇒ 这本账已经**就是**铸票历史，再加一份内存状态只会多一个会和它对不上的读数。
 //
 // 读不出来就返回空：这一页的主体是网关表，一条账本读失败不该让整页 500。
-func (s *Server) poolMintRows(accounts []types.Account) ([]poolMintRow, int) {
-	samples, err := s.st.Samples()
-	if err != nil {
-		s.opt.Log.Warn("公开页读采样账本失败", "err", err)
-		return nil, 0
-	}
+func poolMintRows(accounts []types.Account, samples []types.Sample) ([]poolMintRow, int) {
 	label := make(map[int64]string, len(accounts))
 	for _, a := range accounts {
 		label[a.ID] = a.Label

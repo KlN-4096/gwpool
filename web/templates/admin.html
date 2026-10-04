@@ -1,30 +1,43 @@
 {{define "content"}}
 <div class="page-head">
   <h1>管理后台</h1>
-  <p>代理、账号、网关与采样数据的实时快照，刷新页面即可更新。</p>
-  <p><a href="/admin/coverage">区域覆盖与探索出口 →</a></p>
+  <p>先看有效账号与库存，再按网关定位问题。所有读数为页面加载时的快照。</p>
 </div>
 
 <nav class="tabs" data-tabs hidden data-js>
   <a href="#overview">概览</a>
-  <a href="#proxies">出口代理 <span class="n">{{len .Proxies}}</span></a>
-  <a href="#owners">上传者 <span class="n">{{len .Owners}}</span></a>
-  <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
-  <a href="#external">外部账号 <span class="n">{{len .External}}</span></a>
   <a href="#gateways">网关 <span class="n">{{len .Gateways}}</span></a>
-  <a href="#slots">账号×网关 <span class="n">{{.SlotTotal}}</span></a>
-  <a href="#samples">采样记录 <span class="n">{{.TotalSamples}}</span></a>
-  <a href="#fails">取票失败 <span class="n">{{len .Fails}}</span></a>
-  <a href="#config">配置</a>
+  <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
+  <a href="#proxies">出口 <span class="n">{{len .Proxies}}</span></a>
+  <a href="#samples">记录</a>
+  <a href="#config">设置</a>
 </nav>
 
 <section id="tab-overview">
+  <div class="kpis">
+    <a class="kpi featured ok" href="#accounts"><b data-stat="effective">{{.Health.Effective}}</b><span>有效账号</span><small>其中上游暂限 {{.Health.Held}}</small></a>
+    <a class="kpi ok" href="#gateways"><b>{{.Supply.Ready}}</b><span>可交付网关</span><small>已知 {{len .Gateways}} · 目标 {{.Supply.Target}}</small></a>
+    <a class="kpi" href="#gateways"><b>{{.Supply.Expiring}}</b><span>{{.Supply.WindowMin}} 分钟内临期</span><small>不更新则跌破交付门槛</small></a>
+    <a class="kpi" href="#accounts"><b data-stat="hosted">{{.Health.Hosted}}</b><span>托管账号</span><small>含待验证、停用及凭据异常</small></a>
+  </div>
+  <details class="metric-note"><summary>待验证 {{.Health.Pending}} · 已停用 {{.Health.Disabled}} · 凭据异常 {{.Health.Invalid}} <span class="muted">有效账号统计口径</span></summary>
+    <p>有效 = 已启用、凭据本地检查未见过期或身份冲突且有成功铸票记录。未提供到期时间时只依据历史成功，不保证实时有效或此刻可调度；429和请求预算等临时限制不等于凭据失效。页面不额外探测，也不改变原有匿名开放门槛。</p>
+  </details>
+  <div class="grid-2 even">
+    <div class="card"><header class="card-head"><h2>库存与活动</h2><a href="#gateways">查看网关 →</a></header>
+      <div class="card-body"><p>维护目标 <strong>{{.Supply.Target}}</strong> · 当前数量差额 <strong>{{.Supply.Gap}}</strong></p>
+      <p>最近 {{.Supply.WindowMin}} 分钟：{{.Supply.Attempts}} 次尝试，{{.Supply.Landed}} 次正常返回落点。</p>
+      <p class="foot">请求成功不代表库存净增。维护优先缺失已知网关；有需求且账号充足才执行，仍受预算和退避限制。</p></div></div>
+    <div class="card"><header class="card-head"><h2>排查入口</h2></header><div class="card-body">
+      <div class="actions"><a href="#fails">近期取票失败 {{len .Fails}}</a><a href="#proxies">出口代理 {{len .Proxies}}</a><a href="/admin/coverage">区域覆盖与探索出口 →</a></div>
+      <p class="foot">网关页集中查看路由库存、冷却建议与接触分层；记录页保留逐请求和账号接触明细。未验证不等于满血。</p>
+    </div></div>
+  </div>
   {{if .MintAllAvailable}}
-  <div class="card">
-    <header class="card-head"><div><h2>按范围打票</h2>
-      <p>先选大区或具体出口，再预览账号×出口组合与额度过滤；确认后才执行。默认原9个基线出口，全部国家必须显式选择。</p>
-      <p>新铸只用动态出口，仍遵守单区额度与不随扩区增长的账号总额度。重复提交不叠加，排队最多15分钟，重启清空；自然探索不受范围选择影响。</p>
-    </div></header>
+  <details class="card"{{if .MintAll.Active}} open{{end}}>
+    <summary class="card-head"><div><h2>手动探索 · 按范围打票</h2>
+      <p>默认不选范围；选九大区后预览、确认才执行。沿用国家与账号总预算，排队最多15分钟。</p>
+    </div></summary>
     <div class="card-body">
       <div class="actions">
         {{if .MintAll.Active}}<span>按范围打票进行中</span>{{else}}<a class="button primary" href="/admin/mint-all">选择范围与预览</a>{{end}}
@@ -34,7 +47,7 @@
       <p>本轮共 {{.MintAll.Total}} 个组合 · 排队 {{.MintAll.Queued}} · 执行中 {{.MintAll.Running}} · 成功 {{.MintAll.Succeeded}} · 失败 {{.MintAll.Failed}} · 跳过 {{.MintAll.Skipped}}</p>
       <p class="muted">开始 {{.MintAllStarted}} UTC{{if .MintAllFinished}} · 结束 {{.MintAllFinished}} UTC{{end}}</p>
       {{range $reason, $n := .MintAll.SkipReasons}}<p class="muted">跳过 {{$n}} 个：{{$reason}}</p>{{end}}
-      {{else}}<p class="muted">尚未执行全量打票。</p>{{end}}
+      {{else}}<p class="muted">本进程尚未执行范围打票。</p>{{end}}
       {{if .MintAll.Problems}}
       <details><summary>本轮跳过/失败明细（最多保留前 200 条，共 {{.MintAll.Skipped}} 个跳过、{{.MintAll.Failed}} 个失败）</summary>
         <div class="table-wrap"><table>
@@ -53,38 +66,8 @@
       </tr>{{end}}</tbody>
     </table></div>
     {{end}}
-  </div>
+  </details>
   {{end}}
-  <div class="card">
-    <header class="card-head"><div><h2>消费端冷却统计</h2>
-      <p>最近 7 天、最多 8192 个匿名自报样本，每个消费方最多保留 1024 个。个人至少 2 次成功才推荐；池子参考值需至少 3 个有足够样本的独立消费方。推荐参与消费端下一周期，不改正在执行的窗口。</p>
-      <p>失败只指明确降级，网络错误不计。最高建议24小时，不保证到点恢复；超过上限的失败会阻止该账号获得更短建议，直到证据过期。这里的推荐不是消费端已学到的固定档位。</p>
-    </div></header>
-    {{if .CooldownStats}}
-    <div class="table-wrap"><table>
-      <thead><tr><th>网关</th><th>来源×匿名账号数</th><th>成功 / 失败</th><th>池子建议</th><th>账号差异与明细</th></tr></thead>
-      <tbody>{{range .CooldownStats}}<tr>
-        <td>{{.Gateway}}</td><td>{{len .Accounts}}</td><td>{{.Successes}} / {{.Failures}}</td>
-        <td>{{if .Recommendation.Seconds}}{{.Recommendation.Seconds}} 秒（{{.Recommendation.Samples}} 样本）{{else}}不足3个具备有效建议的独立消费方{{end}}</td>
-        <td>{{if .AccountDifferences}}观察到档位差异{{else}}尚无充分差异证据{{end}}
-          <details><summary>各匿名账号</summary>{{range .Accounts}}<p>来源 {{.ReporterID}} / {{printf "%.10s" .AccountTag}}：{{.Successes}} 成功 / {{.Failures}} 失败；{{if .Recommendation.Seconds}}建议 {{.Recommendation.Seconds}} 秒{{else if eq .RecommendationReason "failure_above_limit"}}实际静置达到或超过24小时仍失败，暂无可推荐档位{{else}}最高档以内的有效成功样本不足2次{{end}}</p>{{end}}</details>
-        </td>
-      </tr>{{end}}</tbody>
-    </table></div>
-    {{else}}<div class="card-body"><p class="muted">尚无冷却观察样本。只使用自然业务与已有预热结果，不额外打上游探测。</p></div>{{end}}
-  </div>
-  <div class="kpis wide">
-    <a class="kpi" href="#proxies"><b>{{len .Proxies}}</b><span>出口代理</span><small>系统访问上游时使用的代理出口</small><small class="facets" data-facets-of="t-proxies"></small></a>
-    <a class="kpi" href="#owners"><b>{{len .Owners}}</b><span>上传者</span><small>每人名下可以挂好几份凭据</small></a>
-    <a class="kpi" href="#accounts"><b>{{len .Accounts}}</b><span>账号</span><small>托管着凭据、参与探测的账号</small><small class="facets" data-facets-of="t-accounts"></small></a>
-    <a class="kpi" href="#external"><b>{{len .External}}</b><span>外部账号</span><small>借别的账号的接入 key 来取票、池里没有凭据的上游账号</small></a>
-    <a class="kpi" href="#gateways"><b>{{len .Gateways}}</b><span>网关</span><small>探测过程中发现的上游网关，以及各自手上的路由 Cookie</small><small class="facets" data-facets-of="t-gateways"></small></a>
-    <a class="kpi" href="#slots"><b>{{.SlotTotal}}</b><span>账号×网关</span><small>每个账号在各网关上的使用与校验状态</small><small class="facets">
-      {{- with index .SlotVerdicts 0}}<span class="badge ok">正常 {{.}}</span>{{end}}
-      {{- with index .SlotVerdicts 1}}<span class="badge bad">降级 {{.}}</span>{{end}}
-      {{- with index .SlotVerdicts 2}}<span class="badge">未知 {{.}}</span>{{end}}</small></a>
-    <a class="kpi" href="#samples"><b>{{.TotalSamples}}</b><span>采样记录</span><small>探测请求明细（统计范围为最近 {{len .Samples}} 条）</small><small class="facets" data-facets-of="t-samples"></small></a>
-  </div>
 </section>
 
 <section id="tab-proxies">
@@ -157,9 +140,9 @@
   </div>
 </section>
 
-<section id="tab-owners">
-  <div class="card">
-    <header class="card-head"><div><h2>上传者</h2><p>一个人可能托管好几份凭据，总览令牌是他进入 <code>/u/…</code> 的唯一凭证。</p></div></header>
+<section id="tab-owners" data-tab-group="accounts">
+  <details class="card">
+    <summary class="card-head"><div><h2>上传者 · {{len .Owners}}</h2><p>展开管理归属与总览令牌；托管账号列表在下方。</p></div></summary>
     {{if .Owners}}
     <div class="table-wrap"><table id="t-owners" data-grid data-placeholder="搜索名称或令牌">
       <thead><tr><th class="num">ID</th><th>名称</th><th class="num">账号数</th><th>添加时间（UTC）</th><th data-nosort>总览令牌</th><th data-nosort></th></tr></thead>
@@ -180,10 +163,11 @@
     <p class="empty">还没有上传者。</p>
     {{end}}
     <p class="foot">账号专属页 <code>/a/…</code> <strong>刻意不显示</strong>总览令牌：那个页面地址是会被转发出去的，而总览令牌能打开这个人全部账号的页面和接入 key。所以这里是唯一的找回入口——有人丢了令牌，从这张表里给他。</p>
-  </div>
+  </details>
 </section>
 
-<section id="tab-accounts">
+<section id="tab-accounts" data-tab-group="accounts">
+  <div class="actions section-links"><a href="#owners">上传者 {{len .Owners}}</a><a href="#external">外部账号 <span class="n">{{len .External}}</span></a></div>
   <div class="card">
     <header class="card-head"><div><h2>账号</h2><p>池里托管着凭据的账号，一号一张卡；点名称进账号页看请求记录。只来取票、池里没有凭据的在「外部账号」那一页。</p>
       {{- if .Accounts}}{{template "region-legend" (index .Accounts 0).Card.Regions}}{{end}}</div></header>
@@ -198,6 +182,7 @@
           <td class="a-id">{{.ID}}</td>
           <td class="a-name">{{if .ViewToken}}<a class="clip" href="/a/{{.ViewToken}}" title="{{.Label}}（打开账号页）">{{.Label}}</a>{{else}}<span class="clip" title="{{.Label}}">{{.Label}}</span>{{end}}
             {{- if not .Enabled}} <span class="badge bad">已停用</span>{{end}}
+            {{- if eq .Health "effective"}} <span class="badge ok">有效</span>{{else if eq .Health "pending"}} <span class="badge warn">待验证</span>{{else if eq .Health "invalid"}} <span class="badge bad">凭据异常</span>{{end}}
             {{- if .Held}} <span class="badge warn" title="上游 429 把它按住了（额度耗尽或打太猛）。仍是启用状态，到点自己恢复，不用人去点。">上游按住 {{.Held}}</span>{{end}}
             {{- with .Card.Fails}} <a class="badge bad" href="#fails" title="最近几次没给出票，明细在「取票失败」页签">取票失败 {{len .}}</a>{{end}}</td>
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else if .Plan}}<span class="badge">{{.Plan}}</span>{{end}}</td>
@@ -227,7 +212,7 @@
   </div>
 </section>
 
-<section id="tab-external">
+<section id="tab-external" data-tab-group="accounts">
   <div class="card">
     <header class="card-head"><div><h2>外部账号</h2><p>池里没有这些号的凭据：有人拿某个账号的接入 key 替自己别的 Codex 号取票（或对外开放时不带 key 来取），池子按报上来的上游 ID 自动登记一行，记它烧过哪些网关，免得把烧过的再发给它。只接收分发、不参与探测；删掉的话下次取票会重建，烧过的网关记录也跟着丢。</p></div></header>
     {{if .External}}
@@ -262,7 +247,8 @@
 <section id="tab-gateways">
   <div class="card">
     <header class="card-head">
-      <div><h2>网关</h2><p>探测过程中发现的全部网关、各自手上的路由 Cookie，以及实际从哪些国家/城市到达过它（只有这一页看得到，首页只给出口数）。Cookie 内容不在页面显示，只能通过 <code>/cookie</code> 接口获取。</p></div>
+      <div><h2>网关总览</h2><p>库存、来源、实际出口与消费观察集中查看；可交付只代表路由寿命足够，不代表任意消费账号当前满血。</p></div>
+      <a href="/admin/coverage">区域覆盖与探索出口 →</a>
       <form method="post" action="/admin/rescan">
         <button type="submit" class="primary">找新网关</button>
       </form>
@@ -273,23 +259,45 @@
       {{else}}<p class="err">没派出去：{{.Rescan}}</p>{{end}}
     </div>
     {{end}}
-    <div class="card-body"><p class="foot">池子<strong>自己走不出冷启动</strong>：发现扫描必须派要票的人<strong>以外</strong>的账号去
-      （派他自己的话，找到的落点被那一发当场烧掉），所以只有一个账号时它永远挑不出人。
-      这个按钮就是那时候唯一的出路——另一条是再传一份凭据。每踢一次会花掉被派中那个号的一发上游。</p></div>
+    <div class="card-body"><div class="actions"><span class="badge ok">可交付 {{.Supply.Ready}}</span><span class="badge">维护目标 {{.Supply.Target}}</span><span class="badge warn">{{.Supply.WindowMin}}分钟内临期 {{.Supply.Expiring}}</span></div>
+      <p class="foot">“找新网关”会安排真实上游请求，受账号、出口与预算限制；查看本页不会触发探测。消费观察保留7天，unknown单列；冷却报告和接触轮次是不同分母，不能相加。</p></div>
     {{if .Gateways}}
     <div class="table-wrap"><table id="t-gateways" data-grid data-natsort data-size="100"
-        data-facets="live:Cookie 有效:ok|expired:Cookie 已过期|none:没有 Cookie" data-placeholder="搜索网关、国家或城市">
-      <thead><tr><th>网关</th><th>Cookie 剩余</th><th>铸票账号</th><th class="num">出口</th><th>到达过的国家/城市</th><th>首次发现（UTC）</th></tr></thead>
+        data-facets="ready:可交付:ok|short:寿命不足:warn|expired:已过期|none:无票" data-placeholder="搜索网关、账号、国家或模型">
+      <thead><tr><th>网关 / 路由状态</th><th>路由剩余</th><th>铸票账号</th><th class="num">出口</th><th>到达过的国家/城市</th><th>消费观察</th><th>首次发现（UTC）</th></tr></thead>
       <tbody>
       {{range .Gateways}}
         <tr data-facet="{{.PairState}}">
-          <td class="mono">{{.Name}}</td>
-          <td>{{if eq .PairState "live"}}{{.PairLeft}}{{else if eq .PairState "expired"}}<span class="muted">已过期</span>{{else}}<span class="muted">没有</span>{{end}}</td>
+          <td><b class="mono">{{.Name}}</b><div class="sub">{{if eq .PairState "ready"}}<span class="badge ok">可交付</span>{{else if eq .PairState "short"}}<span class="badge warn">寿命不足</span>{{else if eq .PairState "expired"}}<span class="badge">已过期</span>{{else}}<span class="badge">无票</span>{{end}}</div></td>
+          <td>{{if .PairLeft}}{{.PairLeft}}{{else}}—{{end}}</td>
           <td>{{if .MintedBy}}{{.MintedBy}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td class="num" title="请求过的出口：{{.ExitLabels}}">{{.Exits}}</td>
           <td class="text">{{if .Places}}<details class="places"><summary>{{range $i, $p := .Places}}{{if $i}} · {{end}}{{$p.Country}}{{if $p.Known}}（{{$p.Known}} 城）{{end}}{{end}}</summary>
             {{- range .Places}}<div class="sub"><b>{{.Country}}</b>：{{range $i, $c := .Cities}}{{if $i}}、{{end}}{{$c}}{{end}}</div>{{end}}</details>
             {{- else}}<span class="muted">—</span>{{end}}</td>
+          <td class="gateway-observation">
+            <div>满血 {{.Full}} / 刷新 {{.Refreshed}} / 未知 {{.Unknown}}</div>
+            <div class="sub">冷却参考：{{if .CooldownLabel}}{{.CooldownLabel}}{{else}}暂无池级建议{{end}}</div>
+            {{if or .Contacts .Cooldown.Samples}}
+            <details><summary>分层样本与冷却明细</summary>
+              <div class="observation-detail">
+                <h3>消费端冷却统计</h3>
+                {{with .Cooldown}}{{if .Samples}}
+                <p>成功 {{.Successes}} / 失败 {{.Failures}} · 来源×匿名账号数 {{len .Accounts}}</p>
+                <p>{{if .Recommendation.Seconds}}池子建议 {{.Recommendation.Seconds}} 秒（{{.Recommendation.Samples}} 样本）{{else}}不足3个具备有效建议的独立消费方{{end}}；不保证到点恢复。</p>
+                <p>{{if .AccountDifferences}}观察到档位差异{{else}}尚无充分差异证据{{end}}</p>
+                {{range .Accounts}}<p class="sub">来源 {{.ReporterID}} / {{printf "%.10s" .AccountTag}}：{{.Successes}} 成功 / {{.Failures}} 失败；{{if .Recommendation.Seconds}}建议 {{.Recommendation.Seconds}} 秒{{else if eq .RecommendationReason "failure_above_limit"}}实际静置达到或超过24小时仍失败，暂无可推荐档位{{else}}最高档以内的有效成功样本不足2次{{end}}</p>{{end}}
+                {{else}}<p class="muted">尚无冷却观察样本。</p>{{end}}{{end}}
+                <h3>消费接触分层统计</h3>
+                <p class="foot">以下按身份、模型、判据、来源和间隔分开。时长仅为已结束窗口均值，有截尾偏差；不是有效期承诺。</p>
+                {{range .Contacts}}<div class="observation-group">
+                  <b>{{.Model}}</b> · {{.Criterion}} · {{.Source}} / {{.First}} · 间隔 {{.Interval}}
+                  <p class="sub">#{{.ReporterID}} / {{printf "%.10s" .AccountTag}} · 满血 {{.Full}} / 刷新 {{.Refreshed}} / 未知 {{.Unknown}}</p>
+                  <p class="sub">观测时长：{{if .WindowSamples}}{{.WindowMeanMS}}ms / {{.WindowSamples}}样本{{else}}待统计{{end}}</p>
+                </div>{{else}}<p class="muted">暂无新协议接触样本；不把旧冷却报告当作完整接触率分母。</p>{{end}}
+              </div>
+            </details>{{end}}
+          </td>
           <td><span class="mono">{{.FirstSeen}}</span>{{if .FirstSeenBy}}<div class="sub">{{.FirstSeenBy}}</div>{{end}}</td>
         </tr>
       {{end}}
@@ -301,17 +309,8 @@
   </div>
 </section>
 
-<section id="tab-slots">
-  <div class="card">
-    <header class="card-head"><div><h2>消费接触分层统计</h2><p>每个匿名消费身份×网关的一轮接触只计一次。full / refreshed / unknown 分列；unknown 不算失败。按实际间隔、模型、判据、来源和本地首次跟踪状态分开，不全局拉黑或缩短冷却。时长仅含已观察到结束的满血窗口，有截尾偏差。</p></div></header>
-    {{if .ContactStats}}
-    <div class="table-wrap"><table data-grid data-size="25" data-placeholder="搜索网关、模型或判据">
-      <thead><tr><th>网关</th><th>报告者 / 匿名身份</th><th>模型 / 判据</th><th>来源 / 首次状态</th><th>实际间隔</th><th>满血 / 刷新 / 未知</th><th>观测时长均值 / 样本</th></tr></thead>
-      <tbody>{{range .ContactStats}}<tr><td>{{.Gateway}}</td><td>#{{.ReporterID}} / {{printf "%.10s" .AccountTag}}</td>
-        <td>{{.Model}}<div class="sub">{{.Criterion}}</div></td><td>{{.Source}} / {{.First}}</td><td>{{.Interval}}</td>
-        <td>{{.Full}} / {{.Refreshed}} / {{.Unknown}}</td><td>{{if .WindowSamples}}{{.WindowMeanMS}}ms / {{.WindowSamples}}{{else}}待统计{{end}}</td></tr>{{end}}</tbody>
-    </table></div>{{else}}<p class="empty">暂无新协议样本；不把旧冷却报告当作完整接触率分母。</p>{{end}}
-  </div>
+<section id="tab-slots" data-tab-group="records">
+  <div class="actions section-links"><a href="#samples">采样记录</a><a href="#fails">取票失败</a><a href="#gateways">按网关查看消费统计 →</a></div>
   <div class="card">
     <header class="card-head"><div><h2>账号×网关 接触记录</h2><p>按账号汇总：碰过几个网关、其中几个近期取过票或还在退避、最近一次校验结果。<strong>点开</strong>看每个网关的明细。</p></div></header>
     {{if .SlotAccounts}}
@@ -335,12 +334,12 @@
     {{else}}
     <p class="empty">暂无数据。</p>
     {{end}}
-    <p class="foot">近期取过：交付过、离上次交付还不到「账号×网关冷却」那个时长。<strong>这是读数不是闸</strong>——池子照样会把它再派给这个账号，躲不躲要客户端自己按账本决定。退避中：校验未通过或请求失败后，该账号在这个网关上暂停使用，<strong>这个才是闸</strong>。</p>
-    <p class="foot">这是一本<strong>台账，既不是锁也不再是闸</strong>：每一行记的是「这个账号已经碰过这个网关了」，供人和客户端查。2026-10-03 起池子<strong>不</strong>按它拒发——消费和账本归客户端记，池子只守一条：它自己在一个满血窗口（183 秒）内拿这个号的凭据打过上游的那些网关，不发。路由 Cookie 本身不互斥，同一张可以同时发给好几个账号。</p>
+    <p class="foot">近期取过：交付过、离上次交付还不到「历史统计窗口」那个时长。<strong>这是读数不是闸</strong>，消费冷却由客户端执行；退避中才表示该账号在该网关暂不可选。校验结果是历史最后一次读数，不是当前健康保证。</p>
+    <p class="foot">历史接触数量和“近期取过”不阻止交付；服务端用该账号铸票后的短期排除（183秒）和真实失败退避仍会拦截。消费端自己的冷却独立执行。路由 Cookie 不互斥，同一张可以交给不同账号。</p>
   </div>
 </section>
 
-<section id="tab-samples">
+<section id="tab-samples" data-tab-group="records">
   <div class="card">
     <header class="card-head"><div><h2>采样记录</h2><p>探测请求明细，按时间倒序排列。显示最近 {{len .Samples}} 条，共 {{.TotalSamples}} 条。</p></div></header>
     {{if .Samples}}
@@ -367,7 +366,7 @@
   </div>
 </section>
 
-<section id="tab-fails">
+<section id="tab-fails" data-tab-group="records">
   <div class="card">
     <header class="card-head"><div><h2>取票失败</h2><p><code>/cookie</code> 没给出票的那几次，按时间倒序。客户端那头只会看到一个 502/503，原因在这里。</p></div></header>
     {{if .Fails}}
@@ -394,55 +393,73 @@
 <section id="tab-config">
   {{with .Config}}
   <div class="card">
-    <header class="card-head"><div><h2>配置</h2>
+    <header class="card-head"><div><h2>运行设置</h2>
       {{if .ReadOnly}}<p>这个实例没接配置文件，这一节只能看不能改。</p>
-      {{else}}<p>改完<strong>立即生效，不用重启</strong>。配置文件：<code>{{.Path}}</code></p>{{end}}
+      {{else}}<p>保存后热加载，后续操作读取新值；不会中断在途请求，也不保证立即补满库存。</p>{{end}}
     </div></header>
     <div class="card-body">
       {{if .Note}}<div class="note info"><p>{{.Note}}</p></div>{{end}}
       {{if .Err}}<p class="err" role="alert">{{.Err}}</p>{{end}}
       {{if not .ReadOnly}}
-      <form method="post" action="/admin/config">
-        <fieldset>
-          <legend>模型 <span class="hint">勾中的就是候选，<strong>第一个是默认</strong>；顺序按当前配置里的来</span></legend>
-          <div class="choices">
-          {{range .AllModels}}
-            <label class="choice"><input type="checkbox" name="models" value="{{.Name}}"{{if .Selected}} checked{{end}}>
-              <span class="mono">{{.Name}}</span></label>
-          {{end}}
-          </div>
-        </fieldset>
-        <div class="fields">
-          <label>对外根地址 <span class="hint">填进 sub2api 的那个地址，如 <code>https://pool.example.com</code>。只要协议和域名，不要路径。留空则页面上写「问管理员要」</span>
-            <input name="public_base_url" inputmode="url" autocomplete="off" spellcheck="false" value="{{.PublicBaseURL}}"></label>
-          <label>别的模型名 <span class="hint">上面没列的手打，逗号或换行分隔</span>
-            <input name="models_extra" autocomplete="off" spellcheck="false"></label>
-          <label>每账号每国家尝试次数 <span class="hint">滚动1小时，0 = 默认2。绑定、查询出口和请求失败也计次；同国不同城市共用。扫描、铸票、续票和交付验证共用此预算</span>
-            <input name="upstream_per_region_hour" inputmode="numeric" value="{{.UpstreamPerRegionHour}}"></label>
-          <label>每账号每小时总尝试次数 <span class="hint">0 = 默认50，独立于国家或大区数量；重启不重置已用次数</span>
-            <input name="upstream_per_account_hour" inputmode="numeric" value="{{.UpstreamPerAccountHour}}"></label>
-          <label>账号×网关冷却（分钟） <span class="hint">0 = 用默认值 240。<strong>只管读数与统计窗口，不再拦交付</strong>（2026-10-03 起消费冷却交给客户端账本）：九区格子的「最近多久取过」和上面那张接触记录都按它算。实测真实恢复时长 30 分钟到 3 小时都见过</span>
-            <input name="slot_cooldown_minutes" inputmode="numeric" value="{{.SlotCooldownMinutes}}"></label>
-          <label>一次取票最多试几个网关 <span class="hint">0 = 用默认值 2。<strong>交付前验证开着时</strong>每多试一个就多花一发上游（state-echo），关着时试的都是已有活票的网关、一发都不打</span>
-            <input name="max_tries_per_deliver" inputmode="numeric" value="{{.MaxTriesPerDeliver}}"></label>
-          <label>预铸富余张数 <span class="hint">0 = 不预铸、全按需（最省上游请求）。默认 2。目标张数 = 最忙的号用过的张数 + 这个数，最多 190（上游网关总共约 190–201 个）。填超过 190 = 停止预铸</span>
-            <input name="spare_target" inputmode="numeric" value="{{.SpareTarget}}"></label>
-          <label>最低活票数 <span class="hint">0 = 不设下界（默认）。目标张数取「最忙的号用过的张数 + 富余」和这个数的<strong>较大者</strong>，所以池子空闲时也不会塌下去、下一个人来不用现等铸票。富余是相对量，这个是绝对底线；填超过 190 按 190 算，<strong>不会</strong>像富余那样变成「停止预铸」</span>
-            <input name="min_pairs" inputmode="numeric" value="{{.MinPairs}}"></label>
-          <label>对外开放门槛（托管账号数） <span class="hint">托管账号少于这个数就只服务上传者。按账号数而不按活 pair 数：按需铸票的池子不囤票。默认 2（冗余底线）——实测单个账号就能摸到整张网关表（105/105），触达面不是瓶颈，只有「一个号被停用或被 429 按住就整池停摆」才是</span>
-            <input name="min_accounts" inputmode="numeric" value="{{.MinAccounts}}"></label>
+      <form method="post" action="/admin/config" class="settings-form">
+        <div class="settings-grid">
+          <fieldset class="setting-group">
+            <legend>接入与模型</legend>
+            <label>对外根地址 <span class="hint">供客户端填写；只填协议与域名，留空则不展示。</span>
+              <input name="public_base_url" type="url" autocomplete="off" spellcheck="false" placeholder="https://pool.example.com" value="{{.PublicBaseURL}}"></label>
+            <div class="field-label">候选模型 <span class="hint">按下方顺序，首个勾选项作为默认；保留当前配置顺序。</span></div>
+            <div class="choices model-choices">{{range .AllModels}}
+              <label class="choice"><input type="checkbox" name="models" value="{{.Name}}"{{if .Selected}} checked{{end}}><span class="mono">{{.Name}}</span></label>
+            {{end}}</div>
+            <label>自定义模型 <span class="hint">追加到候选末尾，以逗号或空格分隔。</span>
+              <input name="models_extra" autocomplete="off" spellcheck="false" placeholder="可留空"></label>
+          </fieldset>
+          <fieldset class="setting-group">
+            <legend>请求预算</legend>
+            <p class="hint">扫描、新铸、续票与额外验证共用。绑定、Geo或请求失败也计次，重启不重置。</p>
+            <label>每账号 × 每国家 <span class="hint">滚动1小时；同国城市共桶，不是每大区。</span>
+              <div class="input-unit"><input type="number" min="0" max="100000" name="upstream_per_region_hour" value="{{.UpstreamPerRegionHour}}"><span>次 / 小时</span></div></label>
+            <label>每账号总上限 <span class="hint">独立于国家数，扩区不扩大这个总额。</span>
+              <div class="input-unit"><input type="number" min="0" max="100000" name="upstream_per_account_hour" value="{{.UpstreamPerAccountHour}}"><span>次 / 小时</span></div></label>
+            <p class="foot">填0分别使用默认2次 / 50次，不代表无限。</p>
+          </fieldset>
+          <fieldset class="setting-group">
+            <legend>库存恢复与续票</legend>
+            <div class="fields">
+              <label>需求富余 <span class="hint">0–100；0不关闭已知网关恢复。</span>
+                <div class="input-unit"><input type="number" min="0" max="100" name="spare_target" value="{{.SpareTarget}}"><span>张</span></div></label>
+              <label>最低目标 <span class="hint">0–190；0仅表示不设这项下界。</span>
+                <div class="input-unit"><input type="number" min="0" max="190" name="min_pairs" value="{{.MinPairs}}"><span>张</span></div></label>
+            </div>
+            <label class="choice setting-toggle"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}><span>尝试续票<span class="hint">来源账号经静态出口续临期票；漂移会退避，不保证永久续住。</span></span></label>
+            <details><summary>目标如何计算</summary><p class="foot">取「近期最忙消费者需求＋富余」「最低目标」「已知可恢复网关数」的较大者，封顶190（实现上限，不是上游全集）。先补缺失已知网关，再续临期票；有需求且至少两个可用账号才维护，始终受预算限制。</p></details>
+          </fieldset>
+          <fieldset class="setting-group">
+            <legend>交付验证</legend>
+            <label class="choice setting-toggle"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}><span>池端交付前验证<span class="hint">用消费者凭据做state-echo；关闭时交付标记为未验证，客户端保护独立。</span></span></label>
+            <label>单次交付候选上限 <span class="hint">0 = 默认2；表单最高10。</span>
+              <div class="input-unit"><input type="number" min="0" max="10" name="max_tries_per_deliver" value="{{.MaxTriesPerDeliver}}"><span>个网关</span></div></label>
+            <details><summary>请求成本与边界</summary><p class="foot">候选验证通常需要取state＋echo两发；已有可用state时可能只需一发。现铸另计，均受相同预算限制。验证提前开始接触计时；开启池端验证后不能把已验证交付作为“未使用”归还。匿名路径无消费者凭据，不能执行该验证。</p></details>
+          </fieldset>
+          <fieldset class="setting-group">
+            <legend>公开访问</legend>
+            <label class="choice setting-toggle"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}><span>允许无接入Key取票<span class="hint">仍须达到下方账号门槛；只交付现成票。</span></span></label>
+            <label>开放资格账号门槛 <span class="hint">0 = 默认2，不按当前活票数判断。</span>
+              <div class="input-unit"><input type="number" min="0" max="100000" name="min_accounts" value="{{.MinAccounts}}"><span>个</span></div></label>
+            <p class="foot">沿用原有门槛口径：启用、有凭据、成功铸过票。它不额外检查当前AT期限，因此可能与顶部“有效账号”不同；本次界面整理不改变开放规则。</p>
+          </fieldset>
+          <details class="setting-group">
+            <summary>高级 · 统计与生效范围</summary>
+            <label>历史统计窗口 <span class="hint">原“账号×网关冷却”；只影响近期记录展示，不控制消费冷却。0 = 默认240分钟。</span>
+              <div class="input-unit"><input type="number" min="0" max="10080" name="slot_cooldown_minutes" value="{{.SlotCooldownMinutes}}"><span>分钟</span></div></label>
+            <p class="foot">配置文件：<code>{{.Path}}</code></p>
+            <p class="foot">密钥、监听、存储路径等启动项不在此编辑。代理追加与启停在“出口”页；重排、改地址或删除仍需维护已有会话并按部署流程处理。</p>
+          </details>
         </div>
-        <label class="choice"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}>
-          <span>票富裕时允许没上传凭据的人取</span></label>
-        <label class="choice"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}>
-          <span>给快到点的票续命 <span class="hint">用原铸票账号和票的 <code>__cflb</code> 经静态出口续票，优先稀有网关；落点可能漂移，不保证长期续住。每张消耗一发真实请求，与探索共享账号总预算；连续漂移会退避</span></span></label>
-        <label class="choice"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}>
-          <span>交付前用 state-echo 验一次满血 <span class="hint">每次交付多花两发上游（和铸票共用每区每小时那份预算）。不会烧掉窗口，只是让窗口提前开始计时</span></span></label>
-        <div class="actions"><button type="submit" class="primary">保存并立即生效</button></div>
+        <div class="settings-save"><span class="muted">仅修改本表配置项，不触发全量打票。</span><button type="submit" class="primary">保存设置</button></div>
       </form>
       {{end}}
     </div>
-    <p class="foot"><strong>出口代理、密钥、监听地址不在这儿改。</strong>代理里是 socks 口令，放进网页表单等于把凭据搬进浏览器和 HTTP 日志；而且 <code>proxies</code> 的下标编进了 sid，运行中换顺序会让已经发出去的 sid 指向另一条出口。那几项改配置文件 + 重启。</p>
   </div>
   {{end}}
 </section>

@@ -168,17 +168,17 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 0 = 用默认值（types.SlotCooldown）。上限一周：再大就不是「冷却」而是拉黑了。
+	// 历史显示窗口：0使用默认值，上限一周；不再控制交付冷却。
 	cooldown, err := atoiField(r, "slot_cooldown_minutes", 0, 7*24*60)
 	if err != nil {
 		return nil, err
 	}
-	// 每多试一个网关就多花一发上游，所以上限卡得很死。
+	// 候选切换可能产生额外取state/echo请求，保留现有有界上限。
 	tries, err := atoiField(r, "max_tries_per_deliver", 0, 10)
 	if err != nil {
 		return nil, err
 	}
-	// 0 是合法值：全按需、不预铸（见 config.Config.SpareTarget）。
+	// 0不增加需求富余；已知网关恢复与最低目标仍可能维护库存。
 	spare, err := atoiField(r, "spare_target", 0, 100)
 	if err != nil {
 		return nil, err
@@ -201,8 +201,7 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 		"public_base_url":           strings.TrimSpace(r.FormValue("public_base_url")),
 		"upstream_per_region_hour":  perRegionHour,
 		"upstream_per_account_hour": perAccountHour,
-		// 两个开关默认关，理由见 config.Config 上的字段注释（都是「花一个满血窗口
-		// 换一个读数」）。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
+		// 两个开关默认关。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
 		// 不能靠「缺键不动」。
 		"verify_full_at_deliver": truthy(r.FormValue("verify_full_at_deliver")),
 		"renew_pairs":            truthy(r.FormValue("renew_pairs")),

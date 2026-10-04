@@ -45,10 +45,7 @@ type poolView struct {
 	Upload uploadForm
 	// 对外开放状态是承诺，得让人看得见。
 	//
-	// OpenAccounts/Threshold 数的是**托管账号数**，不是活 pair 数——按需铸票的池子
-	// 不囤票，按货架存量判等于永远关着（见 types.AccountsForContinuous）。
-	// 和下面那个 Accounts 是同一个数，分开两个字段是因为一个在讲「开放门槛」、
-	// 另一个在讲「池子规模」，哪天门槛改成别的判据时不该牵连那张概览卡片。
+	// OpenAccounts按调度原有开放资格统计，不等于展示侧的凭据有效性读数。
 	PublicEnabled bool
 	PublicOpen    bool
 	OpenAccounts  int
@@ -78,7 +75,7 @@ type poolView struct {
 
 	// ReadyCount 在服务端算好。原来这张卡片靠 JS 数表格行，关掉 JS 就只剩「—」。
 	ReadyCount int
-	Accounts   int
+	Health     accountHealth
 	Model      string
 	Effort     string
 	// OwnerToken 非空 = 这个浏览器带着身份 cookie，直接给一个进总览页的按钮。
@@ -94,33 +91,11 @@ type poolView struct {
 	Supply supplyLedger
 }
 
-// supplyLedger 是可交付网关数的收支账，**全部现算、不留历史**。
-//
-// 为什么页面上非得有它：可交付网关数一天里从 96 滑到 53，页面上只有那一个瞬时数，
-// 看的人无从判断是池子坏了还是正常潮汐——只能猜。而它的涨落机制其实很简单：
-// 票到期是唯一的退场途径（寿命 PairLifetime，剩余不足 DeliverFloor 就不再算可交付
-// ⇒ 一张票只在这个数里待 55 分钟），所以这个数 = 铸入速率 × 55 分钟。
-// 把同一个时长窗口里「要掉下去几张」和「刚补进来几张」并排放，方向就自明了。
-//
-// **刻意不算「过去 N 分钟退场了几张」**：一个网关在 store 里只有一张 pair，补了新票
-// 旧票就被覆盖掉 ⇒ 那个数既漏记又会和「铸入」重复计一次同一个网关，净值不可信。
-// 现状里两个都成立的读数只有「现在手上这些票什么时候掉下去」和「哪几张是刚铸的」。
+// supplyLedger keeps inventory and request activity separate, without forecasting.
 type supplyLedger struct {
-	// WindowMin 是前后两个数共用的窗口长度（分钟），模板要照它写文案。
-	WindowMin int
-	// Expiring = 可交付的票里，窗口内就会跌破 DeliverFloor 的张数（不补就会掉下去）。
-	Expiring int
-	// Minted = 窗口内新铸出来的票的张数（按 __cflb 的死期倒推铸出时刻）。
-	Minted int
-	// Target 是预铸的目标深度（sched.PairTarget）。比可交付数高 = 池子还在往上补。
-	Target int
-	// 下面三个是算给人看的时长（分钟）：票寿命、不再算可交付的剩余门槛，以及
-	// 两者之差——一张票真正待在「可交付」里的时长。
-	// 模板里**不许**把它们写成字面量：Go 模板没有算术，改了常量页面会继续说旧数，
-	// 而「页面上的 60 分钟」正是读者推算涨落的依据。
-	LifeMin  int
-	FloorMin int
-	ReadyMin int
+	WindowMin, FloorMin, Ready, Expiring, Target, Gap int
+	Attempts, Landed                                  int
+	Unavailable                                       bool
 }
 
 // poolMintRow 是公开页「铸票记录」里的一行。
@@ -338,6 +313,8 @@ type adminView struct {
 	MintAllFinished  string
 	CooldownStats    []types.CooldownStats
 	ContactStats     []types.ContactStats
+	Health           accountHealth
+	Supply           supplyLedger
 
 	base
 	Proxies    []proxyRow
@@ -383,6 +360,7 @@ type accountRow struct {
 	Label   string
 	Plan    string
 	Enabled bool
+	Health  string
 	// OwnerID 是归属的上传者。0 = 匿名占位行（不是谁托管的）。
 	OwnerID int64
 	// DisabledReason 让管理员一眼看出是「上游否决」还是「上传者自己关的」。
@@ -438,12 +416,16 @@ type adminGatewayRow struct {
 	Exits       int    // 请求过的出口数，和首页那个「出口 N」是同一个数
 	ExitLabels  string // 那几个出口本身，给悬停
 	// 这个网关手上那张路由 Cookie（原来单独一个页签，一个网关最多一张，就并进来了）。
-	// PairState 是筛选用的 live / expired / none；cookie 本体一个字都不往页面上放。
+	// PairState: ready / short / expired / none; never expose cookie contents.
 	PairState string
 	PairLeft  string
 	MintedBy  string
 	// Places 是实际从哪些国家/城市到达过这个网关，只给管理员看（首页只给出口数）。
-	Places []gatewayPlace
+	Places                   []gatewayPlace
+	Contacts                 []types.ContactStats
+	Full, Refreshed, Unknown int
+	Cooldown                 types.CooldownStats
+	CooldownLabel            string
 }
 
 // gatewayPlace 是到达过某个网关的一个国家，和从那个国家出去的城市。

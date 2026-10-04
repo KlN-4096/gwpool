@@ -15,3 +15,5 @@
 - 接触报告的Owner ReporterID与旧credential ReporterID分域；admin/root不能作为独立消费者上报。7天/8192总/每reporter1024，unknown不计有结论分母，窗口结束补报不得改初始身份/结论。
 - OAuth用`Tokens`保留AT/轮换RT/ID，`ClaimsFor`统一输入/刷新前后身份一致性；AT缺ID可由ID token或显式真实ID补齐，缺AT的RT输入也适用。ID token只补身份/plan/email，不能提供AT寿命。
 - 上传最多刷新一次，后台刷新写回前同样校验身份和AT有效期；OAuth错误仅固定类别/HTTP状态，原响应body/description不得进入日志或页面，Tokens格式化打码。回归见oauth/upload_identity/refresh测试。
+- 页面“有效账号”=启用、有凭据、本地身份/已知期限无异常且RegionMint成功过；临时429计入有效并单列，不声称此刻可调度。无exp保留历史证据口径；展示不修改原匿名开放资格或调度。
+- 库存快照与请求样本分母独立，不由cflb期限倒推铸票或预测涨跌；网关接触full/refreshed/unknown保留模型等分层，不与冷却报告数量相加。
