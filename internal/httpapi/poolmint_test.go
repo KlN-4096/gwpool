@@ -70,12 +70,12 @@ func TestPoolShowsMaskedMintHistory(t *testing.T) {
 func TestMaskLabel(t *testing.T) {
 	for in, want := range map[string]string{
 		"sample-account@example.test": "sa***@example.test",
-		"ab@gmail.com":             "ab***@gmail.com",
-		"a@gmail.com":              "a***@gmail.com",
-		"朋友的号":                     "朋友***",
-		"pro1":                     "pr***",
-		"":                         "***",
-		"   ":                      "***",
+		"ab@gmail.com":                "ab***@gmail.com",
+		"a@gmail.com":                 "a***@gmail.com",
+		"朋友的号":                        "朋友***",
+		"pro1":                        "pr***",
+		"":                            "***",
+		"   ":                         "***",
 		// 没有域名的 @ 不该留一个裸 @ 在页面上。
 		"someone@": "so***",
 	} {
