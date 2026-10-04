@@ -17,3 +17,4 @@
 - 上传最多刷新一次，后台刷新写回前同样校验身份和AT有效期；OAuth错误仅固定类别/HTTP状态，原响应body/description不得进入日志或页面，Tokens格式化打码。回归见oauth/upload_identity/refresh测试。
 - 页面“有效账号”=启用、有凭据、本地身份/已知期限无异常且RegionMint成功过；临时429计入有效并单列，不声称此刻可调度。无exp保留历史证据口径；展示不修改原匿名开放资格或调度。
 - 库存快照与请求样本分母独立，不由cflb期限倒推铸票或预测涨跌；网关接触full/refreshed/unknown保留模型等分层，不与冷却报告数量相加。
+- `GET /gateways?model=…`每次从7天接触报告计算全池priority，仅同model/foreground/state-echo-v1且full或refreshed，至少5样本；未知/业务复验不进分母，未达门槛不下发。与已有个人分层并存，不等同能力证明；清单和单/批交付同时给历史机房国家，未知留空，不按请求出口猜测。

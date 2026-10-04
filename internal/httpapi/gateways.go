@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"gwpool/internal/contact"
+	"gwpool/internal/coverage"
 	"gwpool/internal/types"
 )
 
@@ -26,6 +28,12 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	recommendations := s.cooldownRecommendations(r, now)
 	contactStats := s.contactStats(r, now)
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if model != "" && !validContactToken(model) {
+		s.badRequest(w, http.StatusBadRequest, "model 格式错误")
+		return
+	}
+	priorities := contact.Priorities(s.st.ContactReports(), model, now)
 	pairs := s.effectivePairs(now)
 	// 按网关名收一份这个账号自己的槽位：槽位表的键格式归 store 所有，
 	// 这里只认 Slot 自己带的两个字段，免得为一个拼键函数把 store 拖进来。
@@ -45,10 +53,12 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		ValidForS int  `json:"valid_for_s"`
 		// 刻意没有 leased：一张 pair 同时给几个号用是允许的（见 types.Pair 的注释），
 		// 「被别人占着」这个状态不存在了。
-		UsedByYou  bool                          `json:"used_by_you"`
-		LastUsedAt string                        `json:"last_used_at,omitempty"`
-		Cooldown   *types.CooldownRecommendation `json:"cooldown,omitempty"`
-		Contacts   []types.ContactStats          `json:"contacts,omitempty"`
+		UsedByYou         bool                          `json:"used_by_you"`
+		LastUsedAt        string                        `json:"last_used_at,omitempty"`
+		Cooldown          *types.CooldownRecommendation `json:"cooldown,omitempty"`
+		Contacts          []types.ContactStats          `json:"contacts,omitempty"`
+		Priority          *types.GatewayPriority        `json:"priority,omitempty"`
+		DatacenterCountry string                        `json:"datacenter_country,omitempty"`
 	}
 	out := struct {
 		Account string `json:"account"`
@@ -80,6 +90,10 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Live++
 		it := row{Name: name, PairReady: true, ValidForS: int(left.Seconds()), Contacts: contactStats[name]}
+		it.DatacenterCountry = coverage.DatacenterCountry(name)
+		if priority, ok := priorities[name]; ok {
+			it.Priority = &priority
+		}
 		if recommendation, ok := recommendations[name]; ok {
 			it.Cooldown = &recommendation
 		}

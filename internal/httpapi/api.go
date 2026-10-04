@@ -32,6 +32,7 @@ import (
 	"gwpool/internal/config"
 	"gwpool/internal/contact"
 	"gwpool/internal/cooldown"
+	"gwpool/internal/coverage"
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
@@ -1621,6 +1622,7 @@ func (s *Server) noteVia(ref string, via int64) {
 // 包一层而不是改 types：那边签名是冻结的。嵌入是匿名字段，JSON 会摊平成同一层。
 type deliveryResponse struct {
 	types.Delivery
+	DatacenterCountry string `json:"datacenter_country,omitempty"`
 	// TTLIsAdvisory 恒为 true：valid_for_s 是**建议值**不是承诺。
 	// 该不该换 pair 由客户端判断——只有它知道自己那一发对不对劲，
 	// 判断该换了就带 force=1 再来一次。
@@ -1651,8 +1653,9 @@ type batchResponse struct {
 
 func (s *Server) delivered(d types.Delivery) deliveryResponse {
 	return deliveryResponse{Delivery: d, TTLIsAdvisory: true,
-		CookieVersion:  types.CookieVersion(d.Cookie),
-		PairRemainingS: s.pairRemainingS(d)}
+		DatacenterCountry: coverage.DatacenterCountry(d.Gateway),
+		CookieVersion:     types.CookieVersion(d.Cookie),
+		PairRemainingS:    s.pairRemainingS(d)}
 }
 
 // pairRemainingS 算交付出去这张 pair 的剩余寿命：向下取整到秒，负数钳 0。

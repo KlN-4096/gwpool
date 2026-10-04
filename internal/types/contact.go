@@ -65,3 +65,9 @@ type ContactStats struct {
 	WindowSamples int    `json:"window_samples"`
 	WindowMeanMS  int64  `json:"window_mean_ms"`
 }
+
+type GatewayPriority struct {
+	Model   string `json:"model"`
+	Full    int    `json:"full"`
+	Samples int    `json:"samples"`
+}

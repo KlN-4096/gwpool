@@ -44,6 +44,12 @@ var datacenterDirectory = func() map[string]datacenterLocation {
 	return out
 }()
 
+// DatacenterCountry is historical gateway geography, not the minting proxy's
+// exit country. Missing directory entries remain unknown.
+func DatacenterCountry(name string) string {
+	return datacenterDirectory[name].Country
+}
+
 type DatacenterGroup struct {
 	Country, City       string
 	Total, Found, Ready int
