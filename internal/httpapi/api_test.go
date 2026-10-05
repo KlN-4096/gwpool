@@ -2043,8 +2043,9 @@ func TestAdminGatewaysShowPlacesAndPair(t *testing.T) {
 	gw, _, _ = strings.Cut(gw, "<section")
 	for _, want := range []string{
 		// 「城市不明」列在明细里，但不算进几城。
-		"IT（2 城） · SA</summary>", "Milan、Rome", "（城市不明）",
-		`<td>#1 pro1</td>`, `<td>#2 朋友的号</td>`, "#77（已删除）",
+		"IT（2 城）", "Milan、Rome", "（城市不明）",
+		`title="#1 pro1"`, `title="#2 朋友的号"`, "#77（已删除）",
+		`data-size="25"`, `id="gateway-detail-dialog"`, `class="gateway-detail-content"`,
 		`data-facet="ready"`, `data-facet="expired"`, `data-facet="none"`,
 	} {
 		if !strings.Contains(gw, want) {

@@ -53,7 +53,8 @@ func (s *Store) AddCooldownReport(report types.CooldownReport) (bool, error) {
 		next = append([]types.CooldownReport(nil), next[len(next)-cooldown.MaxReports:]...)
 	}
 	s.st.CooldownReports = next
-	if err := s.save(); err != nil {
+	updates, dropped := diffReports(before, next, cooldownKey)
+	if err := s.save(stateChange{Cooldowns: updates, DropCooldowns: dropped}); err != nil {
 		s.st.CooldownReports = before
 		return false, err
 	}

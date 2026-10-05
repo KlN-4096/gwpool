@@ -28,12 +28,32 @@ import (
 
 func main() {
 	path := flag.String("config", "config.json", "配置文件路径")
+	checkpointOnly := flag.Bool("checkpoint-only", false, "仅重放并持久化状态快照后退出；必须先停服务")
 	flag.Parse()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	if err := run(*path, log); err != nil {
+	runCommand := run
+	if *checkpointOnly {
+		runCommand = checkpointOnlyRun
+	}
+	if err := runCommand(*path, log); err != nil {
 		log.Error("退出", "err", err)
 		os.Exit(1)
 	}
+}
+
+// Offline maintenance only: no minter, listener or background scheduler exists.
+// Deployment rollback uses this before switching to a snapshot-only old binary.
+func checkpointOnlyRun(path string, _ *slog.Logger) error {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	checkpointErr := st.Checkpoint()
+	return errors.Join(checkpointErr, st.Close())
 }
 
 // newMinter 按配置搭铸票客户端。
@@ -49,10 +69,10 @@ func newMinter(cfg config.Config, live *config.Live, log *slog.Logger) *mint.Cli
 		Fingerprint: cfg.Fingerprint,
 		Model:       cfg.Model,
 
-		UpstreamPerRegionHour: cfg.UpstreamPerRegionHour,
+		UpstreamPerRegionHour:  cfg.UpstreamPerRegionHour,
 		UpstreamPerAccountHour: cfg.UpstreamPerAccountHour,
-		Live:                  live,
-		Log:                   log, // 只用来记出口熔断的开合
+		Live:                   live,
+		Log:                    log, // 只用来记出口熔断的开合
 	}
 }
 

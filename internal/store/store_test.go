@@ -236,8 +236,9 @@ func TestUpsertGatewayRollsBackExistingOnSaveFailure(t *testing.T) {
 	if _, err := s.UpsertGateway("unified-5", 1, types.Exit{Region: "US"}); err != nil {
 		t.Fatal(err)
 	}
-	// 把 state.json 换成一个目录：写 .tmp 还能成，Rename 必失败。
-	breakSave(t, dir)
+	// Close the actual journal handle: writes must fail, not a now-unused
+	// snapshot destination that incremental commits no longer touch.
+	breakSave(t, s)
 
 	if _, err := s.UpsertGateway("unified-5", 1, types.Exit{Region: "JP"}); err == nil {
 		t.Fatal("落盘失败该报错")
@@ -250,7 +251,7 @@ func TestUpsertGatewayRollsBackExistingOnSaveFailure(t *testing.T) {
 func TestPutSlotAndPairRollBackOnSaveFailure(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir)
-	breakSave(t, dir)
+	breakSave(t, s)
 	if err := s.PutSlot(types.Slot{AccountID: 1, Gateway: "g"}); err == nil {
 		t.Error("落盘失败该报错")
 	}
@@ -271,14 +272,10 @@ func TestPutSlotAndPairRollBackOnSaveFailure(t *testing.T) {
 	}
 }
 
-// breakSave 让 save 的 Rename 必定失败：目标占成一个非空目录。
-func breakSave(t *testing.T, dir string) {
+// breakSave fails the actual durable write path.
+func breakSave(t *testing.T, s *Store) {
 	t.Helper()
-	p := filepath.Join(dir, stateFile)
-	if err := os.RemoveAll(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(p, "占位"), 0o700); err != nil {
+	if err := s.journal.file.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -871,7 +868,10 @@ func TestSaveKeepsBackups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Adding the first account now backs up the initialized empty state.
+	// Backups are snapshot generations, not one full copy per mutation.
+	if err := s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
 	daily := filepath.Join(dir, "state.json.daily-"+time.Now().UTC().Format("20060102"))
 	initial, err := os.ReadFile(filepath.Join(dir, "state.json.bak"))
 	if err != nil || strings.Contains(string(initial), "一号") || !strings.Contains(string(initial), `"owner_keys_migrated": true`) {
@@ -880,6 +880,9 @@ func TestSaveKeepsBackups(t *testing.T) {
 
 	if _, err := s.AddAccount(types.Account{Label: "二号",
 		Creds: types.Creds{AccessToken: "tok", AccountID: "acct-2"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
 	// .bak 必须是**上一次**的内容：只有一号，没有二号。

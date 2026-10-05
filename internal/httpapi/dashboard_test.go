@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -127,6 +128,17 @@ func TestDashboardSettingsFixture(t *testing.T) {
 	st.accounts[0].Creds.AccessToken = fakeToken(st.accounts[0].Creds.AccountID, "pro", time.Now().Add(time.Hour))
 	st.accounts[1].Creds.AccessToken = fakeToken(st.accounts[1].Creds.AccountID, "plus", time.Now().Add(time.Hour))
 	pool.target = 106
+	st.accounts[0].Label = "fixture-long-account-for-preview-with-many-characters@example.invalid"
+	basePair := st.pairs["unified-142"]
+	for i := 1; i <= 32; i++ {
+		name := fmt.Sprintf("unified-%d", i)
+		st.gws[name] = types.Gateway{Name: name, FirstSeenBy: 1, FirstSeenAt: time.Now().Add(-time.Duration(i) * time.Hour)}
+		pair := basePair
+		pair.Gateway = name
+		st.pairs[name] = pair
+		st.samples = append(st.samples, types.Sample{AccountID: 1, Gateway: name, Status: 200,
+			Observed: types.Observed{Country: "JP", City: fmt.Sprintf("Preview City %d with a long district name", i)}})
+	}
 	st.contacts = []types.ContactReport{{ReporterID: 1, ContactObservation: types.ContactObservation{
 		Gateway: "unified-142", Model: "gpt-6-luna", Criterion: "echo-v1", Source: "foreground",
 		First: "repeat", GapKnown: true, ElapsedSeconds: 7200, Outcome: "full", At: time.Now(),

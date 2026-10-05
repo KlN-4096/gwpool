@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"gwpool/internal/config"
 	"gwpool/internal/mint"
 	"gwpool/internal/types"
 )
@@ -410,6 +411,7 @@ func (s *Scheduler) premintBare(ctx context.Context, n int) {
 func (s *Scheduler) runInventory(ctx context.Context, n int, allowBootstrap bool) {
 	workers := s.premintWorkers(n)
 	r := &premintRound{want: n, tried: map[string]bool{}, aimed: map[string]bool{}, allowBootstrap: allowBootstrap}
+	r.routing = s.newInventoryRoutingRound()
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -447,6 +449,7 @@ const premintPickTries = 4
 // 每个字段都只在 mu 里读写，**循环条件本身也在里面**：got 和 missed 一起封顶这一轮
 // 的总发数（最多 2n 发），各个 worker 分头各算一份就等于把那个封顶乘上并发数。
 type premintRound struct {
+	routing        *inventoryRoutingRound // immutable model; prediction cache protected by mu
 	mu             sync.Mutex
 	want           int             // 缺口，同时也是失手预算
 	got            int             // 补上的格子数
@@ -482,10 +485,11 @@ func (r *premintRound) result() (got, missed, combos int) {
 // 「这一发有没有补上一格」就永远答「没有」。并发之后更要紧——别的 worker 的新落点
 // 会把读数一起抬高，原先那个「全局活票数比铸票前多了没有」的判据会直接失效。
 type premintPlan struct {
-	acct     types.Account
-	region   types.Region
-	live     map[string]bool
-	expected string // 历史恢复预测；空值是受限的冷池引导，不是已证实恢复路线。
+	acct       types.Account
+	region     types.Region
+	live       map[string]bool
+	expected   string // 历史恢复预测；空值是受限的冷池引导，不是已证实恢复路线。
+	prediction *types.InventoryPrediction
 	// release 放掉这个大区的裸铸标记，铸完**必须**调（见 claimRegion）。
 	release func()
 }
@@ -509,6 +513,9 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 			plan.release()
 			continue
 		}
+		if acct.Creds.AccountID != plan.acct.Creds.AccountID {
+			plan.prediction = nil
+		}
 		plan.acct = acct
 		if plan.expected != "" {
 			if _, ready := s.freshPair(plan.expected, types.DeliverFloor); ready {
@@ -522,9 +529,10 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 		var seed types.Pair
 		var got minted
 		if err == nil {
+			attemptCtx = withInventoryPrediction(attemptCtx, plan.acct.ID, plan.region.Exit, plan.prediction)
 			sid, seed, err = s.premintSID(plan.region.Key)
 			if err != nil {
-				s.sampleAttemptFailure(plan.acct, plan.region.Exit, "", types.PurposeInventory, types.Observed{}, err)
+				s.sampleAttemptFailure(plan.acct, plan.region.Exit, "", types.PurposeInventory, types.Observed{}, err, plan.prediction)
 			}
 		}
 		// want 留空：裸铸就是去看它能落到哪，谈不上「落点漂移」。带种子也一样——
@@ -582,6 +590,13 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 		// 所以它的收益高于普通的「去摸一个新落点」—— 后者只多一个槽位。
 		prefer: func(key string) bool { return seedless[key] },
 	}
+	mode := s.cfg().InventoryRoutingMode()
+	if r.routing != nil && mode == config.InventoryRoutingAssist {
+		known := s.st.Gateways()
+		pol.rank = func(account types.Account, region types.Region) int {
+			return inventoryPredictionRank(r.routing.forecast(account, region), known, live, r.aimed)
+		}
+	}
 	for try := 0; try < premintPickTries; try++ {
 		// First restrict selection to a missing, historically reachable gateway.
 		// Lifetime country fairness only ranks within that recovery cohort.
@@ -624,7 +639,13 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 			if expected == "" {
 				r.unproven++
 			}
-			return premintPlan{acct: a, region: reg, live: live, expected: expected, release: release}, true
+			plan := premintPlan{acct: a, region: reg, live: live, expected: expected, release: release}
+			if r.routing != nil && mode != config.InventoryRoutingOff {
+				prediction := r.routing.forecast(a, reg)
+				prediction.Mode, prediction.DecidedAt = mode, s.now()
+				plan.prediction = &prediction
+			}
+			return plan, true
 		}
 		release()
 	}
@@ -776,21 +797,7 @@ func (s *Scheduler) PairTarget() int {
 	// IsZero 要单独判：零值表示「从没交付过」，而测试里的假时钟可能把 cutoff
 	// 推到零值之前，那时 After 会把它算成「刚取过」。
 	cutoff := s.now().Add(-types.PairLifetime)
-	used := map[int64]int{}
-	for _, sl := range s.st.Slots() {
-		if !sl.LastDeliver.IsZero() && sl.LastDeliver.After(cutoff) {
-			used[sl.AccountID]++
-		}
-	}
-	busiest := 0
-	for _, a := range s.st.Accounts() {
-		if !a.Enabled {
-			continue
-		}
-		if n := used[a.ID]; n > busiest {
-			busiest = n
-		}
-	}
+	busiest := s.busiestDeliveries(cutoff)
 	// 富余张数是配置项：0 就是「全按需，只补被人用掉的」。见 config.Config.SpareTarget。
 	spare := s.cfg().SpareTarget
 	// 填得比网关总数还大 = 停止预铸，不报错（用户 10-03 定的）：那个数本来就铸不出来，
@@ -800,7 +807,7 @@ func (s *Scheduler) PairTarget() int {
 	}
 	// 下界：不管有没有人在用，手上至少备这么多张（见 config.Config.MinPairs）。
 	// 在 spare 那条「停止预铸」的早返回**之后**：那是运营方显式关掉预铸，下界不该把它打开。
-	_, recoverable := s.inventoryRoutes()
+	_, recoverable := s.inventoryEvidenceSnapshot()
 	return min(max(busiest+spare, s.cfg().MinPairs, recoverable), types.GatewayCeiling)
 }
 

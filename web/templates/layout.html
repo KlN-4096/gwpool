@@ -381,6 +381,34 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
 .settings-save { display: flex; justify-content: space-between; align-items: center; gap: 1rem; margin-top: 1rem; padding: 1rem 0 .1rem; border-top: 1px solid var(--line); }
 .gateway-observation { min-width: 15rem; white-space: normal; }
 #t-gateways td { vertical-align: top; }
+#t-gateways { table-layout: fixed; width: 100%; min-width: 920px; }
+#t-gateways th:nth-child(1) { width: 15%; }
+#t-gateways th:nth-child(2) { width: 9%; }
+#t-gateways th:nth-child(3) { width: 19%; }
+#t-gateways th:nth-child(4) { width: 12%; }
+#t-gateways th:nth-child(5) { width: 14%; }
+#t-gateways th:nth-child(6) { width: 13%; }
+#t-gateways th:nth-child(7) { width: 11%; }
+#t-gateways th:nth-child(8) { width: 7%; }
+#t-gateways td { padding-top: .7rem; padding-bottom: .7rem; }
+.gateway-source, .gateway-date, .gateway-cooldown { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gateway-counts { display: flex; gap: .4rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gateway-counts > span { color: var(--muted); }
+.gateway-cover { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.gateway-details > summary { color: var(--accent); cursor: pointer; list-style: none; }
+.gateway-details > summary::-webkit-details-marker { display: none; }
+.gateway-details[open] { min-width: 22rem; white-space: normal; }
+.gateway-detail-content { overflow-wrap: anywhere; white-space: normal; }
+.gateway-detail-content h3 { font-size: 13px; margin: 1.5rem 0 .65rem; }
+.gateway-detail-content p { margin: .45rem 0; }
+.gateway-meta { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: .5rem .8rem; font-size: 13px; }
+.gateway-meta dt { color: var(--muted); }
+.gateway-meta dd { margin: 0; }
+#gateway-detail-dialog { box-sizing: border-box; width: min(540px, 100%); max-width: 100%; height: 100%; max-height: 100%; margin: 0 0 0 auto; padding: 1.5rem; border: 0; border-left: 1px solid var(--line); background: var(--surface); color: var(--fg); overflow-y: auto; }
+#gateway-detail-dialog::backdrop { background: #0006; }
+#gateway-detail-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--line); }
+#gateway-detail-dialog > header p { margin: 0 0 .3rem; font-size: 12px; }
+#gateway-detail-dialog h2 { margin: 0; font-size: 20px; }
 .observation-detail { max-width: 34rem; min-width: 15rem; padding: .75rem; margin-top: .5rem; background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; }
 .observation-detail h3 { margin: .5rem 0; font-size: 13px; }
 .observation-detail p { margin: .4rem 0; }
@@ -728,6 +756,32 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
     render();
   }
   for (const t of document.querySelectorAll('table[data-grid]')) grid(t);
+
+  // 网关详情：委托点击，分页后仍可用；保留行内原文用于搜索及无JS回退。
+  const gatewayDialog = document.getElementById('gateway-detail-dialog');
+  if (gatewayDialog && typeof gatewayDialog.showModal === 'function') {
+    let gatewayOpener = null;
+    document.addEventListener('click', function (event) {
+      const summary = event.target.closest('#t-gateways .gateway-details > summary');
+      if (summary) {
+        const details = summary.parentElement;
+        const content = details.querySelector('.gateway-detail-content');
+        if (!content) return;
+        event.preventDefault();
+        gatewayOpener = summary;
+        gatewayDialog.querySelector('#gateway-detail-title').textContent = details.closest('tr').dataset.gateway;
+        gatewayDialog.querySelector('[data-gateway-detail-body]').replaceChildren(content.cloneNode(true));
+        gatewayDialog.showModal();
+        gatewayDialog.querySelector('[data-close-gateway]').focus();
+      }
+      if (event.target.closest('[data-close-gateway]') && gatewayDialog.open) gatewayDialog.close();
+    });
+    gatewayDialog.addEventListener('close', function () {
+      gatewayDialog.querySelector('[data-gateway-detail-body]').replaceChildren();
+      if (gatewayOpener && gatewayOpener.isConnected) gatewayOpener.focus();
+      gatewayOpener = null;
+    });
+  }
 
   // 概览卡片里的分类计数，取自对应表格
   for (const el of document.querySelectorAll('[data-facets-of]')) {

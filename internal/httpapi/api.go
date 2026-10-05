@@ -204,7 +204,10 @@ type Server struct {
 	// 最近的交付失败，给页面回答「为什么客户端报 502」。
 	fails failLog
 	// started 写在管理页那张失败表上：失败只存在内存里，重启前的已经没了。
-	started time.Time
+	started      time.Time
+	contacts     contactCache
+	cooldowns    cooldownCache
+	catalogPairs pairCatalogCache
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
 	tplMintAll                                                    *template.Template
@@ -505,9 +508,26 @@ type caller struct {
 	ownerID int64
 }
 
+type requestCallerKey struct{}
+type requestCaller struct {
+	server *Server
+	caller caller
+	ok     bool
+}
+
+// Share authorization only inside this request, never between requests: account
+// enablement and credential expiry are still checked for every new catalog.
+func (s *Server) resolveCallerOnce(r *http.Request) *http.Request {
+	c, ok := s.resolveCaller(r)
+	return r.WithContext(context.WithValue(r.Context(), requestCallerKey{}, requestCaller{s, c, ok}))
+}
+
 // resolveCaller 按 key 认人。管理员密钥先看，再逐个账号比对派生 key。
 // 账号数是几十量级，线性扫一遍不值得为它建索引。
 func (s *Server) resolveCaller(r *http.Request) (caller, bool) {
+	if cached, ok := r.Context().Value(requestCallerKey{}).(requestCaller); ok && cached.server == s {
+		return cached.caller, cached.ok
+	}
 	got := bearer(r)
 	if got == "" {
 		return caller{}, false
@@ -1633,11 +1653,15 @@ type deliveryResponse struct {
 	CookieVersion string `json:"cookie_version"`
 	// PairRemainingS 是**这张 pair 自己**还能活多久（秒）。
 	//
-	// 和 ValidForS 是**两件事**，一个字都不许混：ValidForS 是满血窗口的剩余
-	// （150 秒量级，过了就该换票），PairRemainingS 是路由的剩余（小时量级，
+	// 和 ValidForS 是**两件事**：ValidForS 是交付参考窗口的剩余，
+	// PairRemainingS 是路由的剩余（小时量级，
 	// 过了这张 cookie 谁都用不了）。消费端拿它决定要不要在业务请求里顺手续一发
 	// （剩不到 12 分钟才续，见 /pair/renew）。混成一个的后果是每发都续、或者永不续。
 	PairRemainingS int `json:"pair_remaining_s"`
+	// Absolute route deadline calculated by the pool for this exact cookie.
+	// Preserves RouteDeadline's existing rules (including legacy cflb fallback),
+	// but is independent of the advisory delivery/full-strength window.
+	RouteExpiresAt time.Time `json:"route_expires_at,omitzero"`
 }
 
 // batchResponse 是带 count 的 /cookie 的回话。**count 没带时不走这个形状**——
@@ -1652,28 +1676,14 @@ type batchResponse struct {
 }
 
 func (s *Server) delivered(d types.Delivery) deliveryResponse {
-	return deliveryResponse{Delivery: d, TTLIsAdvisory: true,
+	out := deliveryResponse{Delivery: d, TTLIsAdvisory: true,
 		DatacenterCountry: coverage.DatacenterCountry(d.Gateway),
-		CookieVersion:     types.CookieVersion(d.Cookie),
-		PairRemainingS:    s.pairRemainingS(d)}
-}
-
-// pairRemainingS 算交付出去这张 pair 的剩余寿命：向下取整到秒，负数钳 0。
-//
-// 按 CflbExpiresAt 算，因为钉路由的是 __cflb（见 types.PairLifetime），续期换到的
-// 也正是它。读不出来就报 0：
-//   - 零值 = 老记录（store.Open 的兜底会填上，这里只是不去赌它填过了）；
-//   - cookie 对不上 = 池子手上那张已经不是交付出去的这张，那它的死期和消费端
-//     手里这张无关。
-//
-// 两种都报 0，而消费端把 0 和字段缺失都当成「不续」——方向是安全的那边
-// （少续一次只是少一张票，照着一个不属于这张 cookie 的死期去续才会写坏账本）。
-func (s *Server) pairRemainingS(d types.Delivery) int {
-	p, ok := s.st.Pairs()[d.Gateway]
-	if !ok || p.Cookie != d.Cookie {
-		return 0
+		CookieVersion:     types.CookieVersion(d.Cookie)}
+	if p, ok := s.st.Pairs()[d.Gateway]; ok && p.Cookie == d.Cookie {
+		out.RouteExpiresAt = p.ExpiresAt
+		out.PairRemainingS = int(max(time.Until(p.CflbExpiresAt), 0) / time.Second)
 	}
-	return int(max(time.Until(p.CflbExpiresAt), 0) / time.Second)
+	return out
 }
 
 // truthy 认几种常见的「真」写法：客户端是别人写的，别为了一个开关卡他。

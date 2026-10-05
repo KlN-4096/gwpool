@@ -231,6 +231,10 @@ type Config struct {
 	// 默认关：它会在没人要票时自己花额度，开之前先看一眼 `续票一轮结束` 那行日志。
 	RenewPairs bool `json:"renew_pairs"`
 
+	// InventoryRouting controls the optional country predictor. Shadow records
+	// forecasts without changing selection; assist only breaks inventory ties.
+	InventoryRouting string `json:"inventory_routing,omitempty"`
+
 	// MintConcurrency 是预铸同时派几个**不同账号**去铸票，0 时按 Defaults（1 = 串行）。
 	//
 	// 并发是**跨账号**的：同一个号仍然串行（store.LockAccount，SPEC 红线 2），而且同一个号
@@ -296,10 +300,11 @@ func Defaults() Config {
 			MinAccounts: types.AccountsForContinuous(types.SlotCooldown)},
 		UpstreamPerRegionHour:  2,
 		UpstreamPerAccountHour: 50,
-		SlotCooldownMinutes:   int(types.SlotCooldown / time.Minute),
-		MaxTriesPerDeliver:    2,
-		SpareTarget:           types.SpareTarget,
-		MintConcurrency:       defaultMintConcurrency,
+		SlotCooldownMinutes:    int(types.SlotCooldown / time.Minute),
+		MaxTriesPerDeliver:     2,
+		SpareTarget:            types.SpareTarget,
+		MintConcurrency:        defaultMintConcurrency,
+		InventoryRouting:       InventoryRoutingShadow,
 		// 这两个开关默认关，理由在字段注释里：两个都是「花一个满血窗口换一个读数」。
 		VerifyFullAtDeliver: false,
 	}
@@ -371,6 +376,11 @@ func Load(path string) (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("fingerprint 只能是 %q 或 %q，给的是 %q",
 			FingerprintSub2api, FingerprintMint, cfg.Fingerprint)
+	}
+	switch cfg.InventoryRoutingMode() {
+	case InventoryRoutingOff, InventoryRoutingShadow, InventoryRoutingAssist:
+	default:
+		return Config{}, fmt.Errorf("inventory_routing 只能是 off、shadow 或 assist")
 	}
 	if cfg.DataDir == "" {
 		return Config{}, fmt.Errorf("data_dir 不能为空")

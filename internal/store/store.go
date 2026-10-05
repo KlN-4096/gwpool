@@ -1,8 +1,5 @@
-// Package store 把全部状态放在两个文件里：state.json 和 samples.jsonl。
-//
-// 为什么不上数据库（SPEC 第 9 节）：几十个账号、十几个网关、每天几十行样本，
-// 装一个 SQLite 驱动就得抬 Go 版本、给 go.mod 加 require，负债比收益大。
-// 全量读进内存、改完原子写，数据量在这个量级下这是最省的做法。
+// Package store stores durable state in a checksummed incremental journal plus
+// periodic state.json snapshots. samples.jsonl remains a separate observation log.
 package store
 
 import (
@@ -52,12 +49,14 @@ const (
 
 // State 是 state.json 的全量内容。
 type State struct {
-	OwnerKeysMigrated bool                   `json:"owner_keys_migrated"`
-	CountryAttempts  map[string]map[string]types.CountryAttempt `json:"country_attempts,omitempty"`
-	AttemptsMigrated bool `json:"attempts_migrated,omitempty"`
-	ContactReports    []types.ContactReport  `json:"contact_reports,omitempty"`
-	CooldownReports   []types.CooldownReport `json:"cooldown_reports,omitempty"`
-	Accounts          []types.Account        `json:"accounts"`
+	JournalVersion    int                                        `json:"journal_version,omitempty"`
+	JournalSequence   uint64                                     `json:"journal_sequence,omitempty"`
+	OwnerKeysMigrated bool                                       `json:"owner_keys_migrated"`
+	CountryAttempts   map[string]map[string]types.CountryAttempt `json:"country_attempts,omitempty"`
+	AttemptsMigrated  bool                                       `json:"attempts_migrated,omitempty"`
+	ContactReports    []types.ContactReport                      `json:"contact_reports,omitempty"`
+	CooldownReports   []types.CooldownReport                     `json:"cooldown_reports,omitempty"`
+	Accounts          []types.Account                            `json:"accounts"`
 	// Owners 是上传者。老文件里没这个键 ⇒ nil ⇒ Open 的一次性迁移给已有的托管行
 	// 补一个（见 migrateOwners）。
 	Owners   []types.Owner            `json:"owners"`
@@ -96,10 +95,22 @@ func bumpID(counter *int64, max int64) int64 {
 // ponytail: 一把读写锁管全部状态和样本追加，写操作会串起来；
 // 数据量到了「一次保存超过几毫秒」才需要拆成 per-map 锁或改增量日志。
 type Store struct {
-	dir     string
-	mu      sync.RWMutex
-	st      State
-	samples *os.File
+	dir            string
+	mu             sync.RWMutex
+	st             State
+	journal        journalState
+	checkpointMu   sync.Mutex
+	checkpointIO   checkpointOperations
+	revisions      Revisions
+	slotIndex      map[int64]map[string]types.Slot
+	demandCache    slotDemandCache
+	slotWriter     slotWriter
+	samples        *os.File
+	routingHistory *routingHistoryCache
+	routingPending *routingHistoryCache // appends made while history is loaded outside mu
+	routingLoadMu  sync.Mutex
+	routingLoadErr error // routingLoadMu protects load/retry state
+	routingRetryAt time.Time
 
 	// 账号锁独立于 mu：持账号锁的人要打上游（几十秒），不能把状态读写一起挡住。
 	accMu    sync.Mutex
@@ -153,6 +164,25 @@ func Open(dir string) (*Store, error) {
 		if s.st.Mints == nil {
 			s.st.Mints = map[string]types.RegionMint{}
 		}
+	}
+	if err := s.openJournal(); err != nil {
+		return nil, err
+	}
+	upgradeJournal := s.st.JournalVersion == 0
+	s.st.JournalVersion = journalVersion
+	s.slotIndex = make(map[int64]map[string]types.Slot)
+	for _, slot := range s.st.Slots {
+		s.indexSlot(slot)
+	}
+	opened := false
+	defer func() {
+		if !opened && s.journal.file != nil {
+			_ = s.journal.file.Close()
+		}
+	}()
+	// Replay before migrations: a journal may already contain the migration or
+	// a newer pair, so neither must be silently reverted by snapshot-only reads.
+	{
 		// 老记录里 ExpiresAt 存的是 __oailb 的 exp，而真正钉路由的 __cflb 比它早死
 		// 300 秒（见 types.PairLifetime）⇒ 那些值整篇偏乐观 300 秒，照着发就会把
 		// 一张路由已经死了的 cookie 当成「刚好够交付」发出去。
@@ -191,6 +221,18 @@ func Open(dir string) (*Store, error) {
 	// 和目录一样显式 Chmod 一次。
 	_ = os.Chmod(samplesPath, filePerm)
 	s.samples = f
+	// Publish an initial snapshot before returning on a new directory. Existing
+	// stores keep migrations durable in the WAL until the next checkpoint.
+	_, snapshotErr := os.Stat(filepath.Join(dir, stateFile))
+	if upgradeJournal || errors.Is(snapshotErr, fs.ErrNotExist) {
+		if err := s.Checkpoint(); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	}
+	opened = true
+	s.startSlotWriter()
+	go s.checkpointLoop()
 	return s, nil
 }
 
@@ -207,7 +249,7 @@ func (s *Store) migrateOwnerKeys() error {
 		s.st.Accounts[i].LegacyConsumerKey = s.st.Accounts[i].Creds.AccessToken != ""
 	}
 	s.st.OwnerKeysMigrated = true
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Accounts: s.st.Accounts, OwnerKeysMigrated: true}); err != nil {
 		s.st.Accounts, s.st.OwnerKeysMigrated = previous, false
 		return fmt.Errorf("迁移账号 key: %w", err)
 	}
@@ -235,33 +277,21 @@ func (s *Store) LockAccount(id int64) func() {
 	return lk.Unlock
 }
 
-func (s *Store) Close() error { return s.samples.Close() }
-
-// save 原子写 state.json。调用方必须已持写锁。
-//
-// 先写 .tmp 再 Rename：崩在写一半时，老文件仍是完整的——里面有 access_token，
-// 丢了就得让托管的人重新上传。
-func (s *Store) save() error {
-	b, err := json.MarshalIndent(s.st, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := filepath.Join(s.dir, stateFile+".tmp")
-	if err := os.WriteFile(tmp, b, filePerm); err != nil {
-		return err
-	}
-	dst := filepath.Join(s.dir, stateFile)
-	s.backup(dst)
-	// Windows 上有人正打开着 state.json（cat、编辑器、备份）时 Rename 会 Access denied，
-	// 这是秒级的瞬时冲突，重试几次就过去了；Linux 上第一次就成。
-	for try := 0; try < 5; try++ {
-		if err = os.Rename(tmp, dst); err == nil {
-			return nil
+func (s *Store) Close() error {
+	s.journal.closeOnce.Do(func() {
+		s.stopSlotWriter()
+		close(s.journal.stop)
+		<-s.journal.done
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		var journalErr error
+		if s.journal.file != nil {
+			journalErr = s.journal.file.Close()
+			s.journal.file = nil
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	_ = os.Remove(tmp)
-	return err
+		s.journal.closeErr = errors.Join(s.samples.Close(), journalErr, s.journal.failed, s.journal.checkpointErr)
+	})
+	return s.journal.closeErr
 }
 
 // backup 在覆盖 state.json 之前留两份副本。
@@ -353,7 +383,7 @@ func (s *Store) migrateOwners() error {
 		}
 	}
 	s.st.Owners = append(s.st.Owners, o)
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Accounts: s.st.Accounts, Owners: []types.Owner{o}}); err != nil {
 		s.st.Accounts = prev
 		s.st.Owners = s.st.Owners[:len(s.st.Owners)-1]
 		return fmt.Errorf("给已有账号补 owner: %w", err)
@@ -404,7 +434,13 @@ func (s *Store) PruneEmptyOwners() (int, error) {
 	removed := len(s.st.Owners) - len(kept)
 	prev := s.st.Owners
 	s.st.Owners = kept
-	if err := s.save(); err != nil {
+	var dropped []int64
+	for _, owner := range prev {
+		if !used[owner.ID] && !owner.CreatedAt.After(cut) {
+			dropped = append(dropped, owner.ID)
+		}
+	}
+	if err := s.save(stateChange{DropOwners: dropped}); err != nil {
 		s.st.Owners = prev
 		return 0, err
 	}
@@ -499,6 +535,19 @@ func (s *Store) Account(id int64) (types.Account, bool) {
 	return types.Account{}, false
 }
 
+// AccountByUpstreamID reads one account without copying the full credentials
+// table; in particular catalog requests only need the anonymous ledger row ID.
+func (s *Store) AccountByUpstreamID(upstreamID string) (types.Account, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, account := range s.st.Accounts {
+		if account.Creds.AccountID == upstreamID {
+			return account, true
+		}
+	}
+	return types.Account{}, false
+}
+
 // AccountByViewToken 供上传者信任视图用。
 func (s *Store) AccountByViewToken(tok string) (types.Account, bool) {
 	s.mu.RLock()
@@ -568,7 +617,7 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 				x.OwnerID = a.OwnerID
 			}
 			s.st.Accounts[i] = x
-			if err := s.save(); err != nil {
+			if err := s.save(stateChange{Accounts: []types.Account{x}}); err != nil {
 				s.st.Accounts[i] = prev
 				return types.Account{}, err
 			}
@@ -617,7 +666,7 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 	// （后者的令牌一个字都不许查——那一页上有对方每个账号的 consumer key）。
 	a.LegacyConsumerKey = false // new imports never obtain a credential-level machine key
 	s.st.Accounts = append(s.st.Accounts, a)
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Accounts: []types.Account{a}}); err != nil {
 		s.st.Accounts = s.st.Accounts[:len(s.st.Accounts)-1] // 没落盘就别留在内存里
 		return types.Account{}, err
 	}
@@ -636,7 +685,7 @@ func (s *Store) AddOwner(label string) (types.Owner, error) {
 		return types.Owner{}, err
 	}
 	s.st.Owners = append(s.st.Owners, o)
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Owners: []types.Owner{o}}); err != nil {
 		s.st.Owners = s.st.Owners[:len(s.st.Owners)-1] // 没落盘就别留在内存里
 		return types.Owner{}, err
 	}
@@ -657,7 +706,7 @@ func (s *Store) SetAccountVia(id, via int64) error {
 			return nil
 		}
 		s.st.Accounts[i].Via = via
-		if err := s.save(); err != nil {
+		if err := s.save(stateChange{Accounts: []types.Account{s.st.Accounts[i]}}); err != nil {
 			s.st.Accounts[i].Via = old // 没落盘就别留在内存里
 			return err
 		}
@@ -693,7 +742,7 @@ func (s *Store) SetAccountEnabled(id int64, enabled bool) error {
 		s.st.Accounts[i].Enabled = enabled
 		// 真的翻了开关才清自动停用的理由：那条话说的是上一次的事。
 		s.st.Accounts[i].DisabledReason = ""
-		if err := s.save(); err != nil {
+		if err := s.save(stateChange{Accounts: []types.Account{s.st.Accounts[i]}}); err != nil {
 			s.st.Accounts[i].Enabled = old // 没落盘就别留在内存里
 			s.st.Accounts[i].DisabledReason = oldReason
 			return err
@@ -720,7 +769,7 @@ func (s *Store) DisableAccount(id int64, reason string) error {
 		oldEnabled, oldReason := s.st.Accounts[i].Enabled, s.st.Accounts[i].DisabledReason
 		s.st.Accounts[i].Enabled = false
 		s.st.Accounts[i].DisabledReason = reason
-		if err := s.save(); err != nil {
+		if err := s.save(stateChange{Accounts: []types.Account{s.st.Accounts[i]}}); err != nil {
 			s.st.Accounts[i].Enabled, s.st.Accounts[i].DisabledReason = oldEnabled, oldReason
 			return err
 		}
@@ -761,7 +810,7 @@ func (s *Store) SetTokens(id int64, access, refresh string) error {
 			s.st.Accounts[i].Enabled = true
 			s.st.Accounts[i].DisabledReason = ""
 		}
-		if err := s.save(); err != nil {
+		if err := s.save(stateChange{Accounts: []types.Account{s.st.Accounts[i]}}); err != nil {
 			s.st.Accounts[i] = old
 			return err
 		}
@@ -818,7 +867,7 @@ func (s *Store) DeleteAccount(id int64) error {
 	for k := range droppedMints {
 		delete(s.st.Mints, k)
 	}
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{DropAccounts: []int64{id}}); err != nil {
 		// 没落盘就把内存复原，否则进程还活着的这段时间里账号凭空消失了。
 		s.st.Accounts = append(s.st.Accounts, types.Account{})
 		copy(s.st.Accounts[idx+1:], s.st.Accounts[idx:])
@@ -878,7 +927,7 @@ func (s *Store) UpsertGateway(name string, seenBy int64, requested types.Exit) (
 		g.ReachableExits = append(g.ReachableExits, requested)
 	}
 	s.st.Gateways[name] = g
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Gateways: map[string]types.Gateway{name: g}}); err != nil {
 		// 落盘失败要把内存退回去。漏掉「网关已存在」这一支的话，新追加的 ReachableExits
 		// 只活在内存里，重启后悄悄回退，而调用方以为写成功了。
 		if found {
@@ -900,10 +949,11 @@ func (s *Store) UpdateGateway(name string, mutate func(*types.Gateway)) error {
 	if !ok {
 		return nil
 	}
-	old := g
+	old := cloneGateway(g)
+	g = cloneGateway(g)
 	mutate(&g)
 	s.st.Gateways[name] = g
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Gateways: map[string]types.Gateway{name: g}}); err != nil {
 		s.st.Gateways[name] = old
 		return err
 	}
@@ -935,7 +985,7 @@ func (s *Store) PutSlot(sl types.Slot) error {
 	k := SlotKey(sl.AccountID, sl.Gateway)
 	old, had := s.st.Slots[k]
 	s.st.Slots[k] = sl
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Slots: map[string]types.Slot{k: sl}}); err != nil {
 		if had {
 			s.st.Slots[k] = old
 		} else {
@@ -954,27 +1004,7 @@ func (s *Store) UpdateSlot(accountID int64, gateway string, mutate func(*types.S
 	if mutate == nil {
 		return errors.New("UpdateSlot 要一个改写函数")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	k := SlotKey(accountID, gateway)
-	old, had := s.st.Slots[k]
-	sl := old
-	if !had {
-		sl = types.Slot{AccountID: accountID, Gateway: gateway, LastVerdict: "unknown"}
-	}
-	mutate(&sl)
-	// 键是由参数算的，不让改写函数把它改到别的账号/网关名下去。
-	sl.AccountID, sl.Gateway = accountID, gateway
-	s.st.Slots[k] = sl
-	if err := s.save(); err != nil {
-		if had {
-			s.st.Slots[k] = old
-		} else {
-			delete(s.st.Slots, k)
-		}
-		return err
-	}
-	return nil
+	return s.queueSlotWrite(slotMutation{accountID, gateway, mutate})
 }
 
 // LongestRestedSlot 在 candidates 里挑这个账号歇得最久的网关（SPEC 第 8 节）。
@@ -1047,7 +1077,7 @@ func (s *Store) NoteRegionMint(accountID int64, regionKey, gateway string, at ti
 		m.Gateway = gateway
 	}
 	s.st.Mints[k] = m
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Mints: map[string]types.RegionMint{k: m}}); err != nil {
 		if had {
 			s.st.Mints[k] = old
 		} else {
@@ -1082,7 +1112,7 @@ func (s *Store) PutPair(p types.Pair) error {
 	defer s.mu.Unlock()
 	old, had := s.st.Pairs[p.Gateway]
 	s.st.Pairs[p.Gateway] = p
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Pairs: map[string]types.Pair{p.Gateway: p}}); err != nil {
 		if had {
 			s.st.Pairs[p.Gateway] = old
 		} else {
@@ -1105,7 +1135,7 @@ func (s *Store) DeletePair(gateway string) error {
 		return nil
 	}
 	delete(s.st.Pairs, gateway)
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{DropPairs: []string{gateway}}); err != nil {
 		s.st.Pairs[gateway] = old
 		return err
 	}
@@ -1121,6 +1151,19 @@ func (s *Store) AppendSample(sm types.Sample) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err = s.samples.Write(b)
+	if err == nil {
+		cache := s.routingHistory
+		if cache == nil {
+			cache = s.routingPending
+		}
+		if cache != nil {
+			if len(b) <= maxRoutingLineBytes {
+				cache.append(sm)
+			} else {
+				cache.skippedLines++
+			}
+		}
+	}
 	return err
 }
 

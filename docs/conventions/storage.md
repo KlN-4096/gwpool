@@ -1,14 +1,18 @@
 # 状态与边界
 
-- `internal/store/store.go` 保存 `state.json` 和 `samples.jsonl`，不使用数据库。
+- `internal/store` 保存 `state.json`＋`state.wal`（GWPWAL02提交头/序号/CRC）和独立`samples.jsonl`，不使用数据库；关键增量Sync成功才ACK，不再每次重写全快照。
+- 提交头记录可信结束偏移；已ACK区间缺失/截断/CRC错拒绝启动，只清理提交边界外残尾。写失败截断并还原提交头、Sync后回滚；回滚不确定即冻结写入，不静默续跑。
+- 快照每分钟或WAL≥4MiB触发：锁内克隆、锁外编码/持久替换、锁内保留并发增量再换WAL。快照切换失败不丢已ACK记录；`checkpoint_failure_test.go`覆盖8处故障。
+- `UpdateSlot`128项有界队列，最多64项/1ms合并一次Sync；组失败还原全部槽位，Close等已准入请求结束。索引/revisions仅在提交成功后更新；不以异步ACK换性能。
 - `State` 顶层 JSON 键是小写；`types.Pair` 等嵌套结构使用 Go 字段名，如 `RegionKey`、`MintedBy`。
 - 所有账号出站共用 Store 的账号锁；调度需要同时持锁时先网关、后账号。
 - `Pair.RegionKey`、`MintedBy` 是后续种子和续票的来源信息，不能从网关名或随机出口反推。
 - 新票按响应中的真实 `Gateway` 保存；漂移不应覆盖原目标网关的票。
 - cookie、凭据、身份串、票号不进诊断输出；运维脚本只输出显式允许的计数、区域、网关和本地账号 ID。
-- 不直接编辑运行中的 `state.json`；它由服务持有并原子保存。
+- 不直接编辑运行中的状态，也不把运行中分别复制的snapshot/WAL当一致备份。旧snapshot-only二进制回滚必须先停新服务，用新binary `-checkpoint-only`重放并落完整最新快照，再保留归档WAL并转换旧快照；不得恢复升级前快照丢新ACK。维护入口没有跨进程锁，严禁在线执行。
 - 冷却报告独立于票/槽位：仅接收已鉴权匿名观察，保留 7 天/全局 8192/每 consumer 1024 条；同事件同载荷幂等、冲突 409，写失败恢复内存。
 - 推荐阶梯1/2/4/6/8/10/12/16/20/24h，下界高于失败证据，24h仍失败不给更短建议；个人至少两次成功，全池至少三个独立consumer、每consumer一票。无能力头按旧10h上限重算证据，不截断新建议。
+- 成功样本实际静置超过计划档+60s时，不参与个人/全池推荐及稳定上报判定；稀疏流量不能证明最短恢复档。原报告与成功计数保留，失败下限仍按实际静置处理，不能一起过滤。
 - 冷却报告`observed_at`保原事件时间，旧报告回退ReceivedAt；同ID事件时间也不可变。POST批量最多32条逐项ACK，部分失败不丢成功；个人>=6报告、最近3条成功同推荐档且跨度>=24h才建议6h上报，新失败/过期撤回策略。
 - sub2api 文件仅在上传页展开为现有单账号上传，身份校验/去重仍由 `/upload` 和 Store 负责。批量重试保留结果、原序号与 owner，不能依赖浏览器 cookie；代理/extra 不迁移。
 - Owner key由根密钥与Owner稳定身份派生，名下至少一份有效凭据才可用；旧credential key仅启动迁移时grandfather，继续鉴权但UI/上传回执不再分发。空库也保存迁移标记，后建账号不得因重启获得旧key资格。
@@ -17,4 +21,6 @@
 - 上传最多刷新一次，后台刷新写回前同样校验身份和AT有效期；OAuth错误仅固定类别/HTTP状态，原响应body/description不得进入日志或页面，Tokens格式化打码。回归见oauth/upload_identity/refresh测试。
 - 页面“有效账号”=启用、有凭据、本地身份/已知期限无异常且RegionMint成功过；临时429计入有效并单列，不声称此刻可调度。无exp保留历史证据口径；展示不修改原匿名开放资格或调度。
 - 库存快照与请求样本分母独立，不由cflb期限倒推铸票或预测涨跌；网关接触full/refreshed/unknown保留模型等分层，不与冷却报告数量相加。
-- `GET /gateways?model=…`每次从7天接触报告计算全池priority，仅同model/foreground/state-echo-v1且full或refreshed，至少5样本；未知/业务复验不进分母，未达门槛不下发。与已有个人分层并存，不等同能力证明；清单和单/批交付同时给历史机房国家，未知留空，不按请求出口猜测。
+- `GET /gateways?model=…`从7天接触报告派生priority，仅同model/foreground/state-echo-v1且full或refreshed、至少5样本；未知/业务复验不进分母。统计按报告revision＋精确证据有效时间区间复用，乱序时间不能按“缓存建立时刻”误失效；个人期限仍逐请求计算，客户端ceiling缓存最多8项。
+- 清单鉴权只在单次请求内复用，不跨请求缓存授权；真实票TTL、使用历史及配置逐次检查。换盆投影按Pairs revision＋donor/fruit到期边界失效，旧/新时钟及替换删除均回归；JSON只复用内部标准编码片段与有界buffer，不拼未经编码的外部输入。
+- 选路辅助缓存最多8192条近7天有效裸铸；启动仅流式读samples末16MiB，64KiB以上单行不训练，初始截断/坏行可见。固定文件快照在Store锁外读取，期间追加由有界pending合并；I/O失败1min退避并回退原策略，不发布半缓存。它不是完整历史数据库，重启不承诺恢复尾部范围外证据。

@@ -39,16 +39,17 @@ func next(seconds int) int {
 }
 
 func successBucket(report types.CooldownReport) int {
-	observed := report.ElapsedSeconds
-	if report.ElapsedSeconds <= report.WindowSeconds+GraceSeconds {
-		observed = report.WindowSeconds
+	// 稀疏流量只证明再次请求时已恢复，不能作为计划档或更长档的成功证据。
+	// 原报告和成功计数仍保留；这里只过滤推荐与稳定上报所用的证据。
+	if report.ElapsedSeconds > report.WindowSeconds+GraceSeconds {
+		return 0
 	}
 	for _, step := range steps {
-		if observed <= step+GraceSeconds {
+		if report.WindowSeconds <= step+GraceSeconds {
 			return step
 		}
 	}
-	return 0 // 最高档之后才恢复，不能证明最高档内恢复。
+	return 0 // 计划档超出推荐范围。
 }
 
 func AccountKey(reporterID int64, tag string) string {

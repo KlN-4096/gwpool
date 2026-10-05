@@ -93,7 +93,7 @@ func (s *Store) ReserveAttempt(account, country string, perCountry, totalLimit i
 		s.st.CountryAttempts = map[string]map[string]types.CountryAttempt{}
 	}
 	s.st.CountryAttempts[key] = next
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Attempts: map[string]map[string]types.CountryAttempt{key: next}}); err != nil {
 		if before == nil {
 			delete(s.st.CountryAttempts, key)
 		} else {
@@ -161,7 +161,7 @@ func (s *Store) MigrateAttempts() (skipped int, err error) {
 	}
 	before := s.st.CountryAttempts
 	s.st.CountryAttempts, s.st.AttemptsMigrated = next, true
-	if err := s.save(); err != nil {
+	if err := s.save(stateChange{Attempts: next, ReplaceAttempts: true, AttemptsMigrated: true}); err != nil {
 		s.st.CountryAttempts, s.st.AttemptsMigrated = before, false
 		return skipped, err
 	}

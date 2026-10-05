@@ -20,6 +20,11 @@
 - 未知国家探索公平性按持久尝试数推进；不能把低次数国家优先套到全部库存恢复。未知/不支持Geo（包括seed）不得铸票；地区403不笼统停号，确切401凭据失效仍停用。
 - `inventoryEvidence` 合并最新RegionMint与旧/过期Pair来源，要求启用有凭据账号、启用动态出口及匹配ReachableExits；按组合＋网关去重，一次漂移不抹掉唯一旧路线。
 - `PairTarget=max(busiest+spare,minPairs,recoverable)`封顶190，busiest包含启用的无凭据消费者占位行；spare>190仍显式关闭补货。缺口按集合计算，其他活票不能抵消某个已知可恢复网关缺失。
+- 需求统计按Slots/Accounts revision及LastDeliver精确cutoff区间复用，恢复证据/唯一网关数按Accounts/Gateway/Pairs/Mints与实时可用出口集复用；无revision的fake直接重算，配置/TTL不静态缓存。
+- 同消费者的交付与归还使用独立可取消门闩，避免拿到尚未提交的同票；不同消费者可以组提交。交付槽位落盘失败必须返回失败，不得仍回成功票。
 - 普通库存周期先已知缺票路线，只有已知数不足target才最多2个未知bootstrap；总尝试仍≤2×缺口，短票/预测错/失败消耗失手预算，路线5分钟至1小时退避。
 - 取票`markDemand`合并唤醒，最短5秒，走原后台锁/预算；唤醒绝不bootstrap或追加专门探索，匿名仍不在HTTP中自行铸票。
 - 点名恢复优先历史来源账号＋出口整体，优先非消费者；无可用历史路线才回落原单发路径。账号锁后重读启用态/凭据，另一任务已补齐则不重复发。回归见 `sched/inventory_recovery_test.go`。
+- `inventory_routing` 为 `off/shadow/assist`，默认shadow只记预测；assist只在原库存候选内、小时负载/国家公平与既有偏好之后打破平局，不影响交付/续票/专门探索。热修改对后续选择生效，不撤销已排定的请求。
+- 国家预测为滚动生产变体，不等于离线冻结模型的已验证收益；选前地理由同请求出口的历史实际国家估计，至少5条且一致率≥80%，身份/国家各≥5条才预测。未知、混合或不支持的地理弃权，不能用本次后验Geo冒充选前信息。
+- 模型每库存轮冻结；`Sample.InventoryPrediction`保留决策时刻、训练截至时刻、模式及支持数，绑定/Geo/HTTP失败也保留预测。预测不得写入inventoryEvidence、替代expected或免掉bootstrap失手预算。

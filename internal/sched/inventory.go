@@ -2,8 +2,11 @@ package sched
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"time"
 
+	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
 
@@ -13,16 +16,59 @@ type inventoryRoute struct {
 	gateway string
 }
 
+type inventoryEvidenceCache struct {
+	mu          sync.Mutex
+	ready       bool
+	revision    store.Revisions
+	regions     []types.Region
+	routes      []inventoryRoute
+	recoverable int
+}
+
 // A source account/exit is a recovery prediction, not a guaranteed landing.
 // Keep stored ticket provenance as well as the latest country landing: one
 // drift must not erase the only historical way back to an expired rare ticket.
 func (s *Scheduler) inventoryEvidence() []inventoryRoute {
+	routes, _ := s.inventoryEvidenceSnapshot()
+	return routes
+}
+
+func countRecoverable(routes []inventoryRoute) int {
+	seen := make(map[string]bool)
+	for _, route := range routes {
+		seen[route.gateway] = true
+	}
+	return len(seen)
+}
+
+func (s *Scheduler) inventoryEvidenceSnapshot() ([]inventoryRoute, int) {
+	regions := s.dynamicRegions(types.Exit{})
+	versioned, ok := s.st.(interface{ Revisions() store.Revisions })
+	if !ok {
+		routes := s.inventoryEvidenceFor(regions)
+		return routes, countRecoverable(routes)
+	}
+	cache := &s.evidenceCache
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	rev := versioned.Revisions()
+	key := store.Revisions{Accounts: rev.Accounts, Gateways: rev.Gateways, Pairs: rev.Pairs, Mints: rev.Mints}
+	if cache.ready && cache.revision == key && slices.Equal(cache.regions, regions) {
+		return cache.routes, cache.recoverable // immutable; callers only iterate this evidence
+	}
+	cache.routes = s.inventoryEvidenceFor(regions)
+	cache.recoverable = countRecoverable(cache.routes)
+	cache.ready, cache.revision, cache.regions = true, key, slices.Clone(regions)
+	return cache.routes, cache.recoverable
+}
+
+func (s *Scheduler) inventoryEvidenceFor(enabledRegions []types.Region) []inventoryRoute {
 	accounts := make(map[int64]bool)
 	for _, a := range s.usable() {
 		accounts[a.ID] = true
 	}
 	regions := make(map[string]types.Exit)
-	for _, r := range s.dynamicRegions(types.Exit{}) {
+	for _, r := range enabledRegions {
 		regions[r.Key] = r.Exit
 	}
 	gateways := s.st.Gateways()

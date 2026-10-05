@@ -1739,6 +1739,22 @@ func TestCookieReportsPairRemainingSeparately(t *testing.T) {
 	}
 }
 
+func TestCookieReportsAbsoluteRouteDeadlineNotAdvisoryWindow(t *testing.T) {
+	srv, _, pool, st, _ := rig(t, types.ModePool)
+	pair := st.pairs["unified-142"]
+	pair.ExpiresAt = time.Now().UTC().Add(time.Hour)
+	st.pairs["unified-142"] = pair
+	got := srv.delivered(pool.delivery)
+	if !got.RouteExpiresAt.Equal(pair.ExpiresAt) || got.RouteExpiresAt.Equal(got.ExpiresAt) {
+		t.Fatal("route deadline must be the stored cookie deadline, not the delivery window")
+	}
+	pair.Cookie = "replacement"
+	st.pairs["unified-142"] = pair
+	if !srv.delivered(pool.delivery).RouteExpiresAt.IsZero() {
+		t.Fatal("a replacement cookie's deadline must not be attached to an older delivery")
+	}
+}
+
 // N3：Detail 按**字符**截，不按字节——它基本全是中文，而它进的是 HTML 页面，
 // 按字节切会把半个汉字落进去。
 func TestFailDetailTruncatesByRune(t *testing.T) {

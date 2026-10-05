@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gwpool/internal/contact"
+	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
 
@@ -88,6 +89,10 @@ func (s *Server) contactStats(r *http.Request, now time.Time) map[string][]types
 	if !ok || caller.admin {
 		return nil
 	}
+	if _, ok := s.st.(interface{ Revisions() store.Revisions }); ok {
+		byConsumer, _ := s.contactData(now)
+		return byConsumer[reportConsumer{caller.reporterID(), tag}]
+	}
 	var reports []types.ContactReport
 	for _, report := range s.st.ContactReports() {
 		if report.ReporterID == caller.reporterID() && report.AccountTag == tag {
@@ -99,4 +104,25 @@ func (s *Server) contactStats(r *http.Request, now time.Time) map[string][]types
 		out[row.Gateway] = append(out[row.Gateway], row)
 	}
 	return out
+}
+
+func (s *Server) encodedContactStats(r *http.Request, now time.Time) map[string]json.RawMessage {
+	tag := strings.ToLower(r.Header.Get("X-Gwpool-Account-Tag"))
+	if !validCooldownTag(tag) {
+		return nil
+	}
+	caller, ok := s.resolveCaller(r)
+	if !ok || caller.admin {
+		return nil
+	}
+	if _, ok := s.st.(interface{ Revisions() store.Revisions }); !ok {
+		rows := s.contactStats(r, now)
+		out := make(map[string]json.RawMessage, len(rows))
+		for gateway, stats := range rows {
+			out[gateway], _ = json.Marshal(stats)
+		}
+		return out
+	}
+	_, _, encoded := s.contactDataEncoded(now)
+	return encoded[reportConsumer{caller.reporterID(), tag}]
 }

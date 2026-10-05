@@ -29,7 +29,7 @@ func (s *Store) AddContactReport(report types.ContactReport) (bool, error) {
 		}
 		s.st.ContactReports = append([]types.ContactReport(nil), before...)
 		s.st.ContactReports[i] = merged
-		if err := s.save(); err != nil {
+		if err := s.save(stateChange{Contacts: []types.ContactReport{merged}}); err != nil {
 			s.st.ContactReports = before
 			return false, err
 		}
@@ -54,7 +54,8 @@ func (s *Store) AddContactReport(report types.ContactReport) (bool, error) {
 		kept[i], kept[j] = kept[j], kept[i]
 	}
 	s.st.ContactReports = kept
-	if err := s.save(); err != nil {
+	updates, dropped := diffReports(before, kept, contactKey)
+	if err := s.save(stateChange{Contacts: updates, DropContacts: dropped}); err != nil {
 		s.st.ContactReports = before
 		return false, err
 	}

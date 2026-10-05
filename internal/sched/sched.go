@@ -288,6 +288,8 @@ type Scheduler struct {
 	lastMintedAt  map[int64]time.Time
 	lastDeliver   time.Time
 	inventoryWake chan struct{} // 合并真实取票需求；仅唤醒维护，不增加专门探索轮次。
+	evidenceCache inventoryEvidenceCache
+	deliveryGates map[int64]chan struct{}
 	// gwLocks 是「同一个网关一次只许有一发在铸」，见 lockGateway。
 	gwLocks map[string]*sync.Mutex
 	// mintingRegions 是「同一个区域一次只许有一发裸铸在打」，见 claimRegion。
@@ -381,6 +383,11 @@ func (s *Scheduler) cfg() config.Config { return s.opt.Live.Get() }
 // 该换本来就是在猜，只有客户端知道自己那一发对不对劲。force 时**必须**换一个网关，
 // 没得换就 ErrNoFullSlot——把原来那张再发一遍等于没换，客户端会死循环。
 func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (types.Delivery, error) {
+	unlock, err := s.lockDelivery(ctx, accountID)
+	if err != nil {
+		return types.Delivery{}, fmt.Errorf("%w: %w", ErrNoFullSlot, err)
+	}
+	defer unlock()
 	consumer, ok := s.account(accountID)
 	if !ok {
 		// 带上停用理由：页面上「手动暂停」和「凭据已死」长得一样，而后者要换票。
@@ -729,6 +736,11 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 	if err != nil {
 		return types.Delivery{}, err
 	}
+	unlock, err := s.lockDelivery(ctx, a.ID)
+	if err != nil {
+		return types.Delivery{}, fmt.Errorf("%w: %w", ErrNoFullSlot, err)
+	}
+	defer unlock()
 	gatewayHint, force, floor := req.Gateway, req.Force, req.Floor()
 	s.markDemand()
 
@@ -794,7 +806,9 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 		// 一次读-改-写记下触碰、交付时刻和还原点。外部消费者的用量也要进账本，
 		// 否则「池子该备多深」这个目标永远看不见他们：池子对外服务得越多，
 		// 目标深度反而不涨。
-		s.noteDeliver(a.ID, sl.Gateway, at, true, p.Cookie)
+		if err := s.noteDeliver(a.ID, sl.Gateway, at, true, p.Cookie); err != nil {
+			return types.Delivery{}, err
+		}
 		// 运营方靠这行判断门槛设得对不对，以及这些票到底是匿名拿走的还是
 		// 鉴权过的跨账号调用方拿走的（后者不受门槛约束）。
 		s.opt.Log.Info("无凭据交付", "upstream", upstreamID, "account", a.ID,
@@ -1110,7 +1124,9 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 		}
 		// 触碰、交付时刻、还原点一次写完。selfMinted 时触碰已经由那一发真实请求记过了
 		// （mintOnce 自己 touch 的），别再覆盖一遍——那会把还原点挪到这次交付之后。
-		s.noteDeliver(consumer.ID, gateway, at, !selfMinted, pair.Cookie)
+		if err := s.noteDeliver(consumer.ID, gateway, at, !selfMinted, pair.Cookie); err != nil {
+			return types.Delivery{}, err
+		}
 		s.markUnverified(consumer.ID, gateway)
 		exp, validFor := s.deliverWindow(at.Add(types.DeliverTTL), pair.ExpiresAt)
 		return types.Delivery{
@@ -1185,7 +1201,9 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 		return types.Delivery{}, fmt.Errorf("网关 %s 的满血窗口只剩 %v，不发", gateway, left.Truncate(time.Second))
 	}
 	// 触碰不用再记：铸那张活票的那一发（mintOnce）已经记过，而它就是首次接触。
-	s.noteDeliver(consumer.ID, gateway, m.firstAt, false, pair.Cookie)
+	if err := s.noteDeliver(consumer.ID, gateway, m.firstAt, false, pair.Cookie); err != nil {
+		return types.Delivery{}, err
+	}
 	exp, validFor := s.deliverWindow(windowEnd, pair.ExpiresAt)
 	return types.Delivery{
 		Gateway:      gateway,
@@ -1378,6 +1396,10 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 		return minted{}, err
 	}
 	sampleStarted := s.now()
+	var prediction *types.InventoryPrediction
+	if purpose == types.PurposeInventory && cur.Cookie == "" && !s.mint.SeedBound(sid) {
+		prediction = inventoryPredictionFromContext(ctx, a.ID, e)
+	}
 	obs, gerr := s.mint.Geo(ctx, e, sid)
 	// Cookie routing does not prove the physical exit country is supported.
 	// Seed requests retain their logical region for accounting only.
@@ -1385,7 +1407,7 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 		gerr = types.ErrUnsupportedCountry
 	}
 	if gerr != nil {
-		s.sampleAttemptFailure(a, e, sid, purpose, obs, gerr)
+		s.sampleAttemptFailure(a, e, sid, purpose, obs, gerr, prediction)
 		return minted{}, fmt.Errorf("出口地理检查: %w", gerr)
 	}
 
@@ -1402,6 +1424,7 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 		Err:      types.SampleErr(res.ErrBody, err),
 		Provider: s.mint.Provider(sid), Purpose: purpose,
 		TargetMatch: e.MatchEvidence(obs, s.mint.SeedBound(sid)), DurationMS: at.Sub(sampleStarted).Milliseconds(),
+		InventoryPrediction: prediction,
 	})
 
 	// 触碰按**保守方向**记：超时和网络错在这里分不清「请求出去了但响应丢了」
@@ -1629,7 +1652,7 @@ func (s *Scheduler) regionFor(a types.Account) (types.Region, bool) {
 	return r, ok
 }
 
-// premintPolicy 是预铸给挑选器的两条偏好。交付路径传 nil（见 minterFor）。
+// premintPolicy 是预铸给挑选器的候选约束和偏好。交付路径传 nil（见 minterFor）。
 //
 // 合成一个结构而不是两个函数参数：这两条是同一件事的两半（哪些组合不要、哪些区域先要），
 // 而 minterFor 的参数表已经够长了。
@@ -1638,6 +1661,9 @@ type premintPolicy struct {
 	skip func(accountID int64, regionKey string) bool
 	// prefer 说这个区域要优先（同一档防封规矩之内）。
 	prefer func(regionKey string) bool
+	// rank only breaks ties after quota/fairness and existing preferences. It
+	// cannot create eligibility or replace a proven recovery route.
+	rank func(types.Account, types.Region) int
 }
 
 // minterFor 挑「谁去铸这一发、经哪个区域」。
@@ -1661,7 +1687,7 @@ type premintPolicy struct {
 // throttle > 0 时跳过「刚铸过票不到这么久」的账号（保温路径用；交付路径传 0，
 // 那边有人在等，节流会直接变成服务不可用）。
 //
-// pol 非 nil 时按预铸的两条偏好再筛/再排一道。交付路径传 nil：那边有人在等票，
+// pol 非 nil 时按预铸的偏好再筛/再排一道。交付路径传 nil：那边有人在等票，
 // 少一个候选就可能直接变成 503。
 func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Duration,
 	pol *premintPolicy) (types.Account, types.Region, bool) {
@@ -1681,6 +1707,7 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		reseed bool // 挑中的那个区域此刻没有种子票
 		unseen bool // 挑中的那个区域终身还没铸过
 		used   time.Time
+		rank   int
 	}
 	var cs []cand
 	for _, a := range s.usable() {
@@ -1701,18 +1728,26 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 			total += n
 		}
 		var drop, prefer func(string) bool
+		var rank func(types.Region) int
 		if pol != nil {
 			if pol.skip != nil {
 				drop = func(key string) bool { return pol.skip(a.ID, key) }
 			}
 			prefer = pol.prefer
+			if pol.rank != nil {
+				rank = func(region types.Region) int { return pol.rank(a, region) }
+			}
 		}
-		pick, picked, reseed, ok := bestRegion(regions, perRegion, limit, s.cfg().AccountAttemptLimit(), s.countryAttemptCounts(a), drop, prefer)
+		pick, picked, reseed, ok := bestRegionRanked(regions, perRegion, limit, s.cfg().AccountAttemptLimit(), s.countryAttemptCounts(a), drop, prefer, rank)
 		if !ok {
 			continue // 九个区域（或点名的那一个）本小时都打满了、或者都被 skip 排掉了
 		}
-		cs = append(cs, cand{a: a, r: pick, sent: total, reseed: reseed,
-			unseen: picked == 0, used: lastUsed[a.ID]})
+		candidate := cand{a: a, r: pick, sent: total, reseed: reseed,
+			unseen: picked == 0, used: lastUsed[a.ID]}
+		if rank != nil {
+			candidate.rank = rank(pick)
+		}
+		cs = append(cs, candidate)
 	}
 	if len(cs) == 0 {
 		return types.Account{}, types.Region{}, false
@@ -1726,6 +1761,9 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		}
 		if cs[i].reseed != cs[j].reseed {
 			return cs[i].reseed
+		}
+		if cs[i].rank != cs[j].rank {
+			return cs[i].rank > cs[j].rank
 		}
 		if !cs[i].used.Equal(cs[j].used) {
 			return cs[i].used.Before(cs[j].used)
@@ -1745,11 +1783,17 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 // drop / prefer 非 nil 时分别排掉和优先某些区域（预铸用，见 premintPolicy）。
 func bestRegion(regions []types.Region, perRegion map[string]int, limit, accountLimit int, lifetime map[string]int64,
 	drop, prefer func(regionKey string) bool) (types.Region, int64, bool, bool) {
+	return bestRegionRanked(regions, perRegion, limit, accountLimit, lifetime, drop, prefer, nil)
+}
+
+func bestRegionRanked(regions []types.Region, perRegion map[string]int, limit, accountLimit int, lifetime map[string]int64,
+	drop, prefer func(regionKey string) bool, rank func(types.Region) int) (types.Region, int64, bool, bool) {
 	if types.MintBudgetFull(perRegion, limit, accountLimit, "") {
 		return types.Region{}, 0, false, false
 	}
 	var best types.Region
 	bestCount, bestPrefer, found := int64(0), false, false
+	bestRank := 0
 	for _, r := range regions {
 		country := geography.CountryKey(r.Exit.Region)
 		if limit > 0 && perRegion[country] >= limit {
@@ -1760,15 +1804,21 @@ func bestRegion(regions []types.Region, perRegion map[string]int, limit, account
 		}
 		p := prefer != nil && prefer(r.Key)
 		n := lifetime[country]
+		value := 0
+		if rank != nil {
+			value = rank(r)
+		}
 		// Failed attempts advance the country just like success. Seed preference
 		// only breaks ties, so a persistently failing exit cannot starve new ones.
 		switch {
 		case !found, n < bestCount:
 		case n == bestCount && p && !bestPrefer:
+		case n == bestCount && p == bestPrefer && value > bestRank:
 		default:
 			continue
 		}
 		best, bestCount, bestPrefer, found = r, n, p, true
+		bestRank = value
 	}
 	return best, bestCount, bestPrefer, found
 }
@@ -1847,7 +1897,7 @@ func (s *Scheduler) holding(accountID int64, gateway string) bool {
 func (s *Scheduler) redeliver(accountID int64, req Request) (types.Delivery, bool) {
 	now := s.now()
 	var best types.Slot
-	for _, sl := range s.st.Slots() {
+	for _, sl := range s.slotsForAccount(accountID) {
 		if sl.AccountID != accountID || sl.LastDeliver.IsZero() {
 			continue
 		}
@@ -1942,7 +1992,7 @@ func (s *Scheduler) notBurning(accountID int64, cands []string) []string {
 func (s *Scheduler) burning(accountID int64) map[string]bool {
 	now := s.now()
 	out := map[string]bool{}
-	for _, sl := range s.st.Slots() {
+	for _, sl := range s.slotsForAccount(accountID) {
 		if sl.AccountID != accountID {
 			continue
 		}
@@ -1965,7 +2015,7 @@ func (s *Scheduler) burnWait(accountID int64, cands []string) time.Duration {
 	}
 	now := s.now()
 	best := time.Duration(0)
-	for _, sl := range s.st.Slots() {
+	for _, sl := range s.slotsForAccount(accountID) {
 		if sl.AccountID != accountID || !want[sl.Gateway] || sl.LastTouch.IsZero() {
 			continue
 		}
@@ -2267,13 +2317,13 @@ func drop(ss []string, v string) []string {
 // Prev* 三个字段必须在**同一次**读-改-写里落下：它们是「这次交付之前」的那一组值，
 // 分两次写就会把这次交付自己写进去的值当成旧值存下来，/release 还原完槽位看起来
 // 还是刚烧过的。票号也在这一组里——漏掉它，还原完票号仍指向一张已经不在的票。
-func (s *Scheduler) noteDeliver(accountID int64, gateway string, at time.Time, touchSelf bool, cookie string) {
+func (s *Scheduler) noteDeliver(accountID int64, gateway string, at time.Time, touchSelf bool, cookie string) error {
 	version := types.CookieVersion(cookie)
 	// 走 updateSlot 这个包装（而不是直接 st.UpdateSlot）：它负责补上 AccountID /
 	// Gateway / 初始判定。这条路现在可能是一条新槽位行的**唯一**写入者
 	// （池子一发上游都没替消费者打的时候），字段补不全的话那行就没有网关名，
 	// 下一次挑选会拿它当候选、而它谁也不是。
-	_ = s.updateSlot(accountID, gateway, func(sl *types.Slot) {
+	return s.updateSlot(accountID, gateway, func(sl *types.Slot) {
 		sl.PrevDeliver, sl.PrevTouch = sl.LastDeliver, sl.LastTouch
 		sl.PrevDeliverVersion = sl.LastDeliverVersion
 		if touchSelf {
@@ -2300,6 +2350,11 @@ var ErrNoRelease = errors.New("没有可归还的交付")
 // 乱报只害他自己（拿回一个其实已经烧掉的槽位，下一发就是降智的），
 // 所以和匿名那个 account 参数一样不设防（见 anonAccount）。
 func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) {
+	unlock, err := s.lockDelivery(context.Background(), accountID)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	// 开着交付前验证时一律不受理：那条路池子**真用消费者的凭据打了两发**
 	// （先铸一张属于它的活票，再 echo），槽位是实烧的——还了就是对池子说谎，
 	// 下一个人会拿到一个已经烧掉的落点，而冷却会从 4 小时缩成一个满血窗口。
@@ -2310,7 +2365,7 @@ func (s *Scheduler) Release(accountID int64, cookieVersion string) (int, error) 
 	}
 	now := s.now()
 	n := 0
-	for _, sl := range s.st.Slots() {
+	for _, sl := range s.slotsForAccount(accountID) {
 		if sl.AccountID != accountID {
 			continue
 		}
@@ -2374,7 +2429,7 @@ func (s *Scheduler) gotThisTicket(sl types.Slot, cookieVersion string, now time.
 // PairLifetime，拿它当窗口既够宽又不多给。
 func (s *Scheduler) DeliveredTo(accountID int64, cookieVersion string) bool {
 	now := s.now()
-	for _, sl := range s.st.Slots() {
+	for _, sl := range s.slotsForAccount(accountID) {
 		if sl.AccountID == accountID && s.gotThisTicket(sl, cookieVersion, now, types.PairLifetime) {
 			return true
 		}

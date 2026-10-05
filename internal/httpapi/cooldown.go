@@ -177,8 +177,9 @@ func (s *Server) cooldownRecommendations(r *http.Request, now time.Time) map[str
 		return nil
 	}
 	out := map[string]types.CooldownRecommendation{}
-	for _, stats := range cooldown.SummarizeWithin(s.st.CooldownReports(), now, cooldownClientCeiling(r)) {
-		if rec := cooldown.ForAccount(stats, caller.reporterID(), tag); rec.Seconds > 0 {
+	entry := s.cooldownData(now, cooldownClientCeiling(r))
+	for _, stats := range entry.stats {
+		if rec := entry.forAccount(stats, caller.reporterID(), tag, now); rec.Seconds > 0 {
 			out[stats.Gateway] = rec
 		}
 	}

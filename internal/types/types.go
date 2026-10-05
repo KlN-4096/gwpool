@@ -280,17 +280,18 @@ func RejectedByUpstream(status int) bool {
 
 // Sample 是一次扫描的落点记录。
 type Sample struct {
-	AccountID   int64
-	RegionKey   string // SPEC.md 第 4 节的区域 key
-	Requested   Exit
-	Observed    Observed
-	Gateway     string
-	Status      int
-	At          time.Time
-	Provider    string `json:",omitempty"`
-	Purpose     string `json:",omitempty"`
-	TargetMatch string `json:",omitempty"`
-	DurationMS  int64  `json:",omitempty"`
+	AccountID           int64
+	RegionKey           string // SPEC.md 第 4 节的区域 key
+	Requested           Exit
+	Observed            Observed
+	Gateway             string
+	Status              int
+	At                  time.Time
+	Provider            string               `json:",omitempty"`
+	Purpose             string               `json:",omitempty"`
+	TargetMatch         string               `json:",omitempty"`
+	DurationMS          int64                `json:",omitempty"`
+	InventoryPrediction *InventoryPrediction `json:",omitempty"`
 	// Err 是这一发失败的具体原因（上游那段 JSON，或本地的错误文本），成功时为空。
 	// 没有它的话 samples.jsonl 里一行 status=400 什么都不告诉人：2026-10-01 首扫
 	// 二十发全 400，真正的原因（账号清单里没有 gpt-6-astra）要单独打一发才看得见。

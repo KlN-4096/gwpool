@@ -133,7 +133,7 @@ func TestCooldownExtendedStepsAndLegacyEvidenceCeiling(t *testing.T) {
 	}
 }
 
-func TestRecommendationUsesActualIdleTimeAndFailureFloor(t *testing.T) {
+func TestRecommendationExcludesLateSuccessesButKeepsFailureFloor(t *testing.T) {
 	now := time.Now()
 	reports := []types.CooldownReport{
 		{AccountTag: "a", Gateway: "g", WindowSeconds: 3600, ElapsedSeconds: 9000, Result: "full", ReceivedAt: now},
@@ -141,10 +141,89 @@ func TestRecommendationUsesActualIdleTimeAndFailureFloor(t *testing.T) {
 		{AccountTag: "a", Gateway: "g", WindowSeconds: 14400, ElapsedSeconds: 14400, Result: "degraded", ReceivedAt: now},
 	}
 	stats := Summarize(reports, now)
-	if got := ForAccount(stats[0], 0, "a"); got.Seconds != 21600 {
-		t.Fatalf("不能将实际2.5h才成功记为1h，且需越过失败的4h档：%+v", got)
+	if got := ForAccount(stats[0], 0, "a"); got.Seconds != 0 {
+		t.Fatalf("实际2.5h才成功不能证明计划1h档，也不能作为更长档的成功证据：%+v", got)
+	}
+	if stats[0].Samples != 3 || stats[0].Successes != 2 || stats[0].Failures != 1 {
+		t.Fatalf("过滤推荐不能删除原始统计：%+v", stats[0])
+	}
+	for range MinOwnSuccesses {
+		reports = append(reports, types.CooldownReport{AccountTag: "a", Gateway: "g",
+			WindowSeconds: 3600, ElapsedSeconds: 3600, Result: "full", ReceivedAt: now})
+	}
+	if got := ForAccount(Summarize(reports, now)[0], 0, "a"); got.Seconds != 21600 {
+		t.Fatalf("有效成功仍需越过失败的4h档：%+v", got)
 	}
 	if len(Summarize(reports, now.Add(Retention+time.Hour))) != 0 {
 		t.Fatal("过期样本仍参与推荐")
+	}
+}
+
+func TestSuccessBucketPlannedWindowGrace(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		planned int
+		elapsed int
+		want    int
+	}{
+		{"on_time", 7200, 7200, 7200},
+		{"grace_boundary", 7200, 7200 + GraceSeconds, 7200},
+		{"beyond_grace", 7200, 7200 + GraceSeconds + 1, 0},
+		{"sparse_traffic", 7200, 36000, 0},
+		{"maximum_grace_boundary", MaxSeconds, MaxSeconds + GraceSeconds, MaxSeconds},
+		{"maximum_beyond_grace", MaxSeconds, MaxSeconds + GraceSeconds + 1, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := successBucket(types.CooldownReport{
+				WindowSeconds: test.planned, ElapsedSeconds: test.elapsed,
+			}); got != test.want {
+				t.Fatalf("successBucket(%d, %d)=%d want %d", test.planned, test.elapsed, got, test.want)
+			}
+		})
+	}
+}
+
+func TestLateSuccessesCannotSupplyPoolEvidenceOrInflateRecommendation(t *testing.T) {
+	now := time.Now()
+	var reports []types.CooldownReport
+	for reporter := range MinPoolReporters {
+		elapsed := 7200
+		if reporter == MinPoolReporters-1 {
+			elapsed = 36000
+		}
+		for range MinOwnSuccesses {
+			reports = append(reports, types.CooldownReport{ReporterID: int64(reporter), AccountTag: "a",
+				Gateway: "g", WindowSeconds: 7200, ElapsedSeconds: elapsed, Result: "full", ReceivedAt: now})
+		}
+	}
+	if got := Summarize(reports, now)[0].Recommendation.Seconds; got != 0 {
+		t.Fatalf("迟到成功不能凑足第三个consumer：%d", got)
+	}
+	for range MinOwnSuccesses {
+		reports = append(reports, types.CooldownReport{ReporterID: MinPoolReporters - 1, AccountTag: "a",
+			Gateway: "g", WindowSeconds: 7200, ElapsedSeconds: 7200, Result: "full", ReceivedAt: now})
+	}
+	stats := Summarize(reports, now)[0]
+	if stats.Recommendation.Seconds != 7200 || ForAccount(stats, MinPoolReporters-1, "a").Seconds != 7200 {
+		t.Fatalf("迟到成功不能抬高个人或全池推荐：%+v", stats)
+	}
+}
+
+func TestLateSuccessRevokesStableReportingEvenWhenItRoundsToSameStep(t *testing.T) {
+	now := time.Now()
+	var reports []types.CooldownReport
+	for i := range StableMinSamples {
+		reports = append(reports, types.CooldownReport{ReporterID: 1, AccountTag: "a",
+			Gateway: "g", WindowSeconds: 14400, ElapsedSeconds: 14400, Result: "full",
+			ReceivedAt: now.Add(time.Duration(i-StableMinSamples+1) * 6 * time.Hour)})
+	}
+	if got := ForAccount(Summarize(reports, now)[0], 1, "a"); got.ReportIntervalSeconds == 0 {
+		t.Fatal("准时成功应允许稳定上报策略")
+	}
+	reports[len(reports)-1].WindowSeconds = 7200
+	reports[len(reports)-1].ElapsedSeconds = 9000
+	got := ForAccount(Summarize(reports, now)[0], 1, "a")
+	if got.Seconds != 14400 || got.ReportIntervalSeconds != 0 {
+		t.Fatalf("迟到成功保留较早的有效推荐，但不能维持稳定上报策略：%+v", got)
 	}
 }

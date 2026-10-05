@@ -262,25 +262,31 @@
     <div class="card-body"><div class="actions"><span class="badge ok">可交付 {{.Supply.Ready}}</span><span class="badge">维护目标 {{.Supply.Target}}</span><span class="badge warn">{{.Supply.WindowMin}}分钟内临期 {{.Supply.Expiring}}</span></div>
       <p class="foot">“找新网关”会安排真实上游请求，受账号、出口与预算限制；查看本页不会触发探测。消费观察保留7天，unknown单列；冷却报告和接触轮次是不同分母，不能相加。</p></div>
     {{if .Gateways}}
-    <div class="table-wrap"><table id="t-gateways" data-grid data-natsort data-size="100"
+    <div class="table-wrap"><table id="t-gateways" data-grid data-natsort data-size="25"
         data-facets="ready:可交付:ok|short:寿命不足:warn|expired:已过期|none:无票" data-placeholder="搜索网关、账号、国家或模型">
-      <thead><tr><th>网关 / 路由状态</th><th>路由剩余</th><th>铸票账号</th><th class="num">出口</th><th>到达过的国家/城市</th><th>消费观察</th><th>首次发现（UTC）</th></tr></thead>
+      <thead><tr><th>网关 / 状态</th><th>路由剩余</th><th>铸票账号</th><th>覆盖</th><th>满血 / 刷新 / 未知</th><th>冷却参考</th><th>首次发现</th><th data-nosort>详情</th></tr></thead>
       <tbody>
       {{range .Gateways}}
-        <tr data-facet="{{.PairState}}">
+        <tr data-facet="{{.PairState}}" data-gateway="{{.Name}}">
           <td><b class="mono">{{.Name}}</b><div class="sub">{{if eq .PairState "ready"}}<span class="badge ok">可交付</span>{{else if eq .PairState "short"}}<span class="badge warn">寿命不足</span>{{else if eq .PairState "expired"}}<span class="badge">已过期</span>{{else}}<span class="badge">无票</span>{{end}}</div></td>
           <td>{{if .PairLeft}}{{.PairLeft}}{{else}}—{{end}}</td>
-          <td>{{if .MintedBy}}{{.MintedBy}}{{else}}<span class="muted">—</span>{{end}}</td>
-          <td class="num" title="请求过的出口：{{.ExitLabels}}">{{.Exits}}</td>
-          <td class="text">{{if .Places}}<details class="places"><summary>{{range $i, $p := .Places}}{{if $i}} · {{end}}{{$p.Country}}{{if $p.Known}}（{{$p.Known}} 城）{{end}}{{end}}</summary>
-            {{- range .Places}}<div class="sub"><b>{{.Country}}</b>：{{range $i, $c := .Cities}}{{if $i}}、{{end}}{{$c}}{{end}}</div>{{end}}</details>
-            {{- else}}<span class="muted">—</span>{{end}}</td>
-          <td class="gateway-observation">
-            <div>满血 {{.Full}} / 刷新 {{.Refreshed}} / 未知 {{.Unknown}}</div>
-            <div class="sub">冷却参考：{{if .CooldownLabel}}{{.CooldownLabel}}{{else}}暂无池级建议{{end}}</div>
-            {{if or .Contacts .Cooldown.Samples}}
-            <details><summary>分层样本与冷却明细</summary>
-              <div class="observation-detail">
+          <td><span class="gateway-source" title="{{.MintedBy}}">{{if .MintedBy}}{{.MintedBy}}{{else}}—{{end}}</span></td>
+          <td data-sort="{{len .Places}}"><span class="gateway-cover">{{len .Places}} 国 · {{.Exits}} 出口</span></td>
+          <td data-sort="{{.Full}}"><span class="gateway-counts"><b>{{.Full}}</b><span>/ {{.Refreshed}}</span><span>/ {{.Unknown}}</span></span></td>
+          <td><span class="gateway-cooldown">{{if .CooldownLabel}}{{.CooldownLabel}}{{else}}—{{end}}</span></td>
+          <td data-sort="{{.FirstSeen}}"><span class="gateway-date mono" title="{{.FirstSeen}} UTC">{{if ge (len .FirstSeen) 10}}{{slice .FirstSeen 0 10}}{{else}}{{.FirstSeen}}{{end}}</span></td>
+          <td class="gateway-detail-cell">
+            <details class="gateway-details"><summary>详情</summary>
+              <div class="gateway-detail-content">
+                <h3>路由与来源</h3>
+                <dl class="gateway-meta">
+                  <dt>铸票账号</dt><dd>{{if .MintedBy}}{{.MintedBy}}{{else}}—{{end}}</dd>
+                  <dt>首次发现</dt><dd>{{.FirstSeen}} UTC</dd>
+                  <dt>发现账号</dt><dd>{{if .FirstSeenBy}}{{.FirstSeenBy}}{{else}}—{{end}}</dd>
+                  <dt>请求出口</dt><dd>{{if .ExitLabels}}{{.ExitLabels}}{{else}}—{{end}}</dd>
+                </dl>
+                <h3>到达过的国家 / 城市</h3>
+                {{range .Places}}<p><b>{{.Country}}{{if .Known}}（{{.Known}} 城）{{end}}</b>：{{range $i, $c := .Cities}}{{if $i}}、{{end}}{{$c}}{{end}}</p>{{else}}<p class="muted">暂无地点观察。</p>{{end}}
                 <h3>消费端冷却统计</h3>
                 {{with .Cooldown}}{{if .Samples}}
                 <p>成功 {{.Successes}} / 失败 {{.Failures}} · 来源×匿名账号数 {{len .Accounts}}</p>
@@ -296,13 +302,16 @@
                   <p class="sub">观测时长：{{if .WindowSamples}}{{.WindowMeanMS}}ms / {{.WindowSamples}}样本{{else}}待统计{{end}}</p>
                 </div>{{else}}<p class="muted">暂无新协议接触样本；不把旧冷却报告当作完整接触率分母。</p>{{end}}
               </div>
-            </details>{{end}}
+            </details>
           </td>
-          <td><span class="mono">{{.FirstSeen}}</span>{{if .FirstSeenBy}}<div class="sub">{{.FirstSeenBy}}</div>{{end}}</td>
         </tr>
       {{end}}
       </tbody>
     </table></div>
+    <dialog id="gateway-detail-dialog" aria-labelledby="gateway-detail-title">
+      <header><div><p class="muted">网关详情</p><h2 id="gateway-detail-title"></h2></div><button type="button" data-close-gateway aria-label="关闭网关详情">关闭</button></header>
+      <div data-gateway-detail-body></div>
+    </dialog>
     {{else}}
     <p class="empty">尚未发现网关。</p>
     {{end}}

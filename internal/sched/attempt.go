@@ -20,14 +20,20 @@ func (s *Scheduler) beginAttempt(ctx context.Context, account types.Account, exi
 	return reserved, err
 }
 
-func (s *Scheduler) sampleAttemptFailure(account types.Account, exit types.Exit, sid, purpose string, obs types.Observed, err error) {
+func (s *Scheduler) sampleAttemptFailure(account types.Account, exit types.Exit, sid, purpose string, obs types.Observed, err error,
+	predictions ...*types.InventoryPrediction) {
 	provider := ""
 	if sid != "" {
 		provider = s.mint.Provider(sid)
 	}
+	var prediction *types.InventoryPrediction
+	if len(predictions) > 0 {
+		prediction = predictions[0]
+	}
 	s.sample(types.Sample{AccountID: account.ID, RegionKey: s.sampleRegion(exit),
 		Requested: exit, Observed: obs, At: s.now(), Err: types.SampleErr("", err),
-		Provider: provider, Purpose: purpose, TargetMatch: exit.MatchEvidence(obs, false)})
+		Provider: provider, Purpose: purpose, TargetMatch: exit.MatchEvidence(obs, false),
+		InventoryPrediction: prediction})
 }
 
 func (s *Scheduler) countryAttemptCounts(account types.Account) map[string]int64 {

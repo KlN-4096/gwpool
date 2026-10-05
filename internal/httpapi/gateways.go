@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"gwpool/internal/contact"
 	"gwpool/internal/coverage"
 	"gwpool/internal/types"
 )
@@ -19,6 +18,7 @@ import (
 // 鉴权和 /cookie 完全一致，连 account 参数的含义也一致：返回的 used_by_you 是**那个
 // 上游账号的**槽位历史，不带 account 就按这把 key 的上传者算。
 func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
+	r = s.resolveCallerOnce(r)
 	// 占位行在这条路上照常用：used_by_you 问的就是「那个上游账号」的槽位历史。
 	upstream, acctID, _, ok := s.whoAsks(w, r)
 	if !ok {
@@ -27,56 +27,31 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	recommendations := s.cooldownRecommendations(r, now)
-	contactStats := s.contactStats(r, now)
+	contactStats := s.encodedContactStats(r, now)
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model != "" && !validContactToken(model) {
 		s.badRequest(w, http.StatusBadRequest, "model 格式错误")
 		return
 	}
-	priorities := contact.Priorities(s.st.ContactReports(), model, now)
-	pairs := s.effectivePairs(now)
+	priorities := s.contactPriorities(model, now)
+	pairs := s.cachedCatalogPairs(now)
 	// 按网关名收一份这个账号自己的槽位：槽位表的键格式归 store 所有，
 	// 这里只认 Slot 自己带的两个字段，免得为一个拼键函数把 store 拖进来。
 	mine := map[string]types.Slot{}
 	if acctID != 0 {
-		for _, sl := range s.st.Slots() {
+		for _, sl := range s.slotsForAccount(acctID) {
 			if sl.AccountID == acctID {
 				mine[sl.Gateway] = sl
 			}
 		}
 	}
 
-	type row struct {
-		Name string `json:"name"`
-		// PairReady = 有活 pair 且剩余够交付。false 意味着你指定它的话池子得现铸。
-		PairReady bool `json:"pair_ready"`
-		ValidForS int  `json:"valid_for_s"`
-		// 刻意没有 leased：一张 pair 同时给几个号用是允许的（见 types.Pair 的注释），
-		// 「被别人占着」这个状态不存在了。
-		UsedByYou         bool                          `json:"used_by_you"`
-		LastUsedAt        string                        `json:"last_used_at,omitempty"`
-		Cooldown          *types.CooldownRecommendation `json:"cooldown,omitempty"`
-		Contacts          []types.ContactStats          `json:"contacts,omitempty"`
-		Priority          *types.GatewayPriority        `json:"priority,omitempty"`
-		DatacenterCountry string                        `json:"datacenter_country,omitempty"`
-	}
-	out := struct {
-		Account string `json:"account"`
-		Live    int    `json:"live"`
-		Target  int    `json:"target"`
-		// 两个门槛数是**池子侧**的常量，而消费端要自己定 min_remaining ——
-		// 不报出来它只能瞎猜，猜高了就每发都取不到票，而且任何读数里都看不出
-		// 是这个参数的事（和「真的没票」长得一模一样）。
-		//
-		// 哪天 DeliverFloor 变成配置项（像 slot_cooldown_minutes 那样），
-		// 这两个字段**必须跟着现读 Live**：报一个过期的门槛出去，消费端会照它
-		// 算 min_remaining，于是每发都取不到票，而两边的读数都「自洽」。
-		DeliverTTLS   int   `json:"deliver_ttl_s"`
-		DeliverFloorS int   `json:"deliver_floor_s"`
-		Gateways      []row `json:"gateways"`
-	}{Account: upstream, Target: s.pool.PairTarget(),
+	// These two durations remain protocol constants, not cached configuration.
+	// Read readiness, caller history and runtime target anew on every request.
+	out := gatewayCatalogResponse{gatewayCatalogHeader: gatewayCatalogHeader{
+		Account: upstream, Target: s.pool.PairTarget(),
 		DeliverTTLS:   int(types.DeliverTTL / time.Second),
-		DeliverFloorS: int(types.DeliverFloor / time.Second)}
+		DeliverFloorS: int(types.DeliverFloor / time.Second)}}
 
 	cooldown := s.slotCooldown()
 	for name := range s.st.Gateways() {
@@ -89,7 +64,7 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out.Live++
-		it := row{Name: name, PairReady: true, ValidForS: int(left.Seconds()), Contacts: contactStats[name]}
+		it := gatewayCatalogRow{Name: name, PairReady: true, ValidForS: int(left.Seconds()), Contacts: contactStats[name]}
 		it.DatacenterCountry = coverage.DatacenterCountry(name)
 		if priority, ok := priorities[name]; ok {
 			it.Priority = &priority
@@ -114,7 +89,10 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 	// 稳定顺序：客户端按这个列表挑，每次换序会让它的选择无端抖动。
 	sort.Slice(out.Gateways, func(i, j int) bool { return out.Gateways[i].Name < out.Gateways[j].Name })
 
-	writeJSON(w, http.StatusOK, out)
+	if err := writeGatewayCatalog(w, out); err != nil {
+		s.opt.Log.Error("encode gateway catalog failed", "error", err)
+		http.Error(w, "清单编码失败", http.StatusInternalServerError)
+	}
 }
 
 // whoAsks 认出「这次是替哪个**上游账号**问」，连它的池内行一起定出来，并把该拒的都拒掉。
@@ -190,6 +168,12 @@ func (s *Server) slotCooldown() time.Duration {
 func (s *Server) rowFor(accountID string) int64 {
 	if accountID == "" {
 		return 0
+	}
+	if indexed, ok := s.st.(interface {
+		AccountByUpstreamID(string) (types.Account, bool)
+	}); ok {
+		account, _ := indexed.AccountByUpstreamID(accountID)
+		return account.ID
 	}
 	for _, a := range s.st.Accounts() {
 		if a.Creds.AccountID == accountID {

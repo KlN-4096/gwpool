@@ -76,12 +76,7 @@ func TestCountryAttemptsConcurrentCountryAndAccountCaps(t *testing.T) {
 
 func TestCountryAttemptsSaveFailureDoesNotReserveInMemory(t *testing.T) {
 	s := open(t, t.TempDir())
-	// A file in place of the directory forces a portable write failure.
-	badDir := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(badDir, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s.dir = badDir
+	breakSave(t, s)
 	if err := s.ReserveAttempt("one", "US", 2, 50, time.Now()); err == nil {
 		t.Fatal("save failure was hidden")
 	}
