@@ -1,5 +1,11 @@
 # 开发日志
 
+## 2026-10-05 — 完成前置推送及期限/总览上线
+- `41270ab520a8b980305f26ee3148137f7c90ff53`已推main，收齐已在线性能/WAL/routing前置与本轮route_expires_at/总览；实验标签源码、截图、生成exe等未自动提交。
+- 精确commit归档经原生Go隔离GOENV/GOWORK构建，bytevirt已部署SHA `b5d004ab7b11fbece57bbecf5a467b38db32c55994d16a92f36aaa065676be18`，配置不变、最新WAL保留，冷备`/opt/gwpool/backup-release-41270ab520a8`。
+- 同WALv2二进制更新脚本经两轮窄审及4项失败恢复测试；在线admin/catalog200、25条分页与106详情行，短窗自然交付59次、ERROR级0，不额外取票或探模型。
+- 配套sub2api正式klno.12已升级bytevirt/31.108；无旧备份清理或额外配置修改。
+
 ## 2026-10-05 — Cookie路由期限与网关总览（本地）
 - `/cookie`仅精确匹配交付cookie时附加已存绝对`route_expires_at`，与150s参考窗口分离；沿用既有RouteDeadline含历史fallback，不在消费端猜剩余时间。两项期限协议定向通过。
 - 网关总览改25条紧凑表，账号/日期摘要、全文留详情用于搜索；native dialog克隆转义DOM，Esc关闭/焦点返回，无JS原生details回退，不动调度预算。
