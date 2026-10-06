@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/url"
 
+	"gwpool/internal/config"
 	"gwpool/internal/sched"
 	"gwpool/internal/types"
 )
@@ -53,6 +54,8 @@ type poolView struct {
 	PublicOpen    bool
 	OpenAccounts  int
 	Threshold     int
+	PublicKey     string
+	PublicLimits  config.PublicWhenSurplus
 
 	// Gateways 是**全部**已知网关：上面那几个 KPI 和页签计数都数它，筛选时不能跟着缩水
 	// （筛着欧洲时顶上写「已知网关 2」是在说池子只剩两个）。表里实际列出来的是 Shown。

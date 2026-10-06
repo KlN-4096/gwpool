@@ -204,10 +204,11 @@ type Server struct {
 	// 最近的交付失败，给页面回答「为什么客户端报 502」。
 	fails failLog
 	// started 写在管理页那张失败表上：失败只存在内存里，重启前的已经没了。
-	started      time.Time
-	contacts     contactCache
-	cooldowns    cooldownCache
-	catalogPairs pairCatalogCache
+	started         time.Time
+	contacts        contactCache
+	cooldowns       cooldownCache
+	catalogPairs    pairCatalogCache
+	publicAdmission publicAdmission
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
 	tplMintAll, tplCleanup                                        *template.Template
@@ -290,15 +291,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /u/{token}", s.gate(http.HandlerFunc(s.handleOwner)))
 	mux.Handle("POST /enter", s.gate(s.sameOrigin(http.HandlerFunc(s.handleEnter))))
 	mux.Handle("POST /logout", s.gate(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
-	mux.HandleFunc("GET /cookie", s.handleCookie)
+	mux.Handle("GET /cookie", s.consumerAPI(s.handleCookie))
 	// /release 和 /cookie 同一把钥匙、同一套 account 语义（见 handleRelease）。
-	mux.HandleFunc("POST /release", s.handleRelease)
+	mux.Handle("POST /release", s.consumerAPI(s.handleRelease))
 	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
-	mux.HandleFunc("POST /pair/renew", s.handleRenew)
-	mux.HandleFunc("POST /cooldown/report", s.handleCooldownReport)
-	mux.HandleFunc("POST /cooldown/reports", s.handleCooldownReports)
-	mux.HandleFunc("POST /contact/report", s.handleContactReport)
-	mux.HandleFunc("GET /gateways", s.handleGateways)
+	mux.Handle("POST /pair/renew", s.consumerAPI(s.handleRenew))
+	mux.Handle("POST /cooldown/report", s.consumerAPI(s.handleCooldownReport))
+	mux.Handle("POST /cooldown/reports", s.consumerAPI(s.handleCooldownReports))
+	mux.Handle("POST /contact/report", s.consumerAPI(s.handleContactReport))
+	mux.Handle("GET /gateways", s.consumerAPI(s.handleGateways))
 	// 管理面的 POST 也要罩 sameOrigin：authAdmin 走 HTTP Basic，而浏览器一旦缓存了
 	// 这个 realm 的凭据，**跨站请求照样会自动带上**——和 cookie 一样是「环境凭证」。
 	// 不罩的话一个第三方页面就能让管理员的浏览器替他删号或改配置。
@@ -512,6 +513,7 @@ type caller struct {
 	acct    types.Account
 	admin   bool
 	ownerID int64
+	public  bool
 }
 
 type requestCallerKey struct{}
@@ -540,6 +542,9 @@ func (s *Server) resolveCaller(r *http.Request) (caller, bool) {
 	}
 	if keyOK(s.opt.AdminKey, got) || keyOK(s.opt.ConsumerKey, got) {
 		return caller{admin: true}, true
+	}
+	if keyOK(s.PublicKey(), got) {
+		return caller{public: true}, true
 	}
 	if strings.HasPrefix(got, "gwp_a_") {
 		for _, owner := range s.st.Owners() {
@@ -679,6 +684,10 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	markPoolRegionLinks(v.Regions, want)
 	ps := s.pool.Public()
 	v.PublicEnabled, v.PublicOpen = ps.Enabled, ps.Open
+	if ps.Enabled {
+		v.PublicKey = s.PublicKey()
+	}
+	v.PublicLimits = s.publicLimits()
 	v.OpenAccounts, v.Threshold = ps.Accounts, ps.Threshold
 	v.Model, v.Effort = s.probeModel(), probeEffort
 	v.BaseURL = s.publicBaseURL()
@@ -1536,7 +1545,11 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	}
 	c, ok := s.resolveCaller(r)
 	if !ok {
-		s.serveAnonymous(w, r, req, wait, count)
+		s.unauthorized(w, "需要有效的接入 Key")
+		return
+	}
+	if c.public {
+		s.servePublic(w, r, req, wait, count)
 		return
 	}
 	acct := c.acct
@@ -1586,43 +1599,31 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// serveAnonymous 处理没带有效 key 的 /cookie。
-//
-// 票富裕时自动对外开放、回落就自动关上（见 sched.PublicState）。
-// 刻意不做限流/配额：现在没需求，门槛本身就是闸门。
-func (s *Server) serveAnonymous(w http.ResponseWriter, r *http.Request, req sched.Request,
+// servePublic uses the same external-account delivery path as ordinary keys,
+// with the public surplus gate retained. No credential ownership is implied.
+func (s *Server) servePublic(w http.ResponseWriter, r *http.Request, req sched.Request,
 	wait time.Duration, count int) {
-	ps := s.pool.Public()
-	if !ps.Enabled {
-		// 没带有效 key，而池子又不对外开放 ⇒ 这就是「你的 key 不认」。
-		s.unauthorized(w, "需要本账号的 key")
-		return
-	}
-	if !ps.Open {
-		s.publicClosed(w, fmt.Sprintf("池子暂不对外开放：托管账号 %d 个，门槛 %d 个",
-			ps.Accounts, ps.Threshold))
-		return
-	}
+	// consumerAPI has checked the public switch/threshold after queue admission.
 	// 必须报上他**自己的**上游账号标识：槽位是 (账号 × 网关)，不知道是谁就没法
 	// 避开他已经烧过的网关。报错的只会害他自己，所以不防乱填。
 	ref := strings.TrimSpace(r.URL.Query().Get("account"))
 	if ref == "" || len(ref) > 128 {
-		s.badRequest(w, http.StatusBadRequest, "匿名取用必须带 account 参数（你自己的上游 account_id）")
+		s.badRequest(w, http.StatusBadRequest, "公共接入必须带 account 参数（你自己的上游 account_id）")
 		return
 	}
 	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait, count,
 		func(rq sched.Request) (types.Delivery, error) {
-			// authed=false：真匿名，门槛照常卡他（那是给上传者留的余量）。
+			// authed=false：公共身份没有上传者特权，调度仍复查开放门槛。
 			d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, false)
 			if err == nil {
-				s.noteVia(ref, 0) // 这一次没带 key
+				s.noteVia(ref, 0) // 公共身份，无上传者归属。
 			}
 			return d, err
 		})
 }
 
-// noteVia 记下匿名占位行最近一次**取到票**是拿谁的 key（0 = 没带 key）。只记成功的：
-// 失败的尝试谁都能发（门槛关着时不带 key 的扫描器），不该把记录冲掉。占位行是取票时
+// noteVia 记下外部账号占位行最近一次**取到票**的上传者来源（0 = 公共身份）。只记成功的：
+// 失败的尝试不该把记录冲掉。占位行是取票时
 // 才建的，所以在取票之后记；「这是谁在用」只有 /cookie 这里知道。没变就不写盘。
 func (s *Server) noteVia(ref string, via int64) {
 	if id := s.rowFor(types.AnonPrefix + ref); id != 0 {
@@ -1731,8 +1732,7 @@ func (s *Server) deliverFailed(w http.ResponseWriter, err error, acctID, consume
 // 鉴权就是 view_token 本身——和这一页同一把钥匙。没有额外的密码：拿得到这个
 // 128 位链接的人本来就能看到这一页的全部内容（含那把 key），再加一道没有意义。
 //
-// 停用后 resolveCaller 不再认这把 key，于是请求掉进匿名通道：公开池关着就是 401，
-// 开着但没到门槛就是 503。这正是「停用后没开公开池就请求不了」。
+// 停用后 resolveCaller 不再认这把 key，请求返回 401；不降级到公共通道。
 func (s *Server) handleAccountEnabled(w http.ResponseWriter, r *http.Request) {
 	tok := r.PathValue("token")
 	if tok == "" {

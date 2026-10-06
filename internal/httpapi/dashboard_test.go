@@ -153,7 +153,8 @@ func TestDashboardSettingsFixture(t *testing.T) {
 	}
 	for _, field := range []string{"models", "public_base_url", "models_extra", "upstream_per_region_hour",
 		"upstream_per_account_hour", "slot_cooldown_minutes", "max_tries_per_deliver", "spare_target",
-		"min_pairs", "min_accounts", "public_enabled", "renew_pairs", "verify_full_at_deliver"} {
+		"min_pairs", "min_accounts", "public_enabled", "renew_pairs", "verify_full_at_deliver",
+		"public_requests_per_minute", "public_max_concurrent", "public_max_queued", "public_queue_wait_ms"} {
 		if !strings.Contains(admin.Body.String(), `name="`+field+`"`) {
 			t.Errorf("setting lost: %s", field)
 		}

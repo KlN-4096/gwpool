@@ -1379,42 +1379,45 @@ func TestEmptyKeyDeniesAll(t *testing.T) {
 	}
 }
 
-// 票富裕时自动对外开放：没 key 也能取，但必须报自己的上游 account_id。
-func TestAnonymousCookie(t *testing.T) {
-	_, h, p, _, _ := rig(t, types.ModePool)
+// 票富裕时允许公共 Key，必须报自己的上游 account_id。
+func TestPublicKeyCookie(t *testing.T) {
+	srv, h, p, _, _ := rig(t, types.ModePool)
+	request := func(path string) *http.Request {
+		return authed(httptest.NewRequest("GET", path, nil), srv.PublicKey())
+	}
 
 	// 开关没开 ⇒ 还是 401，和以前一样。
-	if w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-x", nil)); w.Code != 401 {
+	if w := do(h, request("/cookie?account=acct-x")); w.Code != 401 {
 		t.Fatalf("开关没开却回 %d", w.Code)
 	}
 
 	// 开了但供给不够 ⇒ 503，并告诉他差多少。
 	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 2, Threshold: 6}
-	w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-x", nil))
+	w := do(h, request("/cookie?account=acct-x"))
 	if w.Code != 503 || !strings.Contains(w.Body.String(), "门槛 6") {
 		t.Fatalf("供给不够时应 503 且说明门槛: %d %s", w.Code, w.Body.String())
 	}
 
 	// 开放了但不报 account ⇒ 400：不知道是谁就避不开他烧过的网关。
 	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 7, Threshold: 6}
-	if w := do(h, httptest.NewRequest("GET", "/cookie", nil)); w.Code != 400 {
+	if w := do(h, request("/cookie")); w.Code != 400 {
 		t.Fatalf("匿名没带 account 居然 %d", w.Code)
 	}
 
 	// 报了就放行，并把标识原样交给调度器。
-	w = do(h, httptest.NewRequest("GET", "/cookie?account=acct-x&gateway=unified-142", nil))
+	w = do(h, request("/cookie?account=acct-x&gateway=unified-142"))
 	if w.Code != 200 {
 		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
 	}
 	if len(p.anon) != 1 || p.anon[0] != "acct-x|unified-142|force=false|authed=false" {
 		t.Fatalf("没把匿名标识传下去: %v", p.anon)
 	}
-	// 有 key 的人永远走上传者那条路，不会被当成匿名。
+	// 公共 Key 不获得上传者凭据权限。
 	if len(p.delivered) != 0 {
 		t.Fatalf("匿名请求跑到上传者路径上了: %v", p.delivered)
 	}
-	// 非法 gateway 在认人之前就该拦掉。
-	if w := do(h, httptest.NewRequest("GET", "/cookie?account=a&gateway=../x", nil)); w.Code != 400 {
+	// 有效 Key 下非法 gateway 仍被拒绝。
+	if w := do(h, request("/cookie?account=a&gateway=../x")); w.Code != 400 {
 		t.Fatalf("非法 gateway 居然 %d", w.Code)
 	}
 }
@@ -1476,9 +1479,9 @@ func TestForceAndAdvisoryTTL(t *testing.T) {
 		}
 	}
 
-	// 匿名那条路也要带上。
+	// 公共 Key 的外部账号路径也要带上。
 	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 9, Threshold: 6}
-	do(h, httptest.NewRequest("GET", "/cookie?account=acct-x&force=1", nil))
+	do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-x&force=1", nil), srv.PublicKey()))
 	if len(p.anon) != 1 || !strings.Contains(p.anon[0], "force=true") {
 		t.Fatalf("匿名 force 没传下去: %v", p.anon)
 	}
@@ -1514,7 +1517,7 @@ func TestNoEndpointLeaksCredentials(t *testing.T) {
 		{"总览页（另一个人）", httptest.NewRequest("GET", "/u/"+ownerTok2, nil)},
 		{"cookie", self(httptest.NewRequest("GET", "/cookie", nil))},
 		{"cookie 管理员", admin(httptest.NewRequest("GET", "/cookie?account=2", nil))},
-		{"cookie 匿名", httptest.NewRequest("GET", "/cookie?account=acct-anon", nil)},
+		{"cookie 公共", authed(httptest.NewRequest("GET", "/cookie?account=acct-anon", nil), srv.PublicKey())},
 		{"cookie 管理员缺参", admin(httptest.NewRequest("GET", "/cookie", nil))},
 		{"admin", admin(httptest.NewRequest("GET", "/admin/", nil))},
 		{"未授权", httptest.NewRequest("GET", "/admin/", nil)},

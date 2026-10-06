@@ -446,10 +446,21 @@
           </fieldset>
           <fieldset class="setting-group">
             <legend>公开访问</legend>
-            <label class="choice setting-toggle"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}><span>允许无接入Key取票<span class="hint">仍须达到下方账号门槛；只交付现成票。</span></span></label>
+            <label class="choice setting-toggle"><input type="checkbox" name="public_enabled" value="1"{{if .PublicEnabled}} checked{{end}}><span>开启公共 Key 接入<span class="hint">开启后在公开页显示 Key；仍须达到下方账号门槛。</span></span></label>
             <label>开放资格账号门槛 <span class="hint">0 = 默认2，不按当前活票数判断。</span>
               <div class="input-unit"><input type="number" min="0" max="100000" name="min_accounts" value="{{.MinAccounts}}"><span>个</span></div></label>
-            <p class="foot">沿用原有门槛口径：启用、有凭据、成功铸过票。它不额外检查当前AT期限，因此可能与顶部“有效账号”不同；本次界面整理不改变开放规则。</p>
+            <p class="foot">沿用原有门槛口径：启用、有凭据、成功铸过票。它不额外检查当前AT期限，因此可能与顶部“有效账号”不同。</p>
+            <div class="fields">
+              <label>公共请求总上限 <span class="hint">所有公共用户共享，不是每人额度。</span>
+                <div class="input-unit"><input type="number" min="1" max="100000" name="public_requests_per_minute" value="{{.PublicLimits.RequestsPerMinute}}"><span>次 / 分钟</span></div></label>
+              <label>公共并发上限
+                <div class="input-unit"><input type="number" min="1" max="1000" name="public_max_concurrent" value="{{.PublicLimits.MaxConcurrent}}"><span>个请求</span></div></label>
+              <label>公共排队上限 <span class="hint">0 = 不排队。</span>
+                <div class="input-unit"><input type="number" min="0" max="10000" name="public_max_queued" value="{{.PublicLimits.MaxQueued}}"><span>个请求</span></div></label>
+              <label>最长排队时间 <span class="hint">0 = 不等待，最高1000毫秒。</span>
+                <div class="input-unit"><input type="number" min="0" max="1000" name="public_queue_wait_ms" value="{{.PublicLimits.QueueWaitMS}}"><span>毫秒</span></div></label>
+            </div>
+            <p class="foot">只限制公共 Key；普通 Key 不进入这条队列。限额覆盖列表、取票、归还、续期及上报接口；超限返回 rate_limited 和 Retry-After。重启后重新计数。</p>
           </fieldset>
           <details class="setting-group">
             <summary>高级 · 统计与生效范围</summary>

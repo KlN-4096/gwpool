@@ -1100,6 +1100,7 @@ table.gateway-cards tr.nomatch td::before { content:none; }
      认出身份时只给链接、认不出才给输入框。两页共用一份，免得改一处漏一处。 */}}
 {{define "upload" -}}
 <form id="upload" method="post" action="/upload">
+  <p class="note info upload-recommendation">推荐上传 Free 账号。</p>
   <label>账号凭据 <span class="hint">支持直接导入 sub2api 导出的账号 JSON，也支持 auth.json、凭据 JSON 或每行一个 token；可选择文件或拖入，单文件上限 1 MB、展开后每批最多 100 项</span>
     <textarea name="creds" required spellcheck="false" placeholder="在此粘贴 JSON 或 token"></textarea></label>
   <p class="note info">sub2api 文件只导入标准 OpenAI OAuth 账号，保留账号名称；不迁移代理或其它配置。新账号导入后启用，同归属的重复账号更新凭据并重新启用；不支持的类型会逐项显示跳过原因。凭据仍由服务端校验，过期且有刷新令牌时尝试刷新。</p>

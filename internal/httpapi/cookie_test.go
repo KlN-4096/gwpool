@@ -254,12 +254,12 @@ func TestGatewaysReportsThresholds(t *testing.T) {
 	}
 }
 
-// 匿名那条路：开关开着但没到门槛 ⇒ public_closed，并给一个短的重试建议
+// 公共 Key：开关开着但没到门槛 ⇒ public_closed，并给一个短的重试建议
 // （这条路一发上游都没花，让它来得勤一点不花钱）。
 func TestPublicClosedCode(t *testing.T) {
-	_, h, p, _, _ := rig(t, types.ModePool)
+	srv, h, p, _, _ := rig(t, types.ModePool)
 	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
-	w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil), srv.PublicKey()))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("状态 %d", w.Code)
 	}
@@ -827,7 +827,7 @@ func TestCrossAccountFailureDoesNotExcludeUploader(t *testing.T) {
 //
 // 但灌环面要堵住：**未鉴权**的请求不许往那 200 条里写，否则谁都能把真实诊断挤出去。
 func TestCodesReachTheFailLog(t *testing.T) {
-	_, h, p, _, _ := rig(t, types.ModePool)
+	srv, h, p, _, _ := rig(t, types.ModePool)
 	adminPage := func() string {
 		return do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
 	}
@@ -844,9 +844,9 @@ func TestCodesReachTheFailLog(t *testing.T) {
 	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), "akey")); w.Code != 400 {
 		t.Fatalf("状态 %d", w.Code)
 	}
-	// public_closed：匿名撞上关着的公开池。
+	// public_closed：公共 Key 撞上未达门槛的公开池。
 	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
-	if w := do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil)); w.Code != 503 {
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil), srv.PublicKey())); w.Code != 503 {
 		t.Fatalf("状态 %d", w.Code)
 	}
 	page := adminPage()
@@ -876,13 +876,13 @@ func TestCrossAccountIsNotGatedByPublicSwitch(t *testing.T) {
 	if len(p.anon) != 1 || !strings.HasSuffix(p.anon[0], "authed=true") {
 		t.Fatalf("没报成「鉴权过的」: %v", p.anon)
 	}
-	// 另一侧：真匿名照旧被门槛挡住，而且码不变。
+	// 无 Key 固定 401；公共 Key 单独受门槛限制。
 	w = do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
 	if w.Code != 401 { // 开关没开 ⇒ 没带 key 就是 key 不认
 		t.Fatalf("匿名状态 %d", w.Code)
 	}
 	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
-	w = do(h, httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil))
+	w = do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-outsider", nil), srv.PublicKey()))
 	if w.Code != 503 || decodeFail(t, w).Error.Code != codePublicClosed {
 		t.Fatalf("匿名该被门槛挡住: %d %s", w.Code, w.Body.String())
 	}
@@ -937,18 +937,25 @@ func TestColdStartAndBadParamsLeaveATrace(t *testing.T) {
 	var buf bytes.Buffer
 	srv.opt.Log = slog.New(slog.NewTextHandler(&buf, nil))
 
-	// S-3：畸形参数（鉴权之前就拒了）⇒ 日志里要有，环里不许有。
-	if w := do(h, httptest.NewRequest("GET", "/cookie?wait=abc", nil)); w.Code != 400 {
+	// S-3：先验证 Key，再解析参数；未鉴权请求仍不得写诊断环。
+	if w := do(h, httptest.NewRequest("GET", "/cookie?wait=abc", nil)); w.Code != 401 {
 		t.Fatalf("状态 %d", w.Code)
 	}
-	if !strings.Contains(buf.String(), codeBadRequest) {
-		t.Fatalf("参数不合法没进日志: %s", buf.String())
+	if !strings.Contains(buf.String(), codeConsumerRejected) {
+		t.Fatalf("无效 Key 没进日志: %s", buf.String())
 	}
 	admin := func() string {
 		return do(h, authed(httptest.NewRequest("GET", "/admin/", nil), "akey")).Body.String()
 	}
 	if strings.Contains(admin(), codeBadRequest) {
 		t.Fatal("鉴权前的 400 进了环（未鉴权的请求能把真实诊断挤出去）")
+	}
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?wait=abc", nil),
+		srv.ConsumerKeyFor(st.accounts[0]))); w.Code != 400 {
+		t.Fatalf("有效 Key 的畸形参数状态 %d", w.Code)
+	}
+	if !strings.Contains(buf.String(), codeBadRequest) {
+		t.Fatalf("参数不合法没进日志: %s", buf.String())
 	}
 
 	// S-4：冷启动 ⇒ no_gateway，卡片上要写清「池子自己走不出来」。
@@ -1523,7 +1530,7 @@ func TestRenewRefusesPlaceholderRows(t *testing.T) {
 	}{
 		{"鉴权过的 key 替别人的 ref 续", key, "acct-made-up"},
 		{"换一个全新的 ref（不吃冷却）", key, "acct-another-one"},
-		{"真匿名、零 header", "", "acct-stranger"},
+		{"公共 Key", srv.PublicKey(), "acct-stranger"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			p.public = sched.PublicState{Enabled: true, Open: true}

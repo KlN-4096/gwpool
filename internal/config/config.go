@@ -266,7 +266,7 @@ func (c Config) SlotCooldown() time.Duration {
 	return types.SlotCooldown
 }
 
-// PublicWhenSurplus：池子够格时自动对没上传凭据的人开放 /cookie，不够格自动关上。
+// PublicWhenSurplus：池子够格时接受公共 Key，不够格自动关上。
 //
 // 门槛按**托管账号数**算，不按「此刻有几张活 pair」——理由见
 // types.AccountsForContinuous（按需铸票的池子不囤票，按活 pair 数判等于永远关着）。
@@ -276,8 +276,12 @@ func (c Config) SlotCooldown() time.Duration {
 // 旧配置里残留的那个键会被**静默忽略**然后落到推导值上。线上那份要手工改键名，
 // 不然页面上的门槛数会跟你记的不一样。
 type PublicWhenSurplus struct {
-	Enabled     bool `json:"enabled"`
-	MinAccounts int  `json:"min_accounts"`
+	Enabled           bool `json:"enabled"`
+	MinAccounts       int  `json:"min_accounts"`
+	RequestsPerMinute int  `json:"requests_per_minute"`
+	MaxConcurrent     int  `json:"max_concurrent"`
+	MaxQueued         int  `json:"max_queued"`
+	QueueWaitMS       int  `json:"queue_wait_ms"`
 }
 
 // Defaults 是未配置字段的取值。
@@ -297,7 +301,11 @@ func Defaults() Config {
 		// 门槛取「连续供上需要多少个托管账号」，不是随手填一个小数字让它看起来开着。
 		// 冷却改过的话这个默认值会在 Load 里按**配置里那个冷却**重算。
 		PublicWhenSurplus: PublicWhenSurplus{
-			MinAccounts: types.AccountsForContinuous(types.SlotCooldown)},
+			MinAccounts:       types.AccountsForContinuous(types.SlotCooldown),
+			RequestsPerMinute: DefaultPublicRequestsPerMinute,
+			MaxConcurrent:     DefaultPublicMaxConcurrent,
+			MaxQueued:         DefaultPublicMaxQueued,
+			QueueWaitMS:       DefaultPublicQueueWaitMS},
 		UpstreamPerRegionHour:  2,
 		UpstreamPerAccountHour: 50,
 		SlotCooldownMinutes:    int(types.SlotCooldown / time.Minute),
@@ -501,6 +509,9 @@ func Load(path string) (Config, error) {
 	if cfg.PublicWhenSurplus.Enabled && cfg.PublicWhenSurplus.MinAccounts <= 0 {
 		return Config{}, fmt.Errorf("public_when_surplus.min_accounts 必须为正，" +
 			"否则一个托管账号都没有也会放匿名进来")
+	}
+	if err := cfg.PublicWhenSurplus.validateLimits(); err != nil {
+		return Config{}, err
 	}
 	seen := map[string]bool{}
 	for i, p := range cfg.Proxies {

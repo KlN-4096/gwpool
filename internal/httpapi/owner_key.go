@@ -51,6 +51,9 @@ func (s *Server) ownerKeyAccount(ownerID int64, reference string) (types.Account
 }
 
 func (c caller) reporterID() int64 {
+	if c.public {
+		return publicReporterID
+	}
 	if c.ownerID > 0 {
 		// Disjoint namespace from positive legacy credential IDs; credential
 		// rotation must not split a single owner's statistical identity.

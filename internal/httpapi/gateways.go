@@ -115,6 +115,13 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (upstream strin
 	}
 
 	if c, ok := s.resolveCaller(r); ok {
+		if c.public {
+			if ref == "" {
+				s.badRequest(w, http.StatusBadRequest, "公共接入必须带 account 参数")
+				return "", 0, false, false
+			}
+			return ref, s.rowFor(types.AnonPrefix + ref), true, true
+		}
 		if c.admin {
 			// 管理员没有自己的账号：槽位是 (账号 × 网关)，猜一个就等于把 A 的历史报成 B 的。
 			if ref == "" {
@@ -136,23 +143,8 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (upstream strin
 		return c.acct.Creds.AccountID, c.acct.ID, false, true
 	}
 
-	ps := s.pool.Public()
-	if !ps.Enabled {
-		// 和 /cookie 同一个分类：没带有效 key、池子又不对外开放 = key 不认。
-		// 有码才能让调用方退避——没码的 401 会让它每发请求都照敲一次。
-		s.unauthorized(w, "需要本账号的 key")
-		return "", 0, false, false
-	}
-	if !ps.Open {
-		s.publicClosed(w, "池子暂不对外开放")
-		return "", 0, false, false
-	}
-	if ref == "" {
-		s.badRequest(w, http.StatusBadRequest,
-			"匿名调用必须带 account 参数（你自己的上游 account_id）")
-		return "", 0, false, false
-	}
-	return ref, s.rowFor(types.AnonPrefix + ref), true, true
+	s.unauthorized(w, "需要有效的接入 Key")
+	return "", 0, false, false
 }
 
 // slotCooldown 是当前生效的槽位冷却时长。没接配置文件（测试）就用默认值。

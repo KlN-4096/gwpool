@@ -27,6 +27,7 @@ type configView struct {
 	RenewPairs             bool
 	PublicEnabled          bool
 	MinAccounts            int
+	PublicLimits           config.PublicWhenSurplus
 	// PublicBaseURL 是页面上要告诉人「填进 sub2api 的那个根地址」。
 	// 做成配置项而不是从 Host 头推：那个头是调用方可控的输入（见 config 里的注释）。
 	PublicBaseURL string
@@ -72,6 +73,7 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	v.RenewPairs = c.RenewPairs
 	v.PublicEnabled = c.PublicWhenSurplus.Enabled
 	v.MinAccounts = c.PublicWhenSurplus.MinAccounts
+	v.PublicLimits = c.PublicWhenSurplus
 	v.PublicBaseURL = c.PublicBaseURL
 	v.Path = live.Path()
 
@@ -193,6 +195,24 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	pub := cur.PublicWhenSurplus
 	pub.Enabled = truthy(r.FormValue("public_enabled"))
 	pub.MinAccounts = minAccounts
+	for _, field := range []struct {
+		name     string
+		dst      *int
+		min, max int
+	}{
+		{"public_requests_per_minute", &pub.RequestsPerMinute, 1, config.MaxPublicRequestsPerMinute},
+		{"public_max_concurrent", &pub.MaxConcurrent, 1, config.MaxPublicConcurrent},
+		{"public_max_queued", &pub.MaxQueued, 0, config.MaxPublicQueued},
+		{"public_queue_wait_ms", &pub.QueueWaitMS, 0, config.MaxPublicQueueWaitMS},
+	} {
+		// Preserve configured limits when an older form omits these controls.
+		if r.Form.Has(field.name) {
+			*field.dst, err = atoiField(r, field.name, field.min, field.max)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	return map[string]any{
 		"models": models,
