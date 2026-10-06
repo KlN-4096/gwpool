@@ -2,27 +2,32 @@
 <div class="page-head">
   <h1>区域覆盖与探索出口</h1>
   <p><a href="/admin/">← 管理后台</a></p>
-  <p>先看是否发现过，再看现在能否交付。机房 IP 所在地不等于探索出口，不自动按地理归类。</p>
+  <p>先看机房历史发现进度，再展开缺项和探索配置。</p>
+  <details class="metric-note"><summary>目录、库存与出口的统计口径</summary>
   <p>候选来源：2026-10-01 枚举 unified-1…220，{{.Snapshot.DNSCount}} 个域名当时可解析；这不是可铸票保证，也不是上游全集。</p>
   <p>合并目录 {{len .Snapshot.Candidates}} 个 · 历史已发现 {{.Snapshot.Found}} 个 · 当前寿命可交付 {{.Snapshot.Ready}} 个 · 未设人工目标 {{len .Snapshot.Unassigned}} 个 · 已发现但机房归属未知 {{.Snapshot.UnknownDatacenters}} 个</p>
+  <p>机房 IP 所在地不等于探索出口，不据此自动改变探索配置。</p></details>
   {{if .Note}}<p class="badge ok">{{.Note}}</p>{{end}}
   {{if .Error}}<p class="badge bad">{{.Error}}</p>{{end}}
   {{if not .Writable}}<p>当前为只读展示，未接入可写配置文件。</p>{{end}}
 </div>
 
-<section class="card">
-  <header class="card-head"><div><h2>201 历史目录：机房区域覆盖</h2>
-    <p>按 2026-10-01 DNS/IP 表中的机房国家、城市分组。分母来自当时可解析的目录，不是永久不变的上游全集；发现途径不限出口。</p>
-    <p>“历史目录已齐”只表示此区域目录中的网关都曾被本池发现；票过期不会抹掉发现记录。机房区域不等于代理出口，不据此自动停用同名国家的探索。</p>
-  </div></header>
-  <div class="table-wrap"><table id="t-datacenter-coverage">
+{{template "directory-progress" .Directory}}
+<section class="card" id="t-datacenter-coverage">
+  <header class="card-head"><div><h2>机房国家与城市明细</h2><p>按大区展开，查看历史目录缺项。</p></div></header>
+  {{range .Directory.Areas}}
+  <details class="directory-detail" id="directory-{{.Key}}">
+    <summary>{{.Label}} · {{if .Total}}历史已发现 {{.Found}} / {{.Total}} · 尚缺 {{.Missing}}{{else}}目录暂无条目{{end}}</summary>
+    {{if .Total}}<div class="table-wrap"><table>
     <thead><tr><th>机房国家</th><th>城市/区域</th><th>历史已发现 / 目录总数</th><th>当前有票可交付</th><th>目录状态</th><th>缺失网关</th></tr></thead>
-    <tbody>{{range .Snapshot.Datacenters}}<tr>
+    <tbody>{{range .Groups}}<tr>
       <td>{{.Country}}</td><td>{{.City}}</td><td>{{.Found}} / {{.Total}}</td><td>{{.Ready}}</td>
       <td>{{if .Complete}}历史目录已齐{{else}}尚有缺失{{end}}</td>
       <td>{{range .Missing}}<code>{{.}}</code> {{else}}无缺项{{end}}</td>
     </tr>{{end}}</tbody>
-  </table></div>
+  </table></div>{{else}}<p class="foot">此历史目录暂无条目，不表示该区域没有网关。</p>{{end}}
+  </details>
+  {{end}}
 </section>
 
 <section class="card">

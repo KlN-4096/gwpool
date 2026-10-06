@@ -210,7 +210,7 @@ type Server struct {
 	catalogPairs pairCatalogCache
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
-	tplMintAll                                                    *template.Template
+	tplMintAll, tplCleanup                                        *template.Template
 }
 
 // probeEffort 必须跟 mint 包实际发出去的 payload 一致（SPEC 第 2 节）：
@@ -264,6 +264,9 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if s.tplMintAll, err = parse("mintall.html"); err != nil {
 		return nil, err
 	}
+	if s.tplCleanup, err = parse("cleanup.html"); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -302,6 +305,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
 	mux.Handle("POST /admin/mint-all", s.sameOrigin(http.HandlerFunc(s.handleAdminMintAll)))
 	mux.HandleFunc("GET /admin/mint-all", s.handleAdminMintAll)
+	mux.HandleFunc("GET /admin/accounts/cleanup-401", s.handleCleanupPreview)
+	mux.HandleFunc("GET /admin/accounts/cleanup-result", s.handleCleanupResult)
+	mux.Handle("POST /admin/accounts/cleanup-401", s.sameOrigin(http.HandlerFunc(s.handleCleanupConfirm)))
 	mux.Handle("POST /admin/accounts/{id}/delete", s.sameOrigin(http.HandlerFunc(s.handleAdminDeleteAccount)))
 	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
@@ -1253,6 +1259,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		v.OwnerToken = o.Token
 	}
 	v.NewGateways = s.foundBy(a.ID)
+	v.Activity = summarizeAccountActivity(a.ID, samples, time.Now())
 	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
 	for _, sm := range samples {
 		if sm.AccountID != a.ID {
@@ -1911,7 +1918,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode()}}
+	v := adminView{base: base{Title: "管理", Mode: s.pool.Mode(), Admin: true, AdminPage: "overview"}}
 	v.CooldownStats = cooldown.Summarize(s.st.CooldownReports(), now)
 	v.ContactStats = contact.Summarize(s.st.ContactReports(), now)
 	if s.opt.MintAll != nil {
@@ -1967,6 +1974,12 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		found[g.FirstSeenBy]++
 	}
 	accounts := s.st.Accounts()
+	for _, a := range accounts {
+		if types.UnauthorizedCredential(a) {
+			v.UnauthorizedCount++
+		}
+	}
+	v.Directory = buildDirectory(coverage.Build(s.opt.Live.Get(), gws, s.effectivePairs(now), now))
 	byID, byUpstream := map[int64]types.Account{}, map[string]types.Account{}
 	for _, a := range accounts {
 		byID[a.ID] = a
@@ -2404,7 +2417,7 @@ func (s *Server) renderCode(w http.ResponseWriter, t *template.Template, data an
 // 给 200 等于告诉它这里有东西。wrong 只控制文案，不改状态码。
 func (s *Server) renderGate(w http.ResponseWriter, wrong bool) {
 	s.renderCode(w, s.tplGate, gateView{
-		base:  base{Title: "需要访问码", Mode: s.pool.Mode()},
+		base:  base{Title: "需要访问码", Mode: s.pool.Mode(), Restricted: true},
 		Wrong: wrong,
 	}, http.StatusForbidden)
 }

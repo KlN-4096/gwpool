@@ -4,15 +4,6 @@
   <p>先看有效账号与库存，再按网关定位问题。所有读数为页面加载时的快照。</p>
 </div>
 
-<nav class="tabs" data-tabs hidden data-js>
-  <a href="#overview">概览</a>
-  <a href="#gateways">网关 <span class="n">{{len .Gateways}}</span></a>
-  <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
-  <a href="#proxies">出口 <span class="n">{{len .Proxies}}</span></a>
-  <a href="#samples">记录</a>
-  <a href="#config">设置</a>
-</nav>
-
 <section id="tab-overview">
   <div class="kpis">
     <a class="kpi featured ok" href="#accounts"><b data-stat="effective">{{.Health.Effective}}</b><span>有效账号</span><small>其中上游暂限 {{.Health.Held}}</small></a>
@@ -23,12 +14,15 @@
   <details class="metric-note"><summary>待验证 {{.Health.Pending}} · 已停用 {{.Health.Disabled}} · 凭据异常 {{.Health.Invalid}} <span class="muted">有效账号统计口径</span></summary>
     <p>有效 = 已启用、凭据本地检查未见过期或身份冲突且有成功铸票记录。未提供到期时间时只依据历史成功，不保证实时有效或此刻可调度；429和请求预算等临时限制不等于凭据失效。页面不额外探测，也不改变原有匿名开放门槛。</p>
   </details>
+  {{template "directory-progress" .Directory}}
   <div class="grid-2 even">
     <div class="card"><header class="card-head"><h2>库存与活动</h2><a href="#gateways">查看网关 →</a></header>
       <div class="card-body"><p>维护目标 <strong>{{.Supply.Target}}</strong> · 当前数量差额 <strong>{{.Supply.Gap}}</strong></p>
       <p>最近 {{.Supply.WindowMin}} 分钟：{{.Supply.Attempts}} 次尝试，{{.Supply.Landed}} 次正常返回落点。</p>
       <p class="foot">请求成功不代表库存净增。维护优先缺失已知网关；有需求且账号充足才执行，仍受预算和退避限制。</p></div></div>
-    <div class="card"><header class="card-head"><h2>排查入口</h2></header><div class="card-body">
+    <div class="card"><header class="card-head"><h2>需要关注</h2></header><div class="card-body">
+      <p><a href="/admin/accounts/cleanup-401"><strong>{{.UnauthorizedCount}}</strong> 份当前401停用凭据 · 预览清理 →</a></p>
+      <p>待验证 {{.Health.Pending}} · 上游暂限 {{.Health.Held}}（不纳入401清理）</p>
       <div class="actions"><a href="#fails">近期取票失败 {{len .Fails}}</a><a href="#proxies">出口代理 {{len .Proxies}}</a><a href="/admin/coverage">区域覆盖与探索出口 →</a></div>
       <p class="foot">网关页集中查看路由库存、冷却建议与接触分层；记录页保留逐请求和账号接触明细。未验证不等于满血。</p>
     </div></div>
@@ -170,9 +164,9 @@
   <div class="actions section-links"><a href="#owners">上传者 {{len .Owners}}</a><a href="#external">外部账号 <span class="n">{{len .External}}</span></a></div>
   <div class="card">
     <header class="card-head"><div><h2>账号</h2><p>池里托管着凭据的账号，一号一张卡；点名称进账号页看请求记录。只来取票、池里没有凭据的在「外部账号」那一页。</p>
-      {{- if .Accounts}}{{template "region-legend" (index .Accounts 0).Card.Regions}}{{end}}</div></header>
+      {{- if .Accounts}}{{template "region-legend" (index .Accounts 0).Card.Regions}}{{end}}</div><a class="btn" href="/admin/accounts/cleanup-401">清理401凭据 · {{.UnauthorizedCount}}</a></header>
     {{if .Accounts}}
-    <div class="table-wrap"><table id="t-accounts" class="acards" data-grid data-size="500" data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、上游账号 ID、上传者或接入 key">
+    <div class="table-wrap"><table id="t-accounts" class="acards" data-grid data-size="24" data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、上游账号 ID 或上传者">
       <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>最近取票</th><th data-nosort>操作</th>
         <th data-nosort>上游账号 ID</th><th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间</th>
         <th data-nosort>停用原因</th><th data-nosort>出口记录</th></tr></thead>
@@ -201,7 +195,7 @@
           <td class="l2 a-cov" title="启用出口中有成功铸票记录的数量；不是网关全集完成率">{{.Covered}}</td>
           <td class="l2 a-since" title="UTC">{{.Since}}</td>
           <td class="l2 a-why">{{if and (not .Enabled) .DisabledReason}}停用原因：{{.DisabledReason}}{{end}}</td>
-          <td class="a-rg">{{template "region-cells" .Card.Regions}}</td>
+          <td class="a-rg"><details><summary>区域记录 · {{.Covered}}</summary>{{template "region-cells" .Card.Regions}}</details></td>
         </tr>
       {{end}}
       </tbody>
@@ -262,7 +256,7 @@
     <div class="card-body"><div class="actions"><span class="badge ok">可交付 {{.Supply.Ready}}</span><span class="badge">维护目标 {{.Supply.Target}}</span><span class="badge warn">{{.Supply.WindowMin}}分钟内临期 {{.Supply.Expiring}}</span></div>
       <p class="foot">“找新网关”会安排真实上游请求，受账号、出口与预算限制；查看本页不会触发探测。消费观察保留7天，unknown单列；冷却报告和接触轮次是不同分母，不能相加。</p></div>
     {{if .Gateways}}
-    <div class="table-wrap"><table id="t-gateways" data-grid data-natsort data-size="25"
+    <div class="table-wrap"><table id="t-gateways" class="gateway-cards" data-grid data-natsort data-size="24"
         data-facets="ready:可交付:ok|short:寿命不足:warn|expired:已过期|none:无票" data-placeholder="搜索网关、账号、国家或模型">
       <thead><tr><th>网关 / 状态</th><th>路由剩余</th><th>铸票账号</th><th>覆盖</th><th>满血 / 刷新 / 未知</th><th>冷却参考</th><th>首次发现</th><th data-nosort>详情</th></tr></thead>
       <tbody>

@@ -11,6 +11,9 @@
   <div class="kpi"><b>{{.NewGateways}}</b><span>新发现网关</span></div>
 </div>
 
+<details class="card compact-log">
+<summary>接口地址、接入 key 与个人页面入口</summary>
+<div class="card-body">
 <div class="grid-2">
   <div class="card">
     <header class="card-head"><div><h2>接口地址</h2><p>填进 sub2api 的<strong>根地址</strong>。</p></div></header>
@@ -35,7 +38,8 @@
       <p class="foot">地址和令牌即访问凭证，别分享。丢了只能找管理员查。</p>
       {{if .CanLogout}}
       <form method="post" action="/logout" class="logout">
-        <button type="submit">在这台设备上登出<span class="hint">共用电脑时，清掉浏览器记住的身份；不影响你的凭据</span></button>
+        <button type="submit">在这台设备上登出</button>
+        <p class="hint">共用电脑时，清掉浏览器记住的身份；不影响你的凭据。</p>
       </form>
       {{end}}
     </div>
@@ -53,6 +57,8 @@
   </div>
 </div>
 
+</div>
+</details>
 <nav class="tabs" data-tabs hidden data-js>
   <a href="#accounts">账号 <span class="n">{{len .Accounts}}</span></a>
   <a href="#import">添加账号</a>
@@ -64,15 +70,17 @@
   <button type="button" class="sm" data-fold="close">全部折叠</button>
   <button type="button" class="sm" data-fold="open">全部展开</button>
 </div>
+<div class="owner-grid">
 {{range .Accounts}}
-<details class="card acct" data-acct="{{.ID}}" open>
+<details class="card acct" data-acct="{{.ID}}">
   {{/* summary 里只放标题和行内元素（规范只许这些），所以元信息是 span 不是 p */}}
   <summary class="card-head acct-head">
     <h2>{{.Label}}</h2>
-    <span class="meta">{{if .Plan}}套餐 {{.Plan}} · {{end}}添加于 {{.Since}} UTC · 累计 <strong>{{.Requests}} 次请求</strong>（消耗 <strong>0 token</strong>）· 发现 <strong>{{.NewGateways}} 个新网关</strong> · {{if .LastFetch}}<span title="{{.LastFetchAt}} UTC">最近一次取票 <strong>{{.LastFetch}}</strong></span>{{else}}还没取到过票{{end}}</span>
+    <span class="meta">{{if .Plan}}套餐 {{.Plan}} · {{end}}累计 <strong>{{.Requests}} 次请求</strong> · 发现 <strong>{{.NewGateways}} 个新网关</strong> · {{if .LastFetch}}<span title="{{.LastFetchAt}} UTC">最近一次取票 <strong>{{.LastFetch}}</strong></span>{{else}}还没取到过票{{end}}</span>
     {{if .Enabled}}<span class="badge ok">已启用</span>{{else}}<span class="badge bad">已停用</span>{{end}}
   </summary>
   <div class="card-body">
+    <p class="foot">添加于 {{.Since}} UTC · 探测消耗 <strong>0 token</strong></p>
     {{if not .Enabled}}
     <p class="err">该凭据已停用，不再用它发请求；旧凭证 key 暂不可用。名下其他有效凭据仍可维持账号 key。</p>
     {{if .DisabledReason}}<p>停用原因：</p><pre class="mono">{{.DisabledReason}}</pre>{{end}}
@@ -99,6 +107,7 @@
   <p class="foot"><a href="/a/{{.ViewToken}}">这个账号的详情页 →</a>（请求记录、接口说明、停用开关在那边）</p>
 </details>
 {{end}}
+</div>
 {{else}}
 <div class="card"><p class="empty">你名下还没有凭据，到<a href="#import">添加账号</a>里上传。</p></div>
 {{end}}

@@ -1,12 +1,31 @@
 {{define "content"}}
 <div class="page-head"><h1>按范围打票</h1><p><a href="/admin/#overview">← 返回管理页</a></p></div>
+{{if .Started}}
+<section class="card">
+  <header class="card-head"><div><h2>最近批次{{if .Status.Active}} · 执行中{{else}} · 已结束{{end}}</h2><p>开始 {{.Started}} UTC{{if .Finished}} · 结束 {{.Finished}} UTC{{end}}</p></div><a href="/admin/mint-all">刷新状态</a></header>
+  <div class="card-body">
+    <div class="kpis">
+      <div class="kpi"><b>{{.Status.Total}}</b><span>组合总数</span></div>
+      <div class="kpi"><b>{{.Status.Running}}</b><span>正在执行</span></div>
+      <div class="kpi ok"><b>{{.Status.Succeeded}}</b><span>成功</span></div>
+      <div class="kpi"><b>{{.Status.Failed}} / {{.Status.Skipped}}</b><span>失败 / 跳过</span></div>
+    </div>
+    <p class="foot">{{if .Expires}}任务到期 {{.Expires}} UTC，不是预计完成时间。{{end}}<a href="/admin/#overview">查看批次明细 →</a></p>
+  </div>
+</section>
+{{end}}
 <div class="card"><div class="card-body">
 <p>请选择大区，后台展开为支持的国家，按账号逐国尝试；同国城市不重复入队。每个账号×所选国家本批最多一次，失败也计入国家和账号总尝试次数。</p>
 <p>预览不发上游请求。确认后才执行，最多保留本批15分钟，过期跳过；不会为等下一小时额度而不断排队。</p>
 {{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
 {{with .Preview}}
 <h2>预览</h2>
-<p>{{.Accounts}} 个账号 × {{.Regions}} 个国家出口 = {{.Total}} 个组合；预计排队 {{.Queued}}，跳过 {{.Skipped}}。</p>
+<div class="kpis">
+  <div class="kpi"><b>{{.Accounts}}</b><span>参与账号</span></div>
+  <div class="kpi"><b>{{.Total}}</b><span>账号 × 国家组合</span><small>{{.Regions}} 个国家出口</small></div>
+  <div class="kpi"><b>{{.Queued}}</b><span>预计排队</span></div>
+  <div class="kpi"><b>{{.Skipped}}</b><span>跳过</span></div>
+</div>
 <p>每账号总上限 {{.AccountHourLimit}} 次/小时，独立于大区数量。预计尝试至多 {{.Queued}} 次；并发任务、限流或出口变化可能使实际执行更少。优先选择历史尝试较少的国家。</p>
 {{range $reason, $n := .SkipReasons}}<p>{{$reason}}：{{$n}}</p>{{end}}
 {{end}}
@@ -22,7 +41,7 @@
 <form method="post" action="/admin/mint-all">
   <input type="hidden" name="action" value="preview">
   <label><input type="checkbox" name="all" value="yes">明确选择全部大区（非默认）</label>
-  <div class="regions">
+  <div class="regions scope-areas">
   {{range .Areas}}
     <label><input type="checkbox" name="area" value="{{.Key}}" {{if .Selected}}checked{{end}} {{if not .Countries}}disabled{{end}}>{{.Label}} <small>启用 {{.Countries}} 国</small></label>
   {{end}}

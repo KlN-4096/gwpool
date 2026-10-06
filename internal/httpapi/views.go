@@ -11,8 +11,11 @@ import (
 // 页面逻辑留在 Go 里能被编译器看住，模板只管排版。
 
 type base struct {
-	Title string
-	Mode  types.Mode
+	Title      string
+	Mode       types.Mode
+	Admin      bool
+	AdminPage  string
+	Restricted bool
 }
 
 // ---------- 门禁页 ----------
@@ -162,6 +165,7 @@ type poolRegionFilter struct {
 
 type accountView struct {
 	base
+	Activity accountActivity
 	// ViewToken 只回给持有它的人自己（这一页就是靠它认人的），用来拼本页上的表单地址。
 	ViewToken string
 	Label     string
@@ -307,14 +311,16 @@ type adminView struct {
 	// Config 是「能改的旋钮」那一节。
 	Config configView
 
-	MintAllAvailable bool
-	MintAll          sched.MintAllStatus
-	MintAllStarted   string
-	MintAllFinished  string
-	CooldownStats    []types.CooldownStats
-	ContactStats     []types.ContactStats
-	Health           accountHealth
-	Supply           supplyLedger
+	MintAllAvailable  bool
+	MintAll           sched.MintAllStatus
+	MintAllStarted    string
+	MintAllFinished   string
+	CooldownStats     []types.CooldownStats
+	ContactStats      []types.ContactStats
+	Health            accountHealth
+	Supply            supplyLedger
+	Directory         directoryView
+	UnauthorizedCount int
 
 	base
 	Proxies    []proxyRow

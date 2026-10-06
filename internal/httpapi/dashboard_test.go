@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/sched"
 	"gwpool/internal/types"
 )
 
@@ -175,8 +176,20 @@ func TestDashboardSettingsFixture(t *testing.T) {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			t.Fatal(err)
 		}
-		for name, body := range map[string]string{"admin.html": admin.Body.String(),
-			"index.html": do(handler, httptest.NewRequest("GET", "/", nil)).Body.String()} {
+		srv.opt.MintAll = &fakeMintAllQueue{status: sched.MintAllStatus{Active: true, Total: 36, Queued: 30, Running: 2, Succeeded: 3, Failed: 1, Started: time.Now().Add(-time.Minute), Expires: time.Now().Add(14 * time.Minute)}}
+		pages := map[string]string{"admin.html": admin.Body.String(),
+			"index.html":    do(handler, httptest.NewRequest("GET", "/", nil)).Body.String(),
+			"owner.html":    do(handler, ownerCookieOf(httptest.NewRequest("GET", "/u/"+ownerTok1, nil), ownerTok1)).Body.String(),
+			"account.html":  do(handler, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String(),
+			"coverage.html": do(handler, authed(httptest.NewRequest("GET", "/admin/coverage", nil), "akey")).Body.String(),
+			"mint.html":     do(handler, authed(httptest.NewRequest("GET", "/admin/mint-all", nil), "akey")).Body.String(),
+		}
+		st.accounts[1].Enabled = false
+		st.accounts[1].DisabledReason = "铸票 HTTP 401：fixture"
+		pages["cleanup.html"] = do(handler, authed(httptest.NewRequest("GET", "/admin/accounts/cleanup-401", nil), "akey")).Body.String()
+		srv.opt.SiteKey = "fixture-only"
+		pages["gate.html"] = do(handler, httptest.NewRequest("GET", "/", nil)).Body.String()
+		for name, body := range pages {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
 				t.Fatal(err)
 			}

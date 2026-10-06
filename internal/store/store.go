@@ -611,6 +611,7 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 			// 重新上传就是「我来修它」：解开停用、清掉原因。
 			x.Enabled = true
 			x.DisabledReason = ""
+			x.CredentialRevision = s.st.JournalSequence + 1
 			// 归属只补不改：没有 owner 的（老文件、或占位行刚升级成托管行）挂到上传者
 			// 名下；属于别人的在上面已经 return 掉了，到这儿只剩「无主」或「本来就是我的」。
 			if x.OwnerID == 0 {
@@ -651,6 +652,7 @@ func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 	if a.CreatedAt.IsZero() {
 		a.CreatedAt = time.Now().UTC()
 	}
+	a.CredentialRevision = s.st.JournalSequence + 1
 	// 兜底生成：没有令牌的账号行会让 AccountByViewToken("") 整条匹配出来，
 	// 等于把上传者视图开给任何人。生成放在这里，调用方传了就用调用方的。
 	if a.ViewToken == "" {
@@ -733,6 +735,7 @@ func (s *Store) SetAccountEnabled(id int64, enabled bool) error {
 		}
 		old := s.st.Accounts[i].Enabled
 		oldReason := s.st.Accounts[i].DisabledReason
+		oldRevision := s.st.Accounts[i].CredentialRevision
 		// 开关没变就什么都不做。**特别是不许在这里清理由**：对一个已经被自动停用的号
 		// 再 POST 一次 enabled=false，清掉理由就让它在管理页上和「手动暂停」长得一样，
 		// 于是运营方会反复打开一个凭据已经死了的号（线上刚发生过 token_revoked 那次）。
@@ -742,9 +745,11 @@ func (s *Store) SetAccountEnabled(id int64, enabled bool) error {
 		s.st.Accounts[i].Enabled = enabled
 		// 真的翻了开关才清自动停用的理由：那条话说的是上一次的事。
 		s.st.Accounts[i].DisabledReason = ""
+		s.st.Accounts[i].CredentialRevision = s.st.JournalSequence + 1
 		if err := s.save(stateChange{Accounts: []types.Account{s.st.Accounts[i]}}); err != nil {
 			s.st.Accounts[i].Enabled = old // 没落盘就别留在内存里
 			s.st.Accounts[i].DisabledReason = oldReason
+			s.st.Accounts[i].CredentialRevision = oldRevision
 			return err
 		}
 		return nil
@@ -767,10 +772,13 @@ func (s *Store) DisableAccount(id int64, reason string) error {
 			return nil
 		}
 		oldEnabled, oldReason := s.st.Accounts[i].Enabled, s.st.Accounts[i].DisabledReason
+		oldRevision := s.st.Accounts[i].CredentialRevision
 		s.st.Accounts[i].Enabled = false
 		s.st.Accounts[i].DisabledReason = reason
+		s.st.Accounts[i].CredentialRevision = s.st.JournalSequence + 1
 		if err := s.save(stateChange{Accounts: []types.Account{s.st.Accounts[i]}}); err != nil {
 			s.st.Accounts[i].Enabled, s.st.Accounts[i].DisabledReason = oldEnabled, oldReason
+			s.st.Accounts[i].CredentialRevision = oldRevision
 			return err
 		}
 		return nil
@@ -803,6 +811,7 @@ func (s *Store) SetTokens(id int64, access, refresh string) error {
 		}
 		old := s.st.Accounts[i]
 		s.st.Accounts[i].Creds.AccessToken = access
+		s.st.Accounts[i].CredentialRevision = s.st.JournalSequence + 1
 		if refresh != "" {
 			s.st.Accounts[i].Creds.RefreshToken = refresh
 		}

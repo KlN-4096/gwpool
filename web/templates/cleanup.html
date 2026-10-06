@@ -1,0 +1,31 @@
+{{define "content"}}
+<div class="page-head"><h1>{{.Title}}</h1><p><a href="/admin/#accounts">← 返回账号管理</a></p></div>
+{{if .Finished}}
+<section class="card"><div class="card-body">
+  <h2>清理请求已完成</h2>
+  <p role="status">本次删除 <strong>{{.Deleted}}</strong> 份，状态已变化或已不存在而跳过 <strong>{{.Skipped}}</strong> 份。</p>
+  <p class="foot">此处为上次请求回执。以账号列表当前状态为准。</p>
+  <a class="btn" href="/admin/#accounts">查看账号列表</a>
+</div></section>
+{{else}}
+<div class="note warn"><p>只清理<strong>当前因铸票 HTTP 401 自动停用</strong>的凭据；不包含手动停用、400、403、429或仅有历史401记录的账号。</p></div>
+<section class="card">
+  <header class="card-head"><div><h2>本次候选 · {{len .Rows}} 份</h2><p>确认时再次复核；已恢复、已换凭据的跳过，预览后新增401不加入本次。</p></div></header>
+  {{if .Rows}}
+  <div class="table-wrap"><table data-grid data-size="20" data-placeholder="搜索候选账号">
+    <thead><tr><th>ID</th><th>账号</th><th>套餐</th></tr></thead>
+    <tbody>{{range .Rows}}<tr><td>{{.ID}}</td><td class="text">{{.Label}}</td><td>{{.Plan}}</td></tr>{{end}}</tbody>
+  </table></div>
+  <div class="card-body">
+    <p>删除账号及关联槽位、区域铸票台账。共享路由票、全池网关发现历史保留；不会撤销上游令牌。</p>
+    <p class="foot">预览有效至 {{.Expires}} UTC。删除不可通过本页面撤销。</p>
+    <form method="post" action="/admin/accounts/cleanup-401">
+      <input type="hidden" name="preview" value="{{.Token}}">
+      <label class="choice"><input type="checkbox" name="confirm" value="yes" required>已核对以上候选和删除范围</label>
+      <div class="actions"><button type="submit" class="danger">确认清理以上 {{len .Rows}} 份</button><a href="/admin/#accounts">取消</a></div>
+    </form>
+  </div>
+  {{else}}<p class="empty">当前没有符合条件的401凭据，无需清理。</p>{{end}}
+</section>
+{{end}}
+{{end}}

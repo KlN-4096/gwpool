@@ -454,18 +454,120 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
   .range { margin-left: 0; }
   table.tiles tbody { padding: .75rem .9rem; }
 }
+.admin-shell { display:grid; grid-template-columns:10.5rem minmax(0,1fr); gap:1.4rem; align-items:start; }
+.page-content { min-width:0; }
+section[id^="tab-"],details[id^="directory-"] { scroll-margin-top:4.25rem; }
+.admin-sidebar { position:sticky; top:4.5rem; padding:.4rem 0; }
+.nav-caption { margin:0 0 .65rem .65rem; font-size:11px; color:var(--muted); letter-spacing:.06em; }
+.admin-nav { display:grid; gap:.25rem; }
+.admin-nav a { padding:.55rem .75rem; border-radius:8px; color:var(--fg-2); font-size:13px; }
+.admin-nav a:hover { background:var(--sunken); text-decoration:none; }
+.admin-nav a[aria-current] { background:var(--fg); color:var(--surface); }
+.admin-tools { margin-top:.8rem; padding-top:.8rem; border-top:1px solid var(--line); }
+.admin-sidebar > .foot { padding:.5rem .65rem; }
+.directory-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.6rem; padding:0 1rem 1rem; }
+.directory-cell { display:flex; flex-direction:column; gap:.2rem; background:var(--sunken); color:var(--fg); padding:.7rem .85rem; border-radius:9px; min-width:0; }
+.directory-cell:hover { text-decoration:none; background:var(--accent-soft); }
+.directory-cell > span,.directory-cell small { font-size:12px; color:var(--muted); }
+.directory-cell > b { font-size:1.5rem; font-variant-numeric:tabular-nums; }
+.directory-cell > b.no-directory { font-size:13px; padding:.4rem 0; }
+.directory-cell .meter { margin:.25rem 0; }
+.directory-progress > .metric-note { margin:0; padding:.65rem 1rem; border-top:1px solid var(--line); }
+.directory-detail { border-top:1px solid var(--line); }
+.directory-detail > summary { padding:.7rem 1rem; font-size:13px; }
+.directory-detail > .foot { padding:0 1rem 1rem; }
+.owner-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.8rem; align-items:start; }
+.owner-grid > .card { margin:0; min-width:0; }
+.owner-grid .regions { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.owner-grid summary .meta { display:block; width:100%; }
+.owner-grid .acct-head h2 { overflow-wrap:anywhere; }
+table.acards tbody { grid-template-columns:repeat(2,minmax(0,1fr)); align-items:start; }
+table.acards .regions { grid-template-columns:repeat(3,minmax(0,1fr)); }
+table.acards .a-rg details > summary { color:var(--accent); padding:.3rem 0; }
+.compact-log > summary { padding:.75rem 1rem; color:var(--fg-2); }
+.compact-log > .card { margin:0; border:0; border-radius:0; }
+table.gateway-cards,table.gateway-cards thead,table.gateway-cards tbody { display:block; }
+#t-gateways.gateway-cards { min-width:0; }
+#t-gateways.gateway-cards th { width:auto; }
+#t-gateways.gateway-cards td { padding:0; }
+table.gateway-cards thead tr { display:flex; flex-wrap:wrap; gap:.3rem; padding:.65rem 1rem 0; }
+table.gateway-cards th { width:auto; border:1px solid var(--line); border-radius:5px; padding:.1rem .45rem; }
+table.gateway-cards th[data-nosort] { display:none; }
+table.gateway-cards tbody { display:grid; grid-template-columns:repeat(auto-fill,minmax(15rem,1fr)); gap:.6rem; padding:1rem; }
+table.gateway-cards tbody tr { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.3rem .6rem; padding:.75rem; border:1px solid var(--line); border-radius:10px; background:var(--sunken); min-width:0; }
+table.gateway-cards tr[data-facet="ready"] { border-left:3px solid var(--ok-dot); }
+table.gateway-cards td { border:0; padding:0; width:auto; white-space:normal; font-size:12px; }
+table.gateway-cards td:first-child { grid-column:1; }
+table.gateway-cards td:nth-child(2) { grid-column:2; text-align:right; align-self:start; }
+table.gateway-cards td:nth-child(3) { grid-column:1 / -1; }
+table.gateway-cards td:nth-child(3)::before { content:"铸票 "; color:var(--muted); }
+table.gateway-cards td:nth-child(4) { grid-column:1; }
+table.gateway-cards td:nth-child(5) { grid-column:2; }
+table.gateway-cards td:nth-child(6)::before { content:"冷却 "; color:var(--muted); }
+table.gateway-cards td:nth-child(7) { grid-column:1; }
+table.gateway-cards td:nth-child(7)::before { content:"发现 "; color:var(--muted); }
+table.gateway-cards .gateway-source { display:inline-block; max-width:calc(100% - 3em); vertical-align:bottom; }
+table.gateway-cards .gateway-date,table.gateway-cards .gateway-cooldown { display:inline; }
+table.gateway-cards .gateway-detail-cell { grid-column:2; grid-row:5; }
+table.gateway-cards .gateway-details[open] { position:static; min-width:0; }
+table.gateway-cards tr:has(.gateway-details[open]) { grid-column:1 / -1; }
+table.gateway-cards .gateway-detail-cell:has(.gateway-details[open]) { grid-column:1 / -1; grid-row:auto; }
+table.gateway-cards .gateway-details[open] .gateway-detail-content { min-width:0; overflow-wrap:anywhere; }
+table.gateway-cards tr.nomatch { grid-column:1 / -1; display:block; }
+table.gateway-cards tr.nomatch td::before { content:none; }
+@media(max-width:420px) { table.gateway-cards tbody { grid-template-columns:minmax(0,1fr); } }
+.scope-areas { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.scope-areas label { display:flex; align-items:center; flex-wrap:wrap; padding:.65rem; background:var(--sunken); border-radius:8px; }
+.scope-areas input { width:auto; }
+.scope-areas small { flex-basis:100%; color:var(--muted); font-weight:400; }
+@media(max-width:1000px) { table.acards tbody { grid-template-columns:minmax(0,1fr); } }
+@media(max-width:760px) {
+  .admin-shell { display:block; }
+  .admin-sidebar { position:static; margin-bottom:1rem; }
+  .admin-nav { display:flex; flex-wrap:wrap; gap:.2rem; }
+  .admin-nav a { padding:.45rem .65rem; }
+  .admin-tools { margin-top:.35rem; padding-top:.35rem; }
+  .admin-sidebar > .foot,.nav-caption { display:none; }
+  .owner-grid { grid-template-columns:minmax(0,1fr); }
+}
+@media(max-width:420px) {
+  .directory-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media(pointer:coarse) { .admin-nav a,summary { min-height:44px; } }
 </style>
 </head>
 <body>
 <header class="top"><div class="wrap">
   <a class="brand" href="/"><svg viewBox="0 0 16 16" aria-hidden="true"><rect width="16" height="16" rx="4" fill="currentColor"/><circle cx="5.5" cy="5.5" r="1.8" fill="#fff"/><circle cx="10.5" cy="5.5" r="1.8" fill="#fff"/><circle cx="5.5" cy="10.5" r="1.8" fill="#fff"/><circle cx="10.5" cy="10.5" r="1.8" fill="#fff" opacity=".45"/></svg>gwpool</a>
   <span class="crumb">{{.Title}}</span>
-  {{if eq .Mode "pool"}}<span class="mode" title="任一账号取得的路由 Cookie 可分发给其他账号使用">池模式</span>
+  {{if not .Restricted}}{{if eq .Mode "pool"}}<span class="mode" title="任一账号取得的路由 Cookie 可分发给其他账号使用">池模式</span>
   {{- else}}<span class="mode" title="每个账号只使用自己取得的路由 Cookie">单账号模式</span>{{end}}
-  <button type="button" class="sm" id="reload" hidden data-js title="重新加载本页，看最新状态">↻ 刷新</button>
+  {{end}}<button type="button" class="sm" id="reload" hidden data-js title="重新加载本页，看最新状态">↻ 刷新</button>
 </div></header>
-<main class="wrap">{{template "content" .}}</main>
-<footer class="wrap foot-note">gwpool 只分发路由 Cookie（<code>__cflb</code> / <code>__oailb</code>），业务请求不经过本服务。</footer>
+<main class="wrap{{if .Admin}} admin-shell{{end}}">
+{{if .Admin}}
+<aside class="admin-sidebar" aria-label="管理员导航">
+  <p class="nav-caption">管理控制台</p>
+  {{if eq .AdminPage "overview"}}
+  <nav class="admin-nav" data-tabs>
+    <a href="#overview">概览</a><a href="#gateways">网关</a><a href="#accounts">账号</a>
+    <a href="#proxies">出口</a><a href="#samples">记录</a><a href="#config">设置</a>
+  </nav>
+  {{else}}
+  <nav class="admin-nav">
+    <a href="/admin/#overview">概览</a><a href="/admin/#gateways">网关</a><a href="/admin/#accounts"{{if eq .AdminPage "accounts"}} aria-current="page"{{end}}>账号</a>
+    <a href="/admin/#proxies">出口</a><a href="/admin/#samples">记录</a><a href="/admin/#config">设置</a>
+  </nav>
+  {{end}}
+  <nav class="admin-nav admin-tools">
+    <a href="/admin/coverage"{{if eq .AdminPage "coverage"}} aria-current="page"{{end}}>目录覆盖</a>
+    <a href="/admin/mint-all"{{if eq .AdminPage "mint"}} aria-current="page"{{end}}>范围打票</a>
+  </nav>
+  <p class="foot">管理员专属<br>与站点访问码独立鉴权</p>
+</aside>
+{{end}}
+<div class="page-content">{{template "content" .}}</div></main>
+{{if not .Restricted}}<footer class="wrap foot-note">gwpool 只分发路由 Cookie（<code>__cflb</code> / <code>__oailb</code>），业务请求不经过本服务。</footer>{{end}}
 {{template "upload-parser" .}}
 <script>
 (function () {
@@ -473,18 +575,26 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
   for (const el of document.querySelectorAll('[data-js]')) el.hidden = false;
   // 页面都是服务端现算的，刷新 = 重新加载（保留当前页签和滚动位置）
   document.getElementById('reload').addEventListener('click', function () { location.reload(); });
+  function openDirectoryAnchor() {
+    const id = location.hash.slice(1);
+    if (!/^directory-[a-z-]+$/.test(id)) return;
+    const detail = document.getElementById(id);
+    if (detail && detail.matches('details.directory-detail')) detail.open = true;
+  }
+  openDirectoryAnchor();
+  addEventListener('hashchange', openDirectoryAnchor);
 
   // 账号卡片折叠：记在 localStorage，刷新不丢。按账号 ID 记（池内唯一）。
   const cards = document.querySelectorAll('details[data-acct]');
   if (cards.length) {
-    const FOLD_KEY = 'gwpool.folded';
-    let folded;
-    try { folded = new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]')); } catch (e) { folded = new Set(); }
+    const FOLD_KEY = 'gwpool.expanded.v2';
+    let expanded;
+    try { expanded = new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]')); } catch (e) { expanded = new Set(); }
     for (const d of cards) {
-      if (folded.has(d.dataset.acct)) d.open = false;
+      d.open = expanded.has(d.dataset.acct);
       d.addEventListener('toggle', function () {
-        if (d.open) folded.delete(d.dataset.acct); else folded.add(d.dataset.acct);
-        try { localStorage.setItem(FOLD_KEY, JSON.stringify(Array.from(folded))); } catch (e) { /* 隐私模式存不了就只管这一次 */ }
+        if (d.open) expanded.add(d.dataset.acct); else expanded.delete(d.dataset.acct);
+        try { localStorage.setItem(FOLD_KEY, JSON.stringify(Array.from(expanded))); } catch (e) { /* 隐私模式存不了就只管这一次 */ }
       });
     }
     for (const b of document.querySelectorAll('[data-fold]')) {
@@ -1047,6 +1157,23 @@ details.card:not([open]) > summary h2::before { transform: rotate(-45deg); margi
 </div>
 {{- end}}
 
+{{define "directory-progress"}}
+<section class="card directory-progress">
+  <header class="card-head"><div><h2>{{.Total}} 历史目录 · 机房发现进度</h2><p>历史发现 {{.Found}} / {{.Total}} · 尚缺 {{.Missing}} · 目录外另有 {{.Unknown}} 个</p></div><a href="/admin/coverage">覆盖详情 →</a></header>
+  <div class="directory-grid">
+  {{range .Areas}}
+    <a class="directory-cell" href="/admin/coverage#directory-{{.Key}}">
+      <span>{{.Label}}</span>
+      {{if .Total}}<b>{{.Found}} <small>/ {{.Total}}</small></b>
+      <div class="meter" role="img" aria-label="历史已发现 {{.Found}} / {{.Total}}" style="--v:{{.Found}};--max:{{.Total}}"><i></i></div>
+      <small>当前可交付 {{.Ready}} · 尚缺 {{.Missing}}</small>
+      {{else}}<b class="no-directory">目录暂无条目</b><small>不表示该地区没有网关</small>{{end}}
+    </a>
+  {{end}}
+  </div>
+  <details class="metric-note"><summary>目录口径 · 2026-10-01</summary><p>分母为历史 DNS/IP 机房目录，不是上游全集或代理出口数量。只要发现过就保留进度；票过期不倒退。当前可交付只看路由寿命，不保证消费账号此刻满血。</p></details>
+</section>
+{{end}}
 {{define "region-legend" -}}
 <p class="rg-legend"><span><i class="on"></i>最近 {{.Window}}内成功取得过路由 Cookie</span><span><i></i>区内国家逐个尝试；无近期成功不代表可铸，仍受每国尝试次数、账号总额度与出口能力限制</span><span>数字是区内去重网关编号，<sup>重</sup> = 池中已有；悬停看全名与累计次数</span></p>
 {{- end}}

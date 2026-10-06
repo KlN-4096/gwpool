@@ -98,6 +98,14 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 				return Landing{}, err
 			}
 		}
+		// A queued scan can outlive deletion, refresh or manual disable. Re-read
+		// under the shared account lock before each attempt; never use its old
+		// snapshot to send credentials or recreate deleted slot/mint records.
+		current, exists := s.Store.Account(acct.ID)
+		if !exists || !current.Enabled || current.Creds.AccessToken == "" {
+			return Landing{}, errors.New("账号已删除、停用或无托管凭据")
+		}
+		acct = current
 		tries++
 		l, err := s.attempt(ctx, acct, r)
 		if err == nil {

@@ -142,6 +142,11 @@ func newScanner(t *testing.T, f *fakeMinter) (*Scanner, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	seed := acct
+	seed.Enabled = true
+	if _, err := st.AddAccount(seed); err != nil {
+		t.Fatal(err)
+	}
 	return &Scanner{Mint: f, Store: st, Backoff: time.Nanosecond, MaxTries: 2}, st
 }
 
@@ -454,7 +459,14 @@ func TestSingleAccountConcurrencyIsOne(t *testing.T) {
 // 不同账号之间不该互相排队：锁是 per-account 的，不是全局信号量。
 func TestDifferentAccountsRunInParallel(t *testing.T) {
 	f := newFake()
-	s, _ := newScanner(t, f)
+	s, st := newScanner(t, f)
+	for id := int64(2); id <= 3; id++ {
+		a := acct
+		a.ID, a.Enabled, a.Creds.AccountID = id, true, fmt.Sprintf("parallel-%d", id)
+		if _, err := st.AddAccount(a); err != nil {
+			t.Fatal(err)
+		}
+	}
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for id := int64(1); id <= 3; id++ {

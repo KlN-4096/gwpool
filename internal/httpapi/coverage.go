@@ -37,6 +37,7 @@ type coverageView struct {
 	Error              string
 	CliproxyCountries  []proxycatalog.Country
 	GlobalCountryCount int
+	Directory          directoryView
 }
 
 func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
@@ -46,13 +47,14 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	cfg := s.opt.Live.Get()
 	now := time.Now()
 	view := coverageView{
-		base:     base{Title: "区域覆盖与探索出口", Mode: s.pool.Mode()},
+		base:     base{Title: "区域覆盖与探索出口", Mode: s.pool.Mode(), Admin: true, AdminPage: "coverage"},
 		Snapshot: coverage.Build(cfg, s.st.Gateways(), s.effectivePairs(now), now),
 		Regions:  cfg.RegionDefinitions(), Writable: s.opt.Live != nil && s.opt.Live.Path() != "",
 		Note: r.URL.Query().Get("note"), Error: r.URL.Query().Get("error"),
 		CliproxyCountries:  proxycatalog.CliproxyCountries(),
 		GlobalCountryCount: len(proxycatalog.GlobalCountries()),
 	}
+	view.Directory = buildDirectory(view.Snapshot)
 	for _, region := range view.Regions {
 		view.Exits = append(view.Exits, coverageExitOption{Key: region.Key, Name: region.Name})
 	}

@@ -12,10 +12,12 @@ import (
 
 type mintAllView struct {
 	base
-	Areas   []mintAllArea
-	Keys    []string
-	Preview *sched.MintAllStatus
-	Notice  string
+	Areas                      []mintAllArea
+	Keys                       []string
+	Preview                    *sched.MintAllStatus
+	Notice                     string
+	Status                     sched.MintAllStatus
+	Started, Finished, Expires string
 }
 
 type mintAllArea struct {
@@ -33,7 +35,16 @@ func (s *Server) handleAdminMintAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := s.opt.Live.Get()
-	view := mintAllView{base: base{Title: "按范围打票", Mode: s.pool.Mode()}}
+	view := mintAllView{base: base{Title: "按范围打票", Mode: s.pool.Mode(), Admin: true, AdminPage: "mint"}, Status: s.opt.MintAll.Status()}
+	if !view.Status.Started.IsZero() {
+		view.Started = view.Status.Started.UTC().Format("2006-01-02 15:04:05")
+	}
+	if !view.Status.Finished.IsZero() {
+		view.Finished = view.Status.Finished.UTC().Format("2006-01-02 15:04:05")
+	}
+	if !view.Status.Expires.IsZero() {
+		view.Expires = view.Status.Expires.UTC().Format("2006-01-02 15:04:05")
+	}
 	selectedAreas := map[string]bool{}
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, coverageFormLimit)
