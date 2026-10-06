@@ -66,15 +66,15 @@
     </div>
   </div>
   <div class="card">
-    <header class="card-head"><div><h2>各区域的落点</h2><p>按九大区汇总，区内网关去重。数字为可交付 / 历史发现；同一网关可属于多个大区，不能相加当总数。国家仅在后台逐个探索。</p></div></header>
+    <header class="card-head"><div><h2>各区域的落点 · 机房区域</h2><p>按已发现网关的机房区域归类，每个网关只计入一个区域；机房归属未知的单列。只展示已发现网关与当前可交付数量。</p></div></header>
     <div class="card-body">
-      {{with index .Regions 0}}<a href="{{.Href}}" class="badge{{if .Active}} ok{{end}}">全部 · {{.Ready}} / {{.Total}}</a>{{end}}
+      {{with index .Regions 0}}<a href="{{.Href}}" class="badge{{if .Active}} ok{{end}}">全部 · 已发现 {{.Total}} · 可交付 {{.Ready}}</a>{{end}}
       <div class="kpis region-kpis">
       {{range .Regions}}{{if not .All}}
-        <a class="kpi{{if .Ready}} ok{{else}} off{{end}}{{if .Active}} sel{{end}}" href="{{.Href}}"
+        <a class="kpi{{if .Ready}} ok{{else}} off{{end}}{{if .Active}} sel{{end}}" href="{{.Href}}" data-pool-region="{{.Key}}" data-found="{{.Total}}" data-ready="{{.Ready}}"
            title="{{.Label}}{{if .Key}}（{{.Key}}）{{end}}：{{.Note}}{{if .Active}}　（正在只看这一格）{{end}}{{range $i, $g := .Gateways}}{{if $i}}、{{else}}&#10;{{end}}{{$g.Name}}{{if not $g.Ready}}（暂不可交付）{{end}}{{end}}">
-          <b>{{if .Total}}{{.Ready}}<small> / {{.Total}}</small>{{else}}—{{end}}</b><span>{{.Label}}</span>
-          {{- if .Total}}<div class="meter" style="--v: {{.Ready}}; --max: {{.Total}}"><i></i></div>{{end}}
+          <b>{{if .Total}}{{.Total}}{{else}}—{{end}}</b><span>{{.Label}}</span>
+          <small>{{if .Total}}已发现 {{.Total}} · 当前可交付 {{.Ready}}{{else}}暂无已发现网关{{end}}</small>
         </a>
       {{end}}{{end}}
       </div>
@@ -91,7 +91,7 @@
       <tbody>
       {{range .Shown}}
         <tr class="{{if .PairReady}}ready{{end}}" data-facet="{{if .PairReady}}ready{{else}}idle{{end}}"
-            title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　可达出口 {{.Exits}}　区域 {{if .Regions}}{{range $i, $r := .Regions}}{{if $i}} / {{end}}{{$r}}{{end}}{{else}}未归类{{end}}">
+            title="{{.Name}}　路由 Cookie 剩余 {{.PairLeft}}　可达出口 {{.Exits}}　机房区域 {{if .Regions}}{{range $i, $r := .Regions}}{{if $i}} / {{end}}{{$r}}{{end}}{{else}}未归类{{end}}">
           <td class="mono">{{.Name}}</td>
           <td>{{if .PairReady}}<span class="badge ok">可交付</span>{{else}}<span class="badge">暂不可交付</span>{{end}}</td>
           <td>{{.PairLeft}}</td>

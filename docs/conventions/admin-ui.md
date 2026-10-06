@@ -1,7 +1,7 @@
 # 页面、权限与清理
 
 - 页面门禁（site_key）、上传者/单账号令牌、管理员Basic/Bearer是独立权限；`base.Admin`只在完成管理员鉴权的handler赋值。
-- 管理sidebar与201历史机房目录仅管理view持有；普通用户保留`poolRegionCells`出口九区与紧凑网关格。目录地区和实际出口不可混合。
+- 管理sidebar与201历史机房目录仅管理view持有；公共`poolRegionCells`只对已发现名称查询机房归属（同后台），不遍历候选目录，不下发分母/缺项。九区+未知互斥合计等于全池，未知不从代理出口推断；紧凑网关格保留。
 - `buildDirectory`只汇总Snapshot.Datacenters，目录外另列Unknown；不使用含目录外发现的Snapshot.Found当201分子。零分母显示暂无条目，不报100%。
 - 公共网关无Cookie/账号来源/消费明细；公开动态用poolMintRow白名单。单账号页面只在owner cookie匹配时给总览链接；gate不含运行模式/业务导航/原始私密URL。
 - `acards`和`gateway-cards`仍保留语义表格、搜索/排序/24条分页；详细观察放dialog或原生details，无JS不丢数据。

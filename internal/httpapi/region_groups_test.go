@@ -34,13 +34,7 @@ func TestRegionCardsUseNineAreasAndExcludeFailedSamples(t *testing.T) {
 }
 
 func TestPoolAreaGroupsDeduplicateCountriesAndPreserveEmptySelection(t *testing.T) {
-	cfg, err := config.GlobalCountryRegions(config.Defaults())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cells := poolRegionCells(cfg, []gatewayRow{{Name: "unified-141"}}, map[string]types.Gateway{
-		"unified-141": {ReachableExits: []types.Exit{{Region: "DE"}, {Region: "IT"}, {Region: "FR"}}},
-	})
+	cells := poolRegionCells([]gatewayRow{{Name: "unified-141"}})
 	markPoolRegionLinks(cells, "southeast-asia")
 	if len(cells) != 10 {
 		t.Fatalf("want all + nine areas, got %d", len(cells))

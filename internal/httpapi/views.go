@@ -61,9 +61,8 @@ type poolView struct {
 	Shown []gatewayRow
 	// FilterLabel 非空 = 正在只看某一格，页面上要如实说、并给一条退出去的路。
 	FilterLabel string
-	// Regions 把已知网关按**出口区域**摊开：这张表要回答的是「哪个区域的落点还不够」，
-	// 一条 57 行的平表答不了。一个网关能从好几个区域连通时，它在那几格里都出现——
-	// 那是事实，不是重复计数（格子里数的是「这个区域能摸到几个落点」）。
+	// Regions 按已发现网关的历史机房归属分区，每个网关只计入一格。
+	// 不提供目录总量、缺项或未发现名称；Total仅是本池已经发现的数量。
 	//
 	// 每一格都是个链接（筛选走查询串、服务端过滤）：**不写 JS**，关掉 JS 也能用，
 	// 而且表格那套 data-grid 的搜索/分面/计数全都照常工作——它只是拿到了更少的行。
@@ -122,8 +121,8 @@ type gatewayRow struct {
 	Exits     int
 	PairReady bool   // 池里有剩余 ≥ DeliverFloor 的 pair
 	PairLeft  string // 人读的剩余时间；**不含 cookie 本体**
-	// Regions 是这个网关能从哪几个区域连通（人读的区域名），给行的悬停用。
-	// 空 = 它的出口一个都反查不到区域（见 types.RegionKeyOf 的精确匹配）。
+	// Regions 是该已发现网关的机房区域（最多一个），给行的悬停用。
+	// 空 = 机房归属未知，不能从代理出口推断。
 	Regions []string
 	// regionKeys 是上面那几个区域的 key（含未归类的空串），只给筛选用，模板不读。
 	regionKeys []string
@@ -131,7 +130,7 @@ type gatewayRow struct {
 
 // poolRegionCell 是号池页九宫格的一格：这个区域已知哪些网关、其中几个此刻可交付。
 //
-// 末尾可能多出一格「未归类」：出口反查不到区域的网关要有地方落，否则九格加起来
+// 末尾可能多出一格「未归类」：机房归属未知的网关要有地方落，否则九格加起来
 // 对不上页面自己写的网关总数，而那种对不上没人查得出来。
 type poolRegionCell struct {
 	poolRegionFilter

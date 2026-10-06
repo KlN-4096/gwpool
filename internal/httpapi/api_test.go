@@ -15,7 +15,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"gwpool/internal/config"
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
@@ -2871,9 +2870,7 @@ func TestAccountPageShowsRegionGrid(t *testing.T) {
 	}
 }
 
-// 号池页按九个出口区域摊开已知网关：这一页要回答的是「哪个区域的落点还不够」，
-// 一条平表答不了。一个网关能从几个区域连通就在几格里出现；反查不到区域的落在「未归类」，
-// 否则九格加起来对不上页面自己写的网关总数。
+// 公共页只按已发现网关的机房分区，未知单列；分区合计必须等于全池去重数。
 func TestPoolRegionCells(t *testing.T) {
 	rows := []gatewayRow{
 		{Name: "unified-142", PairReady: true},
@@ -2881,16 +2878,7 @@ func TestPoolRegionCells(t *testing.T) {
 		{Name: "unified-900", PairReady: true},
 		{Name: "unified-404"},
 	}
-	gws := map[string]types.Gateway{
-		// 两个区域都连得通 ⇒ 两格里都出现。
-		"unified-142": {ReachableExits: []types.Exit{{Region: "IT"}, {Region: "JP"}}},
-		"unified-73":  {ReachableExits: []types.Exit{{Region: "IT"}}},
-		// 代理商给的出口不在 types.Regions 那张表里（精确匹配 Region+City）⇒ 未归类。
-		"unified-900": {ReachableExits: []types.Exit{{Region: "US", City: "Dallas"}}},
-		// 一个出口都没记过的也要有地方落。
-		"unified-404": {},
-	}
-	cells := poolRegionCells(config.Defaults(), rows, gws)
+	cells := poolRegionCells(rows)
 
 	byKey := map[string]poolRegionCell{}
 	for _, c := range cells {
@@ -2906,36 +2894,43 @@ func TestPoolRegionCells(t *testing.T) {
 	if len(cells[0].Gateways) != 0 {
 		t.Fatal("「全部」那一格不该列网关名：几十个名字堆在一格里什么也读不出来")
 	}
-	if eu := byKey["europe"]; eu.Total != 2 || eu.Ready != 1 {
+	if eu := byKey["europe"]; eu.Total != 1 || eu.Ready != 1 {
 		t.Fatalf("欧洲那一格的读数不对：%+v", eu)
 	}
 	// 可交付的排前面：这一格最常被问的是「现在这儿能不能拿到票」。
 	if eu := byKey["europe"]; eu.Gateways[0].Name != "unified-142" || !eu.Gateways[0].Ready {
 		t.Fatalf("欧洲那一格没把可交付的排前面：%+v", eu.Gateways)
 	}
-	if ea := byKey["east-asia"]; ea.Total != 1 || ea.Gateways[0].Name != "unified-142" {
-		t.Fatalf("跨区域的网关没在东亚那一格出现：%+v", ea)
+	if ea := byKey["east-asia"]; ea.Total != 0 {
+		t.Fatalf("机房被重复分组：%+v", ea)
 	}
-	if un := byKey[""]; un.Label != "未归类" || un.Total != 1 {
-		t.Fatalf("未归类那一格该收下反查不到区域的和没有出口的：%+v", un)
+	if un := byKey[""]; un.Label != "未归类" || un.Total != 2 {
+		t.Fatalf("未知机房必须单列：%+v", un)
 	}
-	if oc := byKey["oceania"]; oc.Total != 0 || !strings.Contains(oc.Note, "还没在这个区域发现过网关") {
-		t.Fatalf("空区域该如实说没发现过网关：%+v", oc)
+	if oc := byKey["oceania"]; oc.Total != 1 || oc.Ready != 0 {
+		t.Fatalf("已发现但没票仍保留：%+v", oc)
 	}
 	// 回填的那一列要和格子出自同一次计算，否则两处读数会对不上。
-	if got := rows[0].Regions; len(got) != 2 || got[0] != "欧洲" || got[1] != "东亚" {
+	if got := rows[0].Regions; len(got) != 1 || got[0] != "欧洲" {
 		t.Fatalf("网关行的区域列没回填：%v", got)
 	}
-	if got := rows[2].Regions; len(got) != 1 || got[0] != "北美" {
-		t.Fatalf("known country with a custom city must still map to its area: %v", got)
+	if got := rows[2].Regions; len(got) != 0 {
+		t.Fatalf("unknown datacenter inferred: %v", got)
+	}
+	total := 0
+	for _, c := range cells {
+		if !c.All {
+			total += c.Total
+		}
+	}
+	if total != len(rows) {
+		t.Fatal("regional totals differ from discovered set")
 	}
 
 	// 全都不可交付的区域不许标绿。
-	cells = poolRegionCells(config.Defaults(), []gatewayRow{{Name: "unified-73"}}, map[string]types.Gateway{
-		"unified-73": {ReachableExits: []types.Exit{{Region: "IT"}}},
-	})
+	cells = poolRegionCells([]gatewayRow{{Name: "unified-73"}})
 	for _, c := range cells {
-		if c.Key == "europe" && (c.Ready != 0 || !strings.Contains(c.Note, "都没有可交付")) {
+		if c.Key == "oceania" && (c.Ready != 0 || !strings.Contains(c.Note, "都没有可交付")) {
 			t.Fatalf("没有活票的区域不该报可交付：%+v", c)
 		}
 	}
@@ -2956,8 +2951,8 @@ func TestPoolPageRegionFilter(t *testing.T) {
 		}
 	}
 
-	// 只看东亚：rig 的 unified-142 出口是 IT（欧洲），不该出现。
-	ea := do(h, httptest.NewRequest("GET", "/?region=east-asia", nil)).Body.String()
+	// 73在新西兰、142在波兰；故意提供的JP出口不能改变机房分区。
+	ea := do(h, httptest.NewRequest("GET", "/?region=oceania", nil)).Body.String()
 	if !strings.Contains(ea, "unified-73") {
 		t.Fatal("筛东亚把东亚的网关也筛掉了")
 	}
@@ -2986,8 +2981,8 @@ func TestPoolPageRegionFilter(t *testing.T) {
 	}
 
 	// 有网关但一个都不在该区域 ⇒ 空表要说清是哪一格空，而不是「尚未发现网关」。
-	empty := do(h, httptest.NewRequest("GET", "/?region=oceania", nil)).Body.String()
-	if !strings.Contains(empty, "大洋洲还没有已知网关") {
+	empty := do(h, httptest.NewRequest("GET", "/?region=east-asia", nil)).Body.String()
+	if !strings.Contains(empty, "东亚还没有已知网关") {
 		t.Fatal("空区域的空表文案不对")
 	}
 }
@@ -2998,7 +2993,7 @@ func TestPoolPageShowsRegionCells(t *testing.T) {
 	if !strings.Contains(body, "各区域的落点") {
 		t.Fatalf("号池页没有区域分格：\n%s", body)
 	}
-	// rig 里 unified-142 的出口是 IT ⇒ 落在欧洲那一格，而且它有活票 ⇒ 绿。
+	// rig的142机房在波兰，欧洲格有已发现网关且当前有票。
 	cell := poolRegionRowOf(t, body, "欧洲")
 	if !strings.Contains(cell, `class="kpi ok"`) || !strings.Contains(cell, "unified-142") {
 		t.Fatalf("欧洲那一格没收下 unified-142：%s", cell)
@@ -3067,7 +3062,7 @@ func supplyCardOf(t *testing.T, body string) string {
 	if from < 0 {
 		t.Fatalf("号池页没有供给账卡片：\n%s", body)
 	}
-	to := strings.Index(body[from:], "<h2>各区域的落点</h2>")
+	to := strings.Index(body[from:], "<h2>各区域的落点 · 机房区域</h2>")
 	if to < 0 {
 		t.Fatal("供给账卡片没有收尾")
 	}

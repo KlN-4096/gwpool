@@ -673,7 +673,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	}
 	v.Mints, v.TotalMints = poolMintRows(accounts, samples)
 	// 格子先算（它们报的是**整池**的读数，筛选时不许跟着缩水），再按查询串筛表。
-	v.Regions = poolRegionCells(s.opt.Live.Get(), v.Gateways, gws)
+	v.Regions = poolRegionCells(v.Gateways)
 	want := sanitizeLabel(r.URL.Query().Get("region"), "")
 	v.Shown, v.FilterLabel = filterPoolGateways(v.Gateways, v.Regions, want)
 	markPoolRegionLinks(v.Regions, want)
@@ -691,39 +691,26 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 	s.render(w, s.tplPool, v)
 }
 
-// poolRegionCells 把已知网关按出口区域摊成九格（出口反查不到区域的另起一格「未归类」）。
+// poolRegionCells 只对已发现网关查询机房归属；与后台机房分区一致，
+// 但不遍历候选目录、不返回目录总量或尚未发现的名称。未知机房单列。
 //
 // 顺带回填每一行的 Regions 那一列，所以它接的是 rows 的**切片**（元素可改）而不是副本。
 // 两处读数必须出自同一次计算：表里写着「欧洲」而九宫格的欧洲格子里没有它，没人查得出
 // 是哪一边错了。
-func poolRegionCells(cfg config.Config, rows []gatewayRow, gws map[string]types.Gateway) []poolRegionCell {
+func poolRegionCells(rows []gatewayRow) []poolRegionCell {
 	byRegion := map[string][]poolRegionGateway{}
 	for i := range rows {
 		rows[i].regionKeys, rows[i].Regions = nil, nil
 		item := poolRegionGateway{Name: rows[i].Name, Ready: rows[i].PairReady}
-		seen := map[string]bool{}
-		for _, e := range gws[rows[i].Name].ReachableExits {
-			// 反查不到就归「未归类」（key 为空）：这些出口是代理商给的，不在
-			// types.Regions 那张表里（精确匹配 Region+City，见那边的注释）。
-			area := geography.AreaOf(e.Region)
-			k := area.Key
-			if k == geography.UnknownArea {
-				k = ""
-			}
-			if seen[k] {
-				continue
-			}
-			seen[k] = true
-			byRegion[k] = append(byRegion[k], item)
-			rows[i].regionKeys = append(rows[i].regionKeys, k)
-			if k != "" {
-				rows[i].Regions = append(rows[i].Regions, area.Label)
-			}
+		area := geography.AreaOf(coverage.DatacenterCountry(rows[i].Name))
+		key := area.Key
+		if key == geography.UnknownArea {
+			key = ""
 		}
-		// 一个出口都没记过的网关也要有地方落，否则它在这一页上凭空消失。
-		if len(gws[rows[i].Name].ReachableExits) == 0 {
-			byRegion[""] = append(byRegion[""], item)
-			rows[i].regionKeys = append(rows[i].regionKeys, "")
+		byRegion[key] = append(byRegion[key], item)
+		rows[i].regionKeys = []string{key}
+		if key != "" {
+			rows[i].Regions = []string{area.Label}
 		}
 	}
 	out := make([]poolRegionCell, 0, len(geography.Areas)+2)
@@ -813,7 +800,7 @@ func markPoolRegionLinks(cells []poolRegionCell, want string) {
 // poolRegionQuery 是「未归类」那一格在查询串里的值。
 //
 // 不能用空串：空串就是「全部」（没带参数、或带了个空的），两者混在一起的话点「未归类」
-// 会跳回全部，而那一格恰恰是最需要单独看的（那些网关的出口反查不到区域）。
+// 会跳回全部，而那一格恰恰是最需要单独看的（这些已发现网关的机房归属未知）。
 const poolRegionQuery = "other"
 
 // filterPoolGateways 按查询串挑出表里要列的行，并回一句「正在只看谁」。
