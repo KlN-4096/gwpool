@@ -3,6 +3,7 @@
 - `internal/store` 保存 `state.json`＋`state.wal`（GWPWAL02提交头/序号/CRC）和独立`samples.jsonl`，不使用数据库；关键增量Sync成功才ACK，不再每次重写全快照。
 - 接入Key元数据/撤销/生成防重ID/单调序号及统计汇总走同一snapshot/WAL；生成只存SHA256和尾号，批量管理一次提交、失败回滚，已撤销不可启用，旧上传Key未覆盖策略时默认原权限。
 - 管理员Key最多10000、总策略/统计各20000；IP保留8、显式account摘要64、小时桶168，只有七API枚举计数、不记录请求/响应正文。统计快照深克隆，串行flush且按版本保留写盘期间的新计数，失败不清dirty。
+- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage`，已有新Key策略/统计后禁止直接启动旧版；回滚检查须停服务、用新版`-checkpoint-only`重放后判断，保留最新数据并采用识别新字段的修复版，不能恢复升级前快照。
 - 提交头记录可信结束偏移；已ACK区间缺失/截断/CRC错拒绝启动，只清理提交边界外残尾。写失败截断并还原提交头、Sync后回滚；回滚不确定即冻结写入，不静默续跑。
 - 快照每分钟或WAL≥4MiB触发：锁内克隆、锁外编码/持久替换、锁内保留并发增量再换WAL。快照切换失败不丢已ACK记录；`checkpoint_failure_test.go`覆盖8处故障。
 - `UpdateSlot`128项有界队列，最多64项/1ms合并一次Sync；组失败还原全部槽位，Close等已准入请求结束。索引/revisions仅在提交成功后更新；不以异步ACK换性能。
