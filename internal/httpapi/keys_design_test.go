@@ -72,11 +72,14 @@ func TestManagedKeysDesignPreview(t *testing.T) {
 		e.recent[now.Unix()%keyRecentSeconds] = keySecond{at: now.Unix(), count: uint64(12 - i*2)}
 	}
 	paths := map[string]string{
-		"list.html":    "/admin/keys",
-		"detail.html":  "/admin/keys?key=" + url.QueryEscape(keys[0].Record.ID),
-		"detail2.html": "/admin/keys?key=" + url.QueryEscape(keys[1].Record.ID),
-		"upload.html":  "/admin/keys?key=upload%3A1&source=upload",
-		"empty.html":   "/admin/keys?q=no-match",
+		"list.html":              "/admin/keys?source=admin",
+		"accounts.html":          "/admin/keys",
+		"credentials.html":       "/admin/keys?source=legacy",
+		"credential-detail.html": "/admin/keys?source=legacy&key=legacy%3A1",
+		"detail.html":            "/admin/keys?key=" + url.QueryEscape(keys[0].Record.ID),
+		"detail2.html":           "/admin/keys?key=" + url.QueryEscape(keys[1].Record.ID),
+		"upload.html":            "/admin/keys?key=upload%3A1&source=upload",
+		"empty.html":             "/admin/keys?source=admin&q=no-match",
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)

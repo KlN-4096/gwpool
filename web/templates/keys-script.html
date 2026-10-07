@@ -84,7 +84,7 @@
   }
 
   function open(state, opener) {
-    state.opener = opener || document.querySelector('[data-key-open]');
+    state.opener = opener || document.querySelector('.key-source-tabs [aria-current]') || document.querySelector('[data-key-open]');
     state.dialog.showModal();
     document.documentElement.classList.add('key-dialog-open');
   }

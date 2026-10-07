@@ -286,7 +286,7 @@ func TestManagedKeysAdminCreationExportReplayFiltersAndCSRF(t *testing.T) {
 	if w := do(h, httptest.NewRequest("GET", "/admin/keys", nil)); w.Code != 401 {
 		t.Fatal("public admin page")
 	}
-	page := do(h, authed(httptest.NewRequest("GET", "/admin/keys", nil), "offline-admin"))
+	page := do(h, authed(httptest.NewRequest("GET", "/admin/keys?source=admin", nil), "offline-admin"))
 	re := regexp.MustCompile(`name="creation_token" value="([^"]+)"`)
 	match := re.FindStringSubmatch(page.Body.String())
 	if len(match) != 2 {
@@ -335,7 +335,7 @@ func TestManagedKeysAdminCreationExportReplayFiltersAndCSRF(t *testing.T) {
 			t.Fatal("secret re-exposed")
 		}
 	}
-	if !strings.Contains(list.Body.String(), "筛选命中 3 / 7") {
+	if !strings.Contains(list.Body.String(), "筛选命中 3 / 3") {
 		t.Fatal("source filter missing")
 	}
 	id := st.AccessKeys()[0].ID

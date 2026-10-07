@@ -43,15 +43,48 @@ type keyDetailView struct {
 	Average, P50, P95, Accounts string
 }
 type keysView struct {
-	ListURL string
+	ListURL                        string
+	SourceLabel, SourceDescription string
+	IsAdminSource                  bool
+	Tabs                           []keySourceTab
 	base
-	Rows                                                              []managedKeyRow
-	Detail                                                            *keyDetailView
-	Query, Source, Status, Sort, Previous, Next                       string
-	CreationToken, CreatedKeys, Message                               string
-	Total, Matched, Page, Pages, UploadCount, LegacyCount, AdminCount int
-	Requests, Tickets, RPM                                            uint64
-	StatsFailed                                                       bool
+	Rows                                        []managedKeyRow
+	Detail                                      *keyDetailView
+	Query, Source, Status, Sort, Previous, Next string
+	CreationToken, CreatedKeys, Message         string
+	Total, Matched, Page, Pages                 int
+	Requests, Tickets, RPM                      uint64
+	StatsFailed                                 bool
+}
+
+type keySourceTab struct {
+	Source, Label, URL string
+	Count              int
+	Selected           bool
+}
+
+func keySourceLabel(source string) string {
+	switch source {
+	case types.AccessKeyUpload:
+		return "账号 Key"
+	case types.AccessKeyLegacy:
+		return "凭证 Key"
+	case types.AccessKeyAdmin:
+		return "管理员生成 Key"
+	default:
+		return ""
+	}
+}
+
+// Keep only list controls in links; a detail selection is never a list filter.
+func keyListQuery(values url.Values, source string) url.Values {
+	out := url.Values{"source": {source}}
+	for _, field := range []string{"q", "status", "sort", "page"} {
+		if value := values.Get(field); value != "" {
+			out.Set(field, value)
+		}
+	}
+	return out
 }
 
 func keyTime(at time.Time) string {
@@ -98,7 +131,7 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 		keys[id] = types.AccessKey{ID: id, Source: types.AccessKeyLegacy, SubjectID: account.ID, Label: account.Label, CreatedAt: account.CreatedAt}
 		secret := s.ConsumerKeyFor(account)
 		active[id] = account.Enabled && secret != ""
-		owners[id] = fmt.Sprintf("历史账号 #%d · %s", account.ID, account.Label)
+		owners[id] = fmt.Sprintf("凭证 #%d · %s", account.ID, account.Label)
 		if len(secret) >= 6 {
 			masks[id] = "…" + secret[len(secret)-6:]
 		}
@@ -125,7 +158,7 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 		row := managedKeyRow{Key: key, Owner: owners[id], Mask: masks[id], Limits: keyLimitText(key), Metrics: metrics[id],
 			Created: keyTime(key.CreatedAt), Last: keyTime(metrics[id].Usage.LastAt),
 			DetailURL: "/admin/keys?key=" + url.QueryEscape(id), AdminIssued: key.Source == types.AccessKeyAdmin}
-		row.Source = map[string]string{types.AccessKeyUpload: "上传者", types.AccessKeyLegacy: "历史上传", types.AccessKeyAdmin: "管理员生成"}[key.Source]
+		row.Source = keySourceLabel(key.Source)
 		row.LastDate, row.LastClock = "尚无请求", "—"
 		if !row.Metrics.Usage.LastAt.IsZero() {
 			row.LastDate = row.Metrics.Usage.LastAt.UTC().Format("2006-01-02")
@@ -255,36 +288,54 @@ func (s *Server) renderKeys(w http.ResponseWriter, r *http.Request, created, mes
 		http.Error(w, "当前存储不支持 Key 管理", http.StatusNotImplemented)
 		return
 	}
-	token, err := s.creationToken()
-	if err != nil {
-		http.Error(w, "无法生成安全表单", http.StatusInternalServerError)
-		return
-	}
 	now := time.Now().UTC()
 	rows, failed := s.managedKeyRows(store, now)
 	q := r.URL.Query()
-	listQuery := r.URL.Query()
-	listQuery.Del("key")
-	listURL := "/admin/keys"
-	if encoded := listQuery.Encode(); encoded != "" {
-		listURL += "?" + encoded
+	source := q.Get("source")
+	if created != "" {
+		source = types.AccessKeyAdmin
+		q = url.Values{"source": {source}}
+	} else if source == "" {
+		source = types.AccessKeyUpload
+		// Existing direct detail links still open in their own category.
+		if detailSource, _, valid := types.ParseAccessKeyID(q.Get("key")); valid {
+			source = detailSource
+		}
 	}
+	if keySourceLabel(source) == "" {
+		http.Error(w, "Key 分类无效", http.StatusBadRequest)
+		return
+	}
+	token := ""
+	if source == types.AccessKeyAdmin {
+		var err error
+		token, err = s.creationToken()
+		if err != nil {
+			http.Error(w, "无法生成安全表单", http.StatusInternalServerError)
+			return
+		}
+	}
+	listQuery := keyListQuery(q, source)
 	view := keysView{base: base{Title: "接入 Key", Mode: s.pool.Mode(), Admin: true, AdminPage: "keys"},
-		Query: strings.TrimSpace(q.Get("q")), Source: q.Get("source"), Status: q.Get("status"), Sort: q.Get("sort"),
-		CreatedKeys: created, Message: message, CreationToken: token, StatsFailed: failed, Total: len(rows), Page: 1}
-	view.ListURL = listURL
+		Query: strings.TrimSpace(q.Get("q")), Source: source, Status: q.Get("status"), Sort: q.Get("sort"),
+		CreatedKeys: created, Message: message, CreationToken: token, StatsFailed: failed, Page: 1,
+		SourceLabel: keySourceLabel(source), IsAdminSource: source == types.AccessKeyAdmin}
+	view.SourceDescription = map[string]string{
+		types.AccessKeyUpload: "上传者名下统一使用的接入 Key，不新增独立限流。",
+		types.AccessKeyLegacy: "旧版兼容：与单份凭证关联的历史 Key，仅保留原有接入和管理。",
+		types.AccessKeyAdmin:  "独立发放的消费 Key，无需上传凭据，可设置每把 Key 的限额。",
+	}[source]
+	view.ListURL = "/admin/keys?" + listQuery.Encode()
+	counts := map[string]int{}
 	for _, row := range rows {
-		detailQuery := r.URL.Query()
+		counts[row.Key.Source]++
+		if row.Key.Source != source {
+			continue
+		}
+		view.Total++
+		detailQuery := keyListQuery(q, source)
 		detailQuery.Set("key", row.Key.ID)
 		row.DetailURL = "/admin/keys?" + detailQuery.Encode()
-		switch row.Key.Source {
-		case types.AccessKeyUpload:
-			view.UploadCount++
-		case types.AccessKeyLegacy:
-			view.LegacyCount++
-		case types.AccessKeyAdmin:
-			view.AdminCount++
-		}
 		view.Requests += row.Metrics.Usage.Totals.Requests
 		view.Tickets += row.Metrics.Usage.Totals.Tickets
 		view.RPM += row.Metrics.RPM
@@ -292,13 +343,17 @@ func (s *Server) renderKeys(w http.ResponseWriter, r *http.Request, created, mes
 			view.Detail = keyDetail(row, now)
 		}
 		hay := strings.ToLower(row.Key.ID + " " + row.Key.Label + " " + row.Key.Note + " " + row.Owner + " " + row.Mask)
-		if (view.Source == "" || row.Key.Source == view.Source) && (view.Status == "" || row.Status == view.Status) &&
+		if (view.Status == "" || row.Status == view.Status) &&
 			strings.Contains(hay, strings.ToLower(view.Query)) {
 			view.Rows = append(view.Rows, row)
 		}
 	}
+	for _, category := range []string{types.AccessKeyUpload, types.AccessKeyLegacy, types.AccessKeyAdmin} {
+		view.Tabs = append(view.Tabs, keySourceTab{Source: category, Label: keySourceLabel(category),
+			URL: "/admin/keys?source=" + category, Count: counts[category], Selected: category == source})
+	}
 	if q.Get("key") != "" && view.Detail == nil {
-		http.Error(w, "Key 不存在", http.StatusNotFound)
+		http.Error(w, "当前分类中没有此 Key", http.StatusNotFound)
 		return
 	}
 	slices.SortFunc(view.Rows, func(a, b managedKeyRow) int {
@@ -340,8 +395,7 @@ func (s *Server) renderKeys(w http.ResponseWriter, r *http.Request, created, mes
 		view.Page = min(max(n, 1), view.Pages)
 	}
 	link := func(page int) string {
-		values := r.URL.Query()
-		values.Del("key")
+		values := keyListQuery(q, source)
 		values.Set("page", strconv.Itoa(page))
 		return "/admin/keys?" + values.Encode()
 	}
@@ -380,7 +434,16 @@ func (s *Server) handleKeysMutation(w http.ResponseWriter, r *http.Request) {
 	}
 	form := r.PostForm
 	action := form.Get("action")
+	source := form.Get("source")
+	if source != "" && keySourceLabel(source) == "" {
+		http.Error(w, "Key 分类无效", http.StatusBadRequest)
+		return
+	}
 	if action == "create" {
+		if source != "" && source != types.AccessKeyAdmin {
+			http.Error(w, "仅管理员生成分类支持新建 Key", http.StatusBadRequest)
+			return
+		}
 		requestID, valid := s.creationRequestID(form.Get("creation_token"))
 		count, e1 := strconv.Atoi(form.Get("count"))
 		rpm, e2 := parseKeyLimit(form, "rpm")
@@ -404,6 +467,16 @@ func (s *Server) handleKeysMutation(w http.ResponseWriter, r *http.Request) {
 	if action != "enable" && action != "disable" && action != "revoke" && action != "edit" {
 		http.Error(w, "未知操作", http.StatusBadRequest)
 		return
+	}
+	// Source is immutable. Reject mixed or forged category selections before
+	// calling the store so a batch can never partially affect another category.
+	for _, id := range form["ids"] {
+		category, _, valid := types.ParseAccessKeyID(id)
+		if !valid || (source != "" && category != source) {
+			http.Error(w, "所选 Key 必须属于当前同一分类", http.StatusBadRequest)
+			return
+		}
+		source = category
 	}
 	if action == "revoke" && form.Get("confirm_revoke") != "yes" {
 		http.Error(w, "请确认不可恢复撤销", http.StatusBadRequest)
@@ -432,9 +505,9 @@ func (s *Server) handleKeysMutation(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "未变更：选择已失效、已撤销、参数不合法或存储不可用。上传来源不支持独立限额。", http.StatusConflict)
 		return
 	}
-	back := "/admin/keys"
+	backQuery := keyListQuery(r.URL.Query(), source)
 	if action == "edit" {
-		back += "?key=" + url.QueryEscape(form.Get("ids"))
+		backQuery.Set("key", form.Get("ids"))
 	}
-	http.Redirect(w, r, back, http.StatusSeeOther)
+	http.Redirect(w, r, "/admin/keys?"+backQuery.Encode(), http.StatusSeeOther)
 }
