@@ -277,7 +277,11 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 }
 
 func parse(page string) (*template.Template, error) {
-	return template.ParseFS(web.Templates, "templates/layout.html", "templates/upload-parser.html", "templates/"+page)
+	files := []string{"templates/layout.html", "templates/upload-parser.html", "templates/" + page}
+	if page == "keys.html" {
+		files = append(files, "templates/keys-style.html", "templates/keys-script.html")
+	}
+	return template.ParseFS(web.Templates, files...)
 }
 
 // Handler 建路由。用标准库 ServeMux 的方法+路径模式（Go 1.22 起），不引第三方路由。

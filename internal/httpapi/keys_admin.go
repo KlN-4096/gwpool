@@ -21,6 +21,7 @@ const keyFormMax = 256 << 10
 const keyCreationLifetime = 15 * time.Minute
 
 type managedKeyRow struct {
+	LastDate, LastClock, LimitBrief, LimitHint      string
 	Key                                             types.AccessKey
 	Source, Status, StatusText, Mask, Owner, Limits string
 	Created, Last, DetailURL                        string
@@ -42,6 +43,7 @@ type keyDetailView struct {
 	Average, P50, P95, Accounts string
 }
 type keysView struct {
+	ListURL string
 	base
 	Rows                                                              []managedKeyRow
 	Detail                                                            *keyDetailView
@@ -124,6 +126,21 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 			Created: keyTime(key.CreatedAt), Last: keyTime(metrics[id].Usage.LastAt),
 			DetailURL: "/admin/keys?key=" + url.QueryEscape(id), AdminIssued: key.Source == types.AccessKeyAdmin}
 		row.Source = map[string]string{types.AccessKeyUpload: "上传者", types.AccessKeyLegacy: "历史上传", types.AccessKeyAdmin: "管理员生成"}[key.Source]
+		row.LastDate, row.LastClock = "尚无请求", "—"
+		if !row.Metrics.Usage.LastAt.IsZero() {
+			row.LastDate = row.Metrics.Usage.LastAt.UTC().Format("2006-01-02")
+			row.LastClock = row.Metrics.Usage.LastAt.UTC().Format("15:04:05")
+		}
+		row.LimitBrief, row.LimitHint = "不限流", "上传者豁免"
+		if row.AdminIssued {
+			row.LimitBrief, row.LimitHint = "不限", "独立限额"
+			if key.RPM > 0 {
+				row.LimitBrief = strconv.Itoa(key.RPM) + " RPM"
+			}
+			if key.Concurrency > 0 {
+				row.LimitHint = strconv.Itoa(key.Concurrency) + " 并发"
+			}
+		}
 		switch {
 		case !key.RevokedAt.IsZero():
 			row.Status, row.StatusText = "revoked", "已撤销"
@@ -246,10 +263,20 @@ func (s *Server) renderKeys(w http.ResponseWriter, r *http.Request, created, mes
 	now := time.Now().UTC()
 	rows, failed := s.managedKeyRows(store, now)
 	q := r.URL.Query()
+	listQuery := r.URL.Query()
+	listQuery.Del("key")
+	listURL := "/admin/keys"
+	if encoded := listQuery.Encode(); encoded != "" {
+		listURL += "?" + encoded
+	}
 	view := keysView{base: base{Title: "接入 Key", Mode: s.pool.Mode(), Admin: true, AdminPage: "keys"},
 		Query: strings.TrimSpace(q.Get("q")), Source: q.Get("source"), Status: q.Get("status"), Sort: q.Get("sort"),
 		CreatedKeys: created, Message: message, CreationToken: token, StatsFailed: failed, Total: len(rows), Page: 1}
+	view.ListURL = listURL
 	for _, row := range rows {
+		detailQuery := r.URL.Query()
+		detailQuery.Set("key", row.Key.ID)
+		row.DetailURL = "/admin/keys?" + detailQuery.Encode()
 		switch row.Key.Source {
 		case types.AccessKeyUpload:
 			view.UploadCount++
@@ -314,6 +341,7 @@ func (s *Server) renderKeys(w http.ResponseWriter, r *http.Request, created, mes
 	}
 	link := func(page int) string {
 		values := r.URL.Query()
+		values.Del("key")
 		values.Set("page", strconv.Itoa(page))
 		return "/admin/keys?" + values.Encode()
 	}

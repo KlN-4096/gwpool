@@ -2,11 +2,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const html = fs.readFileSync(require('node:path').join(__dirname, 'templates/keys.html'), 'utf8');
+const html = fs.readFileSync(require('node:path').join(__dirname, 'templates/keys-script.html'), 'utf8');
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
 function fixture(withExport = true) {
-  const el = () => ({ checked: false, textContent: '', handlers: {}, addEventListener(n, fn) { this.handlers[n] = fn; } });
+  const el = () => ({ checked: false, textContent: '', handlers: {}, closest() { return null; }, focus() {}, addEventListener(n, fn) { this.handlers[n] = fn; } });
   const items = [el(), el(), el()];
   const form = el(); form.querySelectorAll = () => items;
   const exportValue = el(); exportValue.value = 'gwp_k_test-first\ngwp_k_test-second';
@@ -16,6 +16,7 @@ function fixture(withExport = true) {
     'key-batch': form, 'select-keys': el(), 'key-selection-count': el(),
     'created-keys': withExport ? exportValue : null, 'copy-keys': el(),
     'download-keys': el(), 'key-export-status': el(),
+    'key-batchbar': el(), 'clear-key-selection': el(),
   };
   const out = {};
   const context = {
@@ -40,6 +41,10 @@ test('selection is limited to this page and empty submit is blocked', () => {
   f.items[0].handlers.change();
   assert.equal(f.elements['select-keys'].indeterminate, true);
   assert.equal(f.elements['key-selection-count'].textContent, '已选 2 把');
+  assert.equal(f.elements['key-batchbar'].hidden, false);
+  f.elements['clear-key-selection'].handlers.click();
+  assert.equal(f.items.some(item => item.checked), false);
+  assert.equal(f.elements['key-batchbar'].hidden, true);
 });
 
 test('copy and download preserve only one plaintext key per line', async () => {

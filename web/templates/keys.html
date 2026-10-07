@@ -1,124 +1,116 @@
 {{define "content"}}
-<style>
-.keys-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px}
-.keys-summary>div{padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
-.keys-summary strong{display:block;font-size:24px}.keys-summary span{font-size:12px;color:var(--muted)}
-.key-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
-.key-form label{display:flex;flex-direction:column;gap:6px;min-width:0}
-.key-form input,.key-form select,.key-form textarea{width:100%;box-sizing:border-box}
-.key-form .key-wide{grid-column:1/-1}.key-note{white-space:pre-wrap;overflow-wrap:anywhere}
-.keys-table td,.keys-table th{vertical-align:top}.keys-table .key-name{min-width:180px;max-width:260px;white-space:normal;overflow-wrap:anywhere}
-.key-export{width:100%;min-height:180px;box-sizing:border-box;font-family:ui-monospace,Consolas,monospace;white-space:pre;overflow:auto}
-.keys-actions{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:14px 0}
-.keys-actions label{display:flex;align-items:center;gap:6px}.key-detail-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-.key-detail-grid p{margin:4px 0;overflow-wrap:anywhere}
-@media(max-width:800px){.key-form,.key-detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.keys-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:480px){.key-form,.key-detail-grid{grid-template-columns:minmax(0,1fr)}}
-</style>
-<div class="page-head"><h1>接入 Key</h1><p>上传者、历史账号与管理员生成的独立 Key，统一管理与观察。</p></div>
-{{if .StatsFailed}}<div class="note warn" role="alert">统计保存失败或达到容量上限，当前统计可能不完整；请检查服务日志。Key 管理状态以成功保存的结果为准。</div>{{end}}
-{{if .Message}}<div class="note" role="status">{{.Message}}</div>{{end}}
-{{if .CreatedKeys}}
-<section class="card"><header class="card-head"><div><h2>新 Key · 仅本次显示</h2><p>每行一把，无编号、名称或备注。请立即保存；服务器只保存摘要，无法再次导出原文。</p></div></header>
-<div class="card-body"><textarea class="key-export" id="created-keys" readonly aria-label="新生成 Key，每行一把" spellcheck="false">{{.CreatedKeys}}</textarea>
-<div class="keys-actions"><button type="button" id="copy-keys" hidden data-js>复制全部 Key</button><button type="button" id="download-keys" hidden data-js>下载 .txt</button><span id="key-export-status" role="status"></span><a href="/admin/keys">已保存，返回列表</a></div>
-<p class="foot">刷新或重复提交不会再创建一批。离开后无法恢复此清单；无 JavaScript 时可直接选中文本复制。</p></div></section>
-{{end}}
-<div class="keys-summary">
-<div><strong>{{.Total}}</strong><span>Key 总数 · 上传 {{.UploadCount}} / 历史 {{.LegacyCount}} / 生成 {{.AdminCount}}</span></div>
-<div><strong>{{.RPM}}</strong><span>近 60 秒请求 · 含已识别的拒绝</span></div>
-<div><strong>{{.Requests}}</strong><span>累计完成 HTTP 请求</span></div>
-<div><strong>{{.Tickets}}</strong><span>成功写出票数 · 非模型调用数</span></div>
+{{template "keys-style" .}}
+<div id="keys-page" data-list-url="{{.ListURL}}">
+  <header class="keys-heading">
+    <div><h1>接入 Key</h1><p>管理接入权限，查看每把 Key 的使用情况。</p></div>
+    <div class="key-actions">{{if .CreatedKeys}}<a class="btn" href="#key-result" data-key-open="key-result">查看生成结果</a>{{end}}
+      <a class="btn key-primary" href="#key-create" data-key-open="key-create"><span aria-hidden="true">＋</span> 生成 Key</a>
+    </div>
+  </header>
+  {{if .StatsFailed}}<div class="note warn" role="alert">统计保存失败或达到容量上限，数据可能不完整。请检查服务日志。</div>{{end}}
+  <div class="keys-summary" aria-label="Key 使用概览">
+    <div><span>接入 Key</span><strong>{{.Total}}<small>把</small></strong><p>上传 {{.UploadCount}} · 历史 {{.LegacyCount}} · 生成 {{.AdminCount}}</p></div>
+    <div><span><i class="key-live-dot" aria-hidden="true"></i>近 60 秒请求</span><strong>{{.RPM}}<small>次</small></strong><p>含已识别 Key 的拒绝请求</p></div>
+    <div><span>累计 HTTP 请求</span><strong>{{.Requests}}</strong><p>已完成的接口请求</p></div>
+    <div><span>成功写出票数</span><strong>{{.Tickets}}</strong><p>不代表模型调用数</p></div>
+  </div>
+  <section class="keys-list" aria-labelledby="keys-list-title">
+    <div class="keys-list-heading"><h2 id="keys-list-title">Key 列表 <span>{{.Matched}}</span></h2><span class="key-muted">点击名称查看详情</span></div>
+    <form method="get" action="/admin/keys" class="keys-filter">
+      <label class="keys-search"><span class="key-sr-only">搜索</span><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg><input type="search" name="q" value="{{.Query}}" placeholder="搜索名称、备注或尾号"></label>
+      <label><span class="key-sr-only">来源</span><select name="source"><option value="">全部来源</option><option value="upload"{{if eq .Source "upload"}} selected{{end}}>上传者</option><option value="legacy"{{if eq .Source "legacy"}} selected{{end}}>历史上传</option><option value="admin"{{if eq .Source "admin"}} selected{{end}}>管理员生成</option></select></label>
+      <label><span class="key-sr-only">状态</span><select name="status"><option value="">全部状态</option><option value="active"{{if eq .Status "active"}} selected{{end}}>可用</option><option value="disabled"{{if eq .Status "disabled"}} selected{{end}}>管理停用</option><option value="revoked"{{if eq .Status "revoked"}} selected{{end}}>已撤销</option><option value="inactive"{{if eq .Status "inactive"}} selected{{end}}>无有效来源</option></select></label>
+      <label><span class="key-sr-only">排序</span><select name="sort"><option value="new">创建时间排序</option><option value="rpm"{{if eq .Sort "rpm"}} selected{{end}}>近 60 秒请求</option><option value="requests"{{if eq .Sort "requests"}} selected{{end}}>累计请求排序</option><option value="last"{{if eq .Sort "last"}} selected{{end}}>最后请求排序</option></select></label>
+      <button type="submit">筛选</button>
+    </form>
+    <p id="key-page-status" role="status" class="key-page-status" hidden></p>
+    <form method="post" action="/admin/keys" id="key-batch">
+      <div class="table-wrap"><table class="keys-table">
+        <thead><tr><th class="key-check"><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>名称 / 来源</th><th>状态</th><th>限额</th><th class="key-number">近 60 秒</th><th class="key-number">累计请求</th><th>最后请求 <small>UTC</small></th><th><span class="key-sr-only">详情</span></th></tr></thead>
+        <tbody>{{range .Rows}}<tr data-key-row>
+          <td class="key-check">{{if .Editable}}<input type="checkbox" name="ids" value="{{.Key.ID}}" aria-label="选择 {{.Key.Label}}">{{else}}<span class="key-muted" title="不可操作">—</span>{{end}}</td>
+          <td class="key-identity"><div class="key-identity-inner"><span class="key-avatar" aria-hidden="true">{{template "key-icon"}}</span><div><a class="key-name" href="{{.DetailURL}}" data-key-detail>{{.Key.Label}}</a><div class="key-subline"><span class="key-source key-source-{{.Key.Source}}">{{.Source}}</span><span class="key-mask">{{.Mask}}</span></div></div></div></td>
+          <td><span class="key-status key-status-{{.Status}}"><i aria-hidden="true"></i>{{.StatusText}}</span></td>
+          <td><span class="key-limit">{{.LimitBrief}}</span><small class="key-secondary">{{.LimitHint}}</small></td>
+          <td class="key-number"><strong>{{.Metrics.RPM}}</strong><small class="key-secondary">在途 {{.Metrics.Active}}</small></td>
+          <td class="key-number"><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small class="key-secondary">2xx · {{.Metrics.Usage.Totals.OK}}</small></td>
+          <td class="key-date">{{.LastClock}}<small class="key-secondary">{{.LastDate}}</small></td>
+          <td><a class="key-row-open" href="{{.DetailURL}}" data-key-detail aria-label="查看 {{.Key.Label}} 详情">↗</a></td>
+        </tr>{{else}}<tr><td colspan="8"><div class="keys-empty">{{template "key-icon"}}<h3>没有匹配的 Key</h3><p>试试调整筛选条件，或生成一把新的接入 Key。</p><a href="/admin/keys">清除筛选</a></div></td></tr>{{end}}</tbody>
+      </table></div>
+      <div id="key-batchbar" class="key-batchbar">
+        <span id="key-selection-count" role="status">勾选 Key 后批量操作</span>
+        <button type="button" id="clear-key-selection" class="key-quiet" hidden data-js>取消选择</button>
+        <div class="key-batch-buttons"><button name="action" value="enable" type="submit">启用</button><button name="action" value="disable" type="submit">停用</button><button type="button" class="key-danger-quiet" id="open-key-revoke" hidden data-key-dialog-control>撤销…</button></div>
+        <details class="key-nojs-revoke"><summary>撤销所选</summary><label><input name="confirm_revoke" value="yes" type="checkbox">确认不可恢复撤销</label><button name="action" value="revoke" type="submit" class="danger">确认撤销</button></details>
+      </div>
+    </form>
+    <footer class="keys-pagination"><span>筛选命中 {{.Matched}} / {{.Total}}<span class="key-pagination-extra"> · 每页 50 条</span></span><div>{{if .Previous}}<a class="btn sm" href="{{.Previous}}" aria-label="上一页">←</a>{{end}}<span>第 {{.Page}} / {{.Pages}} 页</span>{{if .Next}}<a class="btn sm" href="{{.Next}}" aria-label="下一页">→</a>{{end}}</div></footer>
+  </section>
+  <div class="keys-foot"><span>上传者与历史上传 Key 不新增限流</span><details><summary>统计口径与说明</summary><p>统计覆盖七个机器 API，从本功能启用后开始累计；HTTP 成功不代表模型能力或满血。票数仅记完整响应写入成功，不保证客户端收到。近 60 秒 / 5 分钟为秒桶近似且重启清空；累计与小时数据每 30 秒保存，正常关闭补存，异常退出可能丢失尚未保存的统计。未知错误 Key 不归因，公共 Key 和根管理员 Key 不在此列表。</p></details></div>
 </div>
+
+<section id="key-create" class="key-panel" data-key-panel aria-labelledby="key-create-title">
+  <header class="key-panel-heading"><div><span class="key-eyebrow">新建接入</span><h2 id="key-create-title">生成独立 Key</h2><p>无需上传账号，生成后即可用于普通消费接入。</p></div><button type="button" class="key-close" data-key-close hidden data-key-dialog-control aria-label="关闭生成窗口">×</button></header>
+  <form method="post" action="/admin/keys">
+    <input type="hidden" name="action" value="create"><input type="hidden" name="creation_token" value="{{.CreationToken}}">
+    <div class="key-panel-body key-form">
+      <label>名称前缀<input name="label" maxlength="80" placeholder="例如：团队接入" autofocus><small>批量生成时自动追加序号</small></label>
+      <label>生成数量<input name="count" type="number" value="1" min="1" max="1000" required><small>每次 1–1000 把</small></label>
+      <div class="key-form-section"><strong>独立限额</strong><span>填写 0 表示不限</span></div>
+      <label>每分钟请求上限<input name="rpm" type="number" value="0" min="0" max="600000" required><small>RPM · 按每把 Key 分别计算</small></label>
+      <label>并发上限<input name="concurrency" type="number" value="0" min="0" max="10000" required><small>同时处理的请求数</small></label>
+      <label class="key-wide">备注 <span class="key-muted">可选</span><textarea name="note" maxlength="1000" rows="2" placeholder="用途、使用方或其他说明"></textarea></label>
+      <p class="key-form-note key-wide">仅提供普通消费权限，不授予管理员或托管凭据权限；不受公共开放门槛影响。</p>
+    </div>
+    <footer class="key-panel-footer"><button type="button" data-key-close hidden data-key-dialog-control>取消</button><button type="submit" class="key-primary">生成 Key</button></footer>
+  </form>
+</section>
+
+{{if .CreatedKeys}}
+<section id="key-result" class="key-panel" data-key-panel data-key-auto aria-labelledby="key-result-title">
+  <header class="key-panel-heading"><div><span class="key-eyebrow key-success">生成成功</span><h2 id="key-result-title">保存你的新 Key</h2><p>{{.Message}}</p></div><button type="button" class="key-close" data-key-close hidden data-key-dialog-control aria-label="关闭生成结果">×</button></header>
+  <div class="key-panel-body"><div class="key-notice">仅本次显示。服务器只保存摘要，离开此页后无法再次获取原文。</div>
+    <textarea class="key-export" id="created-keys" readonly aria-label="新生成 Key，每行一把" spellcheck="false">{{.CreatedKeys}}</textarea>
+    <div class="key-actions"><button type="button" class="key-primary" id="copy-keys" hidden data-js>复制全部 Key</button><button type="button" id="download-keys" hidden data-js>下载 .txt</button><span id="key-export-status" role="status" class="key-muted"></span></div>
+    <p class="key-form-note">每行一把，无编号或备注。无 JavaScript 时可直接选中文本复制。重复提交不会再创建一批。</p>
+  </div><footer class="key-panel-footer"><a class="btn" href="/admin/keys">已保存，完成</a></footer>
+</section>
+{{end}}
+
 {{with .Detail}}
-<section class="card" id="key-detail"><header class="card-head"><div><h2>{{.Key.Label}} <small>{{.Key.ID}}</small></h2><p>{{.Source}} · {{.StatusText}} · {{.Mask}}</p></div><a href="/admin/keys">关闭详情</a></header>
-<div class="card-body"><div class="key-detail-grid">
-<div><p>归属：{{.Owner}}</p><p>创建：{{.Created}} UTC</p><p>最后请求：{{.Last}} UTC</p><p>限额：{{.Limits}}</p></div>
-<div><p>近 60 秒：{{.Metrics.RPM}} 次 / 近 5 分钟：{{.Metrics.FiveMinutes}} 次</p><p>当前在途：{{.Metrics.Active}}</p><p>完成 {{.Metrics.Usage.Totals.Requests}} / 2xx {{.Metrics.Usage.Totals.OK}} / 拒绝 {{.Metrics.Usage.Totals.Denied}}</p><p>4xx {{.Metrics.Usage.Totals.ClientErrors}} / 5xx {{.Metrics.Usage.Totals.ServerErrors}} / 票 {{.Metrics.Usage.Totals.Tickets}}</p></div>
-<div><p>平均耗时：{{.Average}}</p><p>P50 {{.P50}} / P95 {{.P95}}（分桶估计）</p><p>响应字节：{{.Metrics.Usage.Totals.Bytes}}</p><p>不同 account 摘要：{{.Accounts}}（仅显式参数）</p></div>
-</div><p class="key-note">{{.Key.Note}}</p>
-<p class="foot">最近连接对端：{{range .Metrics.Usage.RecentIPs}}<code>{{.}}</code> {{else}}—{{end}}。反向代理后通常是代理地址，不信任转发头，也不将其当真实人数。</p>
-{{if .Editable}}<details><summary>编辑名称、备注{{if .AdminIssued}}和独立限额{{end}}</summary>
-<form method="post" action="/admin/keys" class="key-form" style="margin-top:14px">
-<input type="hidden" name="action" value="edit"><input type="hidden" name="ids" value="{{.Key.ID}}">
-<label>名称<input name="label" maxlength="100" value="{{.Key.Label}}"></label>
-{{if .AdminIssued}}<label>每分钟请求上限 · 0 不限<input name="rpm" type="number" min="0" max="600000" value="{{.Key.RPM}}"></label><label>并发上限 · 0 不限<input name="concurrency" type="number" min="0" max="10000" value="{{.Key.Concurrency}}"></label>{{end}}
-<label class="key-wide">备注<textarea name="note" maxlength="1000" rows="2">{{.Key.Note}}</textarea></label><div class="key-wide"><button type="submit">保存</button></div>
-</form></details>{{end}}
-<details><summary>接口分布与近 7 天小时统计</summary>
-<div class="key-detail-grid">{{range .Endpoints}}<p><code>{{.Path}}</code> · {{.Count}} 次</p>{{end}}</div>
-<div class="table-wrap"><table><thead><tr><th>小时 UTC</th><th>请求</th><th>2xx</th><th>4xx</th><th>5xx</th><th>拒绝</th><th>交付票</th></tr></thead>
-<tbody>{{range .Hours}}<tr><td>{{.Time}}</td><td>{{.Counters.Requests}}</td><td>{{.Counters.OK}}</td><td>{{.Counters.ClientErrors}}</td><td>{{.Counters.ServerErrors}}</td><td>{{.Counters.Denied}}</td><td>{{.Counters.Tickets}}</td></tr>{{else}}<tr><td colspan="7">暂无记录</td></tr>{{end}}</tbody></table></div></details>
-</div></section>
+<section id="key-detail" class="key-panel key-panel-detail" data-key-panel data-key-auto aria-labelledby="key-detail-title">
+  <header class="key-panel-heading"><div><span class="key-eyebrow">{{.Source}} · {{.Key.ID}}</span><h2 id="key-detail-title">{{.Key.Label}}</h2><p><span class="key-status key-status-{{.Status}}"><i aria-hidden="true"></i>{{.StatusText}}</span><span class="key-mask">{{.Mask}}</span></p></div><a class="key-close" href="{{$.ListURL}}" data-key-close aria-label="关闭详情">×</a></header>
+  <div class="key-panel-body">
+    <div class="key-detail-stats"><div><span>近 60 秒</span><strong>{{.Metrics.RPM}}</strong><small>5 分钟 {{.Metrics.FiveMinutes}} 次</small></div><div><span>累计请求</span><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small>在途 {{.Metrics.Active}}</small></div><div><span>成功写出票</span><strong>{{.Metrics.Usage.Totals.Tickets}}</strong><small>HTTP 2xx {{.Metrics.Usage.Totals.OK}}</small></div></div>
+    <dl class="key-facts"><div><dt>归属</dt><dd>{{.Owner}}</dd></div><div><dt>访问限额</dt><dd>{{.Limits}}</dd></div><div><dt>创建时间</dt><dd>{{.Created}} UTC</dd></div><div><dt>最后请求</dt><dd>{{.Last}} UTC</dd></div></dl>
+    {{if .Key.Note}}<div class="key-detail-note"><span>备注</span><p>{{.Key.Note}}</p></div>{{end}}
+    {{if .Editable}}<details class="key-detail-section" id="key-edit"><summary>编辑 Key <span>名称、备注{{if .AdminIssued}}与限额{{end}}</span></summary>
+      <form method="post" action="/admin/keys" class="key-form">
+        <input type="hidden" name="action" value="edit"><input type="hidden" name="ids" value="{{.Key.ID}}">
+        <label class="key-wide">名称<input name="label" maxlength="100" value="{{.Key.Label}}"></label>
+        {{if .AdminIssued}}<label>每分钟请求上限<input name="rpm" type="number" min="0" max="600000" value="{{.Key.RPM}}"><small>0 表示不限</small></label><label>并发上限<input name="concurrency" type="number" min="0" max="10000" value="{{.Key.Concurrency}}"><small>0 表示不限</small></label>{{end}}
+        <label class="key-wide">备注<textarea name="note" maxlength="1000" rows="2">{{.Key.Note}}</textarea></label><div class="key-wide key-edit-actions"><button type="submit" class="key-primary">保存修改</button></div>
+      </form>
+    </details>{{end}}
+    <details class="key-detail-section"><summary>请求质量与耗时 <span>HTTP 统计</span></summary>
+      <dl class="key-facts"><div><dt>4xx / 5xx / 拒绝</dt><dd>{{.Metrics.Usage.Totals.ClientErrors}} / {{.Metrics.Usage.Totals.ServerErrors}} / {{.Metrics.Usage.Totals.Denied}}</dd></div><div><dt>平均耗时</dt><dd>{{.Average}}</dd></div><div><dt>P50 / P95</dt><dd>{{.P50}} / {{.P95}}</dd></div><div><dt>响应字节</dt><dd>{{.Metrics.Usage.Totals.Bytes}}</dd></div><div><dt>account 摘要数</dt><dd>{{.Accounts}}</dd></div></dl><p class="key-form-note">耗时分位为分桶估计；account 摘要仅包含显式传入参数。</p>
+    </details>
+    <details class="key-detail-section"><summary>接口分布 <span>{{len .Endpoints}} 个接口</span></summary><dl class="key-facts">{{range .Endpoints}}<div><dt><code>{{.Path}}</code></dt><dd>{{.Count}} 次</dd></div>{{else}}<p class="key-muted">暂无请求记录</p>{{end}}</dl></details>
+    <details class="key-detail-section"><summary>近 7 天小时统计 <span>UTC</span></summary><div class="table-wrap"><table class="key-hour-table"><thead><tr><th>小时</th><th>请求</th><th>2xx</th><th>4xx</th><th>5xx</th><th>拒绝</th><th>票</th></tr></thead><tbody>{{range .Hours}}<tr><td>{{.Time}}</td><td>{{.Counters.Requests}}</td><td>{{.Counters.OK}}</td><td>{{.Counters.ClientErrors}}</td><td>{{.Counters.ServerErrors}}</td><td>{{.Counters.Denied}}</td><td>{{.Counters.Tickets}}</td></tr>{{else}}<tr><td colspan="7">暂无记录</td></tr>{{end}}</tbody></table></div></details>
+    <details class="key-detail-section"><summary>连接信息</summary><p>{{range .Metrics.Usage.RecentIPs}}<code>{{.}}</code> {{else}}—{{end}}</p><p class="key-form-note">只记录连接对端。反向代理后通常是代理地址，不信任转发头，也不将其当真实人数。</p></details>
+  </div>
+</section>
 {{end}}
-<section class="card"><header class="card-head"><div><h2>批量生成</h2><p>无需上传账号，只提供普通消费权限；不受公共开放门槛影响，不授予管理员或托管凭据权限。</p></div></header>
-<div class="card-body"><details><summary>生成独立 Key</summary><form method="post" action="/admin/keys" class="key-form" style="margin-top:14px">
-<input type="hidden" name="action" value="create"><input type="hidden" name="creation_token" value="{{.CreationToken}}">
-<label>数量 · 1–1000<input name="count" type="number" value="1" min="1" max="1000" required></label><label>名称前缀<input name="label" maxlength="80" placeholder="接入 Key"></label>
-<label>每分钟请求上限 · 0 不限<input name="rpm" type="number" value="0" min="0" max="600000" required></label><label>并发上限 · 0 不限<input name="concurrency" type="number" value="0" min="0" max="10000" required></label>
-<label class="key-wide">备注<textarea name="note" maxlength="1000" rows="2"></textarea></label>
-<div class="key-wide"><button type="submit">生成并显示 Key</button><p class="foot">独立限额只适用于管理员生成来源；上传者及历史上传 Key 不新增限流。</p></div>
-</form></details></div></section>
-<section class="card"><header class="card-head"><div><h2>全部 Key</h2><p>筛选命中 {{.Matched}} / {{.Total}} · 每页最多 50 条；批量选择只作用于本页勾选项。</p></div></header>
-<div class="card-body"><form method="get" action="/admin/keys" class="key-form">
-<label>搜索<input type="search" name="q" value="{{.Query}}" placeholder="名称、备注、ID、尾号"></label>
-<label>来源<select name="source"><option value="">全部来源</option><option value="upload"{{if eq .Source "upload"}} selected{{end}}>上传者</option><option value="legacy"{{if eq .Source "legacy"}} selected{{end}}>历史上传</option><option value="admin"{{if eq .Source "admin"}} selected{{end}}>管理员生成</option></select></label>
-<label>状态<select name="status"><option value="">全部状态</option><option value="active"{{if eq .Status "active"}} selected{{end}}>可用</option><option value="disabled"{{if eq .Status "disabled"}} selected{{end}}>管理停用</option><option value="revoked"{{if eq .Status "revoked"}} selected{{end}}>已撤销</option><option value="inactive"{{if eq .Status "inactive"}} selected{{end}}>无有效来源</option></select></label>
-<label>排序<select name="sort"><option value="new">创建时间</option><option value="rpm"{{if eq .Sort "rpm"}} selected{{end}}>近 60 秒请求</option><option value="requests"{{if eq .Sort "requests"}} selected{{end}}>累计请求</option><option value="last"{{if eq .Sort "last"}} selected{{end}}>最后请求</option></select></label>
-<div class="keys-actions"><button type="submit">应用筛选</button><a href="/admin/keys">重置</a></div></form></div>
-<form method="post" action="/admin/keys" id="key-batch">
-<div class="table-wrap"><table class="keys-table"><thead><tr><th><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>Key / 来源</th><th>状态 / 限额</th><th>近 60s / 5min</th><th>累计 / 2xx / 票</th><th>4xx / 5xx / 拒绝</th><th>最后请求 UTC</th></tr></thead>
-<tbody>{{range .Rows}}<tr>
-<td>{{if .Editable}}<input type="checkbox" name="ids" value="{{.Key.ID}}" aria-label="选择 {{.Key.Label}}">{{end}}</td>
-<td class="key-name"><a href="{{.DetailURL}}"><strong>{{.Key.Label}}</strong></a><div class="foot">{{.Source}} · {{.Key.ID}}</div><code>{{.Mask}}</code></td>
-<td class="key-name">{{.StatusText}}<div class="foot">{{.Limits}}</div></td>
-<td>{{.Metrics.RPM}} / {{.Metrics.FiveMinutes}}<div class="foot">在途 {{.Metrics.Active}}</div></td>
-<td>{{.Metrics.Usage.Totals.Requests}} / {{.Metrics.Usage.Totals.OK}} / {{.Metrics.Usage.Totals.Tickets}}</td>
-<td>{{.Metrics.Usage.Totals.ClientErrors}} / {{.Metrics.Usage.Totals.ServerErrors}} / {{.Metrics.Usage.Totals.Denied}}</td><td>{{.Last}}</td>
-</tr>{{else}}<tr><td colspan="7" class="empty">没有匹配的 Key</td></tr>{{end}}</tbody></table></div>
-<div class="card-body"><div class="keys-actions">
-<button name="action" value="enable" type="submit">启用所选</button><button name="action" value="disable" type="submit">停用所选</button>
-<label><input name="confirm_revoke" value="yes" type="checkbox">确认不可恢复撤销</label><button name="action" value="revoke" type="submit" class="danger">撤销所选</button>
-<span id="key-selection-count" role="status"></span></div><p class="foot">撤销后不能恢复，历史统计保留；上传凭据本身不会被停用或删除。没有有效上传来源的 Key，即使管理启用也仍不可用。</p></div></form>
-<div class="card-body keys-actions">{{if .Previous}}<a class="btn" href="{{.Previous}}">上一页</a>{{end}}<span>第 {{.Page}} / {{.Pages}} 页</span>{{if .Next}}<a class="btn" href="{{.Next}}">下一页</a>{{end}}</div></section>
-<p class="foot">统计覆盖七个机器 API，从本功能启用后开始累计；HTTP 成功不代表模型能力或满血，票数仅记完整响应写入成功，不保证客户端收到。近 60 秒 / 5 分钟为秒桶近似且重启清空；累计与小时数据每 30 秒保存，正常关闭补存，异常退出可能丢失尚未保存的统计。未知错误 Key 不归因。公共 Key 和根管理员 Key 不在此列表。</p>
-<script>
-(function () {
-  'use strict';
-  const form = document.getElementById('key-batch');
-  const all = document.getElementById('select-keys');
-  if (form && all) {
-    const items = Array.from(form.querySelectorAll('input[name="ids"]'));
-    const update = function () {
-      const count = items.filter(function (item) { return item.checked; }).length;
-      all.checked = items.length > 0 && count === items.length;
-      all.indeterminate = count > 0 && count < items.length;
-      document.getElementById('key-selection-count').textContent = '已选 ' + count + ' 把';
-    };
-    all.addEventListener('change', function () { items.forEach(function (item) { item.checked = all.checked; }); update(); });
-    items.forEach(function (item) { item.addEventListener('change', update); });
-    form.addEventListener('submit', function (event) {
-      if (!items.some(function (item) { return item.checked; })) {
-        event.preventDefault(); document.getElementById('key-selection-count').textContent = '请先选择 Key';
-      }
-    });
-    update();
-  }
-  const value = document.getElementById('created-keys');
-  if (!value) return;
-  const status = document.getElementById('key-export-status');
-  document.getElementById('copy-keys').addEventListener('click', async function () {
-    try { await navigator.clipboard.writeText(value.value); status.textContent = '已复制'; }
-    catch (_) { value.focus(); value.select(); status.textContent = '请手动复制选中文本'; }
-  });
-  document.getElementById('download-keys').addEventListener('click', function () {
-    const blob = new Blob([value.value + '\n'], {type:'text/plain;charset=utf-8'});
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url; link.download = 'gwpool-keys.txt'; link.click();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-    status.textContent = '已导出纯文本';
-  });
-})();
-</script>
+
+<section id="key-revoke" class="key-panel" data-key-panel aria-labelledby="key-revoke-title" hidden>
+  <header class="key-panel-heading"><div><span class="key-eyebrow key-danger-text">不可恢复操作</span><h2 id="key-revoke-title">撤销所选 Key？</h2></div><button type="button" class="key-close" data-key-close aria-label="关闭撤销确认">×</button></header>
+  <form method="post" action="/admin/keys" id="key-revoke-form"><input type="hidden" name="action" value="revoke"><div id="key-revoke-ids"></div>
+    <div class="key-panel-body"><p>将撤销 <strong id="key-revoke-count">0</strong> 把 Key。撤销后不能重新启用。</p><p class="key-muted">历史统计保留，上传凭据本身不会被停用或删除。若只是暂时停用，请使用「停用」。</p></div>
+    <footer class="key-panel-footer"><button type="button" data-key-close>取消</button><button type="submit" name="confirm_revoke" value="yes" class="danger">确认撤销</button></footer>
+  </form>
+</section>
+{{template "keys-script" .}}
 {{end}}
+
+{{define "key-icon"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8.5" cy="8.5" r="4.5"/><path d="m12 12 8 8m-3-3 3-3m-6 0 3-3"/></svg>{{end}}
