@@ -36,6 +36,9 @@ type stateChange struct {
 	Sequence          uint64                                     `json:"seq"`
 	NextAccountID     int64                                      `json:"next_account_id,omitempty"`
 	NextOwnerID       int64                                      `json:"next_owner_id,omitempty"`
+	NextAccessKeyID   int64                                      `json:"next_access_key_id,omitempty"`
+	AccessKeys        map[string]types.AccessKey                 `json:"access_keys,omitempty"`
+	KeyUsage          map[string]types.KeyUsage                  `json:"key_usage,omitempty"`
 	OwnerKeysMigrated bool                                       `json:"owner_keys_migrated,omitempty"`
 	AttemptsMigrated  bool                                       `json:"attempts_migrated,omitempty"`
 	Accounts          []types.Account                            `json:"accounts,omitempty"`
@@ -360,6 +363,19 @@ func applyChange(state *State, change stateChange) {
 	state.JournalSequence = change.Sequence
 	state.NextAccountID = max(state.NextAccountID, change.NextAccountID)
 	state.NextOwnerID = max(state.NextOwnerID, change.NextOwnerID)
+	state.NextAccessKeyID = max(state.NextAccessKeyID, change.NextAccessKeyID)
+	if len(change.AccessKeys) > 0 && state.AccessKeys == nil {
+		state.AccessKeys = map[string]types.AccessKey{}
+	}
+	for id, key := range change.AccessKeys {
+		state.AccessKeys[id] = key
+	}
+	if len(change.KeyUsage) > 0 && state.KeyUsage == nil {
+		state.KeyUsage = map[string]types.KeyUsage{}
+	}
+	for id, usage := range change.KeyUsage {
+		state.KeyUsage[id] = usage
+	}
 	state.OwnerKeysMigrated = state.OwnerKeysMigrated || change.OwnerKeysMigrated
 	state.AttemptsMigrated = state.AttemptsMigrated || change.AttemptsMigrated
 	for _, id := range change.DropAccounts {
@@ -617,6 +633,11 @@ func cloneMap[K comparable, V any](from map[K]V) map[K]V {
 }
 
 func cloneState(state State) State {
+	state.AccessKeys = cloneMap(state.AccessKeys)
+	state.KeyUsage = cloneMap(state.KeyUsage)
+	for id, usage := range state.KeyUsage {
+		state.KeyUsage[id] = usage.Clone()
+	}
 	state.Accounts = slices.Clone(state.Accounts)
 	state.Owners = slices.Clone(state.Owners)
 	state.ContactReports = slices.Clone(state.ContactReports)

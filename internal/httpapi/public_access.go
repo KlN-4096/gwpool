@@ -56,6 +56,10 @@ func (s *Server) consumerAPI(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = s.resolveCallerOnce(r)
 		c, ok := s.resolveCaller(r)
+		if c.key.ID != "" {
+			s.serveManagedKey(w, r, c, ok, next)
+			return
+		}
 		if !ok {
 			s.unauthorized(w, "需要有效的接入 Key")
 			return

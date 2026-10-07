@@ -209,9 +209,10 @@ type Server struct {
 	cooldowns       cooldownCache
 	catalogPairs    pairCatalogCache
 	publicAdmission publicAdmission
+	keyMetrics      keyMetrics
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
-	tplMintAll, tplCleanup                                        *template.Template
+	tplMintAll, tplCleanup, tplKeys                               *template.Template
 }
 
 // probeEffort 必须跟 mint 包实际发出去的 payload 一致（SPEC 第 2 节）：
@@ -268,6 +269,10 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if s.tplCleanup, err = parse("cleanup.html"); err != nil {
 		return nil, err
 	}
+	if s.tplKeys, err = parse("keys.html"); err != nil {
+		return nil, err
+	}
+	s.initKeyMetrics()
 	return s, nil
 }
 
@@ -313,6 +318,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /admin/accounts/{id}/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminAccountEnabled)))
 	mux.Handle("POST /admin/config", s.sameOrigin(http.HandlerFunc(s.handleAdminConfig)))
 	mux.HandleFunc("GET /admin/coverage", s.handleCoverage)
+	mux.HandleFunc("GET /admin/keys", s.handleKeys)
+	mux.Handle("POST /admin/keys", s.sameOrigin(http.HandlerFunc(s.handleKeysMutation)))
 	mux.Handle("POST /admin/coverage", s.sameOrigin(http.HandlerFunc(s.handleCoverageConfig)))
 	mux.Handle("POST /admin/proxies", s.sameOrigin(http.HandlerFunc(s.handleAdminAddProxy)))
 	mux.Handle("POST /admin/proxies/enabled", s.sameOrigin(http.HandlerFunc(s.handleAdminProxyEnabled)))
@@ -510,10 +517,12 @@ func (s *Server) ConsumerKeyFor(a types.Account) string {
 
 // caller 是认出来的调用方。admin 为真时 acct 是零值，必须由请求显式指明替谁办事。
 type caller struct {
-	acct    types.Account
-	admin   bool
-	ownerID int64
-	public  bool
+	acct     types.Account
+	admin    bool
+	ownerID  int64
+	public   bool
+	key      types.AccessKey
+	issuedID int64
 }
 
 type requestCallerKey struct{}
@@ -546,22 +555,29 @@ func (s *Server) resolveCaller(r *http.Request) (caller, bool) {
 	if keyOK(s.PublicKey(), got) {
 		return caller{public: true}, true
 	}
+	if strings.HasPrefix(got, "gwp_k_") {
+		if store, supported := s.st.(accessKeyStore); supported {
+			if key, matched := store.ResolveIssuedAccessKey(got); matched {
+				return caller{key: key, issuedID: key.SubjectID}, key.Usable()
+			}
+		}
+		return caller{}, false
+	}
 	if strings.HasPrefix(got, "gwp_a_") {
 		for _, owner := range s.st.Owners() {
 			if keyOK(s.OwnerKeyFor(owner), got) {
 				account, active := s.ownerKeyAccount(owner.ID, strings.TrimSpace(r.URL.Query().Get("account")))
-				return caller{acct: account, ownerID: owner.ID}, active
+				key := s.accessKeyPolicy(types.AccessKeyUpload, owner.ID)
+				return caller{acct: account, ownerID: owner.ID, key: key}, active && key.Usable()
 			}
 		}
 		return caller{}, false
 	}
 	for _, a := range s.st.Accounts() {
-		if !a.Enabled {
-			continue
-		}
 		k := s.ConsumerKeyFor(a)
 		if k != "" && subtle.ConstantTimeCompare([]byte(k), []byte(got)) == 1 {
-			return caller{acct: a}, true
+			key := s.accessKeyPolicy(types.AccessKeyLegacy, a.ID)
+			return caller{acct: a, key: key}, a.Enabled && key.Usable()
 		}
 	}
 	return caller{}, false
@@ -1550,6 +1566,18 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 	}
 	if c.public {
 		s.servePublic(w, r, req, wait, count)
+		return
+	}
+	if c.issuedID > 0 {
+		ref := strings.TrimSpace(r.URL.Query().Get("account"))
+		if ref == "" || len(ref) > 128 {
+			s.badRequest(w, http.StatusBadRequest, "接入 Key 必须带 account 参数（你自己的上游 account_id）")
+			return
+		}
+		s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait, count,
+			func(rq sched.Request) (types.Delivery, error) {
+				return s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
+			})
 		return
 	}
 	acct := c.acct

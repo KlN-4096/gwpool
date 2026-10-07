@@ -70,8 +70,11 @@ type State struct {
 	Mints map[string]types.RegionMint `json:"mints"`
 	// NextAccountID / NextOwnerID 是**永不回收**的 ID 计数器，见 bumpID。
 	// 老文件里没这两个键 ⇒ 0 ⇒ 第一次发号时按现有最大值兜底一次，不用迁移。
-	NextAccountID int64 `json:"next_account_id"`
-	NextOwnerID   int64 `json:"next_owner_id"`
+	NextAccountID   int64                      `json:"next_account_id"`
+	NextOwnerID     int64                      `json:"next_owner_id"`
+	NextAccessKeyID int64                      `json:"next_access_key_id,omitempty"`
+	AccessKeys      map[string]types.AccessKey `json:"access_keys,omitempty"`
+	KeyUsage        map[string]types.KeyUsage  `json:"key_usage,omitempty"`
 }
 
 // bumpID 发一个**永不回收**的 ID：计数器只增不减，max 只在老文件还没有计数器时兜底一次。

@@ -560,6 +560,7 @@ table.gateway-cards tr.nomatch td::before { content:none; }
   </nav>
   {{end}}
   <nav class="admin-nav admin-tools">
+    <a href="/admin/keys"{{if eq .AdminPage "keys"}} aria-current="page"{{end}}>接入 Key</a>
     <a href="/admin/coverage"{{if eq .AdminPage "coverage"}} aria-current="page"{{end}}>目录覆盖</a>
     <a href="/admin/mint-all"{{if eq .AdminPage "mint"}} aria-current="page"{{end}}>范围打票</a>
   </nav>

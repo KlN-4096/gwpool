@@ -115,9 +115,9 @@ func (s *Server) whoAsks(w http.ResponseWriter, r *http.Request) (upstream strin
 	}
 
 	if c, ok := s.resolveCaller(r); ok {
-		if c.public {
+		if c.public || c.issuedID > 0 {
 			if ref == "" {
-				s.badRequest(w, http.StatusBadRequest, "公共接入必须带 account 参数")
+				s.badRequest(w, http.StatusBadRequest, "外部接入必须带 account 参数")
 				return "", 0, false, false
 			}
 			return ref, s.rowFor(types.AnonPrefix + ref), true, true

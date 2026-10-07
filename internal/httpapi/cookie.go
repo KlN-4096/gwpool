@@ -441,6 +441,9 @@ func (s *Server) serveCookie(w http.ResponseWriter, r *http.Request, acctID, con
 	}
 	// count 没带（或只要一张）时**原样回老形状**，一个字节都不变：存量调用方都在读
 	// 顶层那几个字段。
+	if counter, ok := r.Context().Value(keyTicketCounterContext{}).(*int); ok {
+		*counter += len(got)
+	}
 	if count == 1 {
 		writeJSON(w, http.StatusOK, got[0])
 		return

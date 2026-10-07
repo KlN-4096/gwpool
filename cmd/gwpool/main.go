@@ -127,7 +127,12 @@ func run(path string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	// consumer_key 同时是每账号 key 的派生密钥：空的话一把 key 都发不出来，
+	defer func() {
+		if err := api.FlushKeyMetrics(); err != nil {
+			log.Error("关闭时保存 Key 统计失败", "err", err)
+		}
+	}()
+	// consumer_key 同时是每账号 key 的派生密钥：空的话上传者 key 都发不出来，
 	// /cookie 会对所有人 401。宁可吵一句，也别让人对着 401 猜半天。
 	if cfg.ConsumerKey == "" {
 		log.Warn("配置里没有 consumer_key：发不出账号 key，/cookie 会全部 401")
@@ -143,6 +148,9 @@ func run(path string, log *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	metricsStopped := make(chan struct{})
+	go func() { defer close(metricsStopped); api.RunKeyMetrics(ctx) }()
+	defer func() { stop(); <-metricsStopped }()
 	go pool.Run(ctx)    // ModeSingle 时立刻返回：单账号模式绝不保温
 	go mintAll.Run(ctx) // 仅管理员主动入队后才铸票。
 	go queue.run(ctx)

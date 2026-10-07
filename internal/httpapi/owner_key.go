@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"time"
 
 	"gwpool/internal/oauth"
@@ -15,7 +16,8 @@ import (
 // browser tokens and legacy credential keys. The configured root secret is never
 // emitted. Availability is rechecked from current credentials on every request.
 func (s *Server) OwnerKeyFor(owner types.Owner) string {
-	if s.opt.ConsumerKey == "" || owner.ID <= 0 || owner.Token == "" {
+	if s.opt.ConsumerKey == "" || owner.ID <= 0 ||
+		owner.ID > math.MaxInt64-types.AccessKeyMaxID || owner.Token == "" {
 		return ""
 	}
 	m := hmac.New(sha256.New, []byte(s.opt.ConsumerKey))
@@ -53,6 +55,9 @@ func (s *Server) ownerKeyAccount(ownerID int64, reference string) (types.Account
 func (c caller) reporterID() int64 {
 	if c.public {
 		return publicReporterID
+	}
+	if c.issuedID > 0 {
+		return publicReporterID + c.issuedID
 	}
 	if c.ownerID > 0 {
 		// Disjoint namespace from positive legacy credential IDs; credential
