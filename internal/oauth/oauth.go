@@ -140,6 +140,16 @@ func ClaimsFor(tokens Tokens, expectedAccount string) (Claims, error) {
 // 当「继续用原来那张」，别把它写成空值覆盖掉手里那张（那就再也换不了票了）。
 //
 // hc 为 nil 时用默认客户端直连。
+// RefreshError carries only the allowlisted OAuth category, never the upstream body.
+type RefreshError struct {
+	Status int
+	Code   string
+}
+
+func (e *RefreshError) Error() string {
+	return fmt.Sprintf("换票回 HTTP %d：%s", e.Status, e.Code)
+}
+
 func Refresh(ctx context.Context, hc *http.Client, refreshToken string) (Tokens, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
@@ -173,8 +183,7 @@ func Refresh(ctx context.Context, hc *http.Client, refreshToken string) (Tokens,
 	if resp.StatusCode/100 != 2 {
 		// Never echo the upstream body: error descriptions may contain
 		// credentials or identifying fields, and callers also log this error.
-		return Tokens{}, fmt.Errorf("换票回 HTTP %d：%s",
-			resp.StatusCode, refreshErrorCode(body))
+		return Tokens{}, &RefreshError{Status: resp.StatusCode, Code: refreshErrorCode(body)}
 	}
 	var out Tokens
 	if err := json.Unmarshal(body, &out); err != nil {

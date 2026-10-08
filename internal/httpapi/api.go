@@ -1000,7 +1000,7 @@ func (s *Server) parseCreds(ctx context.Context, raw []byte) (types.Creds, oauth
 		}
 		tokens, refreshErr := s.refresh(ctx, refresh)
 		if refreshErr != nil {
-			return types.Creds{}, oauth.Claims{}, fmt.Errorf("用 refresh_token 换 access_token 失败：%w", refreshErr)
+			return types.Creds{}, oauth.Claims{}, &uploadRefreshError{err: refreshErr}
 		}
 		access = tokens.AccessToken
 		if tokens.RefreshToken != "" {
@@ -1063,11 +1063,16 @@ func wrapBareToken(raw []byte, kind string) ([]byte, error) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	diagnostic := newUploadDiagnostics(w)
+	defer diagnostic.finish(s.opt.Log, r.Context())
+	w = diagnostic
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
 	if err != nil {
+		diagnostic.reason = "body_read_failed"
 		http.Error(w, "请求体太大", http.StatusRequestEntityTooLarge)
 		return
 	}
+	diagnostic.stage = "form"
 	label, plan := r.URL.Query().Get("label"), r.URL.Query().Get("plan")
 	raw := bytes.TrimSpace(body)
 	wantJSON := strings.Contains(r.Header.Get("Content-Type"), "json")
@@ -1115,9 +1120,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	creds, claims, err := s.parseCreds(r.Context(), raw)
 	if err != nil {
+		diagnostic.stage = "credentials"
+		diagnostic.credentialFailure(err)
 		http.Error(w, "凭据有问题："+err.Error(), http.StatusBadRequest)
 		return
 	}
+	diagnostic.stage = "store"
 	// token 自己写的 plan 压过表单里手填的那个：手填的只是个标签，票里的是事实，
 	// 而「这票是 free」正是会让整次扫描全军覆没的那件事，得在页面上看得见。
 	if claims.Plan != "" {
@@ -1207,6 +1215,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 303 到 /a/<别人的 view_token>——拿到前者能开对方账号页、能 POST 停掉他的号，
 	// 拿到后者能直接替他取票。等于归属守住了，钥匙从旁边递了出去。
 	if !mine {
+		diagnostic.reason = "owner_conflict"
 		// **409 而不是 200**：这不是一次成功的上传，而前端恰好把「200 就一定有 url」当成了
 		// 契约（layout.html 里 `if (r.ok) location.assign((await r.json()).url)`）。回 200 +
 		// 没有 url 的 JSON ⇒ `location.assign(undefined)` ⇒ 浏览器跳到 /undefined 的裸 404，
@@ -1216,6 +1225,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "这份凭据已经登记过了，页面地址请找它的上传者要。", http.StatusConflict)
 		return
 	}
+	diagnostic.stage = "response"
 	if wantJSON || strings.Contains(r.Header.Get("Accept"), "json") {
 		status := "created"
 		if existed {

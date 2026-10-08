@@ -17,11 +17,11 @@
 - 推荐阶梯1/2/4/6/8/10/12/16/20/24h，下界高于失败证据，24h仍失败不给更短建议；个人至少两次成功，全池至少三个独立consumer、每consumer一票。无能力头按旧10h上限重算证据，不截断新建议。
 - 成功样本实际静置超过计划档+60s时，不参与个人/全池推荐及稳定上报判定；稀疏流量不能证明最短恢复档。原报告与成功计数保留，失败下限仍按实际静置处理，不能一起过滤。
 - 冷却报告`observed_at`保原事件时间，旧报告回退ReceivedAt；同ID事件时间也不可变。POST批量最多32条逐项ACK，部分失败不丢成功；个人>=6报告、最近3条成功同推荐档且跨度>=24h才建议6h上报，新失败/过期撤回策略。
-- sub2api 文件仅在上传页展开为现有单账号上传，身份校验/去重仍由 `/upload` 和 Store 负责。批量重试保留结果、原序号与 owner，不能依赖浏览器 cookie；代理/extra 不迁移。
+- sub2api文件在页面展开为单账号上传；同批完全相同凭据去重、归属令牌trim，先串行确认owner再最多3并发，每项独立请求体/45s限时。失败保原序号/owner；5xx/网络/回执异常均未确认，不自动重试RT，无owner时停止后续项；代理/extra不迁移。
 - Owner key由根密钥与Owner稳定身份派生，名下至少一份有效凭据才可用；旧credential key仅启动迁移时grandfather，继续鉴权但UI/上传回执不再分发。空库也保存迁移标记，后建账号不得因重启获得旧key资格。
 - 接触报告的Owner ReporterID与旧credential ReporterID分域；admin/root不能作为独立消费者上报。7天/8192总/每reporter1024，unknown不计有结论分母，窗口结束补报不得改初始身份/结论。
 - OAuth用`Tokens`保留AT/轮换RT/ID，`ClaimsFor`统一输入/刷新前后身份一致性；AT缺ID可由ID token或显式真实ID补齐，缺AT的RT输入也适用。ID token只补身份/plan/email，不能提供AT寿命。
-- 上传最多刷新一次，后台刷新写回前同样校验身份和AT有效期；OAuth错误仅固定类别/HTTP状态，原响应body/description不得进入日志或页面，Tokens格式化打码。回归见oauth/upload_identity/refresh测试。
+- 上传最多刷新一次，后台刷新写回前校验身份和AT有效期；OAuth错误只带allowlist类别/HTTP状态。上传诊断ID对应stage/reason/status/upstream_status/duration_ms，禁止凭据/身份/原始body/description入日志；Tokens格式化打码。回归见oauth/upload_identity/upload_diagnostics/refresh测试。
 - 页面“有效账号”=启用、有凭据、本地身份/已知期限无异常且RegionMint成功过；临时429计入有效并单列，不声称此刻可调度。无exp保留历史证据口径；展示不修改原匿名开放资格或调度。
 - 库存快照与请求样本分母独立，不由cflb期限倒推铸票或预测涨跌；网关接触full/refreshed/unknown保留模型等分层，不与冷却报告数量相加。
 - `GET /gateways?model=…`从7天接触报告派生priority，仅同model/foreground/state-echo-v1且full或refreshed、至少5样本；未知/业务复验不进分母。统计按报告revision＋精确证据有效时间区间复用，乱序时间不能按“缓存建立时刻”误失效；个人期限仍逐请求计算，客户端ceiling缓存最多8项。

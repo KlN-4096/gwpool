@@ -107,7 +107,7 @@ test('rejects empty/malformed exports, bounds expanded batches and preserves Uni
 });
 
 // 运行真实 layout 中的上传表单块，只用离线 DOM/fetch 替身，验证解析结果确实被接到串行上传。
-function uploadHarness(input, responses) {
+function uploadHarness(input, responses, options = {}) {
   class Element {
     constructor() {
       this.listeners = {};
@@ -136,38 +136,49 @@ function uploadHarness(input, responses) {
     getElementById: id => ids[id],
     createElement: tag => Object.assign(new Element(), { tag })
   };
-  const requests = [], redirects = [];
+  const requests = [], redirects = [], timers = new Map();
   const formSource = readFileSync(path.join(__dirname, 'templates/layout.html'), 'utf8');
   const start = formSource.indexOf("  const form = document.getElementById('upload');");
   const end = formSource.indexOf('\n})();', start);
   assert.ok(start > 0 && end > start);
   const context = {
-    document, gatewayPoolUpload: parser, URLSearchParams,
+    document, gatewayPoolUpload: parser, URLSearchParams, AbortController,
+    setTimeout: fn => { const id = {}; timers.set(id, fn); return id; },
+    clearTimeout: id => timers.delete(id),
     FormData: class extends Map {
-      constructor() { super([['creds', box.value], ['label', 'manual label'], ['kind', 'auto']]); }
+      constructor() {
+        super([['creds', box.value], ['label', 'manual label'], ['kind', 'auto']]);
+        if (options.ownerToken) this.set('owner_token', options.ownerToken);
+      }
     },
     fetch: async (url, options) => {
       requests.push({ url, data: Object.fromEntries(options.body) });
-      const response = responses[requests.length - 1];
+      let response = responses[requests.length - 1];
       assert.ok(response, 'unexpected upload');
-      if (response.error) return { ok: false, status: 400, text: async () => response.error };
-      return { ok: true, json: async () => response };
+      if (typeof response === 'function') response = await response(options);
+      if (response.networkError) throw new TypeError('offline network failure');
+      const raw = response.raw ?? (response.error || JSON.stringify(response));
+      return {
+        ok: !response.error, status: response.status || (response.error ? 400 : 200),
+        headers: { get: name => name.toLowerCase() === 'content-type' ? response.contentType || (response.error ? 'text/plain' : 'application/json') : null },
+        text: async () => raw, json: async () => JSON.parse(raw)
+      };
     },
     location: { pathname: '/', assign: value => redirects.push(value), reload: () => redirects.push('reload') },
     history: { replaceState() {} }
   };
   vm.runInNewContext(formSource.slice(start, end), context);
-  return { box, ids, requests, redirects, submit: () => form.listeners.submit({ preventDefault() {} }) };
+  return { box, button, ids, requests, redirects, timers, submit: () => form.listeners.submit({ preventDefault() {} }) };
 }
 
 test('uploads mapped credentials serially, carries owner token, shows skips and retains only failures with names', async () => {
   const payload = { accounts: [
     account('<img onerror=alert(1)>'),
     { ...account('API key'), type: 'apikey' },
-    account('retry me')
+    account('retry me', { chatgpt_account_id: 'different-offline-account' })
   ] };
   const ui = uploadHarness(JSON.stringify(payload), [
-    { owner_url: '/u/test-owner', owner_token: 'owner-test', label: payload.accounts[0].name, url: '/a/test', status: 'created' },
+    { owner_url: '/u/owner-test', owner_token: 'owner-test', label: payload.accounts[0].name, url: '/a/test', status: 'created' },
     { error: 'offline mock refusal' },
     { error: 'offline retry refusal' }
   ]);
@@ -202,9 +213,130 @@ test('unsupported-only and over-limit exports make no requests; ordinary single 
   await tooMany.submit();
   assert.equal(tooMany.requests.length, 0);
   assert.equal(tooMany.ids['upload-err'].hidden, false);
-  const legacy = uploadHarness(token, [{ owner_url: '/u/test', label: 'legacy', url: '/a/test', status: 'created' }]);
+  const legacy = uploadHarness(token, [{ owner_url: '/u/test', owner_token: 'test', label: 'legacy', url: '/a/test', status: 'created' }]);
   await legacy.submit();
   assert.equal(legacy.requests[0].data.creds, token);
   assert.equal(legacy.requests[0].data.label, 'manual label');
   assert.deepEqual(legacy.redirects, ['/u/test']);
+});
+
+const uploadReceipt = id => ({
+  owner_url: '/u/owner-test', owner_token: 'owner-test',
+  label: 'offline ' + id, url: '/a/offline-' + id, status: 'created'
+});
+const flushPromises = () => new Promise(resolve => setImmediate(resolve));
+const rowMessages = ui => ui.ids['upload-results'].children.flatMap(row => row.children.map(child => child.textContent)).join('\n') + ui.ids['upload-err'].textContent;
+
+test('distinguishes invalid success receipts from network failures without claiming nothing was saved', async () => {
+  const ui = uploadHarness(refresh, [{ raw: '<html>offline proxy page</html>', contentType: 'text/html' }]);
+  await ui.submit();
+  assert.match(rowMessages(ui), /响应|回执/);
+  assert.doesNotMatch(rowMessages(ui), /网络错误|没有提交成功|<html>/);
+  assert.equal(ui.requests.length, 1, 'unknown results must not be automatically retried');
+  assert.equal(ui.box.value, refresh);
+  assert.equal(ui.timers.size, 0);
+});
+
+test('bootstraps one owner, then uses at most three independent requests and prevents resubmission', async () => {
+  const tokens = Array.from({ length: 6 }, (_, i) => refresh + i);
+  const releases = [];
+  let active = 0, maximum = 0;
+  const responses = tokens.map((_, i) => () => new Promise(resolve => {
+    active++;
+    maximum = Math.max(maximum, active);
+    releases[i] = () => { active--; resolve(uploadReceipt(i)); };
+  }));
+  const ui = uploadHarness(tokens.join('\n'), responses);
+  const batch = ui.submit();
+  await flushPromises();
+  assert.equal(ui.requests.length, 1, 'first owner is established serially');
+  await ui.submit();
+  assert.equal(ui.requests.length, 1, 'double submit must not create another batch');
+  releases[0]();
+  await flushPromises();
+  assert.equal(ui.requests.length, 4, 'remaining uploads should use bounded parallelism');
+  assert.equal(maximum, 3);
+  releases[2](); releases[1](); releases[3]();
+  await flushPromises();
+  releases[5](); releases[4]();
+  await batch;
+  assert.equal(new Set(ui.requests.map(x => x.data.creds)).size, 6, 'each worker must own its form body');
+  assert.ok(ui.requests.slice(1).every(x => x.data.owner_token === 'owner-test'));
+  assert.equal(ui.button.disabled, true, 'success redirects without admitting another submit');
+  assert.equal(ui.timers.size, 0);
+});
+
+test('deduplicates identical credentials and retains failures in their original order', async () => {
+  const tokens = [refresh + 'a', refresh + 'b', refresh + 'a', refresh + 'c'];
+  const ui = uploadHarness(tokens.join('\n'), [
+    { error: 'offline rejection' }, uploadReceipt(2), { error: 'offline rejection' }
+  ], { ownerToken: 'owner-test' });
+  await ui.submit();
+  assert.equal(ui.requests.length, 3);
+  assert.equal(ui.box.value, tokens[0] + '\n\n' + tokens[3]);
+  assert.match(rowMessages(ui), /重复/);
+  assert.match(rowMessages(ui), /HTTP 400/);
+});
+
+test('unknown first result stops ownerless batch rather than possibly creating multiple owners', async () => {
+  const tokens = [refresh + 'a', refresh + 'b'];
+  const ui = uploadHarness(tokens.join('\n'), [{ networkError: true }, uploadReceipt(2)]);
+  await ui.submit();
+  assert.equal(ui.requests.length, 1);
+  assert.equal(ui.box.value, tokens.join('\n\n'));
+  assert.match(rowMessages(ui), /未确认|不确定/);
+  assert.doesNotMatch(rowMessages(ui), /没有提交成功/);
+  assert.equal(ui.button.disabled, false);
+});
+
+test('single request timeout releases the batch and does not retry a potentially rotated refresh token', async () => {
+  const ui = uploadHarness(refresh, [options => new Promise((_, reject) => {
+    options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+  })]);
+  const batch = ui.submit();
+  await flushPromises();
+  assert.equal(ui.timers.size, 1);
+  for (const expire of ui.timers.values()) expire();
+  await batch;
+  assert.equal(ui.requests.length, 1);
+  assert.match(rowMessages(ui), /超时/);
+  assert.equal(ui.button.disabled, false);
+  assert.equal(ui.timers.size, 0);
+});
+
+test('normalizes owner whitespace before bootstrap and receipt comparison', async () => {
+  for (const ownerToken of ['   ', ' owner-test \n']) {
+    let resolveFirst;
+    const ui = uploadHarness(refresh + 'a\n' + refresh + 'b', [
+      () => new Promise(resolve => { resolveFirst = resolve; }),
+      uploadReceipt(2)
+    ], { ownerToken });
+    const batch = ui.submit();
+    await flushPromises();
+    assert.equal(ui.requests.length, ownerToken.trim() ? 2 : 1);
+    resolveFirst(uploadReceipt(1));
+    await batch;
+    assert.equal(ui.ids['upload-results'].children.filter(x => x.className === 'bad').length, 0);
+    assert.ok(ui.requests.every(x => !x.data.owner_token || x.data.owner_token === 'owner-test'));
+  }
+});
+
+test('HTTP 504 before owner confirmation stops the batch and reports an unconfirmed result', async () => {
+  const input = refresh + 'a\n' + refresh + 'b';
+  const ui = uploadHarness(input, [{ error: 'offline proxy timeout', status: 504 }, uploadReceipt(2)]);
+  await ui.submit();
+  assert.equal(ui.requests.length, 1);
+  assert.match(rowMessages(ui), /HTTP 504/);
+  assert.match(rowMessages(ui), /未确认/);
+  assert.equal(ui.box.value, refresh + 'a\n\n' + refresh + 'b');
+});
+
+test('whitespace owner input cannot shadow the confirmed owner on partial retry', async () => {
+  const ui = uploadHarness(refresh + 'a\n' + refresh + 'b', [
+    uploadReceipt(1), { error: 'offline refusal' }, uploadReceipt(2)
+  ], { ownerToken: '  \n ' });
+  await ui.submit();
+  assert.equal(ui.requests[1].data.owner_token, 'owner-test');
+  await ui.submit();
+  assert.equal(ui.requests[2].data.owner_token, 'owner-test');
 });
