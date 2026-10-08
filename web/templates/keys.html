@@ -31,7 +31,7 @@
     <form method="post" action="{{.ListURL}}" id="key-batch">
       <input type="hidden" name="source" value="{{.Source}}">
       <div class="table-wrap"><table class="keys-table">
-        <thead><tr><th class="key-check"><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>名称 / 标识</th><th>状态</th>{{if .IsAdminSource}}<th>限额</th>{{end}}<th class="key-number">近 60 秒</th><th class="key-number">累计请求</th><th>最后请求 <small>UTC</small></th><th><span class="key-sr-only">详情</span></th></tr></thead>
+        <thead><tr><th class="key-check"><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>名称 / 标识</th><th>状态</th>{{if .IsAdminSource}}<th>限额</th>{{end}}<th class="key-number">近 60 秒</th><th class="key-number">累计请求</th><th>最后请求 <small data-key-timezone>UTC</small></th><th><span class="key-sr-only">详情</span></th></tr></thead>
         <tbody>{{range .Rows}}<tr data-key-row>
           <td class="key-check">{{if .Editable}}<input type="checkbox" name="ids" value="{{.Key.ID}}" aria-label="选择 {{.Key.Label}}">{{else}}<span class="key-muted" title="不可操作">—</span>{{end}}</td>
           <td class="key-identity"><div class="key-identity-inner"><span class="key-avatar" aria-hidden="true">{{template "key-icon"}}</span><div><a class="key-name" href="{{.DetailURL}}" data-key-detail>{{.Key.Label}}</a><div class="key-subline"><span class="key-source key-source-{{.Key.Source}}">{{.Source}}</span><span class="key-mask">{{.Mask}}</span></div></div></div></td>
@@ -39,7 +39,7 @@
           {{if $.IsAdminSource}}<td><span class="key-limit">{{.LimitBrief}}</span><small class="key-secondary">{{.LimitHint}}</small></td>{{end}}
           <td class="key-number"><strong>{{.Metrics.RPM}}</strong><small class="key-secondary">在途 {{.Metrics.Active}}</small></td>
           <td class="key-number"><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small class="key-secondary">2xx · {{.Metrics.Usage.Totals.OK}}</small></td>
-          <td class="key-date">{{.LastClock}}<small class="key-secondary">{{.LastDate}}</small></td>
+          <td class="key-date"><time data-key-last-time="{{.LastISO}}"{{if .LastISO}} datetime="{{.LastISO}}"{{end}}><span data-key-clock>{{.LastClock}}</span><small class="key-secondary" data-key-date>{{.LastDate}}</small></time></td>
           <td><a class="key-row-open" href="{{.DetailURL}}" data-key-detail aria-label="查看 {{.Key.Label}} 详情">↗</a></td>
         </tr>{{else}}<tr><td colspan="{{if .IsAdminSource}}8{{else}}7{{end}}"><div class="keys-empty">{{template "key-icon"}}<h3>没有匹配的 {{.SourceLabel}}</h3><p>试试调整当前分类的筛选条件{{if .IsAdminSource}}，或生成一把新的 Key{{end}}。</p><a href="/admin/keys?source={{.Source}}">清除筛选</a></div></td></tr>{{end}}</tbody>
       </table></div>
@@ -91,7 +91,7 @@
   <header class="key-panel-heading"><div><span class="key-eyebrow">{{.Source}} · {{.Key.ID}}</span><h2 id="key-detail-title">{{.Key.Label}}</h2><p><span class="key-status key-status-{{.Status}}"><i aria-hidden="true"></i>{{.StatusText}}</span><span class="key-mask">{{.Mask}}</span></p></div><a class="key-close" href="{{$.ListURL}}" data-key-close aria-label="关闭详情">×</a></header>
   <div class="key-panel-body">
     <div class="key-detail-stats"><div><span>近 60 秒</span><strong>{{.Metrics.RPM}}</strong><small>5 分钟 {{.Metrics.FiveMinutes}} 次</small></div><div><span>累计请求</span><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small>在途 {{.Metrics.Active}}</small></div><div><span>成功写出票</span><strong>{{.Metrics.Usage.Totals.Tickets}}</strong><small>HTTP 2xx {{.Metrics.Usage.Totals.OK}}</small></div></div>
-    <dl class="key-facts"><div><dt>归属</dt><dd>{{.Owner}}</dd></div><div><dt>访问限额</dt><dd>{{.Limits}}</dd></div><div><dt>创建时间</dt><dd>{{.Created}} UTC</dd></div><div><dt>最后请求</dt><dd>{{.Last}} UTC</dd></div></dl>
+    <dl class="key-facts"><div><dt>归属</dt><dd>{{.Owner}}</dd></div><div><dt>访问限额</dt><dd>{{.Limits}}</dd></div><div><dt>创建时间</dt><dd>{{.Created}} UTC</dd></div><div><dt>最后请求</dt><dd><time data-key-last-time="{{.LastISO}}" data-key-full-time{{if .LastISO}} datetime="{{.LastISO}}"{{end}}>{{.Last}}</time> <span data-key-timezone>UTC</span></dd></div></dl>
     {{if .Key.Note}}<div class="key-detail-note"><span>备注</span><p>{{.Key.Note}}</p></div>{{end}}
     {{if .Editable}}<details class="key-detail-section" id="key-edit"><summary>编辑 Key <span>名称、备注{{if .AdminIssued}}与限额{{end}}</span></summary>
       <form method="post" action="{{$.ListURL}}" class="key-form">

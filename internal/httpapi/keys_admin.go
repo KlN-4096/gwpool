@@ -21,6 +21,7 @@ const keyFormMax = 256 << 10
 const keyCreationLifetime = 15 * time.Minute
 
 type managedKeyRow struct {
+	LastISO                                         string
 	LastDate, LastClock, LimitBrief, LimitHint      string
 	Key                                             types.AccessKey
 	Source, Status, StatusText, Mask, Owner, Limits string
@@ -161,6 +162,7 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 		row.Source = keySourceLabel(key.Source)
 		row.LastDate, row.LastClock = "尚无请求", "—"
 		if !row.Metrics.Usage.LastAt.IsZero() {
+			row.LastISO = row.Metrics.Usage.LastAt.UTC().Format(time.RFC3339)
 			row.LastDate = row.Metrics.Usage.LastAt.UTC().Format("2006-01-02")
 			row.LastClock = row.Metrics.Usage.LastAt.UTC().Format("15:04:05")
 		}

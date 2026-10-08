@@ -2,6 +2,42 @@
 <script>
 (function () {
   'use strict';
+  function localizeKeyLastRequests(scope) {
+    // Parse explicit UTC instants, never the zone-less fallback display text.
+    // Prepare everything first: unsupported Intl or invalid data retains UTC.
+    let zone, changes;
+    try {
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        year:'numeric', month:'2-digit', day:'2-digit',
+        hour:'2-digit', minute:'2-digit', second:'2-digit',
+        hourCycle:'h23', numberingSystem:'latn'
+      });
+      zone = formatter.resolvedOptions().timeZone;
+      if (!zone) return;
+      changes = [];
+      for (const node of scope.querySelectorAll('[data-key-last-time]')) {
+        const iso = node.dataset.keyLastTime;
+        if (!iso) continue;
+        const date = new Date(iso);
+        if (!Number.isFinite(date.getTime())) return;
+        const parts = Object.fromEntries(formatter.formatToParts(date).map(function (part) { return [part.type, part.value]; }));
+        changes.push({node:node, date:parts.year+'-'+parts.month+'-'+parts.day, clock:parts.hour+':'+parts.minute+':'+parts.second});
+      }
+    } catch (_) { return; }
+    changes.forEach(function (change) {
+      if (change.node.hasAttribute('data-key-full-time')) {
+        change.node.textContent = change.date+' '+change.clock;
+      } else {
+        change.node.querySelector('[data-key-clock]').textContent = change.clock;
+        change.node.querySelector('[data-key-date]').textContent = change.date;
+      }
+    });
+    scope.querySelectorAll('[data-key-timezone]').forEach(function (label) {
+      label.textContent = zone;
+      label.title = '浏览器时区：'+zone;
+    });
+  }
+  localizeKeyLastRequests(document);
   const form = document.getElementById('key-batch');
   const all = document.getElementById('select-keys');
   const items = form ? Array.from(form.querySelectorAll('input[name="ids"]')) : [];
@@ -143,6 +179,7 @@
         const panel = doc.getElementById('key-detail');
         if (!panel) throw new Error('详情响应不完整，请重新打开页面。');
         if (version !== detailVersion || !state.dialog.open) return;
+        localizeKeyLastRequests(panel);
         state.dialog.replaceChildren(document.importNode(panel, true));
         state.dialog.querySelector('[data-key-close]').focus({preventScroll:true});
       } catch (error) {
