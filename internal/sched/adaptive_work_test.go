@@ -45,6 +45,11 @@ func TestExploreDuplicateIsDeferredAndRechecked(t *testing.T) {
 	}
 	clk.add(5 * time.Minute)
 	s.exploreNewGateway(context.Background())
+	if got := len(mn.mintedGateways()); got != 1 {
+		t.Fatalf("combination backoff bypassed the dedicated 15-minute interval: %d", got)
+	}
+	clk.add(10 * time.Minute)
+	s.exploreNewGateway(context.Background())
 	if got := len(mn.mintedGateways()); got != 2 {
 		t.Fatalf("duplicate exploration was not rechecked: %d", got)
 	}

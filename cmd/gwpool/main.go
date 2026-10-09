@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"gwpool/internal/authrefresh"
 	"gwpool/internal/config"
 	"gwpool/internal/httpapi"
 	"gwpool/internal/mint"
@@ -98,14 +99,16 @@ func run(path string, log *slog.Logger) error {
 
 	minter := newMinter(cfg, live, log)
 	minter.Attempts = st
+	refreshExpired := authrefresh.ForRequests(st)
 	pool := sched.New(st, minter, sched.Options{
-		Mode: cfg.Mode,
+		Mode:           cfg.Mode,
+		RefreshExpired: refreshExpired,
 		// 验满血、续期、槽位冷却、对外开放门槛这几个旋钮由调度**现读** live，
 		// 改配置不用重启（管理页上那个按钮写的就是「保存并立即生效」）。
 		Live: live,
 		Log:  log,
 	})
-	queue := newDiscoveryQueue(&scan.Scanner{Mint: minter, Store: st, Log: log}, pool, log)
+	queue := newDiscoveryQueue(&scan.Scanner{Mint: minter, Store: st, Log: log, RefreshExpired: refreshExpired}, pool, log)
 	mintAll := sched.NewMintAllQueue(pool)
 
 	api, err := httpapi.New(pool, st, queue, httpapi.Options{

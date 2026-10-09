@@ -2,17 +2,28 @@ package sched
 
 import (
 	"context"
+	"time"
 
 	"gwpool/internal/coverage"
 	"gwpool/internal/types"
 )
 
-// exploreNewGateway 每轮最多派一发；每两轮至少先于维护获得机会，库存已满也可发现。
+const dedicatedExplorationInterval = 15 * time.Minute
+
+// exploreNewGateway 每15分钟最多获得一次机会；库存已满也可低频发现。
 // 必须由持有 backgroundMu 且有近期需求的 warmOnce 调用；所有锁、限额、落账沿用铸票主路径。
 func (s *Scheduler) exploreNewGateway(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	now := s.now()
+	if now.Before(s.nextExploration) {
+		return
+	}
+	// Consume the opportunity even when candidates/egress fail. Retrying those
+	// every maintenance tick would defeat the dedicated exploration interval.
+	// This process-local gate never throttles inventory repair or renewal.
+	s.nextExploration = now.Add(dedicatedExplorationInterval)
 	before := s.st.Gateways()
 	incomplete := coverage.IncompleteRegions(s.cfg(), before)
 	landed := s.lastLandings()

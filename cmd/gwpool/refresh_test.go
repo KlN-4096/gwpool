@@ -109,3 +109,90 @@ func TestBackgroundRefreshRejectsInvalidIdentityAndExpiredAccess(t *testing.T) {
 		})
 	}
 }
+
+func TestBackgroundRefreshRecoversExplicitExpiryBeforeJWTDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason string
+		wantCalls    int
+	}{
+		{"mint expired", `铸票 HTTP 401：{"error":{"code":"token_expired"}}`, 1},
+		{"scan expired", `上游否决了这个账号（HTTP 401：{"error":{"code":"token_expired"}}）`, 1},
+		{"revoked unchanged", `铸票 HTTP 401：{"error":{"code":"token_revoked"}}`, 0},
+		{"manual unchanged", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = st.Close() }()
+			a, err := st.AddAccount(types.Account{Enabled: true,
+				Creds: types.Creds{AccountID: "acct-a",
+					AccessToken:  refreshTestToken("acct-a", time.Now().Add(7*24*time.Hour)),
+					RefreshToken: "fake-refresh"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.reason == "" {
+				err = st.SetAccountEnabled(a.ID, false)
+			} else {
+				err = st.DisableAccount(a.ID, tc.reason)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			next := refreshTestToken("acct-a", time.Now().Add(10*24*time.Hour))
+			body, _ := json.Marshal(oauth.Tokens{AccessToken: next, RefreshToken: "rotated-fake-refresh"})
+			previous := http.DefaultTransport
+			http.DefaultTransport = refreshTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{},
+					Body: io.NopCloser(strings.NewReader(string(body)))}, nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = previous })
+			refreshDue(context.Background(), st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if calls != tc.wantCalls {
+				t.Fatalf("refresh calls=%d, want=%d", calls, tc.wantCalls)
+			}
+			got, _ := st.Account(a.ID)
+			if tc.wantCalls == 1 {
+				if !got.Enabled || got.DisabledReason != "" || got.Creds.AccessToken != next ||
+					got.Creds.RefreshToken != "rotated-fake-refresh" {
+					t.Fatal("explicit expired account was not recovered with rotated credentials")
+				}
+			} else if got.Enabled || got.Creds != a.Creds {
+				t.Fatal("unrelated rejection/manual state changed")
+			}
+		})
+	}
+}
+
+func TestBackgroundExpiryRecoveryStopsAfterRefreshTokenRejected(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	a, err := st.AddAccount(types.Account{Enabled: true, Creds: types.Creds{
+		AccountID: "acct-a", AccessToken: refreshTestToken("acct-a", time.Now().Add(-time.Minute)),
+		RefreshToken: "fake-refresh"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	previous := http.DefaultTransport
+	http.DefaultTransport = refreshTransport(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: 400, Header: http.Header{},
+			Body: io.NopCloser(strings.NewReader(`{"error":"refresh_token_reused"}`))}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	refreshDue(context.Background(), st, log)
+	refreshDue(context.Background(), st, log)
+	got, _ := st.Account(a.ID)
+	if calls != 1 || got.Enabled || got.DisabledReason != oauth.ExpiredRefreshRejectedReason {
+		t.Fatalf("permanent RT failure retried: calls=%d enabled=%v", calls, got.Enabled)
+	}
+}

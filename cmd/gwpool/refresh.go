@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"gwpool/internal/authrefresh"
 	"gwpool/internal/oauth"
 	"gwpool/internal/store"
 )
@@ -60,33 +61,32 @@ func refreshAccount(ctx context.Context, st *store.Store, log *slog.Logger, id i
 	if !ok || ctx.Err() != nil || a.Creds.RefreshToken == "" || a.Creds.AccessToken == "" {
 		return
 	}
+	if !a.Enabled && (a.DisabledReason == oauth.ExpiredAfterRefreshReason ||
+		a.DisabledReason == oauth.ExpiredRefreshRejectedReason) {
+		return
+	}
+	explicitExpiry := !a.Enabled && oauth.ExpiredReason(a.DisabledReason)
 	cl, err := oauth.Parse(a.Creds.AccessToken)
-	if err != nil {
+	if err != nil && !explicitExpiry {
 		log.Warn("账号的 access_token 读不出声明，跳过续票", "account", a.ID, "err", err)
 		return
 	}
 	// 零值 = 票里没写 exp。不猜，当它还能用。
-	if cl.Expires.IsZero() || cl.Expires.After(deadline) {
+	if !explicitExpiry && (cl.Expires.IsZero() || cl.Expires.After(deadline)) {
 		return
 	}
-	tokens, err := oauth.Refresh(ctx, nil, a.Creds.RefreshToken)
+	updated, err := authrefresh.RefreshLocked(ctx, st, a, a.DisabledReason != "")
 	if err != nil {
 		// 换票失败可能只是上游抖动，不在这里停用，下个小时重试。
 		log.Warn("续票失败", "account", a.ID, "expires", cl.Expires, "err", err)
+		if oauth.RefreshTokenRejected(err) && (explicitExpiry ||
+			(a.Enabled && oauth.AccessExpired(a.Creds.AccessToken, time.Now()))) {
+			if _, saveErr := st.DisableAccountIfCurrent(a, oauth.ExpiredRefreshRejectedReason); saveErr != nil {
+				log.Error("记录过期刷新失败", "account", a.ID, "err", saveErr)
+			}
+		}
 		return
 	}
-	fresh, err := oauth.ClaimsFor(tokens, a.Creds.AccountID)
-	if err != nil {
-		log.Warn("刷新凭据身份校验失败，保留原凭据", "account", a.ID, "err", err)
-		return
-	}
-	if !fresh.Expires.IsZero() && !fresh.Expires.After(time.Now()) {
-		log.Warn("刷新返回的 access_token 已过期，保留原凭据", "account", a.ID)
-		return
-	}
-	if err := st.SetTokens(a.ID, tokens.AccessToken, tokens.RefreshToken); err != nil {
-		log.Error("续票写回失败", "account", a.ID, "err", err)
-		return
-	}
-	log.Info("续了票", "account", a.ID, "原到期", cl.Expires, "轮换了refresh", tokens.RefreshToken != "")
+	log.Info("续了票", "account", a.ID, "原到期", cl.Expires,
+		"轮换了refresh", updated.Creds.RefreshToken != a.Creds.RefreshToken)
 }

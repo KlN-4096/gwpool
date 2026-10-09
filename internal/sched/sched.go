@@ -18,9 +18,11 @@ import (
 	"sync"
 	"time"
 
+	"gwpool/internal/authrefresh"
 	"gwpool/internal/config"
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
+	"gwpool/internal/oauth"
 	"gwpool/internal/types"
 )
 
@@ -239,6 +241,9 @@ const (
 // Options 是调度器的可调参数。零值字段由 New 填默认。
 type Options struct {
 	Mode types.Mode
+	// RefreshExpired runs under the shared account lock; only local expiry or
+	// an exact upstream token_expired may invoke it.
+	RefreshExpired authrefresh.RefreshFunc
 
 	// WarmInterval 保温巡检间隔（仅 ModePool）。
 	WarmInterval time.Duration
@@ -277,6 +282,7 @@ type Scheduler struct {
 
 	backgroundMu        sync.Mutex // 自动保温与管理员全量队列共享后台并发预算。
 	maintenanceFirst    bool       // backgroundMu 保护；交替优先，探索与续票互不长期挤掉机会。
+	nextExploration     time.Time  // backgroundMu 保护；只限制专门探索机会，不限制维护。
 	exploreRegionCursor int        // mu保护；按尝试轮转，不因失败或小时配额重置而回到首国。
 	mu                  sync.Mutex
 	backoff             map[string]time.Duration // 槽位 → 当前指数退避时长；成功归零
@@ -383,6 +389,8 @@ func (s *Scheduler) cfg() config.Config { return s.opt.Live.Get() }
 // 该换本来就是在猜，只有客户端知道自己那一发对不对劲。force 时**必须**换一个网关，
 // 没得换就 ErrNoFullSlot——把原来那张再发一遍等于没换，客户端会死循环。
 func (s *Scheduler) Deliver(ctx context.Context, accountID int64, req Request) (types.Delivery, error) {
+	// Candidate fallback and mint→echo belong to one recovery budget.
+	ctx = withExpiryRecovery(ctx)
 	unlock, err := s.lockDelivery(ctx, accountID)
 	if err != nil {
 		return types.Delivery{}, fmt.Errorf("%w: %w", ErrNoFullSlot, err)
@@ -853,11 +861,12 @@ func (s *Scheduler) anonAccount(upstreamID string) (types.Account, error) {
 // sid 要带出来：state-echo 必须复用铸票时的 sid，否则可能换出口 IP、换网关。
 // obs 也带出来，好让随后那一发 echo 的样本记上同一个出口地理（同 sid ⇒ 同 IP）。
 type minted struct {
-	pair    types.Pair
-	ticket  string
-	sid     string
-	obs     types.Observed
-	firstAt time.Time
+	refreshed bool // expiry recovery already consumed for this account's mint
+	pair      types.Pair
+	ticket    string
+	sid       string
+	obs       types.Observed
+	firstAt   time.Time
 }
 
 // tryGateway 在一个选中的网关上交付那张现成的票。
@@ -1178,9 +1187,7 @@ func (s *Scheduler) finish(ctx context.Context, consumer types.Account, gateway 
 	//
 	// 只在交付前验一次。state-echo 有假阴（满血号偶尔也下发新 state），
 	// 当持续闸门会误杀好槽位（SPEC 红线 4）。
-	echoStarted := s.now()
-	v, verr := s.mint.VerifyFull(ctx, consumer.Creds, exit, m.sid, pair.Cookie, m.ticket)
-	s.recordEcho(consumer.ID, exit, gateway, m.sid, m.obs, v, verr, s.now(), s.now().Sub(echoStarted))
+	v, verr := s.verifyWithExpiry(ctx, consumer, exit, gateway, pair, m)
 	if verr != nil {
 		return types.Delivery{}, fmt.Errorf("state-echo 失败: %w", verr)
 	}
@@ -1375,7 +1382,7 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 	return s.mintOnceFor(ctx, a, e, sid, cur, want, bias, types.PurposeDelivery)
 }
 
-func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Exit, sid string,
+func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Exit, sid string,
 	cur types.Pair, want, bias, purpose string) (minted, error) {
 	// 被上游 429 按住的号一发都不许打。守卫放在这里而不是各个挑人的地方：mintOnce 是
 	// 所有真实铸票的唯一出口（minterFor 挑的、mintPlan 回落自己上的、scan 和保温的
@@ -1389,12 +1396,6 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 			types.ErrRateLimited, left.Round(time.Second))
 	}
 
-	// Direct callers also reserve, while pre-bound callers reuse their reservation.
-	var err error
-	ctx, err = s.beginAttempt(ctx, a, e)
-	if err != nil {
-		return minted{}, err
-	}
 	sampleStarted := s.now()
 	var prediction *types.InventoryPrediction
 	if purpose == types.PurposeInventory && cur.Cookie == "" && !s.mint.SeedBound(sid) {
@@ -1457,6 +1458,9 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 		return minted{}, fmt.Errorf("%w: %w", ErrMintFailed, err)
 	}
 	if res.Status != 200 {
+		if s.opt.RefreshExpired != nil && oauth.TokenExpired(res.Status, res.ErrBody) {
+			return minted{}, fmt.Errorf("%w: %w", ErrUpstreamRejected, oauth.ErrAccessExpired)
+		}
 		msg := fmt.Sprintf("铸票 HTTP %d", res.Status)
 		if res.ErrBody != "" {
 			msg += "：" + res.ErrBody

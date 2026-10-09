@@ -8,8 +8,16 @@ import (
 )
 
 func (s *Scheduler) beginAttempt(ctx context.Context, account types.Account, exit types.Exit) (context.Context, error) {
+	if err := ctx.Err(); err != nil {
+		return ctx, err
+	}
 	if s.accountHeldFor(account.ID) > 0 {
 		return ctx, fmt.Errorf("%w: 上游账号仍在退避", types.ErrRateLimited)
+	}
+	var err error
+	ctx, account, err = s.prepareAccount(ctx, account)
+	if err != nil {
+		return ctx, err
 	}
 	reserved, err := s.mint.BeginAttempt(ctx, account.Creds, exit)
 	if err == nil {

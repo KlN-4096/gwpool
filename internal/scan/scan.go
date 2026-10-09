@@ -17,7 +17,9 @@ import (
 	"net/http"
 	"time"
 
+	"gwpool/internal/authrefresh"
 	"gwpool/internal/geography"
+	"gwpool/internal/oauth"
 	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
@@ -44,6 +46,8 @@ type Minter interface {
 type Scanner struct {
 	Mint  Minter
 	Store *store.Store
+	// RefreshExpired must not reacquire the account lock held by ScanRegion.
+	RefreshExpired authrefresh.RefreshFunc
 
 	Backoff  time.Duration // 失败退避基数，按 2^n 翻倍
 	MaxTries int           // 单个区域最多试几次
@@ -89,6 +93,7 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 
 	var lastErr error
 	tries := 0
+	refreshed := false
 	for try := 0; try < s.maxTries(); try++ {
 		if err := ctx.Err(); err != nil {
 			return Landing{}, err
@@ -106,8 +111,42 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 			return Landing{}, errors.New("账号已删除、停用或无托管凭据")
 		}
 		acct = current
+		if s.RefreshExpired != nil && oauth.AccessExpired(acct.Creds.AccessToken, time.Now()) {
+			if refreshed {
+				return Landing{}, s.rejectExpired(acct, oauth.ExpiredAfterRefreshReason)
+			}
+			refreshed = true
+			var err error
+			acct, err = s.refreshExpired(ctx, acct, oauth.LocalExpiredReason)
+			if err != nil {
+				return Landing{}, err
+			}
+		}
 		tries++
 		l, err := s.attempt(ctx, acct, r)
+		retriedExpiry := false
+		if errors.Is(err, oauth.ErrAccessExpired) {
+			if refreshed {
+				return Landing{}, s.rejectExpired(acct, oauth.ExpiredAfterRefreshReason)
+			}
+			refreshed, retriedExpiry = true, true
+			acct, err = s.refreshExpired(ctx, acct, oauth.UpstreamExpiredReason)
+			if err != nil {
+				return Landing{}, err
+			}
+			// A complete second attempt takes its own budget and SID. It is
+			// never followed by the normal transport retry loop.
+			current, exists = s.Store.Account(acct.ID)
+			if !exists || !current.Enabled || ctx.Err() != nil {
+				return Landing{}, errors.New("账号已删除、停用或请求已取消")
+			}
+			acct = current
+			tries++
+			l, err = s.attempt(ctx, acct, r)
+			if errors.Is(err, oauth.ErrAccessExpired) {
+				return Landing{}, s.rejectExpired(acct, oauth.ExpiredAfterRefreshReason)
+			}
+		}
 		if err == nil {
 			return l, nil
 		}
@@ -129,7 +168,7 @@ func (s *Scanner) ScanRegion(ctx context.Context, acct types.Account, r types.Re
 		// 每一发都要过速率闸、都可能烧掉一个落点，而上游正在限流时连打三发
 		// 恰好是把配额往最没用的地方花。速率闸和出口熔断同理：重试三轮只是把
 		// 同一句话抄三遍。
-		if errors.Is(err, errAnswered) ||
+		if retriedExpiry || errors.Is(err, errAnswered) ||
 			errors.Is(err, types.ErrRateLimited) || errors.Is(err, types.ErrNoExit) ||
 			errors.Is(err, types.ErrUnsupportedCountry) {
 			break
@@ -204,6 +243,9 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 	}
 	if err := s.Store.AppendSample(sm); err != nil {
 		return Landing{}, fmt.Errorf("落样本: %w", err)
+	}
+	if s.RefreshExpired != nil && oauth.TokenExpired(res.Status, res.ErrBody) {
+		return Landing{}, fmt.Errorf("%w: %w", ErrAccountRejected, oauth.ErrAccessExpired)
 	}
 	if mintErr != nil {
 		// **带着状态码回来的失败要先按状态码分类**，不能原样抛出去。

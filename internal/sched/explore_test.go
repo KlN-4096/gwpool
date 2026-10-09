@@ -16,6 +16,65 @@ type explorationBindingFailure struct {
 	seen []string
 }
 
+func TestDedicatedExplorationWaitsFifteenMinutesWithoutBlockingInventory(t *testing.T) {
+	s, st, mn, clk := rig(t, types.ModePool)
+	addAccount(st, 2, "acct-2")
+	seedPairs(st, clk)
+	landBare(mn, "unified-1")
+	s.opt.Live = liveCfg(func(c *config.Config) {
+		c.MinPairs, c.SpareTarget, c.RenewPairs = 3, 0, false
+	})
+	s.markDemand()
+	s.warmOnce(context.Background())
+	if len(mn.mintedGateways()) != 1 {
+		t.Fatal("first eligible maintenance round did not explore once")
+	}
+	// A missing known gateway must still be repaired during the exploration gap.
+	delete(st.pairs, "unified-2")
+	if err := st.NoteRegionMint(2, types.Regions[1].Key, "unified-2", clk.now()); err != nil {
+		t.Fatal(err)
+	}
+	mn.landByAcct = map[string]string{comboKey(2, exitKey(types.Regions[1].Exit)): "unified-2"}
+	for minute := 1; minute <= 14; minute++ {
+		clk.add(time.Minute)
+		s.markDemand()
+		s.warmOnce(context.Background())
+	}
+	if _, ok := st.pairs["unified-2"]; !ok {
+		t.Fatal("dedicated exploration gap also blocked known inventory repair")
+	}
+	if got := len(mn.mintedGateways()); got != 2 {
+		t.Fatalf("want one exploration + one inventory repair before 15 minutes, got %d", got)
+	}
+	clk.add(time.Minute)
+	s.markDemand()
+	s.warmOnce(context.Background())
+	if got := len(mn.mintedGateways()); got != 3 {
+		t.Fatalf("next exploration opportunity did not open at 15 minutes: %d", got)
+	}
+}
+
+func TestDedicatedExplorationFailureStillConsumesOpportunity(t *testing.T) {
+	s, _, mn, clk := rig(t, types.ModePool)
+	mn.mintErr = errors.New("offline failure")
+	s.exploreNewGateway(context.Background())
+	for range 14 {
+		clk.add(time.Minute)
+		s.exploreNewGateway(context.Background())
+	}
+	if got := len(mn.mintedGateways()); got != 1 {
+		t.Fatalf("failed exploration repeated during the interval: %d", got)
+	}
+	clk.add(time.Minute)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.exploreNewGateway(canceled)
+	s.exploreNewGateway(context.Background())
+	if got := len(mn.mintedGateways()); got != 2 {
+		t.Fatalf("cancelled call consumed the next exploration opportunity: %d", got)
+	}
+}
+
 func (m *explorationBindingFailure) NewSIDFor(exit types.Exit, _ bool) (string, error) {
 	m.seen = append(m.seen, exitKey(exit))
 	return "", types.ErrNoExit

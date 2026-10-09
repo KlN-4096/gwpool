@@ -24,6 +24,7 @@ import (
 
 	"gwpool/internal/config"
 	"gwpool/internal/geography"
+	"gwpool/internal/oauth"
 	"gwpool/internal/proxycatalog"
 	"gwpool/internal/types"
 )
@@ -504,6 +505,12 @@ func (c *Client) VerifyFull(ctx context.Context, cr types.Creds, e types.Exit, s
 	// 非 200 不下结论：429/403 的响应头里本来就没有 turn-state，
 	// 照「无新 state = 满血」读就是假阳（作者原版的漏洞，实测 12 发撞出 2 个）。
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+			if oauth.TokenExpired(resp.StatusCode, string(body)) {
+				return &types.Verdict{Status: resp.StatusCode, Note: "token_expired"}, oauth.ErrAccessExpired
+			}
+		}
 		return nil, nil
 	}
 	newState := resp.Header.Get(stateHeader)
