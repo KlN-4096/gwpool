@@ -577,7 +577,10 @@ func (s *Store) AccountByViewToken(tok string) (types.Account, bool) {
 func (s *Store) AddAccount(a types.Account) (types.Account, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.addAccountLocked(a)
+}
 
+func (s *Store) addAccountLocked(a types.Account) (types.Account, error) {
 	if up := a.Creds.AccountID; up != "" {
 		for i, x := range s.st.Accounts {
 			if x.Creds.AccountID != up {

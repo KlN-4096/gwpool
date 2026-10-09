@@ -102,7 +102,35 @@ const gatewayPoolUpload = (function () {
     }
     return { items, skipped, fromSub2api, error: '' };
   }
-  return { parse, clientID: CODEX_CLIENT_ID };
+  function parseLogins(input) {
+    const items = [], skipped = [];
+    let total = 0;
+    for (const line of input.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      total++;
+      if (total > MAX_ITEMS) return { items: [], skipped: [], error: '每批最多 100 项，请拆分提交。' };
+      const fields = line.split('----');
+      if (fields.length < 2 || fields.length > 3) {
+        skipped.push({ index: total, reason: '需为邮箱----密码----可选2FA；含分隔符的密码请用单账号表单。' });
+        continue;
+      }
+      const email = fields[0].trim(), password = fields[1], totp = (fields[2] || '').trim();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !password || password.length > 1024 || totp.length > 2048) {
+        skipped.push({ index: total, reason: '邮箱、密码或2FA字段格式不正确，请检查原始输入。' });
+        continue;
+      }
+      items.push({ index: total, label: email, login: { email, password, totp } });
+    }
+    return { items, skipped, error: '', fromSub2api: false };
+  }
+  function validReceipt(receipt, expectedOwner) {
+    return !!receipt && ['created', 'updated'].includes(receipt.status) &&
+      typeof receipt.label === 'string' && /^\/a\/[A-Za-z0-9_-]+$/.test(receipt.url || '') &&
+      /^[A-Za-z0-9_-]+$/.test(receipt.owner_token || '') &&
+      receipt.owner_url === '/u/' + receipt.owner_token &&
+      (!expectedOwner || receipt.owner_token === expectedOwner);
+  }
+  return { parse, parseLogins, validReceipt, clientID: CODEX_CLIENT_ID };
 })();
 </script>
 {{end}}

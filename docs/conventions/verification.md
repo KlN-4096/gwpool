@@ -3,6 +3,7 @@
 - Go 标准库项目；入口为 `cmd/gwpool`，模板由 `web` 嵌入。
 - 测试用 fake/httptest，不能请求真实上游；非平凡 bug 先添加能失败的回归用例。
 - 上传页面解析与部分成功/重试用 `node --test web/upload_parser.test.cjs` 离线验证；`web/testdata/sub2api-export.json` 是假凭据契约样本，不是真实账号验收。
+- 重登用`internal/reauth`假传输、`httpapi/upload_jobs_test.go`真Store任务测试；`GWPOOL_UPLOAD_PREVIEW_DIR`+`TestUploadWorkspaceFixture`导出假页面。opt-in `reauth_probe`标签单账号探针仅显式授权后运行，配置stdin、账号文件按行读取，输出固定阶段/失败码，不保存Token或写池；遇人机挑战停止。
 - 管理页分组/旧锚点/历史导航用 `node --test web/navigation.test.cjs`；无JS仍展示所有分区。
 - Key管理回归：`store/access_key_test.go`、`httpapi/managed_keys_test.go`、`node --test web/keys.test.cjs`；`GWPOOL_KEYS_PREVIEW_DIR`从离线测试输出列表/生成/详情假数据页面，禁止用生产Key做UI截图。
 - `TestDashboardSettingsFixture`可通过`GWPOOL_PREVIEW_DIR`输出假数据HTML供本地静态预览；不要用生产凭据做截图或表单测试。

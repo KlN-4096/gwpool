@@ -535,6 +535,7 @@ table.gateway-cards tr.nomatch td::before { content:none; }
 }
 @media(pointer:coarse) { .admin-nav a,summary { min-height:44px; } }
 </style>
+{{template "upload-style" .}}
 </head>
 <body>
 <header class="top"><div class="wrap">
@@ -929,243 +930,9 @@ table.gateway-cards tr.nomatch td::before { content:none; }
     }
   });
 
-  const form = document.getElementById('upload');
-  if (form) {
-    const btn = form.querySelector('button[type=submit]');
-    const err = document.getElementById('upload-err');
-    const out = document.getElementById('upload-results');
-    const file = document.getElementById('creds-file');
-    const box = form.elements.creds;
-    const idle = btn.textContent;
-    const UPLOAD_CONCURRENCY = 3;
-    const UPLOAD_TIMEOUT_MS = 45000; // OAuth 服务端上限 30 秒，另留传输/落盘时间。
-    let retryState = null;
-    // No automatic retry: a lost response may already have saved credentials or rotated an RT.
-    async function sendUpload(body) {
-      const controller = new AbortController();
-      const timer = setTimeout(function () { controller.abort(); }, UPLOAD_TIMEOUT_MS);
-      let response, text;
-      try {
-        response = await fetch(form.action, {
-          method: 'POST', headers: { Accept: 'application/json' },
-          body: new URLSearchParams(body), signal: controller.signal
-        });
-        text = await response.text();
-      } catch (_) {
-        return {
-          uncertain: true,
-          error: controller.signal.aborted
-            ? '上传超时，结果未确认；请先查看账号总览，勿直接重复刷新同一令牌。'
-            : '连接中断或响应读取失败，结果未确认；请先查看账号总览后再决定是否重试。'
-        };
-      } finally {
-        clearTimeout(timer);
-      }
-      const requestID = response.headers.get('X-Gwpool-Upload-ID') || '';
-      const trace = /^[a-f0-9]{16}$/.test(requestID) ? '（诊断编号 ' + requestID + '）' : '';
-      const type = response.headers.get('Content-Type') || '';
-      if (!response.ok) {
-        const detail = type.includes('text/plain') ? text.trim().slice(0, 500)
-          : '服务端或接入层拒绝请求，请按状态码核对。';
-        const uncertain = response.status >= 500;
-        return {
-          uncertain,
-          error: 'HTTP ' + response.status + '：' + detail + trace +
-            (uncertain ? ' 结果未确认，请先查看账号总览，不要直接重复刷新。' : '')
-        };
-      }
-      let receipt;
-      try { receipt = JSON.parse(text); } catch (_) { /* Classified below, not as network failure. */ }
-      if (!type.includes('application/json') || !receipt ||
-          !['created', 'updated'].includes(receipt.status) || typeof receipt.label !== 'string' ||
-          !/^\/a\/[A-Za-z0-9_-]+$/.test(receipt.url || '') ||
-          !/^\/u\/[A-Za-z0-9_-]+$/.test(receipt.owner_url || '') ||
-          !/^[A-Za-z0-9_-]+$/.test(receipt.owner_token || '') ||
-          receipt.owner_url !== '/u/' + receipt.owner_token) {
-        return { uncertain: true, error: 'HTTP ' + response.status + ' 上传回执异常，结果未确认；请先查看账号总览。' + trace };
-      }
-      const expectedOwner = body.get('page_owner') || body.get('owner_token');
-      if (expectedOwner && receipt.owner_token !== expectedOwner) {
-        return { uncertain: true, error: '上传回执的归属不一致，请先查看账号总览，暂不重复提交。' + trace };
-      }
-      return { receipt };
-    }
-    function count() {
-      const parsed = gatewayPoolUpload.parse(box.value);
-      btn.textContent = parsed.items.length > 1 ? idle + ' ' + parsed.items.length + ' 份' : idle;
-      if (parsed.skipped.length) btn.textContent += '（跳过 ' + parsed.skipped.length + ' 项）';
-    }
-    async function addFiles(files) {
-      if (box.readOnly) return; // 正在上传：结束时框会被改写成「失败的那几份」，这时塞进来的会丢
-      err.hidden = true;
-      for (const f of files) {
-        if (f.size > 1 << 20) {
-          err.textContent = f.name + ' 太大（' + Math.round(f.size / 1024) + ' KB），单个文件上限 1 MB。';
-          err.hidden = false;
-          continue;
-        }
-        box.value = (box.value.trim() + '\n' + (await f.text()).trim()).trim();
-      }
-      count();
-    }
-    box.addEventListener('input', count);
-    const pick = document.getElementById('pick');
-    pick.addEventListener('click', function () { file.click(); });
-    file.addEventListener('change', async function () {
-      await addFiles(file.files);
-      file.value = '';
-    });
-    // 文件拖到框上：读出来追加进框里，和「选择文件」同一条路。拖的是文字就交给浏览器。
-    box.addEventListener('dragover', function (e) {
-      if (e.dataTransfer.types.includes('Files')) e.preventDefault();
-    });
-    box.addEventListener('drop', function (e) {
-      if (!e.dataTransfer.files.length) return;
-      e.preventDefault(); // 上传中也要拦：不拦的话浏览器会直接打开那个文件、把这一页换掉
-      addFiles(e.dataTransfer.files);
-    });
-    function row(cls, head, text, href, link) {
-      const li = document.createElement('li');
-      li.className = cls;
-      if (head) {
-        const b = document.createElement('b');
-        b.textContent = head;
-        li.append(b);
-      }
-      if (text) {
-        const span = document.createElement('span');
-        span.textContent = text;
-        li.append(span);
-      }
-      if (href) {
-        const a = document.createElement('a');
-        a.href = href;
-        a.textContent = link;
-        li.append(a);
-      }
-      out.append(li);
-      out.hidden = false;
-    }
-    form.addEventListener('submit', async function (e) {
-      e.preventDefault();
-      // 防止重复点击创建出多个账号
-      if (btn.disabled) return;
-      const isRetry = retryState && retryState.items.length && box.value === retryState.text;
-      const parsed = isRetry
-        ? { items: retryState.items, skipped: [], fromSub2api: retryState.fromSub2api, error: '' }
-        : gatewayPoolUpload.parse(box.value);
-      const items = [], duplicates = [], seen = new Map();
-      for (const item of parsed.items) {
-        const fingerprint = item.raw.trim();
-        if (seen.has(fingerprint)) duplicates.push({ item, first: seen.get(fingerprint) });
-        else { seen.set(fingerprint, item.index); items.push(item); }
-      }
-      if (parsed.error) {
-        err.textContent = parsed.error;
-        err.hidden = false;
-        return;
-      }
-      if (!items.length && !parsed.skipped.length) return;
-      const body = new FormData(form);
-      for (const key of ['owner_token', 'page_owner']) {
-        if (body.has(key)) body.set(key, String(body.get(key)).trim());
-      }
-      if (isRetry && retryState.ownerToken && !form.elements.page_owner && !body.get('owner_token')) {
-        body.set('owner_token', retryState.ownerToken);
-      }
-      const manualLabel = items.length === 1 && !parsed.fromSub2api ? body.get('label') : '';
-      btn.disabled = true;
-      pick.disabled = true; // 上传中选进来的文件没处放（框是只读的），干脆别让选
-      box.readOnly = true;
-      err.hidden = true;
-      if (!isRetry) {
-        out.hidden = true;
-        out.replaceChildren();
-      } else {
-        row('more', '重试', '仅重新提交上次失败的项目，保留原编号和历史结果。');
-      }
-      for (const entry of parsed.skipped) {
-        row('bad', '— 已跳过第 ' + entry.index + ' 项' + (entry.label ? ' · ' + entry.label : ''), entry.reason);
-      }
-      for (const duplicate of duplicates) {
-        row('more', '— 已跳过第 ' + duplicate.item.index + ' 项', '与第 ' + duplicate.first + ' 项凭据完全重复，未重复上传。');
-      }
-      const failures = new Map();
-      let owner = isRetry ? retryState.ownerURL : '';
-      let completed = 0, next = 0;
-      function failed(item, message) {
-        failures.set(item.index, item);
-        if (items.length === 1 && !parsed.fromSub2api) {
-          err.textContent = message;
-          err.hidden = false;
-        } else {
-          row('bad', '✗ 第 ' + item.index + ' 项' + (item.label ? ' · ' + item.label : ''), message);
-        }
-      }
-      async function upload(item) {
-        // Each worker owns its request body; never share mutable credential fields.
-        const requestBody = new URLSearchParams(body);
-        requestBody.set('creds', item.raw);
-        requestBody.set('label', item.label || manualLabel || '');
-        const result = await sendUpload(requestBody);
-        if (result.receipt) {
-          const j = result.receipt;
-          owner = j.owner_url;
-          if (!body.get('page_owner')) body.set('owner_token', j.owner_token);
-          row('ok', j.status === 'updated' ? '✓ 已更新' : '✓ 新建', j.label + (j.plan ? ' · ' + j.plan : ''), j.url, '账号页 →');
-        } else {
-          failed(item, result.error);
-        }
-        completed++;
-        btn.textContent = '已处理 ' + completed + ' / ' + items.length + '…';
-        return result;
-      }
-      // Bootstrap an explicit owner before parallel work, including when cookies are unavailable.
-      while (next < items.length && !body.get('page_owner') && !body.get('owner_token')) {
-        const result = await upload(items[next++]);
-        if (result.uncertain) {
-          while (next < items.length) failed(items[next++], '尚未确认上传归属，本项未提交；请先核对账号总览。');
-          break;
-        }
-      }
-      async function worker() {
-        while (next < items.length) await upload(items[next++]);
-      }
-      await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, items.length - next) }, worker));
-      const failedItems = items.filter(item => failures.has(item.index));
-      // 全部成功就回账号总览页看全貌（不是钻进某一个号的 /a/）；就在那一页的话，
-      // 重新加载并切到「账号」页签——只改 hash 不会重新加载，新账号看不见。
-      function goOwner() {
-        if (owner !== location.pathname) return location.assign(owner);
-        history.replaceState(null, '', '#accounts');
-        location.reload();
-      }
-      if (owner && !failedItems.length && !parsed.fromSub2api) {
-        form.reset();
-        goOwner();
-        return;
-      }
-      // 有失败的就留在这儿：失败的留在框里，改好再点一次；成功的拿掉，免得重传。
-      box.value = failedItems.map(item => item.retry).join('\n\n');
-      retryState = {
-        text: box.value, items: failedItems, fromSub2api: parsed.fromSub2api,
-        ownerURL: owner, ownerToken: body.get('owner_token') || ''
-      };
-      box.readOnly = false;
-      pick.disabled = false;
-      btn.disabled = false;
-      count();
-      if (owner) {
-        row('more', '', '', owner + '#accounts', owner === location.pathname ? '刷新查看新账号' : '打开账号总览页 →');
-        out.lastChild.querySelector('a').addEventListener('click', function (e2) {
-          e2.preventDefault();
-          goOwner();
-        });
-      }
-    });
-  }
 })();
 </script>
+{{template "upload-script" .}}
 </body>
 </html>
 {{- end}}
@@ -1173,24 +940,44 @@ table.gateway-cards tr.nomatch td::before { content:none; }
 {{/* 上传表单。参数是 uploadForm（见 views.go）：/u/ 页给自己的令牌（走隐藏字段），首页
      认出身份时只给链接、认不出才给输入框。两页共用一份，免得改一处漏一处。 */}}
 {{define "upload" -}}
-<form id="upload" method="post" action="/upload">
-  <p class="note info upload-recommendation">推荐上传 Free 账号。</p>
-  <label>账号凭据 <span class="hint">支持直接导入 sub2api 导出的账号 JSON，也支持 auth.json、凭据 JSON 或每行一个 token；可选择文件或拖入，单文件上限 1 MB、展开后每批最多 100 项</span>
-    <textarea name="creds" required spellcheck="false" placeholder="在此粘贴 JSON 或 token"></textarea></label>
-  <p class="note info">sub2api 文件只导入标准 OpenAI OAuth 账号，保留账号名称；不迁移代理或其它配置。新账号导入后启用，同归属的重复账号更新凭据并重新启用；不支持的类型会逐项显示跳过原因。凭据仍由服务端校验，过期且有刷新令牌时尝试刷新。</p>
+<form id="upload" method="post" action="/upload" class="upload-workspace" autocomplete="off">
+  <div class="upload-intro"><div><strong>添加或更新账号</strong><p class="hint">导入现有凭据，或登录账号获取 RT。所有结果留在本页。</p></div><span class="pill upload-recommendation">推荐上传 Free 账号。</span></div>
+  <details id="upload-editor" class="upload-editor" open>
+  <summary><span id="upload-editor-title">输入账号信息</span><small>点击展开 / 收起</small></summary>
+  <div class="upload-editor-body">
+  <div class="upload-modes" role="tablist" aria-label="上传方式" hidden data-js>
+    <button type="button" id="upload-mode-credentials" role="tab" aria-selected="true" aria-controls="upload-credentials-panel">凭据 / RT <small>已有 Token 或 JSON</small></button>
+    <button type="button" id="upload-mode-login" role="tab" aria-selected="false" aria-controls="upload-login-panel" tabindex="-1">邮箱密码 <small>协议登录获取 RT</small></button>
+  </div>
+  <section id="upload-credentials-panel" role="tabpanel" aria-labelledby="upload-mode-credentials">
+  <label>账号凭据 <span class="hint">支持 sub2api 导出、auth.json、凭据 JSON，或每行一个 Token；单文件上限 1 MB，每批最多 100 项</span>
+    <textarea name="creds" required spellcheck="false" autocapitalize="off" placeholder="粘贴 JSON、access_token 或 refresh_token，也可拖入文件"></textarea></label>
+  <details class="upload-help"><summary>导入规则与凭据类型</summary>
+  <p class="hint">sub2api 仅导入标准 OpenAI OAuth 账号并保留名称，不迁移代理等设置。同归属的重复账号更新凭据并启用；等待期间若被他人更新、暂停或删除，本任务不会覆盖新状态。</p>
+  <fieldset>
+    <legend>单独粘贴的 Token 类型</legend>
+    <div class="choices">
+      <label class="choice"><input type="radio" name="kind" value="auto" checked><span>自动识别<small>eyJ 为 AT，rt. 为 RT</small></span></label>
+      <label class="choice"><input type="radio" name="kind" value="access"><span>access_token<small>仅 AT 过期后需重新上传</small></span></label>
+      <label class="choice"><input type="radio" name="kind" value="refresh"><span>refresh_token<small>先换取 AT，再校验入库</small></span></label>
+    </div>
+  </fieldset></details>
+  </section>
+  <section id="upload-login-panel" role="tabpanel" aria-labelledby="upload-mode-login" hidden>
+    <div class="login-fields">
+      <label>邮箱<input name="login_email" type="email" autocomplete="off" placeholder="name@example.com" maxlength="254"></label>
+      <label>账号密码<input name="login_password" type="password" autocomplete="new-password" maxlength="1024"></label>
+      <label class="login-totp">2FA 密钥 <span class="hint">选填；不是六位动态码</span><input name="login_totp" type="password" autocomplete="new-password" placeholder="验证器密钥或 otpauth:// 地址" maxlength="2048"></label>
+    </div>
+    <details id="login-batch"><summary>批量粘贴 / 导入文件</summary>
+      <label>每行一个账号 <span class="hint">第三项可空；密码含分隔符时请使用上方单账号表单。不能同时填写两种输入。</span>
+        <textarea name="login_batch" spellcheck="false" autocapitalize="off" placeholder="邮箱----密码----2FA密钥&#10;邮箱----密码"></textarea></label>
+    </details>
+    <p class="note info">使用动态出口登录。邮箱验证码或工作区选项会显示在对应任务卡片；手机、人机验证等不支持的流程直接失败。密码和 2FA 密钥不落盘、不进日志；仅成功后保存 AT / RT。</p>
+    <p class="hint">协议登录为实验功能，可能被上游风控拒绝，不保证获取 RT。请使用自己的或已获授权的账号。</p>
+  </section>
   <label>备注名称 <span class="hint">选填，仅单份普通凭据生效；sub2api 导入使用各账号原名称，不填则使用 token 邮箱</span>
     <input name="label" maxlength="64" autocomplete="off"></label>
-  <fieldset>
-    <legend>凭据类型 <span class="hint">只对单独贴的 token 生效；JSON 自动识别</span></legend>
-    <div class="choices">
-      <label class="choice"><input type="radio" name="kind" value="auto" checked>
-        <span>自动识别<small>eyJ 开头的按 access_token 处理，rt. 开头的按 refresh_token 处理；都不是就手动选</small></span></label>
-      <label class="choice"><input type="radio" name="kind" value="access">
-        <span>access_token<small>直接使用；过期后需要重新上传</small></span></label>
-      <label class="choice"><input type="radio" name="kind" value="refresh">
-        <span>refresh_token<small>先刷新并从 access_token / id_token 读取账号 ID，之后自动续期；两者都缺 ID 时，请改传含真实 account_id 的完整凭据 JSON</small></span></label>
-    </div>
-  </fieldset>
   {{if .PageToken}}<input type="hidden" name="page_owner" value="{{.PageToken}}">
   <p class="note info">在这里上传的凭据都挂到本页。</p>
   {{else if .KnownOwner}}<p class="note info">上传的凭据自动挂到<a href="/u/{{.KnownOwner}}">你的账号总览页</a>（这台设备记住了你的身份），不用再填令牌。要挂到别人的账号页，去那一页的「添加账号」。</p>
@@ -1198,11 +985,15 @@ table.gateway-cards tr.nomatch td::before { content:none; }
     <input name="owner_token" autocomplete="off" spellcheck="false"></label>{{end}}
   <p class="err" id="upload-err" role="alert" hidden></p>
   <div class="actions">
-    <button type="submit" class="primary">上传</button>
+    <button type="submit" class="primary">开始上传</button>
     <button type="button" id="pick" hidden data-js>选择文件…</button>
     <input type="file" id="creds-file" accept=".json,.txt,application/json,text/plain" multiple hidden>
   </div>
-  <ol class="results" id="upload-results" aria-live="polite" hidden></ol>
+  </div></details>
+  <p class="hint" id="upload-summary" role="status" hidden></p>
+  <p class="note warn" id="upload-leave-note" hidden>任务进行中，请保留本页；刷新或关闭会丢失本页的任务访问凭证，任务最长 10 分钟后停止。不要重复提交同一个账号或 RT。</p>
+  <ol class="upload-results" id="upload-results" aria-label="逐项上传结果" hidden></ol>
+  <noscript><p class="hint">未启用 JavaScript：仅支持单份凭据上传；账号密码登录、批量任务和实时进度需启用 JavaScript。</p></noscript>
 </form>
 {{- end}}
 

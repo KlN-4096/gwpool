@@ -115,7 +115,7 @@
 
 <section id="tab-import">
 <div class="card">
-  <header class="card-head"><div><h2>添加账号</h2><p>支持多份凭据及 sub2api 导出文件；导入时保留原账号名称。</p></div></header>
+  <header class="card-head"><div><h2>添加账号</h2><p>导入 Token / JSON，或使用邮箱密码登录；本页显示每项进度与结果。</p></div></header>
   <div class="card-body">
     {{template "upload" .Upload}}
     <p class="foot">探测请求固定为 <code>ping</code>（模型 <code>{{.Model}}</code>，<code>reasoning.effort={{.Effort}}</code>），带 <code>store=false</code>，不在账号里留对话记录。</p>

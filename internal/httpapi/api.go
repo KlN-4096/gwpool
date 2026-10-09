@@ -36,6 +36,7 @@ import (
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
+	"gwpool/internal/reauth"
 	"gwpool/internal/sched"
 	"gwpool/internal/types"
 	"gwpool/web"
@@ -170,6 +171,9 @@ type Options struct {
 	// 存在的唯一理由是测试：测试绝不打真实上游（SPEC 红线 8），而换票是
 	// parseCreds 里唯一会出网的一步。生产永远不设它。
 	Refresh func(ctx context.Context, refreshToken string) (oauth.Tokens, error)
+	// Login is an offline-test injection. Production uses an isolated dynamic
+	// transport and reauth's bounded, challenge-aware login state machine.
+	Login func(context.Context, reauth.Input, reauth.Hooks) (oauth.Tokens, error)
 
 	// Live 非 nil 时管理页可以改配置并热重载；为空则那一节只读（测试走这条路）。
 	Live *config.Live
@@ -210,6 +214,7 @@ type Server struct {
 	catalogPairs    pairCatalogCache
 	publicAdmission publicAdmission
 	keyMetrics      keyMetrics
+	uploadJobs      uploadJobManager
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
 	tplMintAll, tplCleanup, tplKeys                               *template.Template
@@ -277,7 +282,8 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 }
 
 func parse(page string) (*template.Template, error) {
-	files := []string{"templates/layout.html", "templates/upload-parser.html", "templates/" + page}
+	files := []string{"templates/layout.html", "templates/upload-parser.html", "templates/upload-script.html",
+		"templates/upload-style.html", "templates/" + page}
 	if page == "keys.html" {
 		files = append(files, "templates/keys-style.html", "templates/keys-script.html")
 	}
@@ -294,6 +300,10 @@ func (s *Server) Handler() http.Handler {
 	// 它们按定义就是别的服务从服务端调的，没有浏览器、也没有可被利用的环境凭证。
 	mux.Handle("GET /{$}", s.gate(http.HandlerFunc(s.handlePool)))
 	mux.Handle("POST /upload", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUpload))))
+	mux.Handle("POST /upload/jobs", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUploadJobStart))))
+	mux.Handle("GET /upload/jobs/{id}", s.gate(http.HandlerFunc(s.handleUploadJobStatus)))
+	mux.Handle("POST /upload/jobs/{id}/input", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUploadJobInput))))
+	mux.Handle("POST /upload/jobs/{id}/cancel", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUploadJobCancel))))
 	mux.Handle("GET /a/{token}", s.gate(http.HandlerFunc(s.handleAccount)))
 	mux.Handle("POST /a/{token}/enabled", s.gate(s.sameOrigin(http.HandlerFunc(s.handleAccountEnabled))))
 	// owner 总览页和「贴令牌进来」的入口也是给人看的，和上面几个一起罩门禁。
@@ -932,6 +942,7 @@ type authUpload struct {
 
 // refresh 换票，默认直连上游。
 func (s *Server) refresh(ctx context.Context, refreshToken string) (oauth.Tokens, error) {
+	uploadProgress(ctx, "refresh")
 	if s.opt.Refresh != nil {
 		return s.opt.Refresh(ctx, refreshToken)
 	}
@@ -1118,6 +1129,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	uploadProgress(r.Context(), "validate")
 	creds, claims, err := s.parseCreds(r.Context(), raw)
 	if err != nil {
 		diagnostic.stage = "credentials"
@@ -1126,6 +1138,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	diagnostic.stage = "store"
+	uploadProgress(r.Context(), "store")
 	// token 自己写的 plan 压过表单里手填的那个：手填的只是个标签，票里的是事实，
 	// 而「这票是 free」正是会让整次扫描全军覆没的那件事，得在页面上看得见。
 	if claims.Plan != "" {
@@ -1166,7 +1179,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if hasOwner {
 		ownerID = owner.ID
 	}
-	a, err := s.st.AddAccount(types.Account{
+	a, err := s.addUploadedAccount(r.Context(), types.Account{
 		Label:     lbl,
 		PlanType:  sanitizeLabel(plan, "unknown"),
 		Creds:     creds,
@@ -1182,6 +1195,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			if _, perr := s.st.PruneEmptyOwners(); perr != nil {
 				s.opt.Log.Error("清理孤儿 owner 失败", "err", perr)
 			}
+		}
+		if uploadConflict(err) {
+			diagnostic.reason = "account_changed"
+			http.Error(w, "等待期间账号已被更新、停用或删除，本任务没有覆盖新状态。请核对账号总览。", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			diagnostic.reason = "task_canceled"
+			http.Error(w, "任务已取消或过期，未提交入库", http.StatusRequestTimeout)
+			return
 		}
 		s.opt.Log.Error("建账号失败", "err", err)
 		http.Error(w, "存储失败", http.StatusInternalServerError)
@@ -1205,7 +1228,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	// **不排首扫**：新账号进来时没有任何需求，那九发上游纯属白花，而且会把它在
 	// 九个落点上的首次接触全烧掉。等有人要票时按需去找落点（见 Scanner 的注释）。
-	s.opt.Log.Info("收到新账号", "account", a.ID, "label", a.Label)
+	s.opt.Log.Info("收到新账号", "account", a.ID)
 
 	// 归属没落到他头上 ⇒ **一把钥匙都不给**，连 view_token 和 303 的落点都不给。
 	//

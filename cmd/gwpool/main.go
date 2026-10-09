@@ -130,6 +130,15 @@ func run(path string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// Run on every return path, including failed/expired HTTP shutdown. Give
+	// canceled login transports their own bounded drain budget before st.Close.
+	defer func() {
+		drain, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		if err := api.ShutdownUploads(drain); err != nil {
+			log.Error("关闭上传任务失败", "err", err)
+		}
+	}()
 	defer func() {
 		if err := api.FlushKeyMetrics(); err != nil {
 			log.Error("关闭时保存 Key 统计失败", "err", err)

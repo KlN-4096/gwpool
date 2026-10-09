@@ -1,0 +1,447 @@
+{{define "upload-script"}}
+<script>
+(function () {
+  'use strict';
+  const form = document.getElementById('upload');
+  if (!form) return;
+  const byId = id => document.getElementById(id);
+  const box = form.elements.creds;
+  const loginBox = form.elements.login_batch;
+  const btn = form.querySelector('button[type=submit]');
+  const pick = byId('pick'), file = byId('creds-file');
+  const out = byId('upload-results'), err = byId('upload-err');
+  const summary = byId('upload-summary'), leaveNote = byId('upload-leave-note');
+  const editor = byId('upload-editor'), editorTitle = byId('upload-editor-title');
+  const credentialTab = byId('upload-mode-credentials'), loginTab = byId('upload-mode-login');
+  const credentialPanel = byId('upload-credentials-panel'), loginPanel = byId('upload-login-panel');
+  const sourceFields = [box, loginBox, form.elements.login_email, form.elements.login_password,
+    form.elements.login_totp, form.elements.label, form.elements.owner_token].filter(Boolean);
+  const CONCURRENCY = 3, REQUEST_TIMEOUT_MS = 20000, POLL_MS = 1000;
+  const stages = {
+    queued: '排队', connect: '连接授权服务', identify: '提交邮箱', password: '验证密码',
+    totp: '验证 2FA', verify_email: '验证邮箱', authorize: '确认授权',
+    exchange: '获取 RT', validate: '校验凭据', refresh: '使用 RT 换取 AT', store: '安全入库', done: '入库完成'
+  };
+  const states = { queued: '待提交', running: '进行中', waiting: '待补充', completed: '已完成',
+    failed: '失败', canceled: '已取消', uncertain: '待确认', skipped: '已跳过' };
+  let mode = 'credentials', busy = false, retryState = null, confirmedOwner = '';
+  const liveJobs = new Set();
+
+  function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text) node.textContent = text;
+    return node;
+  }
+  function error(message) {
+    err.textContent = message;
+    err.hidden = !message;
+  }
+  function setMode(next) {
+    if (busy) return;
+    mode = next;
+    const login = mode === 'login';
+    credentialPanel.hidden = login;
+    loginPanel.hidden = !login;
+    for (const field of credentialPanel.querySelectorAll('input, textarea')) field.disabled = login;
+    for (const field of loginPanel.querySelectorAll('input, textarea')) field.disabled = !login;
+    box.required = !login;
+    for (const [tab, selected] of [[credentialTab, !login], [loginTab, login]]) {
+      tab.setAttribute('aria-selected', String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    error('');
+    count();
+  }
+  for (const [tab, target] of [[credentialTab, 'credentials'], [loginTab, 'login']]) {
+    tab.addEventListener('click', () => setMode(target));
+    tab.addEventListener('keydown', event => {
+      if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        setMode(target === 'login' ? 'credentials' : 'login');
+        (mode === 'login' ? loginTab : credentialTab).focus();
+      }
+    });
+  }
+  function loginInput() {
+    const email = form.elements.login_email.value.trim();
+    const password = form.elements.login_password.value;
+    const totp = form.elements.login_totp.value.trim();
+    if (loginBox.value.trim()) {
+      if (email || password || totp) return { items: [], skipped: [], error: '请选择单账号表单或批量输入，不要同时填写。' };
+      return gatewayPoolUpload.parseLogins(loginBox.value);
+    }
+    if (!email && !password && !totp) return { items: [], skipped: [], error: '' };
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !password) {
+      return { items: [], skipped: [], error: '请填写完整的邮箱和密码；2FA 密钥可以留空。' };
+    }
+    return { items: [{ index: 1, label: email, login: { email, password, totp } }], skipped: [], error: '' };
+  }
+  function count() {
+    if (busy) return;
+    const parsed = mode === 'login' ? loginInput() : gatewayPoolUpload.parse(box.value);
+    const text = mode === 'login' ? '登录并上传' : '开始上传';
+    btn.textContent = text + (parsed.items.length > 1 ? ' · ' + parsed.items.length + ' 项' : '');
+  }
+  for (const field of [box, loginBox, form.elements.login_email, form.elements.login_password, form.elements.login_totp]) {
+    field.addEventListener('input', count);
+  }
+  async function addFiles(files) {
+    if (busy) return;
+    error('');
+    const selectedMode = mode;
+    const target = selectedMode === 'login' ? loginBox : box;
+    for (const f of files) {
+      if (f.size > 1 << 20 || target.value.length + f.size > 1 << 20) {
+        error('单文件及当前输入合计上限 1 MB，请拆分提交。');
+        continue;
+      }
+      const text = await f.text();
+      if (busy || mode !== selectedMode) return;
+      target.value = (target.value ? target.value + '\n' : '') + text;
+    }
+    if (mode === 'login') byId('login-batch').open = true;
+    count();
+  }
+  pick.addEventListener('click', () => file.click());
+  file.addEventListener('change', async () => { await addFiles(file.files); file.value = ''; });
+  for (const target of [box, loginBox]) {
+    target.addEventListener('dragover', e => { if (e.dataTransfer.types.includes('Files')) e.preventDefault(); });
+    target.addEventListener('drop', e => {
+      if (!e.dataTransfer.files.length) return;
+      e.preventDefault();
+      addFiles(e.dataTransfer.files);
+    });
+  }
+  function card(index, label) {
+    const root = element('li', 'upload-card queued');
+    const heading = element('div', 'upload-card-head');
+    const title = element('strong', '', '第 ' + index + ' 项' + (label ? ' · ' + label : ''));
+    const badge = element('span', 'upload-card-badge', states.queued);
+    const message = element('p', 'upload-card-message', '等待提交');
+    message.setAttribute('role', 'status');
+    const timeline = element('ol', 'upload-card-timeline');
+    timeline.setAttribute('aria-label', '已到达的处理阶段');
+    const challenge = element('div', 'upload-challenge');
+    challenge.hidden = true;
+    const footer = element('div', 'upload-card-footer');
+    heading.append(title, badge);
+    root.append(heading, message, timeline, challenge, footer);
+    out.append(root);
+    out.hidden = false;
+    let prompt = 0;
+    let promptControls = null;
+    return {
+      root, message, footer, challenge,
+      update(state, text, history) {
+        root.className = 'upload-card ' + state;
+        badge.textContent = states[state] || '处理中';
+        message.textContent = text || '';
+        if (history) timeline.replaceChildren(...history.map(stage => element('li', '', stages[stage] || '处理中')));
+        if (state !== 'waiting') challenge.hidden = true;
+      },
+      showPrompt(view, job) {
+        if (!view.challenge) return;
+        challenge.hidden = false;
+        if (prompt === view.prompt_id) {
+          // A lost status response can temporarily hide this exact prompt.
+          // A lost input response is retryable only after the server confirms
+          // that this prompt still has not accepted an answer.
+          if (promptControls?.uncertain && view.submitted === false) {
+            promptControls.submit.disabled = false;
+            promptControls.uncertain = false;
+            promptControls.issue.textContent = '服务端尚未收到本次验证码，可以重新填写并提交。';
+            promptControls.issue.hidden = false;
+          }
+          return;
+        }
+        prompt = view.prompt_id;
+        challenge.replaceChildren();
+        challenge.hidden = false;
+        const isCode = ['email_code', 'totp_code'].includes(view.challenge.kind);
+        const label = element('label', '', view.challenge.kind === 'email_code' ? '请输入邮箱验证码'
+          : view.challenge.kind === 'totp_code' ? '请输入验证器动态码' : '请选择要授权的工作区 / 组织');
+        const controls = element('div', 'upload-challenge-actions');
+        const input = element(isCode ? 'input' : 'select');
+        input.id = 'upload-answer-' + job.id + '-' + prompt;
+        label.htmlFor = input.id;
+        if (isCode) {
+          input.type = 'text'; input.inputMode = 'numeric'; input.autocomplete = 'one-time-code';
+          input.maxLength = 6; input.placeholder = '000000';
+        } else {
+          for (const choice of view.challenge.choices || []) {
+            const option = element('option', '', choice.label);
+            option.value = choice.id;
+            input.append(option);
+          }
+        }
+        const submit = element('button', 'primary', '确认并继续');
+        submit.type = 'button';
+        const hint = element('p', 'hint', '请在 ' + new Date(view.expires).toLocaleTimeString() + ' 前提交；不需要提供邮箱登录密码。');
+        const issue = element('p', 'err'); issue.hidden = true;
+        promptControls = { submit, issue, uncertain: false };
+        const send = async () => {
+          if (submit.disabled) return;
+          const value = input.value.trim();
+          if (isCode && !/^\d{6}$/.test(value)) { issue.textContent = '请输入六位数字验证码。'; issue.hidden = false; return; }
+          submit.disabled = true;
+          issue.hidden = true;
+          const result = await request('/upload/jobs/' + job.id + '/input', {
+            method: 'POST', headers: { Authorization: 'Bearer ' + job.key, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt_id: prompt, value })
+          });
+          input.value = '';
+          if (result.error) {
+            issue.textContent = result.error + (result.uncertain ? ' 请先等待状态更新，勿重复提交验证码。' : '');
+            issue.hidden = false;
+            submit.disabled = !!result.uncertain;
+            promptControls.uncertain = !!result.uncertain;
+          } else {
+            submit.textContent = '已提交，等待验证…';
+            input.disabled = true;
+          }
+        };
+        submit.addEventListener('click', send);
+        input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); send(); } });
+        controls.append(input, submit);
+        challenge.append(label, hint, controls, issue);
+      }
+    };
+  }
+  async function request(path, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(path, { ...options, signal: controller.signal, cache: 'no-store' });
+      const text = await response.text();
+      const type = response.headers.get('Content-Type') || '';
+      if (!response.ok) return {
+        error: 'HTTP ' + response.status + '：' + (type.includes('text/plain') ? text.trim().slice(0, 500) : '服务端或接入层拒绝请求。'),
+        uncertain: response.status >= 500
+      };
+      let data;
+      try { data = JSON.parse(text); } catch (_) { /* Do not display HTML error pages. */ }
+      if (!type.includes('application/json') || !data) return { error: '服务端回执异常，结果未确认。', uncertain: true };
+      return { data };
+    } catch (_) {
+      return { error: controller.signal.aborted ? '请求超时，结果未确认。' : '连接中断，结果未确认。', uncertain: true };
+    } finally { clearTimeout(timer); }
+  }
+  function linkToOwner(owner) {
+    const link = element('a', '', '打开账号总览 →');
+    link.href = owner + '#accounts';
+    link.addEventListener('click', e => {
+      if (owner === location.pathname) {
+        e.preventDefault();
+        history.replaceState(null, '', '#accounts');
+        location.reload();
+      }
+    });
+    return link;
+  }
+  const delay = () => new Promise(resolve => setTimeout(resolve, POLL_MS));
+  async function watch(job, viewCard, expectedOwner) {
+    const deadline = Date.now() + 11 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const result = await request('/upload/jobs/' + job.id, { headers: { Authorization: 'Bearer ' + job.key } });
+      if (result.error) return { error: result.error + ' 可在此卡片重新查询；不要重复登录或刷新 RT。', uncertain: true };
+      const view = result.data;
+      if (view.id !== job.id || !['running', 'waiting', 'completed', 'failed', 'canceled'].includes(view.state) ||
+          !Array.isArray(view.stages) || view.stages.length > 32) {
+        return { error: '任务状态回执异常，结果未确认；请核对账号总览。', uncertain: true };
+      }
+      viewCard.update(view.state, view.message || stages[view.stage] || '处理中', view.stages);
+      if (view.state === 'waiting') viewCard.showPrompt(view, job);
+      if (view.state === 'completed') {
+        if (!gatewayPoolUpload.validReceipt(view.receipt, expectedOwner)) {
+          return { error: '上传回执或归属异常，结果未确认；请核对账号总览。', uncertain: true };
+        }
+        return { receipt: view.receipt };
+      }
+      if (['failed', 'canceled'].includes(view.state)) {
+        return { error: view.message || '任务未完成', canceled: view.state === 'canceled',
+          uncertain: (view.message || '').includes('未确认') };
+      }
+      await delay();
+    }
+    return { error: '任务状态查询已超时，请先查看账号总览，不要重复提交。', uncertain: true };
+  }
+  function finishCard(viewCard, result) {
+    // An unresolved job still needs its cancel/query capability. Do not remove
+    // its only controls just because a status response was lost.
+    if (!result.uncertain) viewCard.footer.replaceChildren();
+    if (result.receipt) {
+      const r = result.receipt;
+      viewCard.update('completed', (r.status === 'updated' ? '已更新 · ' : '已新建 · ') + r.label + (r.plan ? ' · ' + r.plan : ''));
+      const account = element('a', '', '查看账号 →'); account.href = r.url;
+      viewCard.footer.append(account, linkToOwner(r.owner_url));
+    } else {
+      viewCard.update(result.uncertain ? 'uncertain' : result.canceled ? 'canceled' : 'failed', result.error);
+    }
+  }
+  async function upload(item, body, viewCard, onReceipt) {
+    const expectedOwner = body.get('page_owner') || body.get('owner_token') || '';
+    viewCard.update('running', '正在创建任务…');
+    const started = await request('/upload/jobs', { method: 'POST', body });
+    // Never retain login secrets for retries, even after a lost create response.
+    item.login = null;
+    for (const key of ['password', 'totp', 'email']) body.delete(key);
+    if (started.error) {
+      const result = { error: started.error + (started.uncertain ? ' 请先检查账号总览，勿直接重复提交。' : ''), uncertain: started.uncertain };
+      finishCard(viewCard, result);
+      return result;
+    }
+    const job = started.data;
+    if (!/^[a-f0-9]{48}$/.test(job.id || '') || !/^[a-f0-9]{48}$/.test(job.key || '')) {
+      const result = { error: '任务回执异常，结果未确认；请先检查账号总览。', uncertain: true };
+      finishCard(viewCard, result);
+      return result;
+    }
+    liveJobs.add(job.id);
+    const cancel = element('button', '', '取消任务'); cancel.type = 'button';
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      const result = await request('/upload/jobs/' + job.id + '/cancel', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + job.key }
+      });
+      if (result.error) { viewCard.message.textContent = result.error; cancel.disabled = false; }
+      else cancel.textContent = '已请求取消…';
+    });
+    viewCard.footer.append(cancel);
+    const result = await watch(job, viewCard, expectedOwner);
+    if (result.receipt) onReceipt(result.receipt);
+    finishCard(viewCard, result);
+    if (result.uncertain) {
+      const check = element('button', '', '重新查询此任务'); check.type = 'button';
+      check.addEventListener('click', async () => {
+        if (check.disabled) return;
+        check.disabled = true;
+        const latest = await watch(job, viewCard, expectedOwner);
+        if (latest.receipt) onReceipt(latest.receipt);
+        finishCard(viewCard, latest);
+        if (latest.uncertain) { check.disabled = false; viewCard.footer.append(check); }
+        else {
+          liveJobs.delete(job.id);
+          leaveNote.hidden = !busy && liveJobs.size === 0;
+        }
+      });
+      viewCard.footer.append(check);
+    } else liveJobs.delete(job.id);
+    return result;
+  }
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (busy) return;
+    const isRetry = mode === 'credentials' && retryState && box.value === retryState.text;
+    const parsed = isRetry ? { items: retryState.items, skipped: [], error: '', fromSub2api: retryState.fromSub2api }
+      : mode === 'login' ? loginInput() : gatewayPoolUpload.parse(box.value);
+    if (parsed.error) { error(parsed.error); return; }
+    if (!parsed.items.length && !parsed.skipped.length) { error('请先输入账号或凭据。'); return; }
+    const items = [], duplicates = [], seen = new Map();
+    for (const item of parsed.items) {
+      const identity = mode === 'login' ? item.login.email.toLowerCase() : item.raw.trim();
+      if (seen.has(identity)) duplicates.push({ item, first: seen.get(identity) });
+      else { seen.set(identity, item.index); items.push(item); }
+    }
+    seen.clear();
+    const base = new URLSearchParams();
+    const batch = isRetry ? retryState.batch : { ownerToken: '' };
+    for (const key of ['page_owner', 'owner_token', 'label']) {
+      if (form.elements[key]) base.set(key, form.elements[key].value.trim());
+    }
+    const fallbackOwner = batch.ownerToken || (!isRetry ? confirmedOwner : '');
+    if (!base.get('page_owner') && !base.get('owner_token') && fallbackOwner) {
+      base.set('owner_token', fallbackOwner);
+    }
+    base.set('kind', form.elements.kind.value);
+    base.set('mode', mode);
+    const batchMode = mode;
+    busy = true;
+    editor.open = false;
+    editorTitle.textContent = '已提交 ' + items.length + ' 项 · 展开查看输入设置';
+    btn.disabled = pick.disabled = credentialTab.disabled = loginTab.disabled = true;
+    // Existing task cards remain interactive while another batch is submitted.
+    for (const input of sourceFields) input.readOnly = true;
+    error('');
+    summary.hidden = false;
+    leaveNote.hidden = false;
+    if (!isRetry && liveJobs.size === 0) out.replaceChildren();
+    for (const entry of parsed.skipped) card(entry.index, entry.label).update('skipped', entry.reason);
+    for (const duplicate of duplicates) {
+      card(duplicate.item.index, duplicate.item.label).update('skipped', '与第 ' + duplicate.first + ' 项重复，未再次提交。');
+      duplicate.item.login = null;
+    }
+    const cards = new Map(items.map(item => [item.index, card(item.index, item.label)]));
+    // Submitted passwords never become a failure textarea or persistent state.
+    if (batchMode === 'login') {
+      loginBox.value = form.elements.login_email.value = form.elements.login_password.value = form.elements.login_totp.value = '';
+    }
+    const failures = new Set();
+    let completed = 0, succeeded = 0, uncertain = 0, next = 0, stop = false;
+    const showSummary = () => {
+      summary.textContent = '已处理 ' + completed + ' / ' + items.length + ' · 成功 ' + succeeded +
+        ' · 未完成 ' + (completed - succeeded - uncertain) + (uncertain ? ' · 待确认 ' + uncertain : '');
+      btn.textContent = '处理中 ' + completed + ' / ' + items.length;
+    };
+    showSummary();
+    function rememberReceipt(receipt) {
+      // This object belongs to this batch, including its unsubmitted remainder.
+      // A delayed confirmation cannot be lost or reassigned by another tab.
+      batch.ownerToken = receipt.owner_token;
+      if (!base.get('page_owner')) {
+        base.set('owner_token', receipt.owner_token);
+        confirmedOwner = receipt.owner_token;
+      }
+    }
+    async function run(item) {
+      const body = new URLSearchParams(base);
+      if (batchMode === 'login') {
+        for (const [key, value] of Object.entries(item.login)) body.set(key, value);
+      } else body.set('creds', item.raw);
+      body.set('label', item.label && batchMode !== 'login' ? item.label : items.length === 1 ? base.get('label') || '' : '');
+      const result = await upload(item, body, cards.get(item.index), rememberReceipt);
+      if (result.receipt) {
+        succeeded++;
+      } else if (result.uncertain) uncertain++;
+      else failures.add(item.index);
+      completed++;
+      showSummary();
+      return result;
+    }
+    try {
+      // Keep the first successful owner as the whole batch's attribution.
+      while (next < items.length && !base.get('page_owner') && !base.get('owner_token')) {
+        if ((await run(items[next++])).uncertain) { stop = true; break; }
+      }
+      async function worker() { while (!stop && next < items.length) await run(items[next++]); }
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length - next) }, worker));
+      while (next < items.length) {
+        const item = items[next++];
+        cards.get(item.index).update('skipped', '尚未确认这批账号的归属，本项未提交；请先查询前一任务。');
+        failures.add(item.index);
+      }
+    } catch (_) {
+      error('页面处理被中断，已有任务的结果未确认。请保留卡片并核对账号总览，不要直接重复提交。');
+    } finally {
+      for (const item of items) item.login = null;
+      if (batchMode === 'credentials') {
+        const failed = items.filter(item => failures.has(item.index));
+        box.value = failed.map(item => item.retry).join('\n\n');
+        if (!batch.ownerToken) batch.ownerToken = base.get('owner_token') || '';
+        retryState = { text: box.value, items: failed, fromSub2api: parsed.fromSub2api, batch };
+      } else retryState = null;
+      busy = false;
+      editorTitle.textContent = '添加下一批账号 / 编辑未提交项目';
+      btn.disabled = pick.disabled = credentialTab.disabled = loginTab.disabled = false;
+      for (const input of sourceFields) input.readOnly = false;
+      leaveNote.hidden = liveJobs.size === 0;
+      count();
+    }
+  });
+  window.addEventListener('beforeunload', event => {
+    if (busy || liveJobs.size) { event.preventDefault(); event.returnValue = ''; }
+  });
+  setMode('credentials');
+})();
+</script>
+{{end}}

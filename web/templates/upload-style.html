@@ -1,0 +1,60 @@
+{{define "upload-style"}}
+<style>
+.upload-workspace { display: grid; gap: 18px; }
+.upload-workspace > * { min-width: 0; margin-block: 0; }
+.upload-workspace [hidden] { display: none !important; }
+.upload-intro { display: flex; align-items: start; justify-content: space-between; gap: 14px; }
+.upload-intro strong { font-size: 18px; letter-spacing: -.02em; }
+.upload-intro p { margin: 4px 0 0; }
+.upload-intro .pill { white-space: nowrap; color: var(--ok); background: var(--ok-soft); }
+.upload-editor { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.upload-editor > summary { display: flex; justify-content: space-between; gap: 12px; padding: 13px 16px; cursor: pointer; font-size: 13px; font-weight: 600; background: var(--sunken); color: var(--fg-2); }
+.upload-editor > summary small { font-size: 11px; font-weight: 400; color: var(--muted); }
+.upload-editor-body { display: grid; gap: 16px; padding: 16px; }
+.upload-editor-body > * { min-width: 0; margin-block: 0; }
+.upload-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 5px; border: 1px solid var(--line); border-radius: var(--r); background: var(--sunken); }
+.upload-modes button { display: flex; flex-direction: column; align-items: start; gap: 2px; padding: 12px 14px; border-color: transparent; background: transparent; color: var(--muted); box-shadow: none; text-align: left; }
+.upload-modes button[aria-selected="true"] { background: var(--surface); color: var(--accent); border-color: var(--line); box-shadow: var(--shadow); }
+.upload-modes small { font-size: 11px; font-weight: 400; color: var(--muted); }
+.upload-workspace textarea { min-height: 140px; font-family: ui-monospace, monospace; font-size: 13px; }
+.upload-workspace label { margin-bottom: 0; }
+.upload-help, #login-batch { margin-top: 12px; padding: 12px 14px; background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; }
+.upload-help summary, #login-batch summary { cursor: pointer; font-size: 13px; color: var(--fg-2); }
+.upload-help[open] > summary, #login-batch[open] > summary { margin-bottom: 12px; }
+.upload-workspace .note { margin-top: 12px; }
+.login-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.login-totp { grid-column: 1 / -1; }
+.upload-results { list-style: none; padding: 0; display: grid; gap: 12px; }
+.upload-card { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); box-shadow: var(--shadow); }
+.upload-card-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+.upload-card-head strong { font-size: 14px; overflow-wrap: anywhere; }
+.upload-card-badge { flex-shrink: 0; border-radius: 20px; font-size: 11px; font-weight: 600; padding: 2px 8px; color: var(--muted); background: var(--sunken); }
+.upload-card.running .upload-card-badge { color: var(--accent); background: var(--accent-soft); }
+.upload-card.waiting { border-color: var(--warn-dot); }
+.upload-card.waiting .upload-card-badge { color: var(--warn); background: var(--warn-soft); }
+.upload-card.completed .upload-card-badge { color: var(--ok); background: var(--ok-soft); }
+.upload-card.failed .upload-card-badge, .upload-card.uncertain .upload-card-badge { color: var(--bad); background: var(--bad-soft); }
+.upload-card-message { margin: 0; font-size: 13px; color: var(--fg-2); overflow-wrap: anywhere; }
+.upload-card-timeline { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 0; font-size: 11px; color: var(--muted); }
+.upload-card-timeline li { padding: 3px 8px; border: 1px solid var(--line); border-radius: 5px; }
+.upload-card-timeline li:last-child { color: var(--accent); border-color: var(--accent); }
+.upload-card.completed .upload-card-timeline li:last-child { color: var(--ok); border-color: var(--ok-dot); }
+.upload-card.failed .upload-card-timeline li:last-child { color: var(--bad); border-color: var(--bad-dot); }
+.upload-challenge { display: grid; gap: 10px; border-radius: 8px; padding: 14px; background: var(--warn-soft); }
+.upload-challenge .hint { margin: 0; }
+.upload-challenge-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.upload-challenge-actions input, .upload-challenge-actions select { flex: 1; min-width: 150px; width: auto; margin: 0; }
+.upload-challenge-actions input { font: 600 19px ui-monospace, monospace; letter-spacing: .18em; }
+.upload-card-footer { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+.upload-card-footer button { font-size: 12px; padding: 4px 9px; }
+.upload-card-footer a { font-size: 12px; }
+#upload-summary { font-variant-numeric: tabular-nums; padding-top: 4px; }
+@media (max-width: 560px) {
+  .upload-intro { flex-direction: column; gap: 8px; }
+  .login-fields { grid-template-columns: 1fr; }
+  .upload-modes button { padding: 10px; }
+  .upload-card { padding: 13px; }
+  .upload-challenge-actions button { width: 100%; }
+}
+</style>
+{{end}}
