@@ -142,28 +142,6 @@ func (s *Scheduler) inventoryGap() (live, target, gap int) {
 	return live, target, gap
 }
 
-// Named recovery must pick the account and exit as one historical route.
-// Choosing a gateway's exit and an unrelated idle account predicts a different
-// landing. Prefer another source; using the consumer is the bounded fallback.
-func (s *Scheduler) recoveryMinter(gateway string, consumerID int64) (types.Account, types.Region, bool) {
-	routes := make(map[string]bool)
-	for _, route := range s.inventoryEvidence() {
-		if route.gateway == gateway {
-			routes[comboKey(route.account, route.region)] = true
-		}
-	}
-	policy := &premintPolicy{skip: func(id int64, key string) bool {
-		combo := comboKey(id, key)
-		return !routes[combo] || s.workDeferred("inventory|"+combo+"|"+gateway)
-	}}
-	for _, exclude := range []int64{consumerID, 0} {
-		if account, region, ok := s.minterFor(types.Exit{}, exclude, 0, policy); ok {
-			return account, region, true
-		}
-	}
-	return types.Account{}, types.Region{}, false
-}
-
 // Only bootstrap a target that cannot be covered by known recovery routes.
 // Normal maintenance of an established pool must not spend its entire gap
 // trying unproven countries; dedicated exploration has its own one-shot turn.

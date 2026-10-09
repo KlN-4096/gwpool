@@ -61,7 +61,7 @@ func TestRegionsDisabledExitKeepsExistingDeliveryAndSeedRenewalButStopsDynamicWo
 	cfg.Regions = cfg.RegionDefinitions()
 	cfg.Regions[0].Enabled = false
 	s.opt.Live = config.NewLive("", cfg)
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "member", Request{Gateway: "unified-1"}, true); err != nil {
 		t.Fatalf("disabled exploration exit must not invalidate a live route cookie: %v", err)
 	}
 	if len(mn.mintedGateways()) != 0 || mn.echoes != 0 {
@@ -70,13 +70,7 @@ func TestRegionsDisabledExitKeepsExistingDeliveryAndSeedRenewalButStopsDynamicWo
 	if _, ok := s.renewalExit("us-east"); !ok {
 		t.Fatal("disabled dynamic exit blocked an existing seed route")
 	}
-	cfg.VerifyFullAtDeliver = true
-	s.opt.Live = config.NewLive("", cfg)
-	addAccount(st, 2, "acct-2") // 新消费者，不走上一张交付租约的零请求重发快路。
-	if _, err := s.Deliver(context.Background(), 2, Request{Gateway: "unified-1"}); err == nil {
-		t.Fatal("verification cannot initiate upstream work via a disabled exit")
-	}
-	if len(mn.mintedGateways()) != 0 {
-		t.Fatal("disabled exit was used for verification/minting")
+	if _, _, err := s.premintSID("us-east"); err == nil {
+		t.Fatal("disabled exit was used for background minting")
 	}
 }

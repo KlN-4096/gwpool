@@ -39,6 +39,7 @@ type stateChange struct {
 	NextAccessKeyID   int64                                      `json:"next_access_key_id,omitempty"`
 	AccessKeys        map[string]types.AccessKey                 `json:"access_keys,omitempty"`
 	KeyUsage          map[string]types.KeyUsage                  `json:"key_usage,omitempty"`
+	ExternalUsage     map[string]types.ExternalConsumerUsage     `json:"external_usage,omitempty"`
 	OwnerKeysMigrated bool                                       `json:"owner_keys_migrated,omitempty"`
 	AttemptsMigrated  bool                                       `json:"attempts_migrated,omitempty"`
 	Accounts          []types.Account                            `json:"accounts,omitempty"`
@@ -376,6 +377,12 @@ func applyChange(state *State, change stateChange) {
 	for id, usage := range change.KeyUsage {
 		state.KeyUsage[id] = usage
 	}
+	if len(change.ExternalUsage) > 0 && state.ExternalUsage == nil {
+		state.ExternalUsage = map[string]types.ExternalConsumerUsage{}
+	}
+	for id, usage := range change.ExternalUsage {
+		state.ExternalUsage[id] = usage
+	}
 	state.OwnerKeysMigrated = state.OwnerKeysMigrated || change.OwnerKeysMigrated
 	state.AttemptsMigrated = state.AttemptsMigrated || change.AttemptsMigrated
 	for _, id := range change.DropAccounts {
@@ -635,6 +642,7 @@ func cloneMap[K comparable, V any](from map[K]V) map[K]V {
 func cloneState(state State) State {
 	state.AccessKeys = cloneMap(state.AccessKeys)
 	state.KeyUsage = cloneMap(state.KeyUsage)
+	state.ExternalUsage = cloneMap(state.ExternalUsage)
 	for id, usage := range state.KeyUsage {
 		state.KeyUsage[id] = usage.Clone()
 	}

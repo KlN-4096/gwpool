@@ -120,7 +120,6 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 	}
 	got, err := s.mintAttempt(ctx, a, e, sid, cur, want, bias, purpose)
 	if !errors.Is(err, oauth.ErrAccessExpired) || s.opt.RefreshExpired == nil {
-		got.refreshed = expiryRefreshed(ctx, a.ID)
 		return got, err
 	}
 	if expiryRefreshed(ctx, a.ID) {
@@ -141,46 +140,5 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 	if errors.Is(err, oauth.ErrAccessExpired) {
 		return minted{}, s.rejectExpired(a, oauth.ExpiredAfterRefreshReason)
 	}
-	got.refreshed = true
 	return got, err
-}
-
-func (s *Scheduler) verifyWithExpiry(ctx context.Context, a types.Account, e types.Exit, gateway string,
-	pair types.Pair, m minted) (*types.Verdict, error) {
-	ctx = withExpiryRecovery(ctx)
-	if m.refreshed {
-		markExpiryRefreshed(ctx, a.ID)
-	}
-	var err error
-	ctx, a, err = s.prepareAccount(ctx, a)
-	if err != nil {
-		return nil, err
-	}
-	verify := func() (*types.Verdict, error) {
-		started := s.now()
-		v, err := s.mint.VerifyFull(ctx, a.Creds, e, m.sid, pair.Cookie, m.ticket)
-		s.recordEcho(a.ID, e, gateway, m.sid, m.obs, v, err, s.now(), s.now().Sub(started))
-		return v, err
-	}
-	v, err := verify()
-	if !errors.Is(err, oauth.ErrAccessExpired) || s.opt.RefreshExpired == nil {
-		return v, err
-	}
-	if expiryRefreshed(ctx, a.ID) {
-		return v, s.rejectExpired(a, oauth.ExpiredAfterRefreshReason)
-	}
-	markExpiryRefreshed(ctx, a.ID)
-	a, err = s.refreshExpired(ctx, a, oauth.UpstreamExpiredReason)
-	if err != nil {
-		return nil, err
-	}
-	ctx, err = s.beginAttempt(ctx, a, e)
-	if err != nil {
-		return nil, err
-	}
-	v, err = verify()
-	if errors.Is(err, oauth.ErrAccessExpired) {
-		return v, s.rejectExpired(a, oauth.ExpiredAfterRefreshReason)
-	}
-	return v, err
 }

@@ -286,13 +286,6 @@ func TestSchedulingKnobDefaults(t *testing.T) {
 		t.Errorf("每国默认2次/小时、每账号总50次；国家限额=%d",
 			cfg.UpstreamPerRegionHour)
 	}
-	// 交付前验满血是「花一个满血窗口换一个读数」，所以默认关。
-	if cfg.VerifyFullAtDeliver {
-		t.Error("verify_full_at_deliver 默认该关")
-	}
-	if cfg.MaxTriesPerDeliver != 2 {
-		t.Errorf("一次交付最多试几个网关默认该是 2，得到 %d", cfg.MaxTriesPerDeliver)
-	}
 	if cfg.SpareTarget != types.SpareTarget {
 		t.Errorf("富余张数默认该是 %d，得到 %d", types.SpareTarget, cfg.SpareTarget)
 	}
@@ -403,7 +396,6 @@ func TestSchedulingKnobsRejectNegatives(t *testing.T) {
 	for _, body := range []string{
 		`{"upstream_per_region_hour":-1,` + okProxies + `}`,
 		`{"slot_cooldown_minutes":-1,` + okProxies + `}`,
-		`{"max_tries_per_deliver":-1,` + okProxies + `}`,
 		`{"spare_target":-1,` + okProxies + `}`,
 		`{"mint_concurrency":-1,` + okProxies + `}`,
 	} {

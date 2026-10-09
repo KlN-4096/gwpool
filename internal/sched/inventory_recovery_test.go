@@ -67,6 +67,12 @@ func TestPairTargetIncludesExternalConsumerDemand(t *testing.T) {
 	for _, gw := range []string{"unified-1", "unified-2", "unified-3", "unified-4"} {
 		st.slots[slotKey(50, gw)] = types.Slot{AccountID: 50, Gateway: gw, LastDeliver: clk.now()}
 	}
+	if got := s.PairTarget(); got != types.SpareTarget {
+		t.Fatalf("legacy external slots changed supply demand: %d", got)
+	}
+	for _, gw := range []string{"unified-1", "unified-2", "unified-3", "unified-4"} {
+		s.external.delivered(types.ExternalConsumerID("external"), gw, clk.now())
+	}
 	if got, want := s.PairTarget(), types.SpareTarget+4; got != want {
 		t.Fatalf("跨账号消费者真实需求未计入库存目标：got=%d, want=%d", got, want)
 	}
@@ -88,7 +94,7 @@ func TestAnonymousShortageWakesInventoryBeforePeriodicTick(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); s.Run(ctx) }()
 	defer func() { cancel(); <-done }()
-	if _, err := s.DeliverAnonymous(ctx, "external", Request{}, true); err == nil {
+	if _, err := s.DeliverAnonymous(ctx, "external", Request{Gateway: "unified-7"}, true); err == nil {
 		t.Fatal("初始缺库存应先返回缺票")
 	}
 	until := time.Now().Add(time.Second)
@@ -114,9 +120,10 @@ func TestNamedRecoveryUsesHistoricalAccountAndExitTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
-	got, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-7"})
-	if err != nil || got.Gateway != "unified-7" {
-		t.Fatalf("只挑对出口却派错账号，错失已知恢复路线：gateway=%q err=%v", got.Gateway, err)
+	s.runInventory(context.Background(), 1, false)
+	got, ok := st.Pair("unified-7")
+	if !ok || got.MintedBy != 3 {
+		t.Fatalf("后台恢复没有保持账号与出口组合: %+v", got)
 	}
 }
 

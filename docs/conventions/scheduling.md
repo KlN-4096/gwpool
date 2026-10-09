@@ -17,12 +17,13 @@
 - `RegionEnabled` 同时检查稳定 key/出口/启用态，两种延迟队列出手前复查；无上游验证的现成票交付不要求出口继续启用。
 - `premintNote` 只有全池 `ErrNoExit` 才停整轮，局部 `ErrRateLimited` 走原失手预算但不设置全局 halt。
 - OAuth 刷新与铸票共用 Store 账号锁，锁后重读凭据；已持锁的请求恢复不得重入锁。出站前本地 AT 到期、或 HTTP401 精确 `error.code=token_expired` 可用 RT 恢复；其它401沿用原处理。
-- 一次交付每账号至多一次过期恢复，context共享标记跨候选和mint→echo；scan恢复后的失败不再进入传输重试。每次实际重试独立扣原国家/账号预算、保留失败样本；无RT不出站刷新。
+- 一次后台铸票每账号至多一次过期恢复；scan恢复后的失败不再进入传输重试。每次实际重试独立扣原国家/账号预算、保留失败样本；无RT不出站刷新。消费不出站刷新/铸票/echo。
 - 未知国家探索公平性按持久尝试数推进；不能把低次数国家优先套到全部库存恢复。未知/不支持Geo（包括seed）不得铸票；地区403不笼统停号，确切401凭据失效仍停用。
 - `inventoryEvidence` 合并最新RegionMint与旧/过期Pair来源，要求启用有凭据账号、启用动态出口及匹配ReachableExits；按组合＋网关去重，一次漂移不抹掉唯一旧路线。
-- `PairTarget=max(busiest+spare,minPairs,recoverable)`封顶190，busiest包含启用的无凭据消费者占位行；spare>190仍显式关闭补货。缺口按集合计算，其他活票不能抵消某个已知可恢复网关缺失。
-- 需求统计按Slots/Accounts revision及LastDeliver精确cutoff区间复用，恢复证据/唯一网关数按Accounts/Gateway/Pairs/Mints与实时可用出口集复用；无revision的fake直接重算，配置/TTL不静态缓存。
-- 同消费者的交付与归还使用独立可取消门闩，避免拿到尚未提交的同票；不同消费者可以组提交。交付槽位落盘失败必须返回失败，不得仍回成功票。
+- `PairTarget=max(busiest+spare,minPairs,recoverable)`封顶190；busiest取托管历史需求与独立外部1小时交付需求较大值，排除旧anon槽位；spare>190仍关闭补货，缺口按集合计算。
+- 托管需求统计按Slots/Accounts revision与LastDeliver cutoff复用；外部需求只保近期gateway集合，过期回收且乱序请求不能回退时间。恢复证据按账户/网关/票/铸票revision与启用出口复用，TTL不静态缓存。
+- 所有Key复用`/cookie`、`/gateways`原路径，仅接受新契约；明确member+gateway，只读与目录相同的freshPair/Rehome有效票。无Account/Slot准入、183秒避让、池端品质、代选/force/wait/count/消费现场铸票；缺参/旧参数400提示升级，只有release/消费者renew退役426，后台铸票保留。
+- 外部限频为完整成员摘要跨Key共享12/1秒、444/60秒；成功/缺票计数，拒绝不延窗，统计与准入分离。时间必须在限频锁内采样，保持窗口时序；并发/回收回归在external_delivery_test.go。
 - 普通库存周期先已知缺票路线，只有已知数不足target才最多2个未知bootstrap；总尝试仍≤2×缺口，短票/预测错/失败消耗失手预算，路线5分钟至1小时退避。
 - 取票`markDemand`合并唤醒，最短5秒，走原后台锁/预算；唤醒绝不bootstrap或追加专门探索，匿名仍不在HTTP中自行铸票。
 - 点名恢复优先历史来源账号＋出口整体，优先非消费者；无可用历史路线才回落原单发路径。账号锁后重读启用态/凭据，另一任务已补齐则不重复发。回归见 `sched/inventory_recovery_test.go`。

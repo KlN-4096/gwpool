@@ -52,7 +52,7 @@ func TestSlotIndexTracksOnlyCommittedState(t *testing.T) {
 
 func TestBusiestDeliveriesCacheExpiresAndRevises(t *testing.T) {
 	s := open(t, t.TempDir())
-	account, err := s.AddAccount(types.Account{Enabled: true, Creds: types.Creds{AccountID: "one"}})
+	account, err := s.AddAccount(types.Account{Enabled: true, Creds: types.Creds{AccountID: "one", AccessToken: "test-token"}})
 	if err != nil {
 		t.Fatal(err)
 	}

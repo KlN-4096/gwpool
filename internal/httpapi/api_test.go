@@ -63,56 +63,12 @@ type fakePool struct {
 	// calls 数一共取了几次票：wait 那条路最要紧的保证是「等不到就别重跑」，
 	// 重跑一次可能真打一发上游。
 	calls int
-	// queue 非空时逐次弹一张（批量取票用：每张必须是不同落点，而 delivery 那个字段
-	// 每次都回同一张）。弹空之后回 queueErr —— 「要 3 张只拿到 1 张」要能铺出来。
-	queue    []types.Delivery
-	queueErr error
-	// hasCand 顶替 sched.HasCandidate。nil = 一张候选都没有。
-	// 判据归调度（只有它看得见冷却），HTTP 那层照它的答案办——而「池子里有票」
-	// 和「这个账号拿得到票」是两件事，这个 fake 必须能把它们分开。
-	hasCand func(accountID int64, req sched.Request) bool
-
-	released []string
-	relN     int
-	relErr   error
-
-	// deliveredTo 顶替归属闸的判据，askedDelivered 留住它被问过的 (行|票号)——
-	// 「问的是哪一行」正是这道闸的全部内容，光看状态码看不出来。
-	deliveredTo    func(accountID int64, version string) bool
-	askedDelivered []string
-}
-
-func (p *fakePool) Deliver(_ context.Context, accountID int64, req sched.Request) (types.Delivery, error) {
-	p.calls++
-	p.reqs = append(p.reqs, req)
-	p.delivered = append(p.delivered, fmt.Sprintf("%d|%s|force=%v", accountID, req.Gateway, req.Force))
-	if d, err, ok := p.next(); ok {
-		return d, err
-	}
-	return p.delivery, p.err
-}
-
-// next 从 queue 里弹一张。queue 为 nil 时回 ok=false，老用例一个字都不用改。
-func (p *fakePool) next() (types.Delivery, error, bool) {
-	if p.queue == nil {
-		return types.Delivery{}, nil, false
-	}
-	if len(p.queue) == 0 {
-		err := p.queueErr
-		if err == nil {
-			err = sched.ErrNoLivePair
-		}
-		return types.Delivery{}, err, true
-	}
-	d := p.queue[0]
-	p.queue = p.queue[1:]
-	return d, nil, true
 }
 
 func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sched.Request, authed bool) (types.Delivery, error) {
 	p.calls++
 	p.reqs = append(p.reqs, req)
-	p.anon = append(p.anon, fmt.Sprintf("%s|%s|force=%v|authed=%v", upstream, req.Gateway, req.Force, authed))
+	p.anon = append(p.anon, fmt.Sprintf("%s|%s|authed=%v", upstream, req.Gateway, authed))
 	// **这道闸真实实现里有，fake 少了它两轮审查都没抓到跨账号那条**：
 	// HTTP 层所有跨账号用例都绿在「真实实现必然 503」的地方。
 	// 鉴权过的调用方不吃这个门槛（门槛是给上传者留的余量，别把上传者本人挡在门外）。
@@ -120,30 +76,6 @@ func (p *fakePool) DeliverAnonymous(_ context.Context, upstream string, req sche
 		return types.Delivery{}, sched.ErrPublicClosed
 	}
 	return p.delivery, p.err
-}
-
-func (p *fakePool) Release(accountID int64, version string) (int, error) {
-	p.released = append(p.released, fmt.Sprintf("%d|%s", accountID, version))
-	return p.relN, p.relErr
-}
-
-// DeliveredTo 顶替 sched 那份归属比对。nil = 谁都没拿到过任何票。
-//
-// 这个 fake 必须能分开「这张票是池子现持的」和「这张票交付给过**这一行**」：
-// 两者混成一个，/pair/renew 的归属闸（整条路上唯一挡得住人的那道）就无从检验。
-func (p *fakePool) DeliveredTo(accountID int64, version string) bool {
-	p.askedDelivered = append(p.askedDelivered, fmt.Sprintf("%d|%s", accountID, version))
-	if p.deliveredTo == nil {
-		return false
-	}
-	return p.deliveredTo(accountID, version)
-}
-
-func (p *fakePool) HasCandidate(accountID int64, req sched.Request) bool {
-	if p.hasCand == nil {
-		return false
-	}
-	return p.hasCand(accountID, req)
 }
 
 func (p *fakePool) Public() sched.PublicState { return p.public }
@@ -516,7 +448,7 @@ func TestAdminShowsWhoFetchesForAnonymousRows(t *testing.T) {
 	srv, h, _, st, _ := rig(t, types.ModePool)
 	st.accounts[1].Enabled = false
 	st.accounts = append(st.accounts,
-		types.Account{ID: 9, Label: "匿名 acct-outside",
+		types.Account{ID: 9, Label: "匿名 acct-outside", Via: 1,
 			Creds: types.Creds{AccountID: types.AnonPrefix + "acct-outside"}, Enabled: true, ViewToken: "vt-9"},
 		// 报上来的上游 ID 正好是池里 2 号的：管理员要能看出「这就是那个停用了的号」。
 		types.Account{ID: 10, Label: "匿名 acct-b",
@@ -524,7 +456,7 @@ func TestAdminShowsWhoFetchesForAnonymousRows(t *testing.T) {
 	st.slots = map[string]types.Slot{"9|unified-7": {AccountID: 9, Gateway: "unified-7",
 		LastDeliver: time.Date(2026, 10, 2, 12, 37, 36, 0, time.UTC)}}
 	ka := srv.ConsumerKeyFor(st.accounts[0])
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-outside", nil), ka)); w.Code != 200 {
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-outside&gateway=unified-142", nil), ka)); w.Code != 200 {
 		t.Fatalf("替外部账号取票失败 %d: %s", w.Code, w.Body.String())
 	}
 	if got := st.accounts[2].Via; got != 1 {
@@ -548,111 +480,6 @@ func TestAdminShowsWhoFetchesForAnonymousRows(t *testing.T) {
 	}
 	if strings.Contains(ext, types.AnonPrefix) {
 		t.Fatal("上游 ID 带着内部的 anon: 前缀")
-	}
-}
-
-// 调度正确性：A 的 key 取到的必须是 A 的槽位，不是 B 的。
-func TestCookieIsPerAccount(t *testing.T) {
-	srv, h, p, st, _ := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-	kb := srv.ConsumerKeyFor(st.accounts[1])
-
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), ka)); w.Code != 200 {
-		t.Fatalf("A 取不到: %d %s", w.Code, w.Body.String())
-	}
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?gateway=unified-142", nil), kb)); w.Code != 200 {
-		t.Fatalf("B 取不到: %d", w.Code)
-	}
-	want := []string{"1||force=false", "2|unified-142|force=false"}
-	if len(p.delivered) != 2 || p.delivered[0] != want[0] || p.delivered[1] != want[1] {
-		t.Fatalf("池子收到的调用方不对: %v，应为 %v", p.delivered, want)
-	}
-
-	// ?account= 是管理员专用参数。普通调用方带上它必须**仍然交付给他自己**，
-	// 否则谁都能点名替别人取，调度和账本一起串号。
-	p.delivered = nil
-	for _, ref := range []string{"acct-b", "2", "不存在的号"} {
-		w := do(h, authed(httptest.NewRequest("GET", "/cookie?account="+url.QueryEscape(ref), nil), ka))
-		if w.Code != 200 {
-			t.Fatalf("A 带 account=%s 居然 %d", ref, w.Code)
-		}
-	}
-	for i, got := range p.delivered {
-		if got != "1||force=false" {
-			t.Fatalf("第 %d 次被点名改派成了 %s，应恒为账号 1", i, got)
-		}
-	}
-
-	// 停用的账号，key 立刻失效 —— 这就是吊销手段。
-	st.accounts[1].Enabled = false
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), kb)); w.Code != 401 {
-		t.Fatalf("停用账号的 key 还能用: %d", w.Code)
-	}
-}
-
-// /cookie 的鉴权、交付形状、管理员兜底路径。
-func TestCookieAuthAndShape(t *testing.T) {
-	srv, h, p, st, sc := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-
-	for _, key := range []string{"", "wrong", "vt-1"} {
-		r := httptest.NewRequest("GET", "/cookie", nil)
-		if key != "" {
-			r = authed(r, key)
-		}
-		if w := do(h, r); w.Code != 401 {
-			t.Fatalf("key=%q 居然 %d", key, w.Code)
-		}
-	}
-
-	w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), ka))
-	if w.Code != 200 {
-		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
-	}
-	var d types.Delivery
-	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
-		t.Fatalf("返回不是 Delivery JSON: %v", err)
-	}
-	if d.Gateway != "unified-142" || d.Cookie != liveCookie || d.ValidForS != 150 || !d.VerifiedFull {
-		t.Fatalf("交付内容不对: %+v", d)
-	}
-	if !strings.Contains(w.Body.String(), `"valid_for_s":150`) {
-		t.Fatalf("字段名对不上 SPEC: %s", w.Body.String())
-	}
-
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?gateway=../etc", nil), ka)); w.Code != 400 {
-		t.Fatalf("非法 gateway 居然 %d", w.Code)
-	}
-
-	// 管理员兜底：必须显式说替谁取，猜一个就等于把 A 的槽位发给 B。
-	for _, key := range []string{"akey", "ckey"} {
-		if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), key)); w.Code != 400 {
-			t.Fatalf("%s 没带 account 居然 %d", key, w.Code)
-		}
-	}
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=404", nil), "akey")); w.Code != 404 {
-		t.Fatalf("不存在的账号居然 %d", w.Code)
-	}
-	p.delivered = nil
-	// 池内 ID 和上游标识两种写法都认。
-	for i, ref := range []string{"2", "acct-b"} {
-		if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account="+ref, nil), "akey")); w.Code != 200 {
-			t.Fatalf("account=%s 居然 %d", ref, w.Code)
-		}
-		if p.delivered[i] != "2||force=false" {
-			t.Fatalf("account=%s 解析成了 %s", ref, p.delivered[i])
-		}
-	}
-
-	// 全降级 ⇒ 503，宁可 503 也不放降智。
-	p.err = sched.ErrNoFullSlot
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), ka)); w.Code != 503 {
-		t.Fatalf("没有满血槽位时应 503，实为 %d", w.Code)
-	}
-	// 光回 503 就卡死了：这个号在所有已知网关上都烧完了，同一批网关上重铸也不解封，
-	// 只有没碰过的新网关才有窗口 ⇒ 必须去找新落点，而且不能派它自己去。
-	if want := []int64{1}; len(sc.discovery) != 1 || sc.discovery[0] != want[0] {
-		t.Fatalf("槽位烧完没触发找新网关: %v", sc.discovery)
 	}
 }
 
@@ -718,7 +545,7 @@ func TestUpload(t *testing.T) {
 	}
 	// 新账号改从总览页领取稳定的账号 key。
 	newOwner, _ := st2.OwnerByToken(resp["owner_token"])
-	if w := do(h2, authed(httptest.NewRequest("GET", "/cookie", nil), srv2.OwnerKeyFor(newOwner))); w.Code != 200 {
+	if w := do(h2, authed(httptest.NewRequest("GET", "/cookie?account=acct-pro1&gateway=unified-142", nil), srv2.OwnerKeyFor(newOwner))); w.Code != 200 {
 		t.Fatalf("账号 key 用不了: %d %s", w.Code, w.Body.String())
 	}
 
@@ -1409,7 +1236,7 @@ func TestPublicKeyCookie(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
 	}
-	if len(p.anon) != 1 || p.anon[0] != "acct-x|unified-142|force=false|authed=false" {
+	if len(p.anon) != 1 || p.anon[0] != "acct-x|unified-142|authed=false" {
 		t.Fatalf("没把匿名标识传下去: %v", p.anon)
 	}
 	// 公共 Key 不获得上传者凭据权限。
@@ -1435,55 +1262,6 @@ func TestPublicPageShowsOpenState(t *testing.T) {
 	p.public = sched.PublicState{Enabled: true, Open: false, Accounts: 1, Threshold: 6}
 	if body := do(h, httptest.NewRequest("GET", "/", nil)).Body.String(); !strings.Contains(body, "已关闭") {
 		t.Fatal("关闭状态没显示")
-	}
-}
-
-// force=1 要传到调度器，并且 TTL 要标明是建议值。
-func TestForceAndAdvisoryTTL(t *testing.T) {
-	srv, h, p, st, _ := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-
-	w := do(h, authed(httptest.NewRequest("GET", "/cookie?force=1", nil), ka))
-	if w.Code != 200 {
-		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
-	}
-	if len(p.delivered) != 1 || p.delivered[0] != "1||force=true" {
-		t.Fatalf("force 没传下去: %v", p.delivered)
-	}
-	// TTL 是建议值不是承诺，响应里要写明。
-	var got map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got["ttl_is_advisory"] != true {
-		t.Fatalf("缺 ttl_is_advisory: %s", w.Body.String())
-	}
-	// 原有字段一个都不能少。
-	for _, k := range []string{"gateway", "cookie", "expires_at", "valid_for_s", "verified_full"} {
-		if _, ok := got[k]; !ok {
-			t.Fatalf("包了一层之后丢了字段 %q: %s", k, w.Body.String())
-		}
-	}
-
-	// 几种写法都认，没写就是 false。
-	p.delivered = nil
-	for _, v := range []string{"1", "true", "yes", "on"} {
-		do(h, authed(httptest.NewRequest("GET", "/cookie?force="+v, nil), ka))
-	}
-	do(h, authed(httptest.NewRequest("GET", "/cookie?force=0", nil), ka))
-	do(h, authed(httptest.NewRequest("GET", "/cookie", nil), ka))
-	for i, d := range p.delivered {
-		want := i < 4
-		if strings.HasSuffix(d, "force=true") != want {
-			t.Fatalf("第 %d 次 force 解析成了 %s", i, d)
-		}
-	}
-
-	// 公共 Key 的外部账号路径也要带上。
-	p.public = sched.PublicState{Enabled: true, Open: true, Accounts: 9, Threshold: 6}
-	do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-x&force=1", nil), srv.PublicKey()))
-	if len(p.anon) != 1 || !strings.Contains(p.anon[0], "force=true") {
-		t.Fatalf("匿名 force 没传下去: %v", p.anon)
 	}
 }
 
@@ -2561,196 +2339,6 @@ func TestAdminWithoutProxyStates(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "没有配出口代理") {
 		t.Fatal("没接出口状态时该显示一句说明")
-	}
-}
-
-// /gateways 只列**此刻就有活票**的网关（剩余 ≥ DeliverFloor），used_by_you 必须是
-// **问的那个账号**的历史。字段名和形状一个都不许动——sub2api 拿它给落点起名。
-func TestGatewaysList(t *testing.T) {
-	srv, h, p, st, _ := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-	p.target = 7
-	now := time.Now().UTC()
-
-	st.gws = map[string]types.Gateway{
-		"unified-2": {Name: "unified-2"},
-		"unified-1": {Name: "unified-1"},
-		"unified-3": {Name: "unified-3"},
-	}
-	st.pairs = map[string]types.Pair{
-		// 够交付
-		"unified-1": {Gateway: "unified-1", ExpiresAt: now.Add(types.PairLifetime)},
-		// 快死了：列出来客户端也拿不到票，只会白跑一次 /cookie
-		"unified-2": {Gateway: "unified-2", ExpiresAt: now.Add(types.DeliverFloor / 2)},
-		"unified-3": {Gateway: "unified-3", ExpiresAt: now.Add(types.PairLifetime)},
-	}
-	// 1 号在 unified-1 上用掉过一张票（full/degraded 只有交付路径写得出来）。
-	st.slots = map[string]types.Slot{
-		"1|unified-1": {AccountID: 1, Gateway: "unified-1", LastTouch: now,
-			LastVerdict: types.VerdictFull},
-		// 2 号的历史不许串到 1 号头上。
-		"2|unified-3": {AccountID: 2, Gateway: "unified-3", LastTouch: now,
-			LastVerdict: types.VerdictDegraded},
-	}
-
-	w := do(h, authed(httptest.NewRequest("GET", "/gateways", nil), ka))
-	if w.Code != 200 {
-		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
-	}
-	var got struct {
-		Account  string `json:"account"`
-		Live     int    `json:"live"`
-		Target   int    `json:"target"`
-		Gateways []struct {
-			Name       string `json:"name"`
-			PairReady  bool   `json:"pair_ready"`
-			ValidForS  int    `json:"valid_for_s"`
-			UsedByYou  bool   `json:"used_by_you"`
-			LastUsedAt string `json:"last_used_at"`
-		} `json:"gateways"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Account != "acct-upstream" || got.Target != 7 || got.Live != 2 {
-		t.Fatalf("汇总不对: %+v", got)
-	}
-	// 稳定顺序：客户端按这个列表挑，抖动会让它的选择无端变化。
-	// 没活票的 unified-2 直接不出现：列它只会让客户端白跑一次 /cookie。
-	if len(got.Gateways) != 2 || got.Gateways[0].Name != "unified-1" ||
-		got.Gateways[1].Name != "unified-3" {
-		t.Fatalf("清单不对（该只剩有活票的两个、按名字排序）: %+v", got.Gateways)
-	}
-	for _, g := range got.Gateways {
-		if !g.PairReady || g.ValidForS <= 0 {
-			t.Fatalf("列出来的都该是可交付的: %+v", g)
-		}
-	}
-	if !got.Gateways[0].UsedByYou || got.Gateways[0].LastUsedAt == "" {
-		t.Fatalf("unified-1 该标成用过: %+v", got.Gateways[0])
-	}
-	if got.Gateways[1].UsedByYou {
-		t.Fatalf("2 号的历史串到 1 号头上了: %+v", got.Gateways[1])
-	}
-	// 没有 key 又没开放 ⇒ 401，不许把网关清单白送。
-	if w := do(h, httptest.NewRequest("GET", "/gateways", nil)); w.Code != 401 {
-		t.Fatalf("裸请求应 401，实为 %d", w.Code)
-	}
-}
-
-// 一把 key 替**别的**上游账号取票：槽位按报上来的那个账号记，而且池子验不了满血
-// （state-echo 要用那个账号的凭据，池子只有上传者的）⇒ 走匿名那条路。
-func TestCookieForAnotherUpstreamAccount(t *testing.T) {
-	srv, h, p, st, _ := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-
-	w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-别人的号", nil), ka))
-	if w.Code != 200 {
-		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
-	}
-	if len(p.anon) != 1 || p.anon[0] != "acct-别人的号||force=false|authed=true" {
-		t.Fatalf("没按报上来的账号记槽位: anon=%v delivered=%v", p.anon, p.delivered)
-	}
-	if len(p.delivered) != 0 {
-		t.Fatalf("还是按上传者那一行取了: %v", p.delivered)
-	}
-
-	// 报的就是自己 ⇒ 照旧走验满血那条路。
-	w = do(h, authed(httptest.NewRequest("GET", "/cookie?account=acct-upstream", nil), ka))
-	if w.Code != 200 {
-		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
-	}
-	if len(p.delivered) != 1 || len(p.anon) != 1 {
-		t.Fatalf("报自己时不该走匿名路: anon=%v delivered=%v", p.anon, p.delivered)
-	}
-}
-
-// 跨账号问清单：/cookie 把这种票记在 AnonPrefix+<account_id> 那一行上，/gateways 必须照
-// 同一个键读。读错行的后果是静默的——used_by_you 恒为 false，客户端照着一张全是
-// 「没用过」的清单挑，等于没挑。
-func TestGatewaysListForAnotherUpstreamAccount(t *testing.T) {
-	srv, h, _, st, _ := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-	now := time.Now().UTC()
-
-	st.gws = map[string]types.Gateway{"unified-1": {Name: "unified-1"}, "unified-2": {Name: "unified-2"}}
-	// 两个都得有活票，否则清单里根本不会出现（/gateways 只列此刻拿得到票的）。
-	st.pairs = map[string]types.Pair{
-		"unified-1": {Gateway: "unified-1", ExpiresAt: now.Add(types.PairLifetime)},
-		"unified-2": {Gateway: "unified-2", ExpiresAt: now.Add(types.PairLifetime)},
-	}
-	// 池子给外部账号建的占位行（见 sched.anonAccount）。
-	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 acct-friend",
-		Enabled: true, Creds: types.Creds{AccountID: types.AnonPrefix + "acct-friend"}})
-	st.slots = map[string]types.Slot{
-		// 匿名/跨账号交付只写 LastTouch 和 LastDeliver，一个判定都不落。
-		"9|unified-1": {AccountID: 9, Gateway: "unified-1", LastTouch: now, LastDeliver: now},
-		// 出了冷却的那次不算「用过」，否则用久了每个网关都是用过，挑不出落点。
-		"9|unified-2": {AccountID: 9, Gateway: "unified-2",
-			LastTouch: now.Add(-types.SlotCooldown - time.Minute)},
-	}
-
-	w := do(h, authed(httptest.NewRequest("GET", "/gateways?account=acct-friend", nil), ka))
-	if w.Code != 200 {
-		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
-	}
-	var got struct {
-		Account  string `json:"account"`
-		Gateways []struct {
-			Name       string `json:"name"`
-			UsedByYou  bool   `json:"used_by_you"`
-			LastUsedAt string `json:"last_used_at"`
-		} `json:"gateways"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Account != "acct-friend" || len(got.Gateways) != 2 {
-		t.Fatalf("汇总不对: %+v", got)
-	}
-	if !got.Gateways[0].UsedByYou || got.Gateways[0].LastUsedAt == "" {
-		t.Fatalf("占位行的历史没读出来，客户端会把烧过的网关当新落点: %+v", got.Gateways[0])
-	}
-	if got.Gateways[1].UsedByYou {
-		t.Fatalf("出了冷却还算用过: %+v", got.Gateways[1])
-	}
-}
-
-// 交付失败要在页面上说得出为什么：客户端那头只看到一个 502/503。
-// 上传者页只给原因，管理页才给原始错误（里面是出口名、上游状态码这类内部读数）。
-func TestDeliverFailuresShowOnPages(t *testing.T) {
-	srv, h, p, st, _ := rig(t, types.ModePool)
-	ka := srv.ConsumerKeyFor(st.accounts[0])
-	p.err = fmt.Errorf("unified-142 上没有验过满血的槽位: %w", sched.ErrNoFullSlot)
-
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?gateway=unified-142", nil), ka)); w.Code != 503 {
-		t.Fatalf("该 503，实为 %d", w.Code)
-	}
-
-	mine := do(h, httptest.NewRequest("GET", "/a/vt-1", nil)).Body.String()
-	if !strings.Contains(mine, "没有可交付的活票") || !strings.Contains(mine, "unified-142") {
-		t.Fatal("上传者页没说为什么取不到票")
-	}
-	// 错误码也要落在页面上：同一句人话底下可能是两种完全不同的处置。
-	if !strings.Contains(mine, codeNoLivePair) {
-		t.Fatal("上传者页没显示错误码")
-	}
-	if strings.Contains(mine, "ErrNoFullSlot") || strings.Contains(mine, "上没有验过满血的槽位:") {
-		t.Fatal("上传者页漏了原始错误")
-	}
-	// 另一个账号的页面不该看见这条。
-	if other := do(h, httptest.NewRequest("GET", "/a/vt-2", nil)).Body.String(); strings.Contains(other, "没有可交付的活票") {
-		t.Fatal("失败记录串到别人页面上了")
-	}
-
-	r := httptest.NewRequest("GET", "/admin/", nil)
-	r.SetBasicAuth("admin", "akey")
-	admin := do(h, r).Body.String()
-	if !strings.Contains(admin, "没有可交付的活票") || !strings.Contains(admin, "上没有验过满血的槽位:") {
-		t.Fatal("管理页该连原始错误一起给")
-	}
-	if !strings.Contains(admin, codeNoLivePair) {
-		t.Fatal("管理页没显示错误码")
 	}
 }
 

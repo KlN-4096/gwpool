@@ -56,7 +56,7 @@ func createManagedKeys(t *testing.T, st *store.Store, count, rpm, concurrency in
 	return keys
 }
 
-func TestManagedKeysIndependentAuthorityAndSevenEndpointPolicy(t *testing.T) {
+func TestManagedKeysIndependentAuthorityAndActiveEndpointPolicy(t *testing.T) {
 	s, h, st, p, _ := managedKeyRig(t)
 	key := createManagedKeys(t, st, 1, 0, 0)[0]
 	for _, path := range []string{"/admin/keys", "/admin/"} {
@@ -71,14 +71,14 @@ func TestManagedKeysIndependentAuthorityAndSevenEndpointPolicy(t *testing.T) {
 	}
 	// Closed public switch and a hosted reference do not change the independent path.
 	ref := st.Accounts()[0].Creds.AccountID
-	w := do(h, authed(httptest.NewRequest("GET", "/cookie?account="+url.QueryEscape(ref), nil), key.Key))
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?gateway=unified-142&account="+url.QueryEscape(ref), nil), key.Key))
 	if w.Code != 200 || len(p.delivered) != 0 || len(p.anon) != 1 || !strings.Contains(p.anon[0], "authed=true") {
 		t.Fatal("independent key gained credentials or public gate", w.Code, p.anon, p.delivered)
 	}
 	for _, path := range []string{"/release", "/pair/renew"} {
 		w := do(h, authed(httptest.NewRequest("POST", path+"?account="+url.QueryEscape(ref), strings.NewReader(`{}`)), key.Key))
-		if w.Code != 409 {
-			t.Fatal("external ownership guard missing", path, w.Code)
+		if w.Code != 426 {
+			t.Fatal("retired endpoint still active", path, w.Code)
 		}
 	}
 	if err := st.UpdateAccessKeys([]string{key.Record.ID}, types.AccessKeyPatch{Action: "disable"}); err != nil {
@@ -112,7 +112,7 @@ func TestManagedKeysUploadAndLegacyExemptAndPolicyImmediate(t *testing.T) {
 	}
 	for _, key := range keys {
 		for i := 0; i < 5; i++ {
-			if w := do(h, authed(httptest.NewRequest("GET", "/gateways", nil), key.secret)); w.Code != 200 {
+			if w := do(h, authed(httptest.NewRequest("GET", "/gateways?account=member", nil), key.secret)); w.Code != 200 {
 				t.Fatal("automatic key throttled", w.Code)
 			}
 		}
@@ -228,14 +228,14 @@ func TestManagedKeyLimitsIndependentWindowConcurrencyAndRelease(t *testing.T) {
 func TestManagedKeyMetricsTicketsErrorsAndPersistence(t *testing.T) {
 	s, h, st, p, dir := managedKeyRig(t)
 	key := createManagedKeys(t, st, 1, 0, 0)[0]
-	for _, path := range []string{"/cookie?account=external&count=3", "/cookie?account=external&count=bad", "/gateways?account=external"} {
+	for _, path := range []string{"/cookie?account=external&gateway=unified-142", "/cookie?account=external&count=bad", "/gateways?account=external"} {
 		r := authed(httptest.NewRequest("GET", path, nil), key.Key)
 		r.RemoteAddr = "127.0.0.1:5000"
 		r.Header.Set("X-Forwarded-For", "203.0.113.8")
 		do(h, r)
 	}
-	if p.calls != 3 {
-		t.Fatal("batch fixture failed", p.calls)
+	if p.calls != 1 {
+		t.Fatal("single-ticket fixture failed", p.calls)
 	}
 	if err := st.UpdateAccessKeys([]string{key.Record.ID}, types.AccessKeyPatch{Action: "disable"}); err != nil {
 		t.Fatal(err)
@@ -243,7 +243,7 @@ func TestManagedKeyMetricsTicketsErrorsAndPersistence(t *testing.T) {
 	do(h, authed(httptest.NewRequest("GET", "/gateways?account=external", nil), key.Key))
 	values, _ := s.keyMetrics.snapshot(time.Now())
 	v := values[key.Record.ID]
-	if v.Usage.Totals.Requests != 4 || v.Usage.Totals.Tickets != 3 || v.Usage.Totals.OK != 2 || v.Usage.Totals.ClientErrors != 2 || v.Usage.Totals.Denied != 1 || v.Active != 0 || v.RPM != 4 {
+	if v.Usage.Totals.Requests != 4 || v.Usage.Totals.Tickets != 1 || v.Usage.Totals.OK != 2 || v.Usage.Totals.ClientErrors != 2 || v.Usage.Totals.Denied != 1 || v.Active != 0 || v.RPM != 4 {
 		t.Fatal("incorrect counters", v)
 	}
 	if len(v.Usage.AccountHashes) != 1 || len(v.Usage.Hours) != 1 || v.Usage.RecentIPs[len(v.Usage.RecentIPs)-1] != "127.0.0.1" || strings.Contains(strings.Join(v.Usage.RecentIPs, ","), "203.0.113.8") {
@@ -509,7 +509,7 @@ func TestManagedKeyWorksWithNoUploadedCredentialsOrRootConsumerKey(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"/cookie?account=external", "/gateways?account=external"} {
+	for _, path := range []string{"/cookie?account=external&gateway=unified-142", "/gateways?account=external"} {
 		if w := do(s.Handler(), authed(httptest.NewRequest("GET", path, nil), key.Key)); w.Code != 200 {
 			t.Fatal("independent key needs uploaded credentials", path, w.Code)
 		}

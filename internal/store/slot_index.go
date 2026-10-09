@@ -53,7 +53,7 @@ func (s *Store) BusiestDeliveries(cutoff time.Time) int {
 	busiest := 0
 	var from, until time.Time
 	for _, account := range s.st.Accounts {
-		if !account.Enabled {
+		if !account.Enabled || account.Creds.AccessToken == "" {
 			continue
 		}
 		count := 0

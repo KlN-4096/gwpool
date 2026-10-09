@@ -20,10 +20,8 @@ import (
 )
 
 var publicEndpoints = []struct{ method, path string }{
-	{"GET", "/cookie?account=external"},
+	{"GET", "/cookie?account=external&gateway=unified-142"},
 	{"GET", "/gateways?account=external"},
-	{"POST", "/release?account=external"},
-	{"POST", "/pair/renew?account=external"},
 	{"POST", "/cooldown/report"},
 	{"POST", "/cooldown/reports"},
 	{"POST", "/contact/report"},
@@ -75,7 +73,7 @@ func TestPublicAccessSwitchThresholdAndPermission(t *testing.T) {
 	}
 	// Claiming a hosted account's ID must still use the untrusted external path.
 	ref := st.accounts[0].Creds.AccountID
-	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?account="+url.QueryEscape(ref), nil), key)); w.Code != 200 {
+	if w := do(h, authed(httptest.NewRequest("GET", "/cookie?gateway=unified-142&account="+url.QueryEscape(ref), nil), key)); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	if len(p.delivered) != 0 || len(p.anon) != 1 {
@@ -83,8 +81,8 @@ func TestPublicAccessSwitchThresholdAndPermission(t *testing.T) {
 	}
 	for _, path := range []string{"/release", "/pair/renew"} {
 		w := do(h, authed(httptest.NewRequest("POST", path+"?account="+url.QueryEscape(ref), strings.NewReader(`{}`)), key))
-		if w.Code != http.StatusConflict {
-			t.Fatalf("lost external ownership guard: %s %d", path, w.Code)
+		if w.Code != http.StatusUpgradeRequired {
+			t.Fatalf("retired endpoint remained active: %s %d", path, w.Code)
 		}
 	}
 }
@@ -165,7 +163,7 @@ func TestPublicAccessBudgetSharedAndOrdinaryKeyBypass(t *testing.T) {
 		}
 	}
 	p.public = sched.PublicState{}
-	w := do(h, authed(httptest.NewRequest("GET", "/cookie", nil), srv.ConsumerKeyFor(st.accounts[0])))
+	w := do(h, authed(httptest.NewRequest("GET", "/cookie?account=member&gateway=unified-142", nil), srv.ConsumerKeyFor(st.accounts[0])))
 	if w.Code != 200 {
 		t.Fatal("ordinary key affected by public gate/budget", w.Code)
 	}

@@ -208,7 +208,17 @@
 
 <section id="tab-external" data-tab-group="accounts">
   <div class="card">
-    <header class="card-head"><div><h2>外部账号</h2><p>池里没有这些号的凭据：有人拿某个账号的接入 key 替自己别的 Codex 号取票（或对外开放时不带 key 来取），池子按报上来的上游 ID 自动登记一行，记它烧过哪些网关，免得把烧过的再发给它。只接收分发、不参与探测；删掉的话下次取票会重建，烧过的网关记录也跟着丢。</p></div></header>
+    <header class="card-head"><div><h2>外部账号统计</h2><p>网关选择、验证、冷却与重试均由客户端负责。以下汇总仅供观察，不参与交付判断，也没有历史身份数量准入限制。取票按外部成员限频：12次/秒、444次/分钟。身份仅保存摘要。</p></div></header>
+    {{if .ExternalUsage}}
+    <div class="table-wrap"><table>
+      <thead><tr><th>成员摘要</th><th>请求</th><th>成功交付</th><th>限频</th><th>最近网关</th><th>最近请求 UTC</th></tr></thead>
+      <tbody>{{range .ExternalUsage}}<tr>
+        <td class="mono">{{.ID}}</td><td>{{.Requests}}</td><td>{{.Delivered}}</td><td>{{.Limited}}</td>
+        <td>{{.LastGateway}}</td><td>{{.LastAt.UTC.Format "2006-01-02 15:04:05"}}</td>
+      </tr>{{end}}</tbody>
+    </table></div>
+    {{end}}
+    <p class="foot">下面是升级前保留的外部占位历史，已停止更新，不再影响取票或补货决策。</p>
     {{if .External}}
     <div class="table-wrap"><table id="t-external" data-grid data-placeholder="搜索上游账号 ID 或关联账号">
       <thead><tr><th class="num">ID</th><th>上游账号 ID</th><th>关联账号</th><th class="num">取过票的网关</th><th>最近一次取票（UTC）</th><th>登记时间（UTC）</th><th data-nosort></th></tr></thead>
@@ -224,7 +234,7 @@
           <td class="mono">{{if .LastDeliver}}{{.LastDeliver}}{{else}}<span class="muted">还没取到过</span>{{end}}</td>
           <td class="mono">{{.Since}}</td>
           <td><form method="post" action="/admin/accounts/{{.ID}}/delete"
-                onsubmit="return confirm('确定删除外部账号 {{.ID}}（{{.Upstream}}）？下次有人替它取票会重建，烧过的网关记录会丢。')">
+                onsubmit="return confirm('确定删除历史外部账号 {{.ID}}（{{.Upstream}}）及其旧记录？此操作不改变当前交付策略。')">
             <input type="hidden" name="back" value="external">
             <button class="danger sm" type="submit">删除</button></form></td>
         </tr>
@@ -337,8 +347,8 @@
     {{else}}
     <p class="empty">暂无数据。</p>
     {{end}}
-    <p class="foot">近期取过：交付过、离上次交付还不到「历史统计窗口」那个时长。<strong>这是读数不是闸</strong>，消费冷却由客户端执行；退避中才表示该账号在该网关暂不可选。校验结果是历史最后一次读数，不是当前健康保证。</p>
-    <p class="foot">历史接触数量和“近期取过”不阻止交付；服务端用该账号铸票后的短期排除（183秒）和真实失败退避仍会拦截。消费端自己的冷却独立执行。路由 Cookie 不互斥，同一张可以交给不同账号。</p>
+    <p class="foot">本表为池内触碰与旧交付的历史记录，不决定消费准入；校验结果不是当前健康保证。消费冷却、品质验证和选择全部由客户端执行。</p>
+    <p class="foot">新交付不写消费槽位，不根据旧槽位的183秒窗口、退避或交付次数拦截。路由 Cookie 不互斥，同一张可交给不同成员。</p>
   </div>
 </section>
 
@@ -438,11 +448,9 @@
             <details><summary>目标如何计算</summary><p class="foot">取「近期最忙消费者需求＋富余」「最低目标」「已知可恢复网关数」的较大者，封顶190（实现上限，不是上游全集）。先补缺失已知网关，再续临期票；有需求且至少两个可用账号才维护，始终受预算限制。</p></details>
           </fieldset>
           <fieldset class="setting-group">
-            <legend>交付验证</legend>
-            <label class="choice setting-toggle"><input type="checkbox" name="verify_full_at_deliver" value="1"{{if .VerifyFullAtDeliver}} checked{{end}}><span>池端交付前验证<span class="hint">用消费者凭据做state-echo；关闭时交付标记为未验证，客户端保护独立。</span></span></label>
-            <label>单次交付候选上限 <span class="hint">0 = 默认2；表单最高10。</span>
-              <div class="input-unit"><input type="number" min="0" max="10" name="max_tries_per_deliver" value="{{.MaxTriesPerDeliver}}"><span>个网关</span></div></label>
-            <details><summary>请求成本与边界</summary><p class="foot">候选验证通常需要取state＋echo两发；已有可用state时可能只需一发。现铸另计，均受相同预算限制。验证提前开始接触计时；开启池端验证后不能把已验证交付作为“未使用”归还。匿名路径无消费者凭据，不能执行该验证。</p></details>
+            <legend>客户端调度</legend>
+            <p class="foot">所有 Key 通过 /cookie 明确点名取票。选择、品质验证、冷却和重试均由 Sub2api 负责；池端不替消费者铸票或验证。</p>
+            <p class="foot">每个完整成员标识共享滚动限频：12 次/秒、444 次/分钟；跨 Key 合并，缺票请求也计数。超限返回 429 与 Retry-After。</p>
           </fieldset>
           <fieldset class="setting-group">
             <legend>公开访问</legend>

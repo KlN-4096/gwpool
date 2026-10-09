@@ -19,7 +19,7 @@ func TestOwnerKeySurvivesCredentialChangesButRequiresOneActiveCredential(t *test
 	if key == "" || key == owner.Token || key == srv.OwnerKeyFor(st.owners[1]) {
 		t.Fatal("owner keys must be independent stable machine credentials")
 	}
-	request := func() *http.Request { return authed(httptest.NewRequest("GET", "/gateways", nil), key) }
+	request := func() *http.Request { return authed(httptest.NewRequest("GET", "/gateways?account=member", nil), key) }
 	first, ok := srv.resolveCaller(request())
 	if !ok || first.acct.ID != 1 || first.reporterID() != -owner.ID {
 		t.Fatal("owner key did not resolve")
@@ -145,7 +145,7 @@ func TestOwnerKeyWorksAfterRealStoreRestart(t *testing.T) {
 	if key != after.OwnerKeyFor(reopened.Owners()[0]) {
 		t.Fatal("owner key changed on restart")
 	}
-	response := do(after.Handler(), authed(httptest.NewRequest("GET", "/gateways", nil), key))
+	response := do(after.Handler(), authed(httptest.NewRequest("GET", "/gateways?account=member", nil), key))
 	if response.Code != http.StatusOK {
 		t.Fatal("saved owner key failed HTTP authentication after restart", response.Code)
 	}

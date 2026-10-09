@@ -21,7 +21,7 @@ func TestGatewayPriorityFreshListAndDeliveryCountry(t *testing.T) {
 				Source: "foreground", Outcome: "full", At: time.Now()}})
 	}
 	read := func() int {
-		w := do(handler, authed(httptest.NewRequest("GET", "/gateways?model=luna", nil), key))
+		w := do(handler, authed(httptest.NewRequest("GET", "/gateways?account=member&model=luna", nil), key))
 		if w.Code != 200 {
 			t.Fatal(w.Code, w.Body.String())
 		}

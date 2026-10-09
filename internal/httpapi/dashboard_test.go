@@ -152,8 +152,8 @@ func TestDashboardSettingsFixture(t *testing.T) {
 		t.Fatal(admin.Body.String())
 	}
 	for _, field := range []string{"models", "public_base_url", "models_extra", "upstream_per_region_hour",
-		"upstream_per_account_hour", "slot_cooldown_minutes", "max_tries_per_deliver", "spare_target",
-		"min_pairs", "min_accounts", "public_enabled", "renew_pairs", "verify_full_at_deliver",
+		"upstream_per_account_hour", "slot_cooldown_minutes", "spare_target",
+		"min_pairs", "min_accounts", "public_enabled", "renew_pairs",
 		"public_requests_per_minute", "public_max_concurrent", "public_max_queued", "public_queue_wait_ms"} {
 		if !strings.Contains(admin.Body.String(), `name="`+field+`"`) {
 			t.Errorf("setting lost: %s", field)
@@ -161,7 +161,7 @@ func TestDashboardSettingsFixture(t *testing.T) {
 	}
 	values := url.Values{"models": cfg.Models, "spare_target": {"20"}, "min_pairs": {"90"},
 		"renew_pairs": {"1"}, "upstream_per_region_hour": {"2"}, "upstream_per_account_hour": {"50"},
-		"slot_cooldown_minutes": {"240"}, "max_tries_per_deliver": {"2"}, "min_accounts": {"2"}}
+		"slot_cooldown_minutes": {"240"}, "min_accounts": {"2"}}
 	request := httptest.NewRequest(http.MethodPost, "/admin/config", strings.NewReader(values.Encode()))
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if err := request.ParseForm(); err != nil {
@@ -170,8 +170,13 @@ func TestDashboardSettingsFixture(t *testing.T) {
 	changes, err := configChanges(request, cfg)
 	if err != nil || changes["spare_target"] != 20 || changes["min_pairs"] != 90 ||
 		changes["renew_pairs"] != true || changes["slot_cooldown_minutes"] != 240 ||
-		changes["upstream_per_account_hour"] != 50 || changes["verify_full_at_deliver"] != false {
+		changes["upstream_per_account_hour"] != 50 {
 		t.Fatalf("grouped form changed settings: %v %v", changes, err)
+	}
+	for _, retired := range []string{"verify_full_at_deliver", "max_tries_per_deliver"} {
+		if strings.Contains(admin.Body.String(), `name="`+retired+`"`) || changes[retired] != nil {
+			t.Fatalf("retired consumer setting remains: %s", retired)
+		}
 	}
 	if dir := os.Getenv("GWPOOL_PREVIEW_DIR"); dir != "" {
 		if err := os.MkdirAll(dir, 0700); err != nil {

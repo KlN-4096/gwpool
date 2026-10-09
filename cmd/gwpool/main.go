@@ -152,8 +152,7 @@ func run(path string, log *slog.Logger) error {
 	srv := &http.Server{
 		Addr:    cfg.Listen,
 		Handler: api.Handler(),
-		// 刻意不设 WriteTimeout：一次 /cookie 要真打上游铸票 + state-echo，
-		// 实测 20~90 s，设了就会把正常交付切断。只拦慢读头。
+		// 上传/管理操作可能等待上游，保留原写超时策略；取票只读库存。
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}

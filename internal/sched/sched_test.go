@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,30 +86,6 @@ func (f *fakeStore) Gateways() map[string]types.Gateway {
 		out[k] = v
 	}
 	return out
-}
-
-// 照 store.LongestRestedSlot 的语义实现：没记录的优先，退避中的跳过。
-func (f *fakeStore) LongestRestedSlot(accountID int64, candidates []string) (types.Slot, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	now := f.clk.now()
-	names := append([]string(nil), candidates...)
-	sort.Strings(names)
-	var best types.Slot
-	found := false
-	for _, gw := range names {
-		sl, ok := f.slots[slotKey(accountID, gw)]
-		if !ok {
-			sl = types.Slot{AccountID: accountID, Gateway: gw, LastVerdict: "unknown"}
-		}
-		if now.Before(sl.BackoffUntil) {
-			continue
-		}
-		if !found || sl.LastTouch.Before(best.LastTouch) {
-			best, found = sl, true
-		}
-	}
-	return best, found
 }
 
 // Slot 只给用例自己断言用，不在 sched.Store 接口里。
@@ -672,10 +647,8 @@ func rig(t *testing.T, mode types.Mode) (*Scheduler, *fakeStore, *fakeMinter, *c
 		seedGateway(st, mn, gw, i, 1)
 		mn.full[gw] = true
 	}
-	// 这组用例测的是**交付前验满血打开**那条路。它默认关（见 config.Config 的字段
-	// 注释），默认那条路由 TestDeliverWithoutVerifyNeverEchoes 盯着。
 	s := New(st, mn, Options{Mode: mode, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(func(c *config.Config) { c.VerifyFullAtDeliver = true })})
+		Live: liveCfg(nil)})
 	return s, st, mn, clk
 }
 
@@ -687,10 +660,6 @@ func liveCfg(set func(*config.Config)) *config.Live {
 	}
 	return config.NewLive("", c)
 }
-
-// verifyOn / legacyOn 是 liveCfg 的两个常用改法。
-// 两个开关都默认关，所以「测的是开着那条路」的用例要自己打开。
-func verifyOn(c *config.Config) { c.VerifyFullAtDeliver = true }
 
 // seedPairs 给每个已知网关一张新鲜的 pair。
 //
@@ -719,167 +688,41 @@ func addAccount(st *fakeStore, id int64, upstream string) {
 
 func mustDeliver(t *testing.T, s *Scheduler, acctID int64, hint string) types.Delivery {
 	t.Helper()
-	d, err := s.Deliver(context.Background(), acctID, Request{Gateway: hint})
+	d, err := s.DeliverAnonymous(context.Background(), fmt.Sprint(acctID), Request{Gateway: hint}, true)
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	return d
 }
 
+// backgroundMint follows the same account lock, reservation and SID ordering as
+// inventory work. Consumer requests must never use this path.
+func backgroundMint(ctx context.Context, s *Scheduler, id int64, want string) (minted, error) {
+	unlock := s.st.LockAccount(id)
+	defer unlock()
+	a, ok := s.account(id)
+	if !ok {
+		return minted{}, ErrAccountUnusable
+	}
+	r := types.Regions[0]
+	ctx, err := s.beginAttempt(ctx, a, r.Exit)
+	if err != nil {
+		return minted{}, err
+	}
+	sid, pair, err := s.premintSID(r.Key)
+	if err != nil {
+		return minted{}, err
+	}
+	return s.mintOnceFor(ctx, a, r.Exit, sid, pair, want, "", types.PurposeInventory)
+}
+
 // ---------- 用例 ----------
-
-// 取的必须是歇得最久的那个槽位，而不是随便一个网关。
-func TestDeliverPicksLongestRested(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedPairs(st, clk)
-	now := clk.now()
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now.Add(-time.Hour)}
-	st.slots[slotKey(1, "unified-2")] = types.Slot{AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-3 * time.Hour)}
-	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3", LastTouch: now.Add(-2 * time.Hour)}
-
-	d := mustDeliver(t, s, 1, "")
-	if d.Gateway != "unified-2" {
-		t.Fatalf("交付了 %s，应该是歇了 3 小时的 unified-2", d.Gateway)
-	}
-	if !d.VerifiedFull || d.ValidForS != 150 {
-		t.Fatalf("交付字段不对: %+v", d)
-	}
-	if got := d.ExpiresAt.Sub(now); got != types.DeliverTTL {
-		t.Fatalf("有效期 %v，应为 %v", got, types.DeliverTTL)
-	}
-	// 单账号模式一个网关只打一发（那一发既建 pair 又是首次接触），加一发 echo。
-	if got := mn.mintedGateways(); len(got) != 1 || got[0] != "unified-2" {
-		t.Fatalf("铸票流水 %v，应只有一发打在 unified-2", got)
-	}
-	if mn.echoes != 1 {
-		t.Fatalf("state-echo 打了 %d 发，应为 1（不能当持续闸门）", mn.echoes)
-	}
-	// 交付后该槽位已被烧过：窗口过完之后必须换成次久的那个。
-	// （窗口**之内**再问是原样再发同一张，见 TestRedeliverWithinWindow。）
-	clk.add(types.DeliverTTL + time.Second)
-	if d2 := mustDeliver(t, s, 1, ""); d2.Gateway != "unified-3" {
-		t.Fatalf("第二次交付 %s，应轮到 unified-3", d2.Gateway)
-	}
-}
-
-// 没有触碰记录的槽位（从没碰过）优先级最高。
-func TestNeverTouchedWinsOverRested(t *testing.T) {
-	s, st, _, clk := rig(t, types.ModeSingle)
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: clk.now().Add(-99 * time.Hour)}
-	delete(st.gws, "unified-3")
-	seedPairs(st, clk)
-	// unified-2 没有任何记录 ⇒ 零值 LastTouch ⇒ 比歇了 99 小时的还靠前。
-	if d := mustDeliver(t, s, 1, ""); d.Gateway != "unified-2" {
-		t.Fatalf("交付 %s，从未触碰的 unified-2 该优先", d.Gateway)
-	}
-}
-
-// 判降级就换下一个槽位，不交付降智的东西。
-func TestDegradedFallsThrough(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedPairs(st, clk)
-	now := clk.now()
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now.Add(-time.Hour)}
-	st.slots[slotKey(1, "unified-2")] = types.Slot{AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-3 * time.Hour)}
-	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3", LastTouch: now.Add(-2 * time.Hour)}
-	mn.full["unified-2"] = false
-
-	d := mustDeliver(t, s, 1, "")
-	if d.Gateway != "unified-3" {
-		t.Fatalf("交付 %s，unified-2 降级后应换 unified-3", d.Gateway)
-	}
-	if sl, _ := st.Slot(1, "unified-2"); sl.LastVerdict != "degraded" || !sl.BackoffUntil.After(now) {
-		t.Fatalf("降级槽位没被标记/退避: %+v", sl)
-	}
-	if sl, _ := st.Slot(1, "unified-3"); sl.LastVerdict != "full" {
-		t.Fatalf("交付的槽位应记 full: %+v", sl)
-	}
-}
-
-// 全部降级 ⇒ ErrNoFullSlot（HTTP 层映射成 503）。宁可 503 也不放降智。
-func TestAllDegradedReturnsNoFullSlot(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedPairs(st, clk)
-	// 默认只试 2 个（每试一个都要花一发上游），这里要看「三个都试过」所以放开。
-	s.opt.MaxTriesPerDeliver = 3
-	for gw := range st.gws {
-		mn.full[gw] = false
-	}
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err = %v，应为 ErrNoFullSlot", err)
-	}
-	// 三个槽位都该试过一遍，都该进退避。
-	if got := len(mn.mintedGateways()); got != 3 {
-		t.Fatalf("试了 %d 个槽位，应为 3", got)
-	}
-	for gw := range st.gws {
-		if sl, _ := st.Slot(1, gw); sl.BackoffUntil.IsZero() {
-			t.Fatalf("%s 没进退避: %+v", gw, sl)
-		}
-	}
-}
-
-// 铸票本身失败（HTTP 非 200 之类）也要退避，不能快重试。
-func TestMintFailureBacksOff(t *testing.T) {
-	s, st, mn, _ := rig(t, types.ModeSingle)
-	mn.mintErr = errors.New("socks5 连不上")
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err = %v，应为 ErrNoFullSlot", err)
-	}
-	if mn.echoes != 0 {
-		t.Fatalf("铸票都失败了还 echo 了 %d 发", mn.echoes)
-	}
-	if sl, _ := st.Slot(1, "unified-1"); sl.BackoffUntil.IsZero() {
-		t.Fatal("铸票失败的槽位没进退避")
-	}
-}
-
-// 硬失败的退避必须翻倍且封顶在 backoffMax。
-func TestBackoffDoublesAndCaps(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	mn.mintErr = errors.New("socks5 连不上")
-	// 按常量算，别把数字写死：封顶值 2026-10-01 从 20 分钟压到 1 分钟，
-	// 写死的话这个测试只会在改常量时红一次，证明不了「翻倍 + 封顶」这件事本身。
-	want := []time.Duration{backoffBase, 2 * backoffBase, 4 * backoffBase,
-		backoffMax, backoffMax}
-	for i, w := range want {
-		at := clk.now()
-		if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
-			t.Fatalf("第 %d 轮 err = %v", i, err)
-		}
-		sl, _ := st.Slot(1, "unified-1")
-		if got := sl.BackoffUntil.Sub(at); got != w {
-			t.Fatalf("第 %d 轮退避 %v，应为 %v", i, got, w)
-		}
-		// 等退避过期**再加一个满血窗口**：失败那一发按保守方向记了触碰
-		// （mintOnce 读不出落点时按想去的地方记），而窗口闸会把这个槽位按住
-		// types.FullWindow —— 不等它过去的话下一轮根本走不到铸票，
-		// 退避也就不会翻倍（见 coolingSet 闸 2）。
-		clk.add(types.FullWindow + w + time.Second)
-	}
-	// 退避期内不该再选它：唯一候选在退避中 ⇒ 直接 ErrNoFullSlot，一发都不打。
-	before := len(mn.mintedGateways())
-	s.bumpBackoff(1, "unified-1")
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err = %v", err)
-	}
-	if after := len(mn.mintedGateways()); after != before {
-		t.Fatalf("退避期内还打了 %d 发", after-before)
-	}
-	// 交付成功要把退避清零，否则一次误判会越积越长。
-	mn.mintErr = nil
-	clk.add(backoffMax + time.Second)
-	mustDeliver(t, s, 1, "unified-1")
-	if sl, _ := st.Slot(1, "unified-1"); !sl.BackoffUntil.IsZero() {
-		t.Fatalf("成功后退避没清零: %+v", sl)
-	}
-}
 
 // 单账号模式绝不保温：保温那一发恰好烧掉自己要用的窗口。
 func TestSingleModeNeverWarms(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	addAccount(st, 2, "acct-2")
-	mustDeliver(t, s, 1, "") // 制造「有需求」
+	s.markDemand()
 	st.pairs = map[string]types.Pair{}
 	s.opt.WarmInterval = time.Millisecond
 
@@ -947,63 +790,6 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	}
 }
 
-// 多账号模式：扫描账号保温，消费账号只打属于自己的那一发首次接触。
-// 并且「上游没下发新 __oailb」不算失败（SPEC 红线 3）。
-func TestPoolModeConsumerMintsOwnTicket(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	mn.noNewPair = true // 带 pair 打进去，上游接受、不换 cookie
-	st.accounts = []types.Account{
-		// 角色一律 both：产品规则是「上传了凭据的就能用池子」。
-		// 谁保温谁消费由调用方传的 accountID 决定，不由 Role 决定。
-		{ID: 1, Label: "甲", Enabled: true,
-			Creds: types.Creds{AccessToken: "s", AccountID: "acct-1"}},
-		{ID: 2, Label: "乙", Enabled: true,
-			Creds: types.Creds{AccessToken: "c", AccountID: "acct-2"}},
-	}
-	st.gws["unified-9"] = types.Gateway{Name: "unified-9", FirstSeenBy: 1, ReachableExits: []types.Exit{{Region: "ES"}}}
-	landBare(mn, "unified-9") // 池子里只有这一个网关，裸铸从哪个区域出发都该落到它
-	mn.full["unified-9"] = true
-	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(verifyOn)})
-
-	d := mustDeliver(t, s, 2, "")
-	if d.Gateway != "unified-9" || d.Cookie != cookiePrefix+"unified-9" {
-		t.Fatalf("交付内容不对: %+v", d)
-	}
-	// 第一发是扫描账号建 pair，第二发是消费账号的首次接触。
-	mn.mu.Lock()
-	calls := append([]types.Sample(nil), mn.mints...)
-	mn.mu.Unlock()
-	if len(calls) != 2 || calls[0].AccountID != 1 || calls[1].AccountID != 2 {
-		t.Fatalf("铸票流水应为 [扫描账号, 消费账号]，实为 %+v", calls)
-	}
-	// 窗口烧在各自的槽位上，不要串账。
-	if sl, ok := st.Slot(1, "unified-9"); !ok || sl.LastTouch.IsZero() {
-		t.Fatalf("扫描账号的槽位没记触碰: %+v", sl)
-	}
-	if sl, _ := st.Slot(2, "unified-9"); sl.LastVerdict != "full" {
-		t.Fatalf("消费账号的槽位应记 full: %+v", sl)
-	}
-	// 窗口内再要一次：原样再发同一张，**谁都不劳烦**（一发上游都不打）。
-	again := mustDeliver(t, s, 2, "")
-	if again.Gateway != d.Gateway || again.Cookie != d.Cookie {
-		t.Fatalf("窗口内重复请求没拿到同一张: %+v", again)
-	}
-	mn.mu.Lock()
-	n := len(mn.mints)
-	mn.mu.Unlock()
-	if n != 2 {
-		t.Fatalf("窗口内重复请求又打了上游，流水共 %d 发", n)
-	}
-	// 窗口过完：这个 (账号 × 网关) 进冷却，而池子里只有这一个网关 ⇒ 老实 503。
-	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.Deliver(context.Background(), 2, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("窗口过完、唯一的网关在冷却里，却还发得出票: %v", err)
-	}
-}
-
 // 单账号并发硬性 1：这是已知的封号主因，不能靠全局信号量糊过去。
 func TestOneInFlightPerAccount(t *testing.T) {
 	s, _, mn, _ := rig(t, types.ModeSingle)
@@ -1013,7 +799,7 @@ func TestOneInFlightPerAccount(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = s.Deliver(context.Background(), 1, Request{})
+			_, _ = backgroundMint(context.Background(), s, 1, "")
 		}()
 	}
 	wg.Wait()
@@ -1050,7 +836,7 @@ func driftRig(t *testing.T, from, to string) (*Scheduler, *fakeStore, *fakeMinte
 func TestNamedGatewayDriftIsFailure(t *testing.T) {
 	s, st, _, _ := driftRig(t, "unified-1", "unified-77")
 
-	_, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"})
+	_, err := backgroundMint(context.Background(), s, 1, "unified-1")
 	if !errors.Is(err, ErrMintFailed) || !strings.Contains(err.Error(), "落点漂移") {
 		t.Fatalf("err = %v，点名网关时漂移该是 ErrMintFailed 且说清是漂移", err)
 	}
@@ -1068,82 +854,25 @@ func TestNamedGatewayDriftIsFailure(t *testing.T) {
 func TestUnnamedDriftDeliversWhereItLanded(t *testing.T) {
 	s, st, _, clk := driftRig(t, "unified-1", "unified-77")
 
-	d, err := s.Deliver(context.Background(), 1, Request{})
+	got, err := backgroundMint(context.Background(), s, 1, "")
 	if err != nil {
 		t.Fatalf("没点名网关时漂移不该算失败: %v", err)
 	}
+	d := got.pair
 	if d.Gateway != "unified-77" {
-		t.Fatalf("交付了 %s，抽签抽到的是 unified-77", d.Gateway)
+		t.Fatalf("铸到了 %s，抽签抽到的是 unified-77", d.Gateway)
 	}
 	// 账本两条：pair 落在实际落点上，交付时刻也记在那一行。
 	if p, ok := st.Pair("unified-77"); !ok || p.Cookie != d.Cookie {
 		t.Fatalf("pair 没落在实际落点上: %+v", p)
 	}
-	if sl, ok := st.Slot(1, "unified-77"); !ok || sl.LastDeliver.IsZero() {
-		t.Fatalf("交付没记在实际落点的槽位上: %+v", sl)
+	if sl, ok := st.Slot(1, "unified-77"); !ok || sl.LastTouch.IsZero() || !sl.LastDeliver.IsZero() {
+		t.Fatalf("铸票应只记录实际落点触碰: %+v", sl)
 	}
 	if sl, ok := st.Slot(1, "unified-1"); ok && !sl.LastDeliver.IsZero() {
 		t.Fatalf("交付记到了想去的那个网关上: %+v", sl)
 	}
 	_ = clk
-}
-
-// B-2：漂到调用方**明确排除**的网关上时不许交付。
-//
-// exclude 编码的是「我自己烧过这个」——池子账本上没有记录，两条冷却闸都看不见。
-// 换票（force + exclude_versions 把有票的网关全排掉）正好最常落到这一格，
-// 于是客户端拿回一张自己刚烧过的落点，而验证默认关 ⇒ 无从察觉。
-func TestUnnamedDriftRespectsExclude(t *testing.T) {
-	s, st, _, _ := driftRig(t, "unified-1", "unified-77")
-
-	_, err := s.Deliver(context.Background(), 1, Request{Exclude: map[string]bool{"unified-77": true}})
-	if !errors.Is(err, ErrNoLivePair) {
-		t.Fatalf("err = %v，漂到被排除的网关上该拒发（而且归成等得起的那一格）", err)
-	}
-	// 票照旧留在池里：白来的供给别扔，只是不发给**他**。
-	if _, ok := st.Pair("unified-77"); !ok {
-		t.Fatal("拒发不等于扔掉这张票")
-	}
-}
-
-// 槽位是 (账号 × 网关)：给 A 算出来的不能发给 B。
-func TestDeliverIsPerAccount(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	st.accounts = []types.Account{
-		{ID: 1, Label: "A", Enabled: true,
-			Creds: types.Creds{AccessToken: "a", AccountID: "acct-1"}},
-		{ID: 2, Label: "B", Enabled: true,
-			Creds: types.Creds{AccessToken: "b", AccountID: "acct-2"}},
-	}
-	for i, gw := range []string{"unified-1", "unified-2"} {
-		seedGateway(st, mn, gw, i, 1)
-		mn.full[gw] = true
-	}
-	// 两个网关都铺上活票：这一条测的是**挑选**按 (账号 × 网关) 走，不是铸票。
-	// 不铺票会掉进回落铸票，而那条路的落点由区域定、根本不看候选集，测的就不是这件事了。
-	seedPairs(st, clk)
-	// A 刚烧过 1，B 刚烧过 2 ⇒ 两个人该拿到相反的网关。
-	now := clk.now()
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
-	st.slots[slotKey(2, "unified-2")] = types.Slot{AccountID: 2, Gateway: "unified-2", LastTouch: now}
-	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(verifyOn)})
-
-	if d := mustDeliver(t, s, 1, ""); d.Gateway != "unified-2" {
-		t.Fatalf("A 拿到 %s，它刚烧过 unified-1，应给 unified-2", d.Gateway)
-	}
-	if d := mustDeliver(t, s, 2, ""); d.Gateway != "unified-1" {
-		t.Fatalf("B 拿到 %s，它刚烧过 unified-2，应给 unified-1", d.Gateway)
-	}
-	// 各走各的账本，不串号。
-	if sl, _ := st.Slot(1, "unified-2"); sl.LastVerdict != "full" {
-		t.Fatalf("A 的槽位没记上: %+v", sl)
-	}
-	if sl, _ := st.Slot(2, "unified-1"); sl.LastVerdict != "full" {
-		t.Fatalf("B 的槽位没记上: %+v", sl)
-	}
 }
 
 // 剩余不足 DeliverFloor 的 pair 不能直接交付，要**裸铸**一张顶上。
@@ -1158,7 +887,7 @@ func TestStalePairIsRemintedNotRenewed(t *testing.T) {
 		Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
 		ExpiresAt: clk.now().Add(types.DeliverFloor - time.Minute), MintedBy: 1,
 	}
-	d := mustDeliver(t, s, 1, "")
+	s.premintBare(context.Background(), 1)
 	if n := len(mn.mintedGateways()); n != 1 {
 		t.Fatalf("该现铸一发顶上，实际打了 %d 发", n)
 	}
@@ -1166,135 +895,9 @@ func TestStalePairIsRemintedNotRenewed(t *testing.T) {
 	if p.ExpiresAt.Sub(clk.now()) < types.DeliverFloor {
 		t.Fatalf("续期后的 pair 剩余 %v，不够 DeliverFloor", p.ExpiresAt.Sub(clk.now()))
 	}
-	if d.Cookie != p.Cookie {
-		t.Fatal("交付的应是续期后的那张 cookie")
-	}
-}
-
-// 没有可用消费账号时要明确报错，不要拿空凭据去打上游。
-// 不存在 / 已停用 / 没凭据的账号都不能交付：state-echo 要用它自己的凭据打一发。
-func TestDeliverRejectsUnusableAccount(t *testing.T) {
-	s, st, _, _ := rig(t, types.ModeSingle)
-	st.accounts = append(st.accounts,
-		types.Account{ID: 2, Label: "停用", Enabled: false,
-			Creds: types.Creds{AccessToken: "x", AccountID: "acct-2"}},
-		types.Account{ID: 3, Label: "只回报", Enabled: true,
-			Creds: types.Creds{AccountID: "acct-3"}})
-	// 必须是**有 sentinel 的**那个错：没有它的话这件事掉进 no_live_pair，
-	// 于是运营方逐个启号来验时拿到「稍后再试」+ 挂满 wait + 白排一次发现扫描，
-	// 而真实原因是那个号本身（见 httpapi 的 classify）。
-	for _, id := range []int64{0, 2, 3, 99} {
-		_, err := s.Deliver(context.Background(), id, Request{})
-		if !errors.Is(err, ErrAccountUnusable) {
-			t.Fatalf("账号 %d: err=%v，应为 ErrAccountUnusable", id, err)
-		}
-	}
-	// 停用理由要带出来：「手动暂停」和「凭据已死」要做的事完全不同。
-	if err := s.st.DisableAccount(2, "铸票 HTTP 401：token_revoked"); err != nil {
-		t.Fatal(err)
-	}
-	_, err := s.Deliver(context.Background(), 2, Request{})
-	if err == nil || !strings.Contains(err.Error(), "token_revoked") {
-		t.Fatalf("停用理由没带出来: %v", err)
-	}
 }
 
 // ---------- 审查回归用例 ----------
-
-// B1：有效期必须从**首次接触**起算。铸票 + echo 的往返不能白算进满血窗口。
-func TestExpiryRunsFromFirstContact(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	delete(st.gws, "unified-2")
-	delete(st.gws, "unified-3")
-	mn.mintCost = 60 * time.Second // 一发 60 s 往返，接近实测上限
-
-	start := clk.now()
-	d := mustDeliver(t, s, 1, "")
-	if want := start.Add(types.DeliverTTL); !d.ExpiresAt.Equal(want) {
-		t.Fatalf("ExpiresAt=%v，应为首次接触 %v + %v = %v", d.ExpiresAt, start, types.DeliverTTL, want)
-	}
-	// 往返已经吃掉 60 s，剩余只有 90 s，不能还写 150。
-	if d.ValidForS != 90 {
-		t.Fatalf("valid_for_s=%d，往返 60 s 后应为 90", d.ValidForS)
-	}
-	if left := d.ExpiresAt.Sub(clk.now()); left > types.FullWindow {
-		t.Fatalf("交付期 %v 超出了满血窗口 %v", left, types.FullWindow)
-	}
-}
-
-// B1 续：往返把窗口吃到不够用，这个槽位就该算失败，不许发一张马上过期的。
-func TestExhaustedWindowIsNotDelivered(t *testing.T) {
-	s, st, mn, _ := rig(t, types.ModeSingle)
-	delete(st.gws, "unified-2")
-	delete(st.gws, "unified-3")
-	mn.mintCost = 140 * time.Second // 剩 10 s，低于 minDeliverWindow
-
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v，窗口烧光了还交付", err)
-	}
-}
-
-// B2：两个账号并发交付时互为铸票者，嵌套持锁就是 ABBA 死锁，必须都能返回。
-func TestNoDeadlockBetweenAccounts(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	mn.delay = 10 * time.Millisecond
-	addAccount(st, 1, "acct-1")
-	addAccount(st, 2, "acct-2")
-	// 两个网关各有一张快过期的 pair，分别由对方铸的 ⇒ minterFor 会交叉选人：
-	// A 的铸票者是 2、B 的铸票者是 1。
-	for i, gw := range []string{"unified-1", "unified-2"} {
-		seedGateway(st, mn, gw, i, int64(i+1))
-		mn.full[gw] = true
-		st.pairs[gw] = types.Pair{Gateway: gw, Cookie: cookiePrefix + gw,
-			ExpiresAt: clk.now().Add(time.Minute), MintedBy: int64(2 - i)}
-	}
-	// 两个号各刚烧过一个网关 ⇒ 冷却过滤让他们挑到**不同**的网关。
-	// 不铺这两行的话两个人会挑同一个，然后第二个卡在网关锁上根本走不到账号锁，
-	// 屏障永远等不满——测不出 ABBA，只测出「网关锁确实是串行的」。
-	now := clk.now()
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
-	st.slots[slotKey(2, "unified-2")] = types.Slot{AccountID: 2, Gateway: "unified-2", LastTouch: now}
-	// 票全低于交付门槛 ⇒ 两路都走回落铸票，而那条路按**区域**单飞：撞上同一个区域的那一路
-	// 会被当场挡回去，于是它根本走不到账号锁、屏障等不满 —— 和上面「挑到不同网关」同一个
-	// 道理，换成区域再说一遍。铸票者是交叉的（1 号的是 2、2 号的是 1，各自只剩对方可选），
-	// 给 2 号的 us-east 记一笔 ⇒ 它改挑 us-west(→unified-2)，1 号仍挑 us-east(→unified-1)，
-	// 正好各自落在**对方**烧过的那个上，两路都能走完 finish，ABBA 才真的有得可死。
-	if err := st.NoteRegionMint(2, "us-east", "", now); err != nil {
-		t.Fatal(err)
-	}
-	// 确定性屏障：两个 goroutine 都拿到**第一把**锁之后才放行，
-	// 嵌套持锁的实现到这一步必然互等。靠 sleep 撞时序是撞不出来的。
-	barrier := make(chan struct{})
-	var arrived int32
-	st.afterLock = func(int64) {
-		if k := atomic.AddInt32(&arrived, 1); k <= 2 {
-			if k == 2 {
-				close(barrier)
-			}
-			<-barrier
-		}
-	}
-	// 开着验证才有「铸票者锁 → 消费者锁」这两段，ABBA 才有得可死。
-	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(verifyOn)})
-
-	done := make(chan error, 2)
-	for _, id := range []int64{1, 2} {
-		go func(id int64) {
-			_, err := s.Deliver(context.Background(), id, Request{})
-			done <- err
-		}(id)
-	}
-	for i := 0; i < 2; i++ {
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("并发交付死锁了：3 秒内没返回")
-		}
-	}
-}
 
 // S-2：交付的回落路径**不带**那张快到点的 pair 去续，改成裸铸。
 //
@@ -1312,7 +915,7 @@ func TestFallbackMintGoesBareNotRenew(t *testing.T) {
 		Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
 		ExpiresAt: clk.now().Add(30 * time.Second), MintedBy: 1,
 	}
-	d, err := s.Deliver(context.Background(), 1, Request{})
+	got, err := backgroundMint(context.Background(), s, 1, "")
 	if err != nil {
 		t.Fatalf("回落该裸铸出一张新票，却 %v", err)
 	}
@@ -1324,8 +927,8 @@ func TestFallbackMintGoesBareNotRenew(t *testing.T) {
 	if left := st.pairs["unified-1"].ExpiresAt.Sub(clk.now()); left < types.DeliverFloor {
 		t.Fatalf("裸铸之后 pair 只剩 %v，没拿回新的 65 分钟票", left)
 	}
-	if d.ValidForS <= 0 {
-		t.Fatalf("交付的有效期不对: %+v", d)
+	if got.pair.Cookie == "" {
+		t.Fatal("后台裸铸没有返回票")
 	}
 }
 
@@ -1333,15 +936,16 @@ func TestFallbackMintGoesBareNotRenew(t *testing.T) {
 // 这条是 2026-10-01 实测的结论（两个号真并发带同一张票各打一发，4/4 都 200、
 // 都没被换路由），详见 types.Pair 的注释。曾经的租约互斥就是按这个结论删掉的。
 func TestPairIsSharedAcrossConsumers(t *testing.T) {
-	s, st, _, _ := rig(t, types.ModeSingle)
+	s, st, _, clk := rig(t, types.ModeSingle)
 	addAccount(st, 2, "acct-2")
 	delete(st.gws, "unified-2")
 	delete(st.gws, "unified-3")
+	seedPairs(st, clk)
 	var buf bytes.Buffer
 	s.opt.Log = slog.New(slog.NewTextHandler(&buf, nil))
 
-	a := mustDeliver(t, s, 1, "")
-	b := mustDeliver(t, s, 2, "")
+	a := mustDeliver(t, s, 1, "unified-1")
+	b := mustDeliver(t, s, 2, "unified-1")
 	if a.Gateway != "unified-1" || b.Gateway != "unified-1" {
 		t.Fatalf("唯一的网关没能同时发给两个号: %s / %s", a.Gateway, b.Gateway)
 	}
@@ -1349,7 +953,7 @@ func TestPairIsSharedAcrossConsumers(t *testing.T) {
 		t.Fatalf("两个号拿到的不是同一张票: %q / %q", a.Cookie, b.Cookie)
 	}
 	// 同一个号再要一次也照样拿得到：没有任何东西在互斥。
-	if again := mustDeliver(t, s, 1, ""); again.Gateway != "unified-1" {
+	if again := mustDeliver(t, s, 1, "unified-1"); again.Gateway != "unified-1" {
 		t.Fatalf("A 第二次拿到了 %s", again.Gateway)
 	}
 	if log := buf.String(); strings.Contains(log, "池子深度不足") {
@@ -1357,49 +961,11 @@ func TestPairIsSharedAcrossConsumers(t *testing.T) {
 	}
 }
 
-// S1：调用方自己断了，不该把好槽位打进退避。
-func TestClientCancelDoesNotBackoff(t *testing.T) {
-	s, st, mn, _ := rig(t, types.ModeSingle)
-	mn.mintErr = context.Canceled
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := s.Deliver(ctx, 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v", err)
-	}
-	for gw := range st.gws {
-		if sl, _ := st.Slot(1, gw); !sl.BackoffUntil.IsZero() {
-			t.Fatalf("%s 因为调用方断连进了退避: %+v", gw, sl)
-		}
-	}
-	// 而且断了就别再往下试其它槽位了，白烧供给。
-	if n := len(mn.mintedGateways()); n != 0 {
-		t.Fatalf("调用方已断还打了 %d 发", n)
-	}
-}
-
-// S2：判降级只歇一个满血窗口，不进指数——那个判据有假阴。
-func TestDegradedUsesShortHold(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	mn.full["unified-1"] = false
-	for i := 0; i < 3; i++ {
-		at := clk.now()
-		if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
-			t.Fatalf("第 %d 轮 err=%v", i, err)
-		}
-		sl, _ := st.Slot(1, "unified-1")
-		if got := sl.BackoffUntil.Sub(at); got != types.FullWindow {
-			t.Fatalf("第 %d 轮降级退避 %v，应恒为一个满血窗口 %v", i, got, types.FullWindow)
-		}
-		clk.add(types.FullWindow + time.Second)
-	}
-}
-
 // S6：铸票超时也要记触碰——请求可能已经出站，窗口已经烧了。
 func TestMintErrorStillRecordsTouch(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("i/o timeout")
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := backgroundMint(context.Background(), s, 1, "unified-1"); err == nil {
 		t.Fatalf("err=%v", err)
 	}
 	sl, ok := st.Slot(1, "unified-1")
@@ -1464,7 +1030,6 @@ func anonRig(t *testing.T, n, accts, min int) (*Scheduler, *fakeStore, *clock, *
 	// 开关和门槛在**配置**里，不在 Options：Public() 现读它，于是管理页改完立即生效。
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) {
-			c.VerifyFullAtDeliver = true
 			c.PublicWhenSurplus.Enabled = true
 			c.PublicWhenSurplus.MinAccounts = min
 		}),
@@ -1478,40 +1043,33 @@ func TestAnonymousAllowedWhenSurplus(t *testing.T) {
 	if ps := s.Public(); !ps.Open || ps.Accounts != 6 {
 		t.Fatalf("应开放: %+v", ps)
 	}
-	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{}, false)
+	d, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{Gateway: "unified-1"}, false)
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
-	if d.Cookie == "" || d.ValidForS != 150 {
+	if d.Cookie == "" || d.ValidForS <= 150 {
 		t.Fatalf("交付内容不对: %+v", d)
 	}
 	// 没有他的凭据就做不了 state-echo，不能对外声称验过。
 	if d.VerifiedFull {
 		t.Fatal("匿名交付不该写 verified_full=true")
 	}
-	for _, want := range []string{"无凭据交付", "authed=false", "gateway=" + d.Gateway, "free_gateways=6"} {
+	for _, want := range []string{"external stock delivered", "gateway=" + d.Gateway} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("无凭据交付日志缺了 %q: %s", want, buf.String())
 		}
 	}
-	// 槽位按 (占位账号 × 网关) 记下了，而且占位账号没有凭据。
-	var anon types.Account
+	// External delivery no longer creates a scheduling account or slots.
 	for _, a := range st.Accounts() {
 		if a.Creds.AccountID == "anon:acct-outsider" {
-			anon = a
+			t.Fatal("external delivery created an account")
 		}
 	}
-	if anon.ID == 0 || anon.Creds.AccessToken != "" {
-		t.Fatalf("占位账号不对: %+v", anon.Label)
-	}
-	if sl, _ := st.Slot(anon.ID, d.Gateway); sl.LastTouch.IsZero() {
-		t.Fatal("匿名的槽位没记触碰，下次会把他烧过的网关再发给他")
-	}
-	// 他再要一次，应该换一个没烧过的网关。
+	// Only the client decides whether to reuse or change this gateway.
 	clk.add(types.DeliverTTL + time.Second)
-	d2, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{}, false)
-	if err != nil || d2.Gateway == d.Gateway {
-		t.Fatalf("第二次又给了同一个网关 %s (err=%v)", d2.Gateway, err)
+	d2, err := s.DeliverAnonymous(context.Background(), "acct-outsider", Request{Gateway: d.Gateway}, false)
+	if err != nil || d2.Gateway != d.Gateway {
+		t.Fatalf("pool changed the client's gateway %s (err=%v)", d2.Gateway, err)
 	}
 }
 
@@ -1559,7 +1117,7 @@ func TestAnonymousGetsOnlyFreshStockAndNeverMints(t *testing.T) {
 	if free := s.FreeGateways(); free != 1 {
 		t.Fatalf("空闲数算成了 %d，应为 1", free)
 	}
-	d, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false)
+	d, err := s.DeliverAnonymous(context.Background(), "x", Request{Gateway: "unified-6"}, false)
 	if err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
@@ -1571,7 +1129,7 @@ func TestAnonymousGetsOnlyFreshStockAndNeverMints(t *testing.T) {
 	p := st.pairs["unified-6"]
 	p.ExpiresAt = clk.now().Add(types.DeliverFloor - time.Minute)
 	st.pairs["unified-6"] = p
-	_, err = s.DeliverAnonymous(context.Background(), "y", Request{}, false)
+	_, err = s.DeliverAnonymous(context.Background(), "y", Request{Gateway: "unified-6"}, false)
 	if err == nil {
 		t.Fatal("货架空了还交付成功了")
 	}
@@ -1596,22 +1154,22 @@ func TestAnonymousGetsOnlyFreshStockAndNeverMints(t *testing.T) {
 func TestUploaderStillServedAfterAnonymous(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1, 1)
 	addAccount(st, 2, "acct-2")
-	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{Gateway: "unified-1"}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
-	up, err := s.Deliver(context.Background(), 2, Request{})
+	up, err := s.DeliverAnonymous(context.Background(), "acct-2", Request{Gateway: "unified-1"}, true)
 	if err != nil {
 		t.Fatalf("上传者被匿名挤掉了: %v", err)
 	}
-	if !up.VerifiedFull {
-		t.Fatal("上传者那条路还是要验满血的")
+	if up.VerifiedFull {
+		t.Fatal("取票不能替客户端声称验满")
 	}
 }
 
 // 匿名报一个上传者的上游 ID，不能污染那个上传者的账本。
 func TestAnonymousCannotPolluteUploaderLedger(t *testing.T) {
 	s, st, _, _ := anonRig(t, 6, 1, 1)
-	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", Request{}, false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "acct-1", Request{Gateway: "unified-1"}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	for _, sl := range st.slots {
@@ -1625,93 +1183,11 @@ func TestAnonymousCannotPolluteUploaderLedger(t *testing.T) {
 func TestNoStickyExitFails(t *testing.T) {
 	s, _, mn, _ := rig(t, types.ModeSingle)
 	mn.sidErr = errors.New("没有可用的粘性供应商")
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := backgroundMint(context.Background(), s, 1, ""); err == nil {
 		t.Fatalf("err=%v", err)
 	}
 	if n := len(mn.mintedGateways()); n != 0 {
 		t.Fatalf("没有粘性出口还打了 %d 发", n)
-	}
-}
-
-// ---------- 强制刷新 ----------
-
-// 普通路径发歇得最久的那张，不管他手上正拿着谁。
-func TestNormalPathPicksLongestRested(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedHeldGateway(st, mn, clk)
-	if d := mustDeliver(t, s, 1, ""); d.Gateway != "unified-2" {
-		t.Fatalf("普通路径给了 %s，应是歇得最久的 unified-2", d.Gateway)
-	}
-}
-
-// force=1 必须换一个网关：调用方就是因为手上那张不行了才来的。
-// 「手上那张」靠槽位 LastTouch 认（租约字段已按 2026-10-01 的实测删掉，见 types.Pair）。
-func TestForceSkipsHeldGateway(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedHeldGateway(st, mn, clk)
-
-	// 点名他正拿着的那个 + force ⇒ 没得换，只能 503。这一条只有 holding() 真生效才过。
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1", Force: true}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v，force 点名自己手上那张时应 ErrNoFullSlot", err)
-	}
-	echoesBefore := mn.echoes
-	forced, err := s.Deliver(context.Background(), 1, Request{Force: true})
-	if err != nil {
-		t.Fatalf("force: %v", err)
-	}
-	if forced.Gateway != "unified-2" {
-		t.Fatalf("force 给了 %s，应让开他手上的 unified-1、换到 unified-2", forced.Gateway)
-	}
-	// 换来的那张照样验过满血——force 不是「不验了」的意思。
-	if !forced.VerifiedFull || mn.echoes != echoesBefore+1 {
-		t.Fatalf("force 那次没走 state-echo: verified=%v echoes %d→%d",
-			forced.VerifiedFull, echoesBefore, mn.echoes)
-	}
-}
-
-// seedHeldGateway 让 1 号手上正拿着 unified-1（刚碰过），unified-2 则歇了三小时。
-func seedHeldGateway(st *fakeStore, mn *fakeMinter, clk *clock) {
-	now := clk.now()
-	delete(st.gws, "unified-3")
-	// unified-2 没票 ⇒ 这两个用例都要走回落铸票，而回落是从区域出发、不冲着
-	// 「歇得最久的那个候选」去的 ⇒ 落点得显式钉在 unified-2 上。
-	// 用例仍然在验「别把他手上的 unified-1 发回去」。
-	landBare(mn, "unified-2")
-	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1", LastTouch: now}
-	st.slots[slotKey(1, "unified-2")] = types.Slot{AccountID: 1, Gateway: "unified-2", LastTouch: now.Add(-3 * time.Hour)}
-	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: now.Add(time.Hour), MintedBy: 1}
-}
-
-// 没得换就 503：把原来那张再发一遍等于没换，客户端会死循环。
-func TestForceWithNothingElseFails(t *testing.T) {
-	s, st, _, _ := rig(t, types.ModeSingle)
-	delete(st.gws, "unified-2")
-	delete(st.gws, "unified-3")
-
-	mustDeliver(t, s, 1, "")
-	if _, err := s.Deliver(context.Background(), 1, Request{Force: true}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v，没得换时应 ErrNoFullSlot", err)
-	}
-}
-
-// 匿名那条路也认 force。
-func TestForceForAnonymous(t *testing.T) {
-	s, _, _, _ := anonRig(t, 6, 1, 1)
-	first, err := s.DeliverAnonymous(context.Background(), "x", Request{}, false)
-	if err != nil {
-		t.Fatalf("DeliverAnonymous: %v", err)
-	}
-	forced, err := s.DeliverAnonymous(context.Background(), "x", Request{Force: true}, false)
-	if err != nil {
-		t.Fatalf("force: %v", err)
-	}
-	if forced.Gateway == first.Gateway {
-		t.Fatalf("匿名 force 还是给了同一个网关 %s", forced.Gateway)
-	}
-	// 指名要自己正租着的那张 + force ⇒ 没得换，老实失败。
-	if _, err := s.DeliverAnonymous(context.Background(), "x", Request{Gateway: forced.Gateway, Force: true}, false); err == nil {
-		t.Fatal("指名自己租着的那张还 force，居然成功了")
 	}
 }
 
@@ -1777,7 +1253,7 @@ func TestBestRegionPrefersUnattemptedCountryOverSeedless(t *testing.T) {
 		lifetime[r.Exit.Region] = 50
 	}
 
-	got, count, preferred, ok := bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, 50, lifetime, nil, prefer)
+	got, count, preferred, ok := bestRegionRanked(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, 50, lifetime, nil, prefer, nil)
 	if !ok {
 		t.Fatal("配额没打满，不该说挑不出来")
 	}
@@ -1789,8 +1265,8 @@ func TestBestRegionPrefersUnattemptedCountryOverSeedless(t *testing.T) {
 	}
 
 	// 种子都齐了（prefer 恒 false）⇒ 退到第二档：挑终身没铸过的那个。
-	got, _, preferred, ok = bestRegion(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, 50, lifetime, nil,
-		func(string) bool { return false })
+	got, _, preferred, ok = bestRegionRanked(config.Defaults().CandidateRegions(types.Exit{}), nil, 6, 50, lifetime, nil,
+		func(string) bool { return false }, nil)
 	if !ok || got.Key != unseen.Key || preferred {
 		t.Fatalf("种子齐了该挑终身没铸过的 %s，得到 %s（preferred=%v, ok=%v）",
 			unseen.Key, got.Key, preferred, ok)
@@ -1898,7 +1374,7 @@ func TestUpstreamRejectionDisablesAccount(t *testing.T) {
 	mn.mintStatus = 400
 	mn.mintBody = `{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}`
 
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err == nil {
+	if _, err := backgroundMint(context.Background(), s, 1, "unified-1"); err == nil {
 		t.Fatal("上游回 400 居然交付成功了")
 	}
 	if len(st.disabled) != 1 {
@@ -1921,36 +1397,11 @@ func TestRateLimitDoesNotDisableAccount(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintStatus = 429
 
-	if _, err := s.Deliver(context.Background(), 1, Request{Gateway: "unified-1"}); err == nil {
+	if _, err := backgroundMint(context.Background(), s, 1, "unified-1"); err == nil {
 		t.Fatal("上游回 429 居然交付成功了")
 	}
 	if len(st.disabled) != 0 {
 		t.Fatalf("429 把账号停用了: %v", st.disabled)
-	}
-}
-
-// 一次交付不许把整池供给摸干净：每试一个网关都要真打一发上游验满血，
-// 试过的槽位不管结果都烧掉了。试满上限就认 503，把剩下的留给下一个人。
-func TestDeliverStopsAfterMaxTries(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModePool)
-	// 六个网关，全都验不出满血（rig 自带三个，这里补到六个）。
-	for i := 4; i <= 6; i++ {
-		seedGateway(st, mn, fmt.Sprintf("unified-%d", i), i-1, 1)
-	}
-	for gw := range st.gws {
-		mn.full[gw] = false
-	}
-	// 六个网关都有活票 ⇒ 走「一个个试」那条路；一张票都没有时只抽一次签，
-	// 上限根本乘不上去（见 TestFreshMintDrawsOnlyOnce）。
-	seedPairs(st, clk)
-	s.opt.MaxTriesPerDeliver = 3
-
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v", err)
-	}
-	// 每试一个网关 = 一发铸票。试了 3 个就该停，不该把六个全摸一遍。
-	if n := len(mn.mintedGateways()); n != 3 {
-		t.Fatalf("试了 %d 个网关，上限是 3 —— 不设上限的话一个消费者会把整池摸空", n)
 	}
 }
 
@@ -2134,32 +1585,13 @@ func TestPremintRunsEvenWhenEveryoneJustFetched(t *testing.T) {
 	}
 }
 
-// 503 要把**真实原因**带出去：「没有验过满血的槽位可交付」会把「你的槽位都烧完了」
-// 和「出口全熔断了、谁都铸不出票」说成同一件事，而这两者要做的事完全相反。
-// 2026-10-01 现网就吃过这个：页面上只看到前者，真实原因（没有可用的出口代理）只在日志里。
-func TestDeliverCarriesTheRealCause(t *testing.T) {
-	s, _, mn, _ := rig(t, types.ModeSingle)
-	mn.mintErr = errors.New("要不到粘性出口: 没有可用的出口代理（sticky=true，共 2 条）")
-
-	_, err := s.Deliver(context.Background(), 1, Request{})
-	if !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("调用方认不出该回 503: %v", err)
-	}
-	if !strings.Contains(err.Error(), "没有可用的出口代理") {
-		t.Fatalf("真实原因丢了: %v", err)
-	}
-	if !errors.Is(err, mn.mintErr) {
-		t.Fatalf("底层错误没串起来，上层没法按类型分流: %v", err)
-	}
-}
-
 // 铸票和 state-echo 那两条路也要把原因落进样本：出口熔断那几分钟
 // samples.jsonl 里只剩一串 status=0 的空行，事后什么都查不出来。
 func TestFailedMintRecordsCauseInSample(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = errors.New("经 novproxy 请求失败: socks connect refused")
 
-	_, _ = s.Deliver(context.Background(), 1, Request{})
+	_, _ = backgroundMint(context.Background(), s, 1, "")
 	var failed, withErr int
 	for _, sm := range st.samples {
 		if sm.Status == 200 {
@@ -2187,7 +1619,7 @@ func TestExitOutageDoesNotBackoffSlots(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModeSingle)
 	mn.mintErr = fmt.Errorf("要不到粘性出口: %w", types.ErrNoExit)
 
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
+	if _, err := backgroundMint(context.Background(), s, 1, ""); !errors.Is(err, types.ErrNoExit) {
 		t.Fatalf("该回 503: %v", err)
 	}
 	for key, sl := range st.slots {
@@ -2197,7 +1629,7 @@ func TestExitOutageDoesNotBackoffSlots(t *testing.T) {
 	}
 	// 出口回来了就该立刻能交付，不用等退避。
 	mn.mintErr = nil
-	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
+	if _, err := backgroundMint(context.Background(), s, 1, ""); err != nil {
 		t.Fatalf("出口恢复后仍然交付不了: %v", err)
 	}
 }
@@ -2223,7 +1655,7 @@ func TestDeliverWithoutVerifyNeverEchoes(t *testing.T) {
 		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
 	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1})
 
-	d := mustDeliver(t, s, 1, "")
+	d := mustDeliver(t, s, 1, "unified-1")
 	if mn.echoes != 0 {
 		t.Fatalf("关着验证还 echo 了 %d 发", mn.echoes)
 	}
@@ -2233,189 +1665,33 @@ func TestDeliverWithoutVerifyNeverEchoes(t *testing.T) {
 	if d.VerifiedFull {
 		t.Fatal("没验还写 verified_full=true")
 	}
-	sl, _ := st.Slot(1, "unified-1")
-	if sl.LastVerdict != types.VerdictUnknown {
-		t.Fatalf("判定记成了 %q，没验就该是 unknown（不是 degraded）", sl.LastVerdict)
-	}
-	// 窗口照样要记：票交出去了窗口就算烧了，少记一次会让它被当成新鲜的再发一遍。
-	if sl.LastTouch.IsZero() || sl.LastDeliver.IsZero() {
-		t.Fatalf("交付没记触碰/交付时刻: %+v", sl)
-	}
-}
-
-// 开了验证才回得出 degraded：errDegraded / degradedHold 只在这条路上可达。
-func TestDegradedOnlyReachableWithVerifyOn(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle) // rig 把两个开关都开着
-	seedPairs(st, clk)
-	for gw := range st.gws {
-		mn.full[gw] = false
-	}
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v", err)
-	}
-	degraded := 0
-	for _, sl := range st.slots {
-		if sl.LastVerdict == types.VerdictDegraded {
-			degraded++
-		}
-	}
-	if degraded == 0 {
-		t.Fatal("开着验证、echo 全判降智，却一个 degraded 都没记上")
+	if sl, ok := st.Slot(1, "unified-1"); ok {
+		t.Fatalf("外部交付不应创建池内品质/冷却槽位: %+v", sl)
 	}
 }
 
 // ---------- 150 s 窗口属于槽位，不是 pair 的互斥锁（第 3 条） ----------
 
-// 窗口内重复请求：原样返回同一张，valid_for_s 是**剩余**窗口，一发上游都不打，
-// 也不重置冷却、不烧新槽位。客户端的重连/重试全靠这条。
-func TestRedeliverWithinWindow(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	seedPairs(st, clk)
-
-	first := mustDeliver(t, s, 1, "")
-	mintsBefore, echoesBefore := len(mn.mintedGateways()), mn.echoes
-
-	clk.add(40 * time.Second)
-	again := mustDeliver(t, s, 1, "")
-	if again.Gateway != first.Gateway || again.Cookie != first.Cookie {
-		t.Fatalf("窗口内重复请求换了票：%+v → %+v", first, again)
-	}
-	if want := int((types.DeliverTTL - 40*time.Second) / time.Second); again.ValidForS != want {
-		t.Fatalf("valid_for_s=%d，应是剩余窗口 %d", again.ValidForS, want)
-	}
-	if !again.ExpiresAt.Equal(first.ExpiresAt) {
-		t.Fatalf("重复请求把窗口往后推了：%v → %v", first.ExpiresAt, again.ExpiresAt)
-	}
-	if len(mn.mintedGateways()) != mintsBefore || mn.echoes != echoesBefore {
-		t.Fatalf("窗口内重复请求打了上游：铸票 %d→%d、echo %d→%d",
-			mintsBefore, len(mn.mintedGateways()), echoesBefore, mn.echoes)
-	}
-	// 交付时刻没被改写 ⇒ 冷却照原样起算，不会被重试一路往后推。
-	sl, _ := st.Slot(1, first.Gateway)
-	if !sl.LastDeliver.Add(types.DeliverTTL).Equal(first.ExpiresAt) {
-		t.Fatalf("交付时刻被重置了: %+v", sl)
-	}
-}
-
-// 窗口过完 ⇒ 这个 (账号 × 网关) 进冷却，不再参与挑选。全烧完就 503，**不开后门**。
-func TestWindowElapsedPutsSlotInCooldown(t *testing.T) {
-	s, st, _, clk := rig(t, types.ModeSingle)
-	delete(st.gws, "unified-2")
-	delete(st.gws, "unified-3")
-	seedPairs(st, clk)
-
-	mustDeliver(t, s, 1, "")
-	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("窗口过完、唯一的网关进冷却，还发得出来: %v", err)
-	}
-	// 歇满冷却就该恢复（这时候那张 pair 早过期了，走的是现铸）。
-	clk.add(types.SlotCooldown)
-	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
-		t.Fatalf("歇满 %v 还交付不了: %v", types.SlotCooldown, err)
-	}
-}
-
 // 冷却对匿名/跨账号的占位行一视同仁：他们的交付也写 LastDeliver，
 // 「这个上游账号在这个网关上烧过了」和他有没有上传凭据无关。
-func TestCooldownAppliesToAnonymousToo(t *testing.T) {
+func TestExternalConsumerHasNoPoolCooldown(t *testing.T) {
 	s, _, clk, _ := anonRig(t, 1, 1, 1)
-	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}, false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{Gateway: "unified-1"}, false); err != nil {
 		t.Fatalf("DeliverAnonymous: %v", err)
 	}
 	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{}, false); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("匿名窗口过完还发得出来: %v", err)
+	if _, err := s.DeliverAnonymous(context.Background(), "outsider", Request{Gateway: "unified-1"}, false); err != nil {
+		t.Fatalf("pool retained consumer cooldown: %v", err)
 	}
 	// 换一个上游 ID 就是另一条账本，不受连坐。
-	if _, err := s.DeliverAnonymous(context.Background(), "someone-else", Request{}, false); err != nil {
+	if _, err := s.DeliverAnonymous(context.Background(), "someone-else", Request{Gateway: "unified-1"}, false); err != nil {
 		t.Fatalf("另一个匿名上游被连坐了: %v", err)
 	}
 }
 
 // ---------- 满血窗口过完就能再发（第 10 条） ----------
 
-// 交付完的槽位在**一个满血窗口**之内不再发第二张，过完就放行。
-//
-// 这条用例原名 TestSlotCooldownComesFromConfig，钉的是「slot_cooldown_minutes 要现读
-// Live、别把 4 小时编进去」。2026-10-03 消费冷却那条闸整个删了（见 sched.burning），
-// 那个配置项降级成读数与统计窗口、不再拦交付 ⇒ 这里配 10 分钟或 4 小时都一样，
-// 真正管事的是 types.FullWindow。配置项照旧设上，就为了证明它**不**再影响交付。
-func TestDeliverReopensAfterTheFullWindow(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	addAccount(st, 1, "acct-1")
-	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
-		ReachableExits: []types.Exit{{Region: "US"}}}
-	mn.land["US"] = "unified-1"
-	mn.full["unified-1"] = true
-	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 1}
-	s := New(st, mn, Options{Mode: types.ModeSingle, Now: clk.now, MintGap: -1, RenewGap: -1,
-		Live: liveCfg(func(c *config.Config) { c.SlotCooldownMinutes = 10 })})
-
-	mustDeliver(t, s, 1, "")
-	clk.add(types.DeliverTTL + time.Second)
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("窗口刚过完就又发了一张: %v", err)
-	}
-	// 满血窗口一过就该恢复 —— 而且**早于**配置里那 10 分钟，证明拦它的不再是那个旋钮。
-	clk.add(types.FullWindow)
-	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
-		t.Fatalf("满血窗口过完了还交付不了: %v", err)
-	}
-}
-
 // ---------- 一张活票都没有时只抽一次签（A 条） ----------
-
-// 回落**只铸一发**，哪怕 MaxTriesPerDeliver 开到 5、哪怕抽到的落点正好不可用。
-//
-// 出口只能把落点「倾向」到某个网关、定不住 ⇒「先试 X 再试 Y」就是抽两次签、
-// 花两发请求烧两个铸票者槽位，而两次的分布一模一样。
-func TestFreshMintDrawsOnlyOnce(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModePool)
-	addAccount(st, 2, "acct-2")
-	s.opt.MaxTriesPerDeliver = 5
-	// 一张活 pair 都没有；池子刚拿 1 号的凭据在 unified-3 上打过一发（LastTouch），
-	// 而这一发无论从哪个出口打都会落到 unified-3 ⇒ 抽到的签不可用。
-	//
-	// 铺的是 LastTouch 不是 LastDeliver：后者（「他取过票」）2026-10-03 起不再拦交付
-	// ——消费归客户端账本管（见 sched.burning），拿它铺这个场景会让用例什么都没拦住。
-	st.slots[slotKey(1, "unified-3")] = types.Slot{AccountID: 1, Gateway: "unified-3",
-		LastTouch: clk.now()}
-	for k := range mn.land {
-		mn.land[k] = "unified-3"
-	}
-
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v，抽到的落点正在烧窗口就该老实 503", err)
-	}
-	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("打了 %d 发上游，回落只该抽一次签（还剩两个候选网关没碰）", n)
-	}
-}
-
-// 回落成功时也只花一发：默认不验满血，所以「现铸 + 交付」合起来就是一发请求。
-func TestFreshMintSuccessCostsOneRequest(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	addAccount(st, 1, "acct-1")
-	addAccount(st, 2, "acct-2")
-	for i, gw := range []string{"unified-1", "unified-2", "unified-3"} {
-		seedGateway(st, mn, gw, i, 1)
-	}
-	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
-	s.opt.MaxTriesPerDeliver = 5
-
-	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
-		t.Fatalf("Deliver: %v", err)
-	}
-	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("冷池子交付花了 %d 发上游，应为 1", n)
-	}
-}
 
 // 有活票的网关优先：硬筛之后根本不碰没票的那些，省一发请求外加一个铸票者槽位。
 //
@@ -2427,7 +1703,7 @@ func TestDeliverPrefersGatewayWithLivePair(t *testing.T) {
 	st.pairs["unified-2"] = types.Pair{Gateway: "unified-2", Cookie: cookiePrefix + "unified-2",
 		ExpiresAt: clk.now().Add(types.PairLifetime), CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
 
-	d := mustDeliver(t, s, 1, "")
+	d := mustDeliver(t, s, 1, "unified-2")
 	if d.Gateway != "unified-2" {
 		t.Fatalf("交付了 %s，只有 unified-2 有活票", d.Gateway)
 	}
@@ -2448,106 +1724,15 @@ func TestStalePairDoesNotCountAsLive(t *testing.T) {
 		st.pairs[name] = types.Pair{Gateway: name, Cookie: cookiePrefix + name,
 			ExpiresAt: clk.now().Add(types.DeliverFloor - time.Second), MintedBy: 2}
 	}
-	mustDeliver(t, s, 1, "")
-	if n := len(mn.mintedGateways()); n == 0 {
-		t.Fatal("票全跌破门槛了还当成活票直接发了出去")
+	if _, err := s.DeliverAnonymous(context.Background(), "consumer", Request{Gateway: "unified-1"}, true); !errors.Is(err, ErrNoFullSlot) {
+		t.Fatalf("过短票应明确缺票: %v", err)
+	}
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatal("外部缺票请求不应现场铸票")
 	}
 }
 
 // ---------- 一个区域一次只许有一发裸铸（B 条） ----------
-
-// 两路交付同时撞上冷池子：只许打出去**一发**，另一路当场被挡回去。
-//
-// 原来这一条写的是「按网关拦，第二路等第一路铸完直接用那张票」。按需铸票（mintByRegion）
-// 之后没有网关可拦了——出手前根本不知道会落到哪 ⇒ 退化成按区域单飞。
-// 而且只能是「占不住就走」，不能排队：两路的铸票者不是同一个号，排队等于让后一路在走到
-// **账号锁**之前就停住，前一路正等着账号锁 ⇒ 真死锁（TestNoDeadlockBetweenAccounts
-// 的屏障就是钉这件事，2026-10-02 拿全局锁实测 3 秒超时）。
-//
-// 要守的不变量没变：**不许为同一件事烧两个铸票者槽位**。槽位是池子最紧的资源，
-// 而被挡回去的那一路重试时第一路的票已经在池里了，一发上游都不用打——下面最后一段
-// 就是在证这件事。
-//
-// 三个号、消费者是 2 和 3，而 2 和 3 的本小时配额**打满**⇒ 两路的铸票者都只能是
-// 账号 1，于是两路是同一个 (账号 × 大区)，正是 claimRegion 该拦的那一格。
-//
-// 配额不打满的那一版是条随调度顺序摆的用例：前一路一进 mint.spend 就把账号 1 在
-// us-east 的发数抬成 1，后一路的 minterFor 按「本小时总发数最少的优先」就改挑账号 3
-// ⇒ 两个不同的号走同一个大区 ⇒ 2026-10-03 收窄粒度之后这是**允许**的
-// （见 TestConcurrentBareMintsShareARegionAcrossAccounts），于是它时红时绿。
-//
-// 铸票者不能是其中一个消费者，否则等到票的那个人该被拒——那是另一条规则，由
-// TestWaitingForAnothersMintRechecksOwnWindow 盯着。mintCost 非零，不然「等到的票
-// 还剩多久」这件事恒为真，用例就什么都没证。
-func TestConcurrentFetchMintsOncePerGateway(t *testing.T) {
-	clk := newClock()
-	st := newStore(clk)
-	mn := newMinter(clk)
-	mn.delay = 30 * time.Millisecond
-	mn.mintCost = 60 * time.Second
-	addAccount(st, 1, "acct-1")
-	addAccount(st, 2, "acct-2")
-	addAccount(st, 3, "acct-3")
-	// 把两个消费者从铸票者候选里剔掉：九个大区全打满本小时配额。
-	mn.rateLimit = 6
-	full := map[string]int{}
-	for _, r := range types.Regions {
-		full[r.Key] = 6
-	}
-	mn.ratePerAcct = map[string]map[string]int{"acct-2": full, "acct-3": full}
-	// 只有一个网关、一张票都没有 ⇒ 两个人必然撞上同一个区域。
-	st.gws["unified-1"] = types.Gateway{Name: "unified-1", FirstSeenBy: 1,
-		ReachableExits: []types.Exit{{Region: "US"}}}
-	landBare(mn, "unified-1")
-	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
-
-	var wg sync.WaitGroup
-	out := make([]types.Delivery, 2)
-	errs := make([]error, 2)
-	for i := range out {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			out[i], errs[i] = s.Deliver(context.Background(), int64(i+2), Request{})
-		}(i)
-	}
-	wg.Wait()
-	// 一发、而且只一发：这是这条用例的全部重点。
-	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("两路裸铸打了 %d 发上游，单飞没拦住（烧的是两个铸票者槽位）", n)
-	}
-	// 一个成、一个被挡。谁成谁被挡是调度顺序的事，不钉。
-	won, lost, blocked := 0, 0, int64(0)
-	for i, err := range errs {
-		switch {
-		case err == nil:
-			won++
-			if out[i].Gateway != "unified-1" {
-				t.Fatalf("第 %d 路落点不对: %+v", i+1, out[i])
-			}
-		case errors.Is(err, ErrNoLivePair):
-			// 归成「等得起」那一格：调用方该重试，而不是当成永久 503
-			lost, blocked = lost+1, int64(i+2)
-		default:
-			t.Fatalf("第 %d 路的错不该是这个: %v", i+1, err)
-		}
-	}
-	if won != 1 || lost != 1 {
-		t.Fatalf("成 %d 路、被挡 %d 路，应各一路", won, lost)
-	}
-	// 被挡那一路重试：池子里已经有票了 ⇒ 拿到同一张，而且**一发上游都不用打**。
-	// 这是「挡回去」能成立的全部前提，不验这一条就等于把 503 当成了功能。
-	retry, err := s.Deliver(context.Background(), blocked, Request{})
-	if err != nil {
-		t.Fatalf("被挡的 %d 号重试该直接捡到池里那张票: %v", blocked, err)
-	}
-	if retry.Gateway != "unified-1" {
-		t.Fatalf("重试拿到 %s，池里只有 unified-1 那张", retry.Gateway)
-	}
-	if n := len(mn.mintedGateways()); n != 1 {
-		t.Fatalf("重试又打了上游，共 %d 发", n)
-	}
-}
 
 // claimRegion 的粒度就是 (账号 × 大区)，三条都要钉：同号同区拦、**换号不拦**、换区不拦。
 //
@@ -2584,35 +1769,6 @@ func TestClaimRegionIsPerAccountAndRegion(t *testing.T) {
 		t.Fatal("release 之后占不回来")
 	} else {
 		again()
-	}
-}
-
-// pickExit 只许给九个大区的代表出口：它是唯一会产出「反查不到大区」的出口的地方，
-// 而那个空串会一路带进速率闸的分桶键（acct|""，九个大区的定向铸票挤一个桶互相饿死）
-// 和 (账号 × 大区) 台账。
-func TestPickExitOnlyReturnsStandardRegionExits(t *testing.T) {
-	s := &Scheduler{mint: newMinter(newClock())}
-	wild := types.Exit{Region: "US", City: "Chicago"}
-	if types.RegionKeyOf(wild) != "" {
-		t.Fatalf("这条用例的前提坏了：%+v 居然反查到了大区", wild)
-	}
-	// 混着放：野出口在前，防「取第一条」式的实现碰巧蒙对。
-	mixed := types.Gateway{Name: "unified-1", ReachableExits: []types.Exit{
-		{}, wild, {Region: "US", City: "Dallas"}, {Region: "JP"}}}
-	for i := 0; i < 20; i++ { // pickExit 是随机取，多转几圈
-		got, ok := s.pickExit(mixed)
-		if !ok {
-			t.Fatal("有一条 JP 代表出口，不该说没有可达出口")
-		}
-		if got != (types.Exit{Region: "JP"}) {
-			t.Fatalf("挑到了反查不到大区的出口 %+v", got)
-		}
-	}
-	// 一条标准出口都没有 ⇒ 认「没有已知可达出口」，而不是拿野出口去定向铸：
-	// 那一发的配额会记进空串桶，落点也不会进任何一个大区的台账。
-	if _, ok := s.pickExit(types.Gateway{Name: "unified-2",
-		ReachableExits: []types.Exit{wild}}); ok {
-		t.Fatal("只有野出口时仍然挑了一条出来")
 	}
 }
 
@@ -3127,66 +2283,6 @@ func TestSpareTargetZeroDisablesPremint(t *testing.T) {
 }
 
 // ---------- 一次交付最多试几个网关（E 条） ----------
-
-// 上限从配置来，默认 2：每多试一个网关就多花一发上游。
-func TestMaxTriesComesFromConfig(t *testing.T) {
-	s, _, _, _ := rig(t, types.ModeSingle)
-	if got := s.maxTries(); got != 2 {
-		t.Fatalf("默认上限 %d，应为 2", got)
-	}
-	s.opt.Live = liveCfg(func(c *config.Config) { c.MaxTriesPerDeliver = 4 })
-	if got := s.maxTries(); got != 4 {
-		t.Fatalf("配置改成 4 了，还报 %d", got)
-	}
-}
-
-// 整池同病的故障（出口全没了、速率闸）不换网关重试：换一个只是把同一句话重复一遍，
-// 白烧 N 发请求。
-func TestPoolWideFailureStopsTryingOtherGateways(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModePool)
-	addAccount(st, 2, "acct-2")
-	seedPairs(st, clk)
-	s.opt.MaxTriesPerDeliver = 5
-	mn.mintErr = fmt.Errorf("要不到粘性出口: %w", types.ErrNoExit)
-
-	if _, err := s.Deliver(context.Background(), 1, Request{}); !errors.Is(err, ErrNoFullSlot) {
-		t.Fatalf("err=%v", err)
-	}
-	if n := len(mn.mintedGateways()); n > 1 {
-		t.Fatalf("出口全没了还试了 %d 个网关", n)
-	}
-}
-
-// 交付要如实报出**铸这张票的出口**属于哪个区域，而且和区域台账记的那一格是同一个口径。
-//
-// 消费端（sub2api）拿它把自己的落点按大区归档。网关 = (区域 × 账号)：同一个网关名在
-// 不同账号眼里可能来自不同区域 ⇒ 事后反查不出来，只有铸票那一刻知道。口径和台账错开
-// 一格的后果是消费端把落点记到别的大区，于是「这个号在哪个大区还有没烧过的落点」全错。
-func TestDeliveryCarriesTheMintRegion(t *testing.T) {
-	s, st, _, _ := driftRig(t, "unified-1", "unified-77")
-
-	d, err := s.Deliver(context.Background(), 1, Request{})
-	if err != nil {
-		t.Fatalf("Deliver: %v", err)
-	}
-	mints := st.RegionMints()
-	if len(mints) != 1 {
-		t.Fatalf("区域台账 %d 格，这一发现铸该恰好记一格: %+v", len(mints), mints)
-	}
-	var want string
-	for _, m := range mints {
-		want = m.RegionKey
-	}
-	if want == "" {
-		t.Fatal("台账记了个空区域，这条用例什么都没验到")
-	}
-	if d.Region != want {
-		t.Fatalf("交付报的区域是 %q，台账记的是 %q", d.Region, want)
-	}
-	if p, ok := st.Pair("unified-77"); !ok || p.RegionKey != want {
-		t.Fatalf("pair 上存的区域是 %q，应为 %q", p.RegionKey, want)
-	}
-}
 
 // 不是现铸那条路（直接发池子手上的票）也要报区域；读不出来时报空，不许拿别的顶上。
 func TestDeliveryReportsThePairsRegion(t *testing.T) {

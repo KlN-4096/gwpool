@@ -39,8 +39,8 @@ import (
 
 const (
 	perfWorkers           = 32
-	perfMaxRounds         = 32
-	perfRequiredInventory = 3 * perfMaxRounds
+	perfMaxRounds         = 12 // do not benchmark by violating the member rate limit
+	perfRequiredInventory = 1
 )
 
 // No real minter is constructed. Unexpected outbound calls hit the nil embedded
@@ -187,7 +187,7 @@ func perfSnapshot(t *testing.T, path string) (store.State, map[string]any, time.
 	return state, manifest, delta
 }
 
-type perfConsumer struct{ Key, Account, Tag string }
+type perfConsumer struct{ Key, Account, Tag, Gateway string }
 
 type perfServerReady struct {
 	URL                    string
@@ -269,19 +269,20 @@ func TestProductionSnapshotPerformanceServer(t *testing.T) {
 	historicalTagConsumers := 0
 	var consumerIDs []int64
 	for _, account := range st.Accounts() {
-		if !strings.HasPrefix(account.Creds.AccountID, types.AnonPrefix) ||
-			!account.Enabled || !pool.HasCandidate(account.ID, sched.Request{Force: true}) {
+		if !strings.HasPrefix(account.Creds.AccountID, types.AnonPrefix) || !account.Enabled {
 			continue
 		}
 		// Select the same stock-sufficient cohort for all scenarios. Do not
 		// manufacture new stock or erase cooldown history to finish a long run.
 		available := 0
+		selected := ""
 		now := time.Now()
 		for gateway, pair := range state.Pairs {
-			slot := state.Slots[store.SlotKey(account.ID, gateway)]
-			if pair.ExpiresAt.Sub(now) >= types.DeliverFloor && !slot.BackoffUntil.After(now) &&
-				(slot.LastTouch.IsZero() || now.Sub(slot.LastTouch) >= types.FullWindow) {
+			if pair.ExpiresAt.Sub(now) >= types.DeliverFloor {
 				available++
+				if selected == "" || gateway < selected {
+					selected = gateway
+				}
 			}
 		}
 		if available < perfRequiredInventory {
@@ -303,7 +304,7 @@ func TestProductionSnapshotPerformanceServer(t *testing.T) {
 			historicalTagConsumers++
 		}
 		consumers = append(consumers, perfConsumer{srv.OwnerKeyFor(owner),
-			strings.TrimPrefix(account.Creds.AccountID, types.AnonPrefix), tag})
+			strings.TrimPrefix(account.Creds.AccountID, types.AnonPrefix), tag, selected})
 		consumerIDs = append(consumerIDs, account.ID)
 		if len(consumers) == perfWorkers {
 			break
@@ -359,12 +360,12 @@ func TestProductionSnapshotPerformance(t *testing.T) {
 		t.Skip("set GWPOOL_PERF_SNAPSHOT to the remotely sanitized snapshot directory")
 	}
 	scenario := os.Getenv("GWPOOL_PERF_SCENARIO")
-	if scenario != "gateways" && scenario != "single" && scenario != "batch3" {
-		t.Fatal("GWPOOL_PERF_SCENARIO must be gateways, single or batch3")
+	if scenario != "gateways" && scenario != "single" {
+		t.Fatal("GWPOOL_PERF_SCENARIO must be gateways or single")
 	}
 	rounds, err := strconv.Atoi(os.Getenv("GWPOOL_PERF_ROUNDS"))
 	if err != nil || rounds < 1 || rounds > perfMaxRounds {
-		t.Fatal("GWPOOL_PERF_ROUNDS must be 1..32")
+		t.Fatal("GWPOOL_PERF_ROUNDS must be 1..12")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second)
 	defer cancel()
@@ -441,16 +442,15 @@ func TestProductionSnapshotPerformance(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for range rounds {
-				query := url.Values{"account": {c.Account}, "force": {"1"}, "model": {"gpt-6-luna"}}
+				query := url.Values{"account": {c.Account}, "model": {"gpt-6-luna"}}
 				if c.Tag != "" {
 					query.Set("account_tag", c.Tag)
 				}
 				endpoint := "/cookie"
-				switch scenario {
-				case "gateways":
+				if scenario == "gateways" {
 					endpoint = "/gateways"
-				case "batch3":
-					query.Set("count", "3")
+				} else {
+					query.Set("gateway", c.Gateway)
 				}
 				req, err := http.NewRequest(http.MethodGet, ready.URL+endpoint+"?"+query.Encode(), nil)
 				if err != nil {
@@ -499,10 +499,6 @@ func TestProductionSnapshotPerformance(t *testing.T) {
 	var timings []float64
 	var responseBytes int
 	var contactRows, priorityRows int
-	seen := make([]map[string]bool, perfWorkers)
-	for i := range seen {
-		seen[i] = map[string]bool{}
-	}
 	for result := range results {
 		if result.err != nil {
 			t.Error(result.err)
@@ -534,28 +530,13 @@ func TestProductionSnapshotPerformance(t *testing.T) {
 			contactRows += contacts
 			priorityRows += priorities
 		} else {
-			var tickets []deliveryResponse
-			want := 1
-			var decodeErr error
-			if scenario == "single" {
-				var ticket deliveryResponse
-				decodeErr = json.Unmarshal(result.body, &ticket)
-				tickets = append(tickets, ticket)
-			} else {
-				want = 3
-				var batch batchResponse
-				decodeErr = json.Unmarshal(result.body, &batch)
-				tickets = batch.Tickets
-			}
-			if decodeErr != nil || len(tickets) != want {
-				t.Error("invalid ticket batch")
+			var ticket deliveryResponse
+			if err := json.Unmarshal(result.body, &ticket); err != nil {
+				t.Error("invalid single ticket")
 				continue
 			}
-			for _, ticket := range tickets {
-				if ticket.Gateway == "" || ticket.Cookie == "" || seen[result.worker][ticket.Gateway] {
-					t.Error("missing or repeated ticket in one consumer")
-				}
-				seen[result.worker][ticket.Gateway] = true
+			if ticket.Gateway != ready.Consumers[result.worker].Gateway || ticket.Cookie == "" {
+				t.Error("missing ticket or unrequested gateway")
 			}
 		}
 		timings = append(timings, result.ms)
@@ -591,7 +572,7 @@ func TestProductionSnapshotPerformance(t *testing.T) {
 		"response_bytes":           responseBytes, "state_bytes": ready.StateBytes,
 		"shift_seconds": ready.ShiftSeconds, "fixture_sha256": ready.FixtureSHA256,
 		"source_manifest": ready.Manifest, "go_version": runtime.Version(), "logical_cpus": runtime.NumCPU(),
-		"metric_scope": "32 existing anonymous consumer rows authenticated with local owner keys and populated historical tags, 24h cooldown negotiation; separate native child server and parent load-generator processes/heaps; latency includes complete loopback HTTP response; CPU/IO sampled only in the server process; every response body validated after sampling; Windows process IO includes filesystem/device/network/control pipe, not physical disk-only; fresh fixture per scenario; force=1; distinct gateways per consumer; no scheduler background loops or real minter",
+		"metric_scope": "32 external member references authenticated with local owner keys and populated historical tags; v2 explicit gateway, at most 12 calls/member; separate native child server and parent load generator, complete loopback HTTP latency, server CPU/IO, every body validated; repeated delivery allowed; no background loops or real minter; not comparable to the retired forced/batch protocol benchmark",
 	}
 	output, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {

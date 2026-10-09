@@ -333,6 +333,7 @@ type adminView struct {
 	// 格式见 layout.html 里的 grid()。服务端拼好：上传者名字里的 ":" "|" ";" 会把它拆坏。
 	AccountFacets string
 	External      []accountRow // 匿名占位行：池里没凭据、只来取票的上游账号
+	ExternalUsage []externalUsageRow
 	Gateways      []adminGatewayRow
 	// SlotAccounts 是「账号×网关」按账号汇总：明细一千多行，平铺会占掉整页一大半体积。
 	SlotAccounts []slotAccountRow
@@ -351,6 +352,11 @@ type adminView struct {
 	ProxyEditable bool
 	// ProxyNote / ProxyErr 是刚加完、刚停用完代理跳回来时的回话。
 	ProxyNote, ProxyErr string
+}
+
+type externalUsageRow struct {
+	ID string
+	types.ExternalConsumerUsage
 }
 
 // ownerRow 是一个上传者。**Token 在这一页是故意给的**：迁移出来那个 owner 的令牌

@@ -131,7 +131,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 				default:
 					_ = s.Gateways()
 					_ = s.Slots()
-					_, _ = s.LongestRestedSlot(1, []string{"unified-2", "unified-3"})
+					_, _ = s.Slot(1, "unified-2")
 				}
 			}
 		}(w)
@@ -179,41 +179,6 @@ func TestUpsertGatewayNewAndExits(t *testing.T) {
 	}
 	if g.FirstSeenBy != 2 {
 		t.Errorf("FirstSeenBy 不该被后来者改写，得到 %d", g.FirstSeenBy)
-	}
-}
-
-func TestLongestRestedSlot(t *testing.T) {
-	s := open(t, t.TempDir())
-	now := time.Now().UTC()
-	must := func(err error) {
-		t.Helper()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	must(s.PutSlot(types.Slot{AccountID: 7, Gateway: "unified-a", LastTouch: now.Add(-time.Minute)}))
-	must(s.PutSlot(types.Slot{AccountID: 7, Gateway: "unified-b", LastTouch: now.Add(-time.Hour)}))
-	must(s.PutSlot(types.Slot{AccountID: 7, Gateway: "unified-c", LastTouch: now.Add(-4 * time.Hour),
-		BackoffUntil: now.Add(time.Hour)}))
-	must(s.PutSlot(types.Slot{AccountID: 99, Gateway: "unified-z", LastTouch: time.Time{}}))
-
-	got, ok := s.LongestRestedSlot(7, []string{"unified-a", "unified-b", "unified-c"})
-	if !ok || got.Gateway != "unified-b" {
-		t.Fatalf("该挑歇得最久且不在退避里的 b，得到 %+v ok=%v", got, ok)
-	}
-
-	// 从没碰过的 (账号 × 网关) 优先级最高：首次接触才给满血窗口。
-	got, ok = s.LongestRestedSlot(7, []string{"unified-a", "unified-b", "unified-never"})
-	if !ok || got.Gateway != "unified-never" || !got.LastTouch.IsZero() {
-		t.Fatalf("该挑从没碰过的，得到 %+v", got)
-	}
-
-	// 别的账号的槽位不能串进来。
-	if got, ok := s.LongestRestedSlot(7, []string{"unified-c"}); ok {
-		t.Fatalf("只有退避中的候选时该返回 false，得到 %+v", got)
-	}
-	if _, ok := s.LongestRestedSlot(7, nil); ok {
-		t.Error("没有候选时该返回 false")
 	}
 }
 

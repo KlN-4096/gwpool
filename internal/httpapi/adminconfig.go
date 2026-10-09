@@ -19,9 +19,7 @@ type configView struct {
 
 	UpstreamPerRegionHour  int
 	UpstreamPerAccountHour int
-	VerifyFullAtDeliver    bool
 	SlotCooldownMinutes    int
-	MaxTriesPerDeliver     int
 	SpareTarget            int
 	MinPairs               int
 	RenewPairs             bool
@@ -65,9 +63,7 @@ func buildConfigView(live *config.Live, note, errMsg string) configView {
 	v.Models = c.Models
 	v.UpstreamPerRegionHour = c.UpstreamPerRegionHour
 	v.UpstreamPerAccountHour = c.AccountAttemptLimit()
-	v.VerifyFullAtDeliver = c.VerifyFullAtDeliver
 	v.SlotCooldownMinutes = c.SlotCooldownMinutes
-	v.MaxTriesPerDeliver = c.MaxTriesPerDeliver
 	v.SpareTarget = c.SpareTarget
 	v.MinPairs = c.MinPairs
 	v.RenewPairs = c.RenewPairs
@@ -131,7 +127,6 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opt.Log.Info("管理页改了配置", "models", c.Models,
 		"upstream_per_region_hour", c.UpstreamPerRegionHour,
-		"verify_full_at_deliver", c.VerifyFullAtDeliver,
 		"slot_cooldown", c.SlotCooldown(),
 		"public", c.PublicWhenSurplus.Enabled, "min_accounts", c.PublicWhenSurplus.MinAccounts)
 	s.adminConfigDone(w, r, "已保存并立即生效", "")
@@ -172,11 +167,6 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	}
 	// 历史显示窗口：0使用默认值，上限一周；不再控制交付冷却。
 	cooldown, err := atoiField(r, "slot_cooldown_minutes", 0, 7*24*60)
-	if err != nil {
-		return nil, err
-	}
-	// 候选切换可能产生额外取state/echo请求，保留现有有界上限。
-	tries, err := atoiField(r, "max_tries_per_deliver", 0, 10)
 	if err != nil {
 		return nil, err
 	}
@@ -221,15 +211,12 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 		"public_base_url":           strings.TrimSpace(r.FormValue("public_base_url")),
 		"upstream_per_region_hour":  perRegionHour,
 		"upstream_per_account_hour": perAccountHour,
-		// 两个开关默认关。表单里没勾就是关——复选框不发值，所以这里必须显式写 false，
-		// 不能靠「缺键不动」。
-		"verify_full_at_deliver": truthy(r.FormValue("verify_full_at_deliver")),
-		"renew_pairs":            truthy(r.FormValue("renew_pairs")),
-		"slot_cooldown_minutes":  cooldown,
-		"max_tries_per_deliver":  tries,
-		"spare_target":           spare,
-		"min_pairs":              minPairs,
-		"public_when_surplus":    pub,
+		// 未勾续票开关时显式写 false。
+		"renew_pairs":           truthy(r.FormValue("renew_pairs")),
+		"slot_cooldown_minutes": cooldown,
+		"spare_target":          spare,
+		"min_pairs":             minPairs,
+		"public_when_surplus":   pub,
 	}, nil
 }
 

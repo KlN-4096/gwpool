@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"gwpool/internal/types"
 )
@@ -14,8 +15,6 @@ type gatewayCatalogRow struct {
 	Name              string                        `json:"name"`
 	PairReady         bool                          `json:"pair_ready"`
 	ValidForS         int                           `json:"valid_for_s"`
-	UsedByYou         bool                          `json:"used_by_you"`
-	LastUsedAt        string                        `json:"last_used_at,omitempty"`
 	Cooldown          *types.CooldownRecommendation `json:"cooldown,omitempty"`
 	Contacts          json.RawMessage               `json:"contacts,omitempty"`
 	Priority          *types.GatewayPriority        `json:"priority,omitempty"`
@@ -23,11 +22,11 @@ type gatewayCatalogRow struct {
 }
 
 type gatewayCatalogHeader struct {
-	Account       string `json:"account"`
-	Live          int    `json:"live"`
-	Target        int    `json:"target"`
-	DeliverTTLS   int    `json:"deliver_ttl_s"`
-	DeliverFloorS int    `json:"deliver_floor_s"`
+	Account       string    `json:"account"`
+	Live          int       `json:"live"`
+	Target        int       `json:"target"`
+	DeliverFloorS int       `json:"deliver_floor_s"`
+	SnapshotAt    time.Time `json:"snapshot_at"`
 }
 
 type gatewayCatalogResponse struct {

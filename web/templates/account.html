@@ -56,7 +56,7 @@
 
 <section id="tab-usage">
   <div class="card">
-    <header class="card-head"><div><h2>接口说明</h2><p>先通过 <code>/cookie</code> 获取路由 Cookie，再携带它向上游发起请求。</p></div></header>
+    <header class="card-head"><div><h2>接口说明</h2><p>客户端自行选择网关、验证品质并维护冷却；原端点仅接受新契约，不保留旧消费调度。</p></div></header>
     <div class="card-body">
       <div class="note warn">
         <p><strong>接口位于站点根路径：</strong>base URL 是站点地址本身，不是本页地址。把 <code>/a/&lt;页面令牌&gt;</code> 当 base URL 的话，请求会变成 <code>/a/&lt;页面令牌&gt;/cookie</code>，返回 404。</p>
@@ -65,13 +65,16 @@
       </div>
 
       <h3>1. 请求</h3>
-      <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
+      <pre class="mono">curl -G -H 'Authorization: Bearer &lt;接入 key&gt;' \
+  --data-urlencode 'account=&lt;account_id/user_id&gt;' \
+  --data-urlencode 'gateway=unified-142' \
+  <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
       <div class="table-wrap"><table class="spec">
         <thead><tr><th>参数</th><th>说明</th></tr></thead>
         <tbody>
-          <tr><td class="mono">gateway</td><td>可选。指定网关名称，例如 <code>unified-142</code>；不指定时由系统选择。</td></tr>
-          <tr><td class="mono">force</td><td>可选。设为 <code>1</code> 时跳过你正在用的网关，换一个。</td></tr>
-          <tr><td class="mono">account</td><td>建议始终填写实际消费的上游 account_id；不同消费账号的冷却独立。账号 key 未指定时使用名下编号最小的有效凭据。</td></tr>
+          <tr><td class="mono">gateway</td><td>必填。来自目录的网关名称；池子不会替你换网关。</td></tr>
+          <tr><td class="mono">account</td><td>必填。完整成员标识 <code>account_id/user_id</code>，上传者自身与 root Key 也不例外。最大128字节，不可含控制字符。</td></tr>
+          <tr><td class="mono">min_remaining</td><td>可选，接受的最低剩余寿命，30–3600秒；默认300秒。</td></tr>
         </tbody>
       </table></div>
 
@@ -81,8 +84,8 @@
   "region":           "europe",
   "cookie":           "__cflb=…; __oailb=…",
   "expires_at":       "2026-10-01T12:44:40Z",
-  "valid_for_s":      150,
-  "verified_full":    true,
+  "valid_for_s":      3412,
+  "verified_full":    false,
   "ttl_is_advisory":  true,
   "cookie_version":   "…",
   "pair_remaining_s": 3412
@@ -94,11 +97,11 @@
           <tr><td class="mono">region</td><td>铸这张票的出口所属区域，如 <code>us-east</code>、<code>europe</code>。只说明票是从哪儿铸的，不保证你这一发也落在这个区域；池子不知道时没有这个字段。</td></tr>
           <tr><td class="mono">cookie</td><td>路由 Cookie，原样放入上游请求的 <code>Cookie</code> 请求头。</td></tr>
           <tr><td class="mono">expires_at</td><td>本次分配的到期时间（UTC）。</td></tr>
-          <tr><td class="mono">valid_for_s</td><td>建议使用时长，单位秒，到期重新取。</td></tr>
-          <tr><td class="mono">verified_full</td><td>分配前是否已对该网关完成可用性校验。</td></tr>
-          <tr><td class="mono">ttl_is_advisory</td><td>固定 <code>true</code>：有效期只是建议值，以上游响应为准。</td></tr>
-          <tr><td class="mono">cookie_version</td><td>这张票的标识。sub2api 用它指名「别再给我这张」或归还，手动调用用不到。</td></tr>
-          <tr><td class="mono">pair_remaining_s</td><td>这张路由 Cookie 本身还能用多少秒（小时量级）。和 <code>valid_for_s</code> 不是一回事：<code>valid_for_s</code> 到了该换票，这个到了 Cookie 谁都用不了。池子算不出来时给 <code>0</code>，意思是「不知道」，不是已经过期。</td></tr>
+          <tr><td class="mono">valid_for_s</td><td>本次实际有效票的剩余秒数，不是150秒消费窗口，也不证明品质。</td></tr>
+          <tr><td class="mono">verified_full</td><td>固定 <code>false</code>。满血验证由消费端用自己的凭据完成。</td></tr>
+          <tr><td class="mono">ttl_is_advisory</td><td>固定 <code>true</code>：寿命不是品质保证，仍需检查上游响应。</td></tr>
+          <tr><td class="mono">cookie_version</td><td>本次交付 Cookie 的版本摘要，可用 <code>exclude_versions</code> 明确拒收旧票。</td></tr>
+          <tr><td class="mono">pair_remaining_s</td><td>与本次交付同一张有效票的剩余秒数，包含换盆后实际截止，不借用旧库存的期限。</td></tr>
         </tbody>
       </table></div>
 
@@ -111,48 +114,39 @@ Cookie: &lt;响应中的 cookie&gt;</pre>
       <p class="foot">请求上游时 Authorization 用的是账号自己的 Codex token，不是本服务的接入 key。</p>
 
       <h3>4. 何时重新获取</h3>
-      <p>路由 Cookie 按「账号 × 网关」分配，出现以下情况时重新调用 <code>/cookie</code>：</p>
+      <p>何时换票与换哪个网关完全由客户端决定：</p>
       <ul>
-        <li>距上次获取已超过 <code>valid_for_s</code> 秒。</li>
-        <li>当前网关不可用、要换一个时，加 <code>force=1</code>：
-          <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https://&lt;站点地址&gt;</span>/cookie?force=1'</pre></li>
-        <li>需要固定使用某个网关时，传入 <code>gateway</code> 参数，例如 <code>/cookie?gateway=unified-142</code>。</li>
+        <li>根据真实凭据期限、品质验证和本地冷却决定是否继续复用。</li>
+        <li>需要换票时，从新鲜目录选择新网关，再通过 <code>/cookie</code> 明确点名。</li>
+        <li>不支持 <code>force</code>、<code>wait</code> 或 <code>count</code>；不会现场铸票、批量取票或裸取代选。</li>
       </ul>
 
       <h3>5. 自己挑网关</h3>
-      <p>不想让池子替你挑，就先要一份清单：</p>
-      <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' <span class="origin">https://&lt;站点地址&gt;</span>/gateways</pre>
+      <p>先取仅含元数据的清单，不批量下载 Cookie：</p>
+      <pre class="mono">curl -G -H 'Authorization: Bearer &lt;接入 key&gt;' \
+  --data-urlencode 'account=&lt;account_id/user_id&gt;' \
+  <span class="origin">https://&lt;站点地址&gt;</span>/gateways</pre>
       <pre class="mono">{
   "account": "acct-…",   <span class="c">// 回显这份清单是按谁算的</span>
   "live":    4,          <span class="c">// 现在有几个网关有活票</span>
   "target":  6,          <span class="c">// 池子想维持的深度</span>
   "gateways": [
     { "name": "unified-167",
-      "pair_ready":   true,     <span class="c">// 有活票；false 的话你指定它池子得现铸，会慢</span>
-      "valid_for_s":  2400,
-      "used_by_you":  false,    <span class="c">// ← 你在这个网关上烧过没。挑 false 的</span>
-      "last_used_at": "2026-10-01T12:00:00Z" }
+      "pair_ready":   true,
+      "valid_for_s":  2400 }
   ]
 }</pre>
-      <p>挑一个 <code>pair_ready=true</code> 且 <code>used_by_you=false</code> 的，然后
-      <code>/cookie?gateway=&lt;挑中的&gt;</code>。</p>
+      <p>结合本地冷却和品质记录选择候选。目录不含 <code>used_by_you</code> 或 <code>last_used_at</code>。
+      Sub2api 按身份/Key/模型隔离短时目录缓存，最多30秒；点名缺票或候选耗尽时刷新。刷新失败表示未知库存，不是耗尽。</p>
 
       <h3>6. 一把 key 给好几个账号用</h3>
-      <p>这把 key 不止能给上传的那个号取票。你手上别的 Codex 账号也能用它，<strong>但必须说清这一发
-      是给谁的</strong>——每次都带上那个账号自己的 <code>account_id</code>（就是它 token 里的
-      <code>chatgpt_account_id</code>）：</p>
-      <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https://&lt;站点地址&gt;</span>/cookie?account=&lt;那个号的 account_id&gt;'
-curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https://&lt;站点地址&gt;</span>/gateways?account=&lt;那个号的 account_id&gt;'</pre>
-      <p>不带的话池子会把这次使用记在<strong>上传者</strong>头上，于是它以为那个网关已经
-      被用过了——白白划掉一个对你这个号其实还是满血的落点。满血是 (账号 × 网关) 的：A 号烧掉
-      unified-167 和 B 号在 unified-167 上是不是满血，毫无关系。</p>
+      <p>每次都必须带实际消费成员的完整标识。同一成员跨 Key 共享滚动限频：
+      <strong>每1秒12次、每60秒444次</strong>；成功与缺票都计数，鉴权失败不占成员额度。
+      清单和报告不占取票额度；公共 Key 与独立 Key 的额外访问限制仍有效。</p>
       <div class="note">
-        <p><strong>这种票回的 <code>verified_full</code> 是 <code>false</code>，别理解成「这张票可能是坏的」。</strong></p>
-        <p>它的意思是<strong>池子答不了这个问题</strong>：验满血要用那个账号自己的凭据打一发，
-        池子手上只有上传者的。拿上传者的凭据去验，答的是上传者的状态，对你这个号没有信息量。</p>
-        <p>票本身没问题——cookie 只是路由，谁铸的都一样，连降智的号铸出来的也一样好。
-        你这个号是不是满血，只取决于<strong>你自己碰过这个网关没</strong>，而那个答案在
-        <code>/gateways</code> 的 <code>used_by_you</code> 里。</p>
+        <p>外部统计只用于观察，不决定交付资格、冷却或排序，也没有历史消费者数量准入上限。
+        <code>/cookie</code> 和 <code>/gateways</code> 直接执行新契约，缺参或携带退役参数时400提示升级；
+        <code>/release</code>、<code>/pair/renew</code> 仅返回停用/升级错误。</p>
       </div>
 
       <h3>7. 状态码</h3>
@@ -162,11 +156,12 @@ curl -H 'Authorization: Bearer &lt;接入 key&gt;' '<span class="origin">https:/
           <tr><td class="mono">200</td><td>成功，返回路由 Cookie。</td><td>按第 3 步携带 Cookie 请求上游。</td></tr>
           <tr><td class="mono">400</td><td>参数不合法，例如 <code>gateway</code> 取值有误。</td><td>网关名只能包含字母、数字、<code>-</code>、<code>_</code>、<code>.</code>。</td></tr>
           <tr><td class="mono">401</td><td>缺少接入 key，或 key 无效。</td><td>检查 Authorization 请求头；账号停用期间 key 不可用。</td></tr>
-          <tr><td class="mono">404</td><td>请求地址错误。</td><td>确认请求的是站点根路径下的 <code>/cookie</code>，而不是本页地址下的路径。</td></tr>
-          <tr><td class="mono">503</td><td>暂时没有可分配的路由 Cookie。</td><td>稍后重试；系统已自动安排为该账号探测新的网关。</td></tr>
+          <tr><td class="mono">426</td><td>消费者归还/续期接口已停用。</td><td>升级至最新版 Sub2api，使用原路径下的新契约。</td></tr>
+          <tr><td class="mono">429</td><td><code>consumer_rate_limited</code>，成员取票超限。</td><td>遵守 <code>Retry-After</code>，不换 Key 绕过成员限频。</td></tr>
+          <tr><td class="mono">503</td><td>指定网关缺有效票，或公共接入未开放。</td><td>按错误码处理；缺票时刷新目录，由客户端重新选择。</td></tr>
         </tbody>
       </table></div>
-      <p class="foot"><strong>503 不是服务故障：</strong>可分配的网关都用掉了，稍后重试。</p>
+      <p class="foot">缺票不是满血耗尽的证据。只在新鲜目录成功返回后，由客户端根据本地状态判断是否耗尽。</p>
     </div>
   </div>
 </section>

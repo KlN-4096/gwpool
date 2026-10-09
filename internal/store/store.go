@@ -70,11 +70,12 @@ type State struct {
 	Mints map[string]types.RegionMint `json:"mints"`
 	// NextAccountID / NextOwnerID 是**永不回收**的 ID 计数器，见 bumpID。
 	// 老文件里没这两个键 ⇒ 0 ⇒ 第一次发号时按现有最大值兜底一次，不用迁移。
-	NextAccountID   int64                      `json:"next_account_id"`
-	NextOwnerID     int64                      `json:"next_owner_id"`
-	NextAccessKeyID int64                      `json:"next_access_key_id,omitempty"`
-	AccessKeys      map[string]types.AccessKey `json:"access_keys,omitempty"`
-	KeyUsage        map[string]types.KeyUsage  `json:"key_usage,omitempty"`
+	NextAccountID   int64                                  `json:"next_account_id"`
+	NextOwnerID     int64                                  `json:"next_owner_id"`
+	NextAccessKeyID int64                                  `json:"next_access_key_id,omitempty"`
+	AccessKeys      map[string]types.AccessKey             `json:"access_keys,omitempty"`
+	KeyUsage        map[string]types.KeyUsage              `json:"key_usage,omitempty"`
+	ExternalUsage   map[string]types.ExternalConsumerUsage `json:"external_usage,omitempty"`
 }
 
 // bumpID 发一个**永不回收**的 ID：计数器只增不减，max 只在老文件还没有计数器时兜底一次。
@@ -1020,35 +1021,6 @@ func (s *Store) UpdateSlot(accountID int64, gateway string, mutate func(*types.S
 		return errors.New("UpdateSlot 要一个改写函数")
 	}
 	return s.queueSlotWrite(slotMutation{accountID, gateway, mutate})
-}
-
-// LongestRestedSlot 在 candidates 里挑这个账号歇得最久的网关（SPEC 第 8 节）。
-//
-// 没有记录的 (账号 × 网关) 优先级最高：这个账号从没碰过那个网关，
-// 首次接触才给满血窗口，这正是池子的全部价值。
-// BackoffUntil 还没到的跳过——快重试只会更快耗尽供给（SPEC 红线 7）。
-func (s *Store) LongestRestedSlot(accountID int64, candidates []string) (types.Slot, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	now := time.Now().UTC()
-	var best types.Slot
-	found := false
-	// 排序只为让同等条件（例如多个从未碰过的网关）下的选择稳定可复现。
-	sorted := append([]string(nil), candidates...)
-	sort.Strings(sorted)
-	for _, gw := range sorted {
-		sl, ok := s.st.Slots[SlotKey(accountID, gw)]
-		if !ok {
-			sl = types.Slot{AccountID: accountID, Gateway: gw, LastVerdict: "unknown"}
-		}
-		if now.Before(sl.BackoffUntil) {
-			continue
-		}
-		if !found || sl.LastTouch.Before(best.LastTouch) {
-			best, found = sl, true
-		}
-	}
-	return best, found
 }
 
 // ---------- 区域铸票台账 ----------

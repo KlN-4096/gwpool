@@ -131,45 +131,9 @@ func TestUnsupportedExitDoesNotStarveExplorationOrInventory(t *testing.T) {
 	}
 }
 
-type timedEchoMinter struct {
-	*fakeMinter
-	clk *clock
-}
-
-func (m *timedEchoMinter) VerifyFull(ctx context.Context, c types.Creds, e types.Exit, sid, pair, ticket string) (*types.Verdict, error) {
-	m.clk.add(1250 * time.Millisecond)
-	return m.fakeMinter.VerifyFull(ctx, c, e, sid, pair, ticket)
-}
-func TestEchoSampleIncludesActualElapsedTime(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModeSingle)
-	s.mint = &timedEchoMinter{mn, clk}
-	if _, err := s.Deliver(context.Background(), 1, Request{}); err != nil {
-		t.Fatal(err)
-	}
-	for _, sample := range st.samples {
-		if sample.Purpose == types.PurposeVerify {
-			if sample.DurationMS != 1250 {
-				t.Fatal(sample.DurationMS)
-			}
-			return
-		}
-	}
-	t.Fatal("missing verification sample")
-}
-
 func TestDirectedAndQueuedWorkRespectProviderCapabilities(t *testing.T) {
 	s, _, mn, _ := rig(t, types.ModePool)
 	s.mint = &regionCapabilityMinter{mn}
-	unsupported := types.Gateway{ReachableExits: []types.Exit{{Region: "US"}}}
-	if _, ok := s.pickExit(unsupported); ok {
-		t.Fatal("directed work selected an unsupported exit")
-	}
-	unsupported.ReachableExits = append(unsupported.ReachableExits, types.Exit{Region: "BR"})
-	for range 100 {
-		if e, ok := s.pickExit(unsupported); !ok || e.Region != "BR" {
-			t.Fatal("mixed gateway selected unsupported exit", e)
-		}
-	}
 	q := NewMintAllQueue(s)
 	status := q.Enqueue()
 	if status.Skipped != 2 {

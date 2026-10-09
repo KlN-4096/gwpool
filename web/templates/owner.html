@@ -53,7 +53,7 @@
     <div class="copy"><pre class="mono" id="account-key">{{.AccountKey}}</pre><button type="button" data-copy="#account-key" hidden data-js>复制</button></div>
     {{if .KeyActive}}<p class="badge ok">可用：名下至少一份凭据有效</p>{{else}}<p class="err">暂不可用：需要至少一份启用且未过期的凭据；恢复后仍使用这把 key。</p>{{end}}
     {{else}}<p class="muted">服务未配置 consumer_key，请联系管理员。</p>{{end}}
-    <p class="foot">这把 key 随账号保留，不随单份凭据更换。旧凭证 key 不再展示或分发，但仍按原凭据启停状态兼容。请始终用 account 参数指定实际消费的上游账号，冷却仍按消费账号 × 网关分别记；未指定时使用名下编号最小的有效凭据。</p>
+    <p class="foot">这把 key 随账号保留，不随单份凭据更换。旧凭证 key 不再展示或分发，但鉴权仍按原凭据启停状态判断。所有 Key 统一使用 /cookie：account 填完整成员标识，gateway 明确点名；缺参数即拒绝并提示升级，品质与冷却由客户端维护。不保留旧消费逻辑。</p>
   </div>
 </div>
 

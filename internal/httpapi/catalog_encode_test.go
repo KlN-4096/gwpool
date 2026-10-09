@@ -18,14 +18,14 @@ func TestGatewayCatalogEncodingPreservesWireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, rows := range [][]gatewayCatalogRow{nil, {}, {{
-		Name: "quoted\"gateway", PairReady: true, ValidForS: 300, UsedByYou: true,
-		LastUsedAt: "2026-10-05T00:00:00Z", Contacts: contacts, DatacenterCountry: "US",
+		Name: "quoted\"gateway", PairReady: true, ValidForS: 300,
+		Contacts: contacts, DatacenterCountry: "US",
 		Cooldown: &types.CooldownRecommendation{Seconds: 3600, ReportIntervalSeconds: 21600,
 			ReportPolicyExpiresAt: time.Now().UTC()},
 		Priority: &types.GatewayPriority{Model: "m", Full: 5, Samples: 6},
 	}, {Name: "without-contacts"}}} {
 		response := gatewayCatalogResponse{gatewayCatalogHeader: gatewayCatalogHeader{
-			Account: "quote\" & <script>", Live: len(rows), Target: 106, DeliverTTLS: 150, DeliverFloorS: 300},
+			Account: "quote\" & <script>", Live: len(rows), Target: 106, SnapshotAt: time.Now().UTC(), DeliverFloorS: 300},
 			Gateways: rows}
 		expected, err := json.Marshal(response)
 		if err != nil {

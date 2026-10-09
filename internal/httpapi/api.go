@@ -47,25 +47,12 @@ import (
 // 两个方法都带 accountID：槽位是 (账号 × 网关) 二元组，池子必须知道是谁在要、
 // 是谁在回报，否则调度和账本都会串号。
 type Pool interface {
-	// req 带着调用方说得上话的那几件事（点名网关、force、两个排除名单、最低剩余寿命）。
-	// 它们全是外部输入，校验在 parseCookieRequest 做完（信任边界只有一道）。
-	Deliver(ctx context.Context, accountID int64, req sched.Request) (types.Delivery, error)
 	// DeliverAnonymous 给池子**手上没有凭据**的那个上游账号交付。upstreamAccountID 是
 	// 他自己的上游账号标识，槽位照常按它记——调度单位永远是 (账号 × 网关)。
 	//
 	// authed 为真 = 调用方自己是鉴权过的，只是替别的上游账号取票。那种调用方不受
 	// public_when_surplus 门槛约束（门槛是给上传者留的余量，不该挡住上传者本人）。
 	DeliverAnonymous(ctx context.Context, upstreamAccountID string, req sched.Request, authed bool) (types.Delivery, error)
-	// Release 还原一次「票取了但一发没打」的交付，返回还原了几个槽位。
-	Release(accountID int64, cookieVersion string) (int, error)
-	// DeliveredTo 报告这张票确实被交付给过这一行。/pair/renew 的归属闸用它，
-	// 而那是那条路上**唯一真正的**安全边界（交回来的 cookie 本体验不了签）。
-	// 判据归调度——它和 /release 共用同一份比对，HTTP 这层绝不自己算一份。
-	DeliveredTo(accountID int64, cookieVersion string) bool
-	// HasCandidate 是 wait 轮询的判据：此刻有没有一张**这个账号**拿得到、而且不用铸
-	// 的票。判据必须和交付是同一把尺子，所以归调度（它才看得见冷却），HTTP 这层
-	// 绝不自己算一份。
-	HasCandidate(accountID int64, req sched.Request) bool
 	// Public 是此刻的对外开放状态，现算不缓存。
 	Public() sched.PublicState
 	// PairTarget 是目标活 pair 数，只给 /gateways 的读数用。
@@ -103,11 +90,6 @@ type Store interface {
 	RegionMints() map[string]types.RegionMint
 	// SetAccountEnabled 只翻一个 bool。给上传者自己停用/启用用。
 	SetAccountEnabled(id int64, enabled bool) error
-	// SetAccountVia 记匿名占位行最近是拿谁的 key 取的票（管理页靠它认人）。
-	SetAccountVia(id, via int64) error
-	// PutPair 覆盖一个网关的 pair。只有 /pair/renew 用它（消费端自己续出来的那张
-	// 交回来），所以这一层写盘只会改 Cookie 和两个死期，不碰 MintedBy。
-	PutPair(p types.Pair) error
 
 	// DeleteAccount 删掉账号连同它的槽位，不动已经铸出来的 pair。
 	DeleteAccount(id int64) error
@@ -311,10 +293,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /enter", s.gate(s.sameOrigin(http.HandlerFunc(s.handleEnter))))
 	mux.Handle("POST /logout", s.gate(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
 	mux.Handle("GET /cookie", s.consumerAPI(s.handleCookie))
-	// /release 和 /cookie 同一把钥匙、同一套 account 语义（见 handleRelease）。
-	mux.Handle("POST /release", s.consumerAPI(s.handleRelease))
-	// /pair/renew 同上。它只把消费端自己续出来的那张记进账本，一发上游都不打。
-	mux.Handle("POST /pair/renew", s.consumerAPI(s.handleRenew))
+	// Retired endpoints only explain the required upgrade; no legacy dispatch.
+	mux.HandleFunc("POST /release", s.handleUpgradeRequired)
+	mux.HandleFunc("POST /pair/renew", s.handleUpgradeRequired)
 	mux.Handle("POST /cooldown/report", s.consumerAPI(s.handleCooldownReport))
 	mux.Handle("POST /cooldown/reports", s.consumerAPI(s.handleCooldownReports))
 	mux.Handle("POST /contact/report", s.consumerAPI(s.handleContactReport))
@@ -1591,7 +1572,7 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 // ---------- /cookie ----------
 
 func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
-	req, wait, count, perr := parseCookieRequest(r)
+	req, perr := parseCookieRequest(r)
 	if perr != nil {
 		s.badRequest(w, http.StatusBadRequest, perr.Error())
 		return
@@ -1601,101 +1582,14 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 		s.unauthorized(w, "需要有效的接入 Key")
 		return
 	}
-	if c.public {
-		s.servePublic(w, r, req, wait, count)
-		return
-	}
-	if c.issuedID > 0 {
-		ref := strings.TrimSpace(r.URL.Query().Get("account"))
-		if ref == "" || len(ref) > 128 {
-			s.badRequest(w, http.StatusBadRequest, "接入 Key 必须带 account 参数（你自己的上游 account_id）")
-			return
-		}
-		s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait, count,
-			func(rq sched.Request) (types.Delivery, error) {
-				return s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
-			})
-		return
-	}
-	acct := c.acct
 	ref := strings.TrimSpace(r.URL.Query().Get("account"))
-	if c.admin {
-		// 管理员兜底必须显式说替谁取：槽位是 (账号 × 网关)，替谁取决定了取哪个槽位，
-		// 猜一个账号就等于把 A 的槽位发给 B。
-		if ref == "" {
-			s.badRequestFor(w, http.StatusBadRequest, 0, "管理员调用必须带 account 参数指明替谁取")
-			return
-		}
-		if acct, ok = s.findAccount(ref); !ok {
-			s.badRequestFor(w, http.StatusNotFound, 0, "没有这个账号")
-			return
-		}
-		ref = ""
-	}
-	// 一把 key 可以替**别的**上游账号取票（上传一份凭据换一把 key，拿它给自己手上好几个
-	// 号用）。那种票的槽位必须按报上来的那个账号记：A 烧掉一个网关和 B 在同一个网关上
-	// 是不是满血毫无关系。
-	//
-	// 代价说在明处：池子**验不了**那张票——state-echo 要用那个账号的凭据打一发，池子
-	// 手上只有上传者的。所以走和匿名同一条路，回去的 verified_full 是 false。
-	if len(ref) > 128 { // 和匿名分支同一个上限：占位行按它建，标识会落盘、上管理页
-		s.badRequest(w, http.StatusBadRequest, "account 参数太长")
+	if !validConsumerRef(ref) {
+		s.badRequest(w, http.StatusBadRequest, "取票必须带 account 参数（完整的上游成员标识）；请升级到最新版 Sub2api")
 		return
 	}
-	if ref != "" && !accountRefMatches(acct, ref) {
-		// 记账归上传者（他的页面该看见这一行），**调度归占位行**：轮询要按那个号的
-		// 冷却判，发现扫描要排除的也是那个号——而池内行里只有上传者。
-		//
-		// authed=true：这条路的调用方**鉴权过了**，走 DeliverAnonymous 只是因为池子
-		// 手上没有那个号的凭据（验不了、也不替它铸），不该连带吃匿名的开放门槛。
-		s.serveCookie(w, r, acct.ID, s.rowFor(types.AnonPrefix+ref), req, wait, count,
-			func(rq sched.Request) (types.Delivery, error) {
-				d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, true)
-				if err == nil {
-					s.noteVia(ref, acct.ID)
-				}
-				return d, err
-			})
-		return
-	}
-	// 挑不出可交付的槽位就 503。宁可 503，也不把降智的东西发出去。
-	s.serveCookie(w, r, acct.ID, acct.ID, req, wait, count, func(rq sched.Request) (types.Delivery, error) {
-		return s.pool.Deliver(r.Context(), acct.ID, rq)
-	})
-}
-
-// servePublic uses the same external-account delivery path as ordinary keys,
-// with the public surplus gate retained. No credential ownership is implied.
-func (s *Server) servePublic(w http.ResponseWriter, r *http.Request, req sched.Request,
-	wait time.Duration, count int) {
-	// consumerAPI has checked the public switch/threshold after queue admission.
-	// 必须报上他**自己的**上游账号标识：槽位是 (账号 × 网关)，不知道是谁就没法
-	// 避开他已经烧过的网关。报错的只会害他自己，所以不防乱填。
-	ref := strings.TrimSpace(r.URL.Query().Get("account"))
-	if ref == "" || len(ref) > 128 {
-		s.badRequest(w, http.StatusBadRequest, "公共接入必须带 account 参数（你自己的上游 account_id）")
-		return
-	}
-	s.serveCookie(w, r, 0, s.rowFor(types.AnonPrefix+ref), req, wait, count,
-		func(rq sched.Request) (types.Delivery, error) {
-			// authed=false：公共身份没有上传者特权，调度仍复查开放门槛。
-			d, err := s.pool.DeliverAnonymous(r.Context(), ref, rq, false)
-			if err == nil {
-				s.noteVia(ref, 0) // 公共身份，无上传者归属。
-			}
-			return d, err
-		})
-}
-
-// noteVia 记下外部账号占位行最近一次**取到票**的上传者来源（0 = 公共身份）。只记成功的：
-// 失败的尝试不该把记录冲掉。占位行是取票时
-// 才建的，所以在取票之后记；「这是谁在用」只有 /cookie 这里知道。没变就不写盘。
-func (s *Server) noteVia(ref string, via int64) {
-	if id := s.rowFor(types.AnonPrefix + ref); id != 0 {
-		if err := s.st.SetAccountVia(id, via); err != nil {
-			s.opt.Log.Error("记匿名行的来源失败", "account", id, "err", err)
-		}
-	}
+	// Every consumer, including uploaded/root keys, uses the same exact route.
+	// A matching stored credential never grants server-side consumer scheduling.
+	s.serveExternalCookie(w, r, ref, req, !c.public)
 }
 
 // deliveryResponse 在 types.Delivery 之外多说两句话。
@@ -1704,19 +1598,15 @@ type deliveryResponse struct {
 	types.Delivery
 	DatacenterCountry string `json:"datacenter_country,omitempty"`
 	// TTLIsAdvisory 恒为 true：valid_for_s 是**建议值**不是承诺。
-	// 该不该换 pair 由客户端判断——只有它知道自己那一发对不对劲，
-	// 判断该换了就带 force=1 再来一次。
+	// Whether to rotate is a local consumer decision, never a pool lease.
 	TTLIsAdvisory bool `json:"ttl_is_advisory"`
 	// CookieVersion 是这张**具体的票**的不透明身份，用来回头指名它：
-	// exclude_versions=<它> 表示「别再给我这张」，/release 用它说「这张我没用」。
+	// exclude_versions=<它> 表示「别再给我这张」。
 	// 算法见 types.CookieVersion（确定性、不存状态、重启后仍一致）。
 	CookieVersion string `json:"cookie_version"`
 	// PairRemainingS 是**这张 pair 自己**还能活多久（秒）。
 	//
-	// 和 ValidForS 是**两件事**：ValidForS 是交付参考窗口的剩余，
-	// PairRemainingS 是路由的剩余（小时量级，
-	// 过了这张 cookie 谁都用不了）。消费端拿它决定要不要在业务请求里顺手续一发
-	// （剩不到 12 分钟才续，见 /pair/renew）。混成一个的后果是每发都续、或者永不续。
+	// Reports the effective pair's real deadline, not a consumer window.
 	PairRemainingS int `json:"pair_remaining_s"`
 	// Absolute route deadline calculated by the pool for this exact cookie.
 	// Preserves RouteDeadline's existing rules (including legacy cflb fallback),
@@ -1724,26 +1614,11 @@ type deliveryResponse struct {
 	RouteExpiresAt time.Time `json:"route_expires_at,omitzero"`
 }
 
-// batchResponse 是带 count 的 /cookie 的回话。**count 没带时不走这个形状**——
-// 那条路原样回 deliveryResponse，存量调用方读的顶层字段一个都不动。
-//
-// Count 和 Want 都要给：语义是「最多这么多张」，拿到几张调用方必须能直接读出来，
-// 而不是去数数组长度再和自己发的参数比对（它那头还要据此更新「平均要试几次」）。
-type batchResponse struct {
-	Tickets []deliveryResponse `json:"tickets"`
-	Count   int                `json:"count"` // 实际给了几张
-	Want    int                `json:"want"`  // 请求的 count，原样回显
-}
-
 func (s *Server) delivered(d types.Delivery) deliveryResponse {
-	out := deliveryResponse{Delivery: d, TTLIsAdvisory: true,
+	return deliveryResponse{Delivery: d, TTLIsAdvisory: true,
 		DatacenterCountry: coverage.DatacenterCountry(d.Gateway),
-		CookieVersion:     types.CookieVersion(d.Cookie)}
-	if p, ok := s.st.Pairs()[d.Gateway]; ok && p.Cookie == d.Cookie {
-		out.RouteExpiresAt = p.ExpiresAt
-		out.PairRemainingS = int(max(time.Until(p.CflbExpiresAt), 0) / time.Second)
-	}
-	return out
+		CookieVersion:     types.CookieVersion(d.Cookie), RouteExpiresAt: d.ExpiresAt,
+		PairRemainingS: int(max(time.Until(d.ExpiresAt), 0) / time.Second)}
 }
 
 // truthy 认几种常见的「真」写法：客户端是别人写的，别为了一个开关卡他。
@@ -1753,43 +1628,6 @@ func truthy(v string) bool {
 		return true
 	}
 	return false
-}
-
-// deliverFailed 统一回写交付失败。细节只进日志不进响应：上游的错误串里可能
-// 裹着请求头之类的东西（红线 1）。
-//
-// 状态码一律 503：对客户端来说这九种都是「这一发拿不到票」，该不该再来、等多久
-// 由码和 Retry-After 说，不由状态码说（而 sub2api 的客户端只认 503 → ErrNoSlot）。
-func (s *Server) deliverFailed(w http.ResponseWriter, err error, acctID, consumerID int64, gateway string) {
-	s.opt.Log.Info("交付失败", "account", acctID, "consumer", consumerID, "gateway", gateway, "err", err)
-	code, msg, retry := s.classify(err)
-	if errors.Is(err, sched.ErrNoFullSlot) {
-		// 这个账号在所有已知网关上都烧完了。光回 503 的话池子就卡在这儿了——
-		// 同一个网关上重铸一张新 pair 对它没用（烧掉的是「这个号接触过这个网关」，
-		// 换票不解封），只有**没碰过的新网关**才有窗口。所以去找新落点。
-		//
-		// 派去的人要排除的是**消费者**，不是记账那一行：跨账号时消费者是占位行，
-		// 而上传者在这里恰恰是最合适的铸票者（烧它的窗口不影响消费者对新落点的首次
-		// 接触）。把上传者当成消费者排掉的话，单上传者的池子永远挑不出铸票者 ⇒
-		// 这种失败唯一的出路被堵死。消费者是占位行时传 0（它没凭据，本来也选不上它）。
-		if s.scan != nil {
-			s.scan.EnqueueDiscovery(consumerID)
-		}
-	}
-	// 页面上要看得见：客户端那头只有一个 502/503，上传者对着它猜不出是哪种。
-	// 码也要落下来——同一句人话底下可能是两种完全不同的处置。
-	detail := err.Error()
-	if code == codeNoGateway {
-		// 冷启动得人踢一脚，而这件事只在日志里说过。只有一个启用账号时它自己就是
-		// 消费者 ⇒ 派谁去找落点都会被排掉（派他自己等于当场烧掉那个落点），
-		// 而网关表空着时现铸也无从下手（pickExit 要一个已在表上的网关）。
-		detail += "｜池子一个网关都没有：要么再上传一个账号（让它去找落点），" +
-			"要么手动 POST /admin/rescan 踢一次"
-	}
-	s.fails.add(deliverFail{At: time.Now(), AccountID: acctID, Gateway: gateway,
-		Code: code, Reason: msg, Detail: detail})
-	writeFail(w, http.StatusServiceUnavailable,
-		apiError{Code: code, Message: msg, RetryAfterSeconds: retrySeconds(retry)})
 }
 
 // handleAccountEnabled 让上传者自己开关这个账号。
@@ -2107,6 +1945,16 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(v.Accounts, func(i, j int) bool { return v.Accounts[i].ID < v.Accounts[j].ID })
 	sort.Slice(v.External, func(i, j int) bool { return v.External[i].ID < v.External[j].ID })
+	if reader, ok := s.st.(interface {
+		ExternalUsage() map[string]types.ExternalConsumerUsage
+	}); ok {
+		for id, usage := range reader.ExternalUsage() {
+			v.ExternalUsage = append(v.ExternalUsage, externalUsageRow{ID: id, ExternalConsumerUsage: usage})
+		}
+		sort.Slice(v.ExternalUsage, func(i, j int) bool {
+			return v.ExternalUsage[i].LastAt.After(v.ExternalUsage[j].LastAt)
+		})
+	}
 	v.AccountFacets = accountFacets(v.Accounts, owners, ownerName)
 	// 账号页签一号一张紧凑卡：最近取票、接入 key、九区域格子和 /u/ 那张卡同一份读数。
 	hosted := make([]types.Account, 0, len(v.Accounts))

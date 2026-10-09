@@ -170,32 +170,11 @@ type Config struct {
 	// never implicitly change the total hourly budget. 0 uses Defaults.
 	UpstreamPerAccountHour int `json:"upstream_per_account_hour"`
 
-	// VerifyFullAtDeliver 决定交付前要不要用 state-echo 验一次满血。**默认关**。
-	//
-	// **2026-10-02 修掉的一条过时理由**：这里原先写「验证动作自己就把要交付的那个窗口烧掉了，
-	// 交出去的已经是个二手落点」。那是错的 —— 当天实测**满血窗口内连打多发都是满血**
-	// （窗口 ≥200s、窗口内 7/7），所以那两发不烧窗口，只是把窗口的计时提前启动、
-	// 消费方少拿几十秒。
-	//
-	// 所以开不开是**成本取舍**，不是「验了就废」：代价是每次交付多 2 发上游请求，
-	// state-echo、铸票与绑定失败共用滚动小时国家预算及独立账号总预算。
-	// 加上 state-echo 有假阴无假阳（SPEC 第 3 节），关掉只损失一个读数、不会把降智的东西
-	// 放出去，所以默认仍然关。
-	VerifyFullAtDeliver bool `json:"verify_full_at_deliver"`
-
 	// SlotCooldownMinutes 是 (账号 × 网关) 烧掉之后要歇多久，0 时按 types.SlotCooldown。
 	//
 	// 这个数至今没测准：实测见过 30 分钟就恢复的，也见过 3 小时还没恢复的，
 	// 默认的 4 小时是保守估算。做成配置项就是为了能按当天的观测调。
 	SlotCooldownMinutes int `json:"slot_cooldown_minutes"`
-
-	// MaxTriesPerDeliver 是一次 /cookie 最多试几个网关，0 时按 Defaults（2）。
-	//
-	// 它是**请求数的乘数**：每多试一个网关，失败也要花一发上游（没票就得现铸）。
-	// 2 的意思是「给你一次改口的机会，然后老实认 503」——试不出来就把供给
-	// 留给下一个人，而不是一个倒霉的消费者把整池摸空（2026-10-01 实测连试 5 个、
-	// 耗 90 秒，最后还是 503）。
-	MaxTriesPerDeliver int `json:"max_tries_per_deliver"`
 
 	// SpareTarget 是池子要比「最忙的那个号用过的 pair 数」多留几张活 pair。
 	//
@@ -309,12 +288,9 @@ func Defaults() Config {
 		UpstreamPerRegionHour:  2,
 		UpstreamPerAccountHour: 50,
 		SlotCooldownMinutes:    int(types.SlotCooldown / time.Minute),
-		MaxTriesPerDeliver:     2,
 		SpareTarget:            types.SpareTarget,
 		MintConcurrency:        defaultMintConcurrency,
 		InventoryRouting:       InventoryRoutingShadow,
-		// 这两个开关默认关，理由在字段注释里：两个都是「花一个满血窗口换一个读数」。
-		VerifyFullAtDeliver: false,
 	}
 }
 
@@ -414,9 +390,6 @@ func Load(path string) (Config, error) {
 	if cfg.SlotCooldownMinutes < 0 {
 		return Config{}, fmt.Errorf("slot_cooldown_minutes 不能为负（0 = 用默认值）")
 	}
-	if cfg.MaxTriesPerDeliver < 0 {
-		return Config{}, fmt.Errorf("max_tries_per_deliver 不能为负（0 = 用默认值）")
-	}
 	if cfg.MintConcurrency < 0 {
 		return Config{}, fmt.Errorf("mint_concurrency 不能为负（0 = 用默认值 %d = 串行）", defaultMintConcurrency)
 	}
@@ -427,9 +400,6 @@ func Load(path string) (Config, error) {
 	if n := len(types.Regions); cfg.MintConcurrency > n {
 		return Config{}, fmt.Errorf("mint_concurrency 最多 %d：再大也只是把上游请求打得更密，"+
 			"而密集铸票是封号特征；真要放开先改这里", n)
-	}
-	if cfg.MaxTriesPerDeliver == 0 {
-		cfg.MaxTriesPerDeliver = Defaults().MaxTriesPerDeliver
 	}
 	// spare_target 的 0 是**真的 0**（全按需、不预铸），所以这里只拦负数——
 	// 负数会让目标深度低于「最忙的号用过的张数」，预铸永远不触发，而那不是
@@ -500,7 +470,7 @@ func Load(path string) (Config, error) {
 	// （而那个函数自己的注释就说冷却是参数不是常量）。
 	//
 	// 0（和没写一样走推导）而不是报错：同一张管理表单上 upstream_per_region_hour、
-	// slot_cooldown_minutes、max_tries_per_deliver 的提示都是「0 = 用默认值」，而那一格
+	// slot_cooldown_minutes 的提示是「0 = 用默认值」，而那一格
 	// 留空时 atoiField 回的就是下限 ⇒ 这一格必须也认 0，否则「留空 = 用默认值」这个
 	// 全表一致的直觉在**唯一一个往开那边失败的格子**上不成立。
 	if n := cfg.PublicWhenSurplus.MinAccounts; n <= 0 || !hasNestedKey(raw, "public_when_surplus", "min_accounts") {

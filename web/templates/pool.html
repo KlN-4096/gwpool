@@ -153,8 +153,11 @@
         <h3>1. 获取接入 key</h3>
         <p>在「上传账号」提交凭据，完成后点击结果卡片的「打开账号总览」，接入 key 在总览页中。</p>
         <h3>2. 请求路由 Cookie</h3>
-        <pre class="mono">curl -H 'Authorization: Bearer &lt;接入 key&gt;' <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
-        <p>返回 JSON，<code>cookie</code> 字段即路由 Cookie。可选参数：<code>gateway=&lt;网关名&gt;</code> 指定网关；<code>force=1</code> 换一个网关。</p>
+        <pre class="mono">curl -G -H 'Authorization: Bearer &lt;接入 key&gt;' \
+  --data-urlencode 'account=&lt;account_id/user_id&gt;' \
+  --data-urlencode 'gateway=unified-142' \
+  <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
+        <p>先通过 <code>/gateways?account=…</code> 获取目录，由客户端按本地品质/冷却选定网关。取票必须带完整成员标识和网关；不支持 force、wait、count 或裸取代选。</p>
         <h3>3. 携带 Cookie 请求上游</h3>
         <p>把 <code>cookie</code> 字段原样放进上游请求的 <code>Cookie</code> 头，在 <code>valid_for_s</code> 秒内用完，到期重新取。</p>
         <p class="foot">完整字段与状态码见账号页的「接入说明」。</p>
@@ -179,8 +182,9 @@
         <p>在客户端的网关池设置中，分别填写以上 URL 和 Key。由客户端传入上游账号标识，按账号分别记账。</p>
         <p class="foot">所有公共用户共享：{{.PublicLimits.RequestsPerMinute}} 次/分钟、并发 {{.PublicLimits.MaxConcurrent}}、排队 {{.PublicLimits.MaxQueued}}、最长等待 {{.PublicLimits.QueueWaitMS}} 毫秒。超限按 Retry-After 退避，普通 Key 不受这条队列影响。</p>
         <details><summary>接口与业务规则</summary>
-          <pre class="mono">curl -H 'Authorization: Bearer &lt;公共 Key&gt;' '<span class="origin">https://&lt;站点地址&gt;</span>/cookie?account=&lt;上游 account_id&gt;'</pre>
-          <p class="foot">沿用普通 Key 的外部账号路径：只交付现成票，无消费者凭据时不做池端满血验证；归还和续期仍须满足原有归属校验。公共 Key 不授予管理权限，缺失或错误 Key 返回 401。</p>
+          <pre class="mono">GET /cookie?account=&lt;account_id/user_id&gt;&amp;gateway=&lt;网关名&gt;
+Authorization: Bearer &lt;公共 Key&gt;</pre>
+          <p class="foot">所有 Key 只交付指定现成票，不做池端品质验证。成员取票另受12次/秒、444次/分钟滚动限频，超限429与Retry-After；取票/目录复用原路径但不兼容旧请求，归还/消费者续期端点426提示停用升级。公共 Key 不授予管理权限，缺失或错误 Key 返回401。</p>
         </details>
       </div>
     </div>

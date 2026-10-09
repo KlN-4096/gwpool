@@ -356,7 +356,9 @@ type Slot struct {
 	LastVerdict  string // VerdictFull / VerdictDegraded / VerdictUnknown
 	BackoffUntil time.Time
 
-	// PrevDeliver / PrevTouch 是交付那一刻存下的**交付之前**那两个时刻，
+	// Legacy fields below are retained only to preserve old persisted records.
+	// Consumer delivery does not create slots, restore releases or accept renewal.
+	// PrevDeliver / PrevTouch 是旧交付那一刻存下的**交付之前**那两个时刻，
 	// 供「票取了但一发没打」的归还（/release）还原用。
 	//
 	// 为什么是存旧值而不是归还时清零：清零会把一次真实的历史接触抹成「从没碰过」，

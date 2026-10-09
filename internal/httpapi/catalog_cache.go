@@ -249,16 +249,3 @@ func (entry cooldownCacheEntry) forAccount(stats types.CooldownStats, reporterID
 	}
 	return rec
 }
-
-func (s *Server) slotsForAccount(accountID int64) []types.Slot {
-	if indexed, ok := s.st.(interface{ SlotsForAccount(int64) []types.Slot }); ok {
-		return indexed.SlotsForAccount(accountID)
-	}
-	var out []types.Slot
-	for _, slot := range s.st.Slots() {
-		if slot.AccountID == accountID {
-			out = append(out, slot)
-		}
-	}
-	return out
-}
