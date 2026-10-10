@@ -1381,9 +1381,10 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 	}
 	v.AccountKey = s.OwnerKeyFor(o)
 	_, v.KeyActive = s.ownerKeyAccount(o.ID, "")
-	v.Accounts, v.LastFetch = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
+	v.Accounts, v.LastMint = s.ownerAccountRows(s.st.AccountsByOwner(o.ID), samples)
 	for _, row := range v.Accounts {
-		v.Requests += row.Requests
+		v.MintAttempts += row.MintAttempts
+		v.Minted += row.Minted
 		v.NewGateways += row.NewGateways
 	}
 	s.render(w, s.tplOwner, v)
@@ -1396,51 +1397,28 @@ func (s *Server) handleOwner(w http.ResponseWriter, r *http.Request) {
 // 「最近的取票失败」，把归还和续期混进来会让人读错；管理员要的 Detail 在管理页
 // 那张全量失败表里，带原始错误。
 func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) ([]ownerAccountRow, string) {
-	// 请求数按账号先汇总一遍：账号可能有好几个，每个都扫一遍全量样本是 O(n×m)。
-	reqs := map[int64]int{}
-	for _, sm := range samples {
-		reqs[sm.AccountID]++
-	}
-	// 最近一次取票：自己的槽位，加上拿这个号的 key 替外部账号取的——那些记在占位行上，
-	// 占位行的 Via 指回最近一次替它取票的那个号。两种都说明上传者那边的对接是通的。
-	// ponytail: Via 只记最近一个号，一个外部账号先后被两把 key 取过时，早先那把 key 的
-	// 号就看不到这几次；要准就得按 (占位行, key) 记取票时间。
-	via := map[int64]int64{}
-	for _, a := range s.st.Accounts() {
-		if a.Via != 0 && a.Creds.AccessToken == "" {
-			via[a.ID] = a.Via
-		}
-	}
-	lastFetch := map[int64]time.Time{}
-	for _, sl := range s.st.Slots() {
-		id := sl.AccountID
-		if v, ok := via[id]; ok {
-			id = v
-		}
-		if sl.LastDeliver.After(lastFetch[id]) {
-			lastFetch[id] = sl.LastDeliver
-		}
-	}
+	now := time.Now().UTC()
+	mintStats := summarizeAccountMints(samples, now)
 	mints := s.st.RegionMints()
 	gws := s.st.Gateways()
 	// 九宫格的滑窗 = 槽位冷却：和调度那把尺子同一个值（见 regionCells）。
 	window := s.slotCooldown()
-	now := time.Now().UTC()
 	var newest time.Time
 	out := make([]ownerAccountRow, 0, len(accs))
 	for _, a := range accs {
 		row := ownerAccountRow{
 			ID: a.ID, Label: a.Label, Plan: a.PlanType,
 			Enabled: a.Enabled, DisabledReason: a.DisabledReason,
-			Since:       a.CreatedAt.Format(time.DateTime),
-			ViewToken:   a.ViewToken,
-			Requests:    reqs[a.ID],
-			NewGateways: s.foundBy(a.ID),
-			Regions:     regionCells(s.opt.Live.Get(), a.ID, mints, samples, gws, window),
-			Fails:       s.fails.failRows(a.ID, 20, false),
+			Since:        a.CreatedAt.Format(time.DateTime),
+			ViewToken:    a.ViewToken,
+			MintAttempts: mintStats[a.ID].attempts,
+			Minted:       mintStats[a.ID].minted,
+			NewGateways:  s.foundBy(a.ID),
+			Regions:      regionCells(s.opt.Live.Get(), a.ID, mints, samples, gws, window),
+			Fails:        s.fails.failRows(a.ID, 20, false),
 		}
-		if t := lastFetch[a.ID]; !t.IsZero() {
-			row.LastFetch, row.LastFetchAt = ago(now, t), t.UTC().Format(time.DateTime)
+		if t := mintStats[a.ID].lastAt; !t.IsZero() {
+			row.LastMint, row.LastMintAt = ago(now, t), t.UTC().Format(time.DateTime)
 			if t.After(newest) {
 				newest = t
 			}
@@ -1958,7 +1936,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	v.AccountFacets = accountFacets(v.Accounts, owners, ownerName)
-	// 账号页签一号一张紧凑卡：最近取票、接入 key、九区域格子和 /u/ 那张卡同一份读数。
+	// 账号页签一号一张紧凑卡：铸票统计、九区域格子和 /u/ 那张卡同一份读数。
 	hosted := make([]types.Account, 0, len(v.Accounts))
 	for _, row := range v.Accounts {
 		hosted = append(hosted, byID[row.ID])

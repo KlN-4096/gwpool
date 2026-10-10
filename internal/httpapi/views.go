@@ -206,13 +206,14 @@ type ownerView struct {
 	Token string
 	Label string
 	Since string
-	// Requests / NewGateways 是名下所有账号的合计。
-	Requests    int
-	NewGateways int
-	// LastFetch 是名下所有账号里最近的那次取票（人读），空 = 一次都没有。
-	LastFetch string
-	Model     string
-	Effort    string
+	// MintAttempts / Minted / NewGateways 是名下所有账号的合计。
+	MintAttempts int
+	Minted       int
+	NewGateways  int
+	// LastMint 仅来自成功铸票样本，不是客户端领取时间。
+	LastMint string
+	Model    string
+	Effort   string
 	// BaseURL 见 poolView.BaseURL。
 	BaseURL string
 	// CanLogout：访客的身份 cookie 正好是这个 owner，给一个「登出」按钮。
@@ -230,13 +231,13 @@ type ownerAccountRow struct {
 	Since          string
 	// ViewToken 用来拼进这个账号详情页的链接。同一个 owner 名下的账号，这一页
 	// 本来就都看得见，不是额外的泄漏面。
-	ViewToken   string
-	Requests    int
-	NewGateways int
-	// LastFetch 是最近一次拿这个号的接入 key 取到票（人读的「12 分钟前」），空 = 还没取到过。
-	// 上传者拿它判断自己那边 sub2api 对接通没通：探测请求数只说明池子在用他的号。
-	LastFetch   string
-	LastFetchAt string // 同一时刻的绝对时间（UTC），给悬停
+	ViewToken    string
+	MintAttempts int
+	Minted       int
+	NewGateways  int
+	// LastMint 是此凭据最近成功获票的样本时间，与接入 Key 的交付统计无关。
+	LastMint   string
+	LastMintAt string // 同一时刻的绝对时间（UTC），给悬停
 	// Regions 恒为 types.Regions 那九个，顺序一致。
 	Regions regionGrid
 	Fails   []failRow
@@ -398,7 +399,7 @@ type accountRow struct {
 	SameAs      string // 报上来的上游 ID 正好是池里某个托管账号的：「#3 xxx（已停用）」
 	Delivered   int    // 取过票的网关数（槽位台账里 LastDeliver 非零的）
 	LastDeliver string // 最近一次取票（UTC）；空 = 一张都没取到过
-	// Card 是 /u/ 那张卡的同一份读数（ownerAccountRows）：最近取票、接入 key、九区域格子、
+	// Card 是 /u/ 那张卡的同一份读数（ownerAccountRows）：铸票统计、九区域格子、
 	// 取票失败。只给托管着凭据的号——管理页账号页签一号一张紧凑卡，就是拿它画的。
 	Card ownerAccountRow
 }

@@ -167,8 +167,8 @@
       {{- if .Accounts}}{{template "region-legend" (index .Accounts 0).Card.Regions}}{{end}}</div><a class="btn" href="/admin/accounts/cleanup-401">清理401凭据 · {{.UnauthorizedCount}}</a></header>
     {{if .Accounts}}
     <div class="table-wrap"><table id="t-accounts" class="acards" data-grid data-size="24" data-facets="{{.AccountFacets}}" data-placeholder="搜索名称、上游账号 ID 或上传者">
-      <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>最近取票</th><th data-nosort>操作</th>
-        <th data-nosort>上游账号 ID</th><th>上传者</th><th class="num">请求数</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间</th>
+      <thead><tr><th class="num">ID</th><th>名称</th><th>套餐</th><th>最近成功铸票</th><th data-nosort>操作</th>
+        <th data-nosort>上游账号 ID</th><th>上传者</th><th class="num">铸票尝试</th><th class="num">成功获票</th><th class="num">发现网关</th><th class="num">区域</th><th>添加时间</th>
         <th data-nosort>停用原因</th><th data-nosort>出口记录</th></tr></thead>
       <tbody>
       {{range .Accounts}}
@@ -180,7 +180,7 @@
             {{- if .Held}} <span class="badge warn" title="上游 429 把它按住了（额度耗尽或打太猛）。仍是启用状态，到点自己恢复，不用人去点。">上游按住 {{.Held}}</span>{{end}}
             {{- with .Card.Fails}} <a class="badge bad" href="#fails" title="最近几次没给出票，明细在「取票失败」页签">取票失败 {{len .}}</a>{{end}}</td>
           <td>{{if eq .Plan "free"}}<span class="badge warn">free</span>{{else if .Plan}}<span class="badge">{{.Plan}}</span>{{end}}</td>
-          <td class="a-fetch" data-sort="{{.Card.LastFetchAt}}">{{if .Card.LastFetch}}<span title="{{.Card.LastFetchAt}} UTC">{{.Card.LastFetch}}</span>{{else}}还没取到过{{end}}</td>
+          <td class="a-fetch" data-sort="{{.Card.LastMintAt}}">{{if .Card.LastMint}}<span title="{{.Card.LastMintAt}} UTC">{{.Card.LastMint}}</span>{{else}}{{if .Card.Minted}}成功时间未记录{{else}}暂无成功记录{{end}}{{end}}</td>
           <td><div class="row-actions">
             <form method="post" action="/admin/accounts/{{.ID}}/enabled"><input type="hidden" name="enabled" value="{{if .Enabled}}0{{else}}1{{end}}">
               <button class="sm" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
@@ -190,7 +190,8 @@
           </div></td>
           <td class="l2 mono">{{.Upstream}}</td>
           <td class="l2 a-owner"><span class="clip short" title="{{.Owner}}">{{.Owner}}</span></td>
-          <td class="l2 a-req">{{.Requests}}</td>
+          <td class="l2 a-req">{{.Card.MintAttempts}}</td>
+          <td class="l2 a-minted">{{.Card.Minted}}</td>
           <td class="l2 a-found">{{.Found}}</td>
           <td class="l2 a-cov" title="启用出口中有成功铸票记录的数量；不是网关全集完成率">{{.Covered}}</td>
           <td class="l2 a-since" title="UTC">{{.Since}}</td>

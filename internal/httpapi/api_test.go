@@ -631,7 +631,7 @@ func TestOwnerPageIsScopedToItsOwnAccounts(t *testing.T) {
 		t.Fatalf("状态 %d: %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{"pro1", k1, "/a/vt-1", "1 次请求", "<span>最近一次取票</span>"} {
+	for _, want := range []string{"pro1", k1, "/a/vt-1", "铸票尝试 <strong>1 次</strong>", "<span>最近成功铸票</span>"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("自己的总览页缺了 %q", want)
 		}
@@ -1890,39 +1890,52 @@ func TestSlotSummaries(t *testing.T) {
 	}
 }
 
-// /u 的「最近一次取票」：自己的槽位，加上拿这个号的 key 替外部账号取的（记在占位行上，
-// Via 指回这个号）。上传者靠它判断自己那边的对接通没通。
-func TestOwnerPageShowsLastFetch(t *testing.T) {
-	_, h, _, st, _ := rig(t, types.ModePool)
-	page := func(tok string) string { return do(h, httptest.NewRequest("GET", "/u/"+tok, nil)).Body.String() }
-	if body := page(ownerTok1); !strings.Contains(body, "还没用接入 key 取到过票") {
-		t.Fatal("还没取过票时没说清楚")
+// 铸票统计按凭据和 owner 隔离，旧消费槽位不能冒充后台成功获票。
+func TestOwnerPageShowsLatestMintPerAccountAndOwner(t *testing.T) {
+	srv, h, _, st, _ := rig(t, types.ModePool)
+	st.samples = nil
+	page := func(tok string) string {
+		srv.smAt = time.Time{} // Each scenario mutates the fake ledger.
+		return do(h, httptest.NewRequest("GET", "/u/"+tok, nil)).Body.String()
+	}
+	if body := page(ownerTok1); !strings.Contains(body, "暂无成功铸票记录") {
+		t.Fatal("no-success state is missing")
 	}
 	now := time.Now()
 	st.accounts = append(st.accounts, types.Account{ID: 9, Label: "匿名 x", Enabled: true, Via: 1,
 		Creds: types.Creds{AccountID: types.AnonPrefix + "x"}})
 	st.slots["9|unified-7"] = types.Slot{AccountID: 9, Gateway: "unified-7", LastDeliver: now.Add(-5 * time.Minute)}
+	st.slots["1|unified-9"] = types.Slot{AccountID: 1, Gateway: "unified-9", LastDeliver: now}
+	if !strings.Contains(page(ownerTok1), "暂无成功铸票记录") {
+		t.Fatal("legacy consumer delivery was counted as minting")
+	}
+	st.samples = []types.Sample{{AccountID: 1, Status: 200, Gateway: "unified-7", At: now.Add(-5 * time.Minute)}}
 	body := page(ownerTok1)
-	for _, want := range []string{"<b>5 分钟前</b><span>最近一次取票</span>", "最近一次取票 <strong>5 分钟前</strong>"} {
+	for _, want := range []string{"<b>5 分钟前</b><span>最近成功铸票</span>", "最近成功铸票 <strong>5 分钟前</strong>"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("经外部账号取票：总览页缺了 %q", want)
 		}
 	}
 	// 别人的总览页不许沾上这次取票。
-	if !strings.Contains(page(ownerTok2), "还没用接入 key 取到过票") {
-		t.Fatal("2 号的总览页算上了 1 号的 key 取的票")
+	if !strings.Contains(page(ownerTok2), "暂无成功铸票记录") {
+		t.Fatal("owner 2 counted owner 1's mint")
 	}
-	// 自己的槽位那一路：比经外部账号那次更新，就报它。
-	st.slots["1|unified-9"] = types.Slot{AccountID: 1, Gateway: "unified-9", LastDeliver: now.Add(-2 * time.Minute)}
-	if body := page(ownerTok1); !strings.Contains(body, "<b>2 分钟前</b><span>最近一次取票</span>") {
-		t.Fatal("自己槽位上更近的那次取票没算进来")
+	// 乱序样本取时间最大值，而不是最后一行；最新失败不能推进成功时间。
+	st.samples = append(st.samples,
+		types.Sample{AccountID: 1, Status: 200, Gateway: "unified-9", At: now.Add(-2 * time.Minute)},
+		types.Sample{AccountID: 1, Status: 200, Gateway: "unified-9", At: now.Add(-20 * time.Minute)},
+		types.Sample{AccountID: 1, Status: 401, At: now},
+	)
+	if body := page(ownerTok1); !strings.Contains(body, "<b>2 分钟前</b><span>最近成功铸票</span>") {
+		t.Fatal("latest successful mint timestamp is incorrect")
 	}
 	// 名下好几个号：顶上那格报最近的一个，各卡片报各自的。
 	st.accounts = append(st.accounts, types.Account{ID: 4, Label: "pro4", Enabled: true, OwnerID: 1, ViewToken: "vt-4",
 		Creds: types.Creds{AccessToken: "x", AccountID: "acct-d"}})
-	st.slots["4|unified-9"] = types.Slot{AccountID: 4, Gateway: "unified-9", LastDeliver: now.Add(-90 * time.Second)}
+	st.samples = append(st.samples, types.Sample{AccountID: 4, Status: 200, Gateway: "unified-9", At: now.Add(-90 * time.Second)})
 	body = page(ownerTok1)
-	for _, want := range []string{"<b>1 分钟前</b><span>最近一次取票</span>", "最近一次取票 <strong>2 分钟前</strong>"} {
+	for _, want := range []string{"<b>1 分钟前</b><span>最近成功铸票</span>", "最近成功铸票 <strong>2 分钟前</strong>",
+		"<b>5</b><span>铸票尝试</span>", "成功获票 <strong>4 次</strong>"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("两个号：总览页缺了 %q", want)
 		}

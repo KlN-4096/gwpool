@@ -276,10 +276,11 @@ table.acards td.a-name .clip { white-space: nowrap; max-width: min(20em, 100%); 
 table.acards td.l2.mono { white-space: normal; overflow-wrap: anywhere; } /* 上游账号 ID，窄屏上别把卡片撑出横向滚动 */
 table.acards td.a-name .badge { font-size: 11.5px; font-weight: 500; }
 table.acards td.a-fetch { margin-left: auto; }
-table.acards td.a-fetch::before { content: "取票 "; }
+table.acards td.a-fetch::before { content: "最近成功铸票 "; }
 table.acards td.l2 { order: 2; }
 table.acards td.a-owner::before { content: "上传者 "; }
-table.acards td.a-req::before { content: "请求 "; }
+table.acards td.a-req::before { content: "铸票尝试 "; }
+table.acards td.a-minted::before { content: "成功获票 "; }
 table.acards td.a-found::before { content: "发现网关 "; }
 table.acards td.a-cov::before { content: "区域 "; }
 table.acards td.a-since::before { content: "添加 "; }
