@@ -170,7 +170,7 @@ func configChanges(r *http.Request, cur config.Config) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 0不增加需求富余；已知网关恢复与最低目标仍可能维护库存。
+	// Retain legacy bootstrap hints; known-gateway maintenance is independent.
 	spare, err := atoiField(r, "spare_target", 0, 100)
 	if err != nil {
 		return nil, err

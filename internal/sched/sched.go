@@ -21,6 +21,7 @@ import (
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
+	"gwpool/internal/ticket"
 	"gwpool/internal/types"
 )
 
@@ -62,6 +63,9 @@ type Store interface {
 	// Pair 取某网关当前的 pair；新鲜度由调用方按 ExpiresAt 自己判断。
 	Pair(gateway string) (types.Pair, bool)
 	PutPair(p types.Pair) error
+	TicketInventory() (map[string]types.Pair, map[string]types.RegionDonor)
+	CommitMint(types.MintCommit) (types.MintCommitResult, error)
+	RouteStates(time.Time) map[string]types.RouteState
 
 	// LockAccount 是**跨包唯一**的单账号互斥，返回解锁函数。
 	// 必须由存储层持有：首扫（scan）和交付（sched）都要打同一个账号，
@@ -105,6 +109,9 @@ type Minter interface {
 	// 那一发会一路走到速率闸才被拒，而那时候要票的人已经等了一个往返。
 	// limit <= 0 当「不设限」（没接配置的裸 mint.Client 才会这样，生产不会）。
 	Rate(acct string) (used map[string]int, limit int)
+	RouteSources(exit types.Exit, seed bool) []types.RouteSource
+	NewSIDForRoute(exit types.Exit, sourceID string, seed bool) (string, error)
+	RouteSource(sid string) types.RouteSource
 }
 
 // ErrNoFullSlot indicates that the requested gateway has no acceptable route
@@ -210,7 +217,7 @@ type Scheduler struct {
 	nextExploration     time.Time  // backgroundMu 保护；只限制专门探索机会，不限制维护。
 	exploreRegionCursor int        // mu保护；按尝试轮转，不因失败或小时配额重置而回到首国。
 	mu                  sync.Mutex
-	workRetries         map[string]workRetry // 按任务+账号+目标退避；不改变消费冷却。
+	routesInFlight      map[string]bool
 	// lastMintedAt 记每个账号最近一次被用作铸票者，用来把铸票摊到各个号上。
 	// 不落盘：重启后重新摊平没有坏处，而落盘就多一份要维护的状态。
 	// 「总共铸过几发」刻意**不**自己记：那个读数在 mint 的速率窗口里，
@@ -323,13 +330,8 @@ func (s *Scheduler) liveGateways() map[string]bool {
 
 // bestCflb 按大区挑出最长寿的那张 `__cflb`（实现在 mint，页面那边共用同一份）。
 func (s *Scheduler) bestCflb() map[string]mint.CflbLease {
-	pairs := map[string]types.Pair{}
-	for name := range s.st.Gateways() {
-		if p, ok := s.st.Pair(name); ok {
-			pairs[name] = p
-		}
-	}
-	return mint.BestCflb(pairs, s.now())
+	pairs, donors := s.st.TicketInventory()
+	return ticket.Best(pairs, donors, s.now())
 }
 
 func (s *Scheduler) rehome(p types.Pair, best map[string]mint.CflbLease) types.Pair {
@@ -418,6 +420,7 @@ func (s *Scheduler) DeliverAnonymous(ctx context.Context, upstreamID string, req
 // obs 也带出来，好让随后那一发 echo 的样本记上同一个出口地理（同 sid ⇒ 同 IP）。
 type minted struct {
 	pair types.Pair
+	gain types.StockGain
 }
 
 // claimRegion 占住「**这个号**此刻有一发裸铸走这个大区」，占不住返回 false。
@@ -518,7 +521,7 @@ func (s *Scheduler) mintOnce(ctx context.Context, a types.Account, e types.Exit,
 }
 
 func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Exit, sid string,
-	cur types.Pair, want, bias, purpose string) (minted, error) {
+	cur types.Pair, want, bias, purpose string) (out minted, finalErr error) {
 	// 被上游 429 按住的号一发都不许打。守卫放在这里而不是各个挑人的地方：mintOnce 是
 	// 所有真实铸票的唯一出口（minterFor 挑的、mintPlan 回落自己上的、scan 和保温的
 	// 都从这儿走），放在挑人处就会漏掉「找不到别人就自己上」那条。
@@ -536,14 +539,21 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 	if purpose == types.PurposeInventory && cur.Cookie == "" && !s.mint.SeedBound(sid) {
 		prediction = inventoryPredictionFromContext(ctx, a.ID, e)
 	}
+	trace, err := s.newMintTrace(ctx, a, e, sid, cur, want, purpose, prediction)
+	defer trace.finish(&out, &finalErr)
+	if err != nil {
+		return minted{}, err
+	}
 	obs, gerr := s.mint.Geo(ctx, e, sid)
+	trace.sample.Observed = obs
+	trace.sample.TargetMatch = e.MatchEvidence(obs, s.mint.SeedBound(sid))
 	// Cookie routing does not prove the physical exit country is supported.
 	// Seed requests retain their logical region for accounting only.
 	if gerr == nil && !geography.Supported(obs.Country) {
 		gerr = types.ErrUnsupportedCountry
 	}
 	if gerr != nil {
-		s.sampleAttemptFailure(a, e, sid, purpose, obs, gerr, prediction)
+		trace.failure = "geo"
 		return minted{}, fmt.Errorf("出口地理检查: %w", gerr)
 	}
 
@@ -554,14 +564,9 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 	res, err := s.mint.Mint(ctx, a.Creds, e, sid, cur.Cookie, cur.CflbExpiresAt)
 	at := s.now()
 	// 每一发都要落样本：上传者视图靠它证明「我们只拿你的凭据打了 ping」。
-	s.sample(types.Sample{
-		AccountID: a.ID, RegionKey: s.sampleRegion(e), Requested: e, Observed: obs,
-		Gateway: res.Gateway, Status: res.Status, At: at,
-		Err:      types.SampleErr(res.ErrBody, err),
-		Provider: s.mint.Provider(sid), Purpose: purpose,
-		TargetMatch: e.MatchEvidence(obs, s.mint.SeedBound(sid)), DurationMS: at.Sub(sampleStarted).Milliseconds(),
-		InventoryPrediction: prediction,
-	})
+	trace.sample.Gateway, trace.sample.Status, trace.sample.At = res.Gateway, res.Status, at
+	trace.sample.Err = types.SampleErr(res.ErrBody, err)
+	trace.sample.DurationMS = at.Sub(sampleStarted).Milliseconds()
 
 	// 触碰按**保守方向**记：超时和网络错在这里分不清「请求出去了但响应丢了」
 	// 和「根本没出站」，而前者窗口已经烧掉了。漏记一次的代价是发出一张降智 pair，
@@ -590,9 +595,14 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 		// 调用方按**更靠内**的那几个先分流，剩下的才算「铸票没成」。
 		// 已有非200响应时优先走下面的状态分类：401/429没有__oailb时同样会报
 		// ErrNoLanding，不能因此跳过停用/Retry-After，下一轮继续白打。
+		trace.failure = "transport"
+		if res.Status == 200 {
+			trace.failure = "invalid_response"
+		}
 		return minted{}, fmt.Errorf("%w: %w", ErrMintFailed, err)
 	}
 	if res.Status != 200 {
+		trace.failure = "upstream"
 		if s.opt.RefreshExpired != nil && oauth.TokenExpired(res.Status, res.ErrBody) {
 			return minted{}, fmt.Errorf("%w: %w", ErrUpstreamRejected, oauth.ErrAccessExpired)
 		}
@@ -620,6 +630,7 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 		return minted{}, fmt.Errorf("%w（%s）", ErrMintFailed, msg)
 	}
 	if res.Gateway == "" {
+		trace.failure = "invalid_response"
 		return minted{}, fmt.Errorf("%w：没拿到落点", ErrMintFailed)
 	}
 
@@ -662,7 +673,8 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 	// 唯一来源，不在表上的网关哪怕有票也永远不会被挑中。定向铸票走到这儿是幂等的，
 	// 顺带把这个请求过的出口补进 ReachableExits（「下次想回来该怎么请求」）。
 	if _, err := s.st.UpsertGateway(res.Gateway, a.ID, reached); err != nil {
-		s.opt.Log.Warn("记网关失败", "gateway", res.Gateway, "err", err)
+		trace.committed, trace.failure = true, "persistence"
+		return minted{}, fmt.Errorf("%w: 记网关: %w", ErrMintFailed, err)
 	}
 	// 记进 (账号 × 区域) 台账：挑下一个铸票者时「这个号哪个区域还没走过」、
 	// 以及「再派这个组合会落到哪」全靠它。
@@ -671,11 +683,13 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 	// 种子铸票照记（见上面那段）：它的出口国家对不上是常态，但大区是 `__cflb` 钉死的。
 	if seeded || reached != (types.Exit{}) {
 		if err := s.st.NoteRegionMint(a.ID, s.cfg().RegionKeyOf(e), res.Gateway, at); err != nil {
-			s.opt.Log.Warn("记区域台账失败", "account", a.ID, "err", err)
+			trace.committed, trace.failure = true, "persistence"
+			return minted{}, fmt.Errorf("%w: 记区域台账: %w", ErrMintFailed, err)
 		}
 	}
 
 	p := cur
+	var gain types.StockGain
 	if res.NewPair != "" {
 		// 上游下发了新 cookie，顶掉旧的。没下发则说明它接受了送进去的 pair，
 		// 网关没变，旧记录照旧有效（SPEC 第 2 节，别当失败）。
@@ -695,27 +709,23 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 			// 正好等于 Regions 里那九个代表出口，RegionKeyOf 会回空串 ⇒ 消费端整片
 			// 画成「未归类」。退回「国家[:城市]」比空着能认。
 			RegionKey: regionKey}
-		// **换盆之后再写：新票替换旧票，TTL 按能拿到的最长 `__cflb` 重算。**
-		//
-		// 不换盆就直接写会丢寿命：这一发很可能是带种子打的，而上游不补发 `__cflb` 时
-		// （常态）新票原样留着**种子那张**，种子的门槛只有 seedCflbFloor（10 分钟）
-		// ⇒ 一张还剩 50 分钟的旧票被一张只剩 10 分钟的新票顶掉，池子凭空少 40 分钟。
-		//
-		// 换盆比「短命就不覆盖」对：新票的 `__oailb` 是新鲜的 65 分钟，拖后腿的只有借来的
-		// `__cflb`，而 `__cflb` 是可以换的（mint.SwapCflb）⇒ 换完的新票 ≥ 两张里任何一张。
-		// best 取**整个大区**最长寿的那张，不只是这个网关的旧票，所以比两两相比还好。
-		//
-		// best 必须在 PutPair **之前**算：旧的 161 那张自己就是候选捐赠者，先写就把它挤掉了。
-		p = s.rehome(p, s.bestCflb())
-		if err := s.st.PutPair(p); err != nil {
+		// Comparison, donor retention and publication share the Store commit
+		// lock. A drift must not overwrite longer stock at its actual landing.
+		committed, err := trace.commit(p)
+		if err != nil {
 			s.opt.Log.Warn("写 pair 失败", "gateway", p.Gateway, "err", err)
 			return minted{}, fmt.Errorf("%w: 写 pair: %w", ErrMintFailed, err)
 		}
+		p, gain = committed.Pair, committed.Gain
+	} else {
+		if _, err := trace.commit(types.Pair{}); err != nil {
+			return minted{}, fmt.Errorf("%w: route evidence: %w", ErrMintFailed, err)
+		}
 	}
 	if res.Gateway != want && want != "" {
-		return minted{}, fmt.Errorf("%w：%w，想要 %s，实到 %s", ErrMintFailed, errLandingDrift, want, res.Gateway)
+		return minted{pair: p, gain: gain}, fmt.Errorf("%w：%w，想要 %s，实到 %s", ErrMintFailed, errLandingDrift, want, res.Gateway)
 	}
-	return minted{pair: p}, nil
+	return minted{pair: p, gain: gain}, nil
 }
 
 // account 取一个能用来打上游的账号。
@@ -762,7 +772,8 @@ type premintPolicy struct {
 	prefer func(regionKey string) bool
 	// rank only breaks ties after quota/fairness and existing preferences. It
 	// cannot create eligibility or replace a proven recovery route.
-	rank func(types.Account, types.Region) int
+	rank  func(types.Account, types.Region) int
+	route func(types.Account, types.Region) bool
 }
 
 // minterFor 挑「谁去铸这一发、经哪个区域」。
@@ -792,6 +803,10 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 	pol *premintPolicy) (types.Account, types.Region, bool) {
 	now := s.now()
 	regions := s.dynamicRegions(want)
+	byKey := make(map[string]types.Region, len(regions))
+	for _, region := range regions {
+		byKey[region.Key] = region
+	}
 	s.mu.Lock()
 	lastUsed := make(map[int64]time.Time, len(s.lastMintedAt))
 	for k, v := range s.lastMintedAt {
@@ -829,8 +844,11 @@ func (s *Scheduler) minterFor(want types.Exit, exclude int64, throttle time.Dura
 		var drop, prefer func(string) bool
 		var rank func(types.Region) int
 		if pol != nil {
-			if pol.skip != nil {
-				drop = func(key string) bool { return pol.skip(a.ID, key) }
+			if pol.skip != nil || pol.route != nil {
+				drop = func(key string) bool {
+					return (pol.skip != nil && pol.skip(a.ID, key)) ||
+						(pol.route != nil && !pol.route(a, byKey[key]))
+				}
 			}
 			prefer = pol.prefer
 			if pol.rank != nil {

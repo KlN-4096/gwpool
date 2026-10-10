@@ -246,6 +246,8 @@ func TestRenewOrdersRareGatewaysFirst(t *testing.T) {
 	st := newStore(clk)
 	mn := newMinter(clk)
 	addAccount(st, 1, "acct-1")
+	addAccount(st, 2, "acct-2")
+	addAccount(st, 3, "acct-3")
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1})
 	renewOn(s)
 
@@ -270,6 +272,13 @@ func TestRenewOrdersRareGatewaysFirst(t *testing.T) {
 	}
 	if due[0].reach >= due[1].reach {
 		t.Fatalf("reach 没算对: rare=%d common=%d", due[0].reach, due[1].reach)
+	}
+	st.accounts[1].Enabled, st.accounts[2].Enabled = false, false
+	due, _ = s.pairsDueForRenew()
+	for _, target := range due {
+		if target.reach != 1 {
+			t.Fatal("disabled historical sources inflated current route availability")
+		}
 	}
 }
 
@@ -372,6 +381,9 @@ type renewalWriteFailure struct {
 }
 
 func (st *renewalWriteFailure) PutPair(types.Pair) error { return st.err }
+func (st *renewalWriteFailure) CommitMint(types.MintCommit) (types.MintCommitResult, error) {
+	return types.MintCommitResult{}, st.err
+}
 
 func TestRenewReportsPairPersistenceFailure(t *testing.T) {
 	clk := newClock()
@@ -385,13 +397,21 @@ func TestRenewReportsPairPersistenceFailure(t *testing.T) {
 	before, _ := base.Pair("unified-9")
 	s := New(st, mn, Options{Now: clk.now, MintGap: -1, RenewGap: -1})
 
-	_, err := s.mintOnce(context.Background(), base.accounts[0], types.Exit{Region: "BR"},
+	got, err := s.mintOnce(context.Background(), base.accounts[0], types.Exit{Region: "BR"},
 		"seed1", before, "unified-9", "unified-9")
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("写票失败被报告成成功：%v", err)
 	}
 	if p, _ := base.Pair("unified-9"); p != before {
 		t.Fatal("写失败后旧票不该变化")
+	}
+	if got.gain.Productive() || len(base.samples) != 1 || base.samples[0].Route == nil {
+		t.Fatal("failed commit reported productive supply or lost its failure observation")
+	}
+	route := base.samples[0].Route
+	if route.Result != "persistence_error" || route.Gain.Productive() || route.TargetHit ||
+		!route.BeforeExpiresAt.IsZero() || !route.AfterExpiresAt.IsZero() {
+		t.Fatal("failed commit published uncommitted inventory evidence")
 	}
 }
 

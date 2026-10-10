@@ -295,6 +295,7 @@ type Sample struct {
 	TargetMatch         string               `json:",omitempty"`
 	DurationMS          int64                `json:",omitempty"`
 	InventoryPrediction *InventoryPrediction `json:",omitempty"`
+	Route               *RouteSample         `json:",omitempty"`
 	// Err 是这一发失败的具体原因（上游那段 JSON，或本地的错误文本），成功时为空。
 	// 没有它的话 samples.jsonl 里一行 status=400 什么都不告诉人：2026-10-01 首扫
 	// 二十发全 400，真正的原因（账号清单里没有 gpt-6-astra）要单独打一发才看得见。
@@ -427,7 +428,7 @@ type Pair struct {
 	// 眼里可能来自不同区域 ⇒ 「这张票属于哪个区域」只有铸它的那一刻知道。
 	//
 	// 旧记录可能是 sampleRegion 兜底的「国家[:城市]」或空串，展示仍兼容。
-	// 当前种子续票只认九个标准 key，并用本字段选择逻辑区域；不能从网关的
+	// 当前种子续票只认配置中保留的稳定 key，并用本字段选择逻辑区域；不能从网关的
 	// ReachableExits 随机反推，否则会把新票和配额记到另一区。
 	RegionKey string
 }
@@ -521,24 +522,13 @@ func FallbackCflbExpiry(oailbExp time.Time) time.Time {
 // 所以少记那一类操作**一律不许落在占位行上**（见 httpapi.handleRelease）。
 const AnonPrefix = "anon:"
 
-// SpareTarget 是池子要比「最忙的那个号」多留几张活 pair。
-//
-//	目标活 pair 数 = min(max(每个号用过的网关数) + SpareTarget, GatewayCeiling)
-//
-// 「用过的网关数」= 那个号 slot 表里 LastDeliver 非零的行数，也就是真有人取走过票的落点。
-// 多留两张的意思是：最忙的那个号手上**永远还有两个没碰过、且已经有活 pair 的网关**，
-// 来取票时不用现等铸票（一发上游要几秒到几十秒）。
-//
-// 目标超过**已知**网关数时，缺口靠裸铸和探索扫描摸新网关来补；超过**上游网关总数**
-// 的那部分永远补不上，所以封顶在 GatewayCeiling。SpareTarget 自己填得比 GatewayCeiling
-// 还大 = 停止预铸（不报错）。
+// SpareTarget is the legacy reserve default, now used only for bounded
+// empty-pool bootstrap. Established maintenance follows known gateway needs.
 const SpareTarget = 2
 
-// GatewayCeiling 是上游网关总数的保守上限：活 pair 数（一个网关一张）不可能超过它。
-//
-// DNS 枚举 chat.gateway.unified-N.api.openai.com 得 201 个，别人统计是 215 个里 14 个
-// 黑洞；按 190 算，给走不到的那几个留余量。不封顶的话，最忙的号用遍全部网关之后
-// 目标就永远够不着，每轮保温都会为它白打几发上游（一轮的失手预算 = 缺口，见 premintBare）。
+// GatewayCeiling retains the legacy configuration boundary: SpareTarget above
+// this value explicitly disables maintenance. It is NOT an upstream discovery
+// ceiling; newly observed gateways are never discarded because of this number.
 const GatewayCeiling = 190
 
 // ErrRateLimited 是速率闸拦下来的。闸是**按上游账号**算的，不是全局：

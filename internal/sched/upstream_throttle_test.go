@@ -68,18 +68,12 @@ func TestMintKeepsOldCflbDeadlineWhenUpstreamOnlyReissuesOailb(t *testing.T) {
 	}
 }
 
-// 新票无条件替换同名网关的旧票，TTL 跟着新票重算。
-//
-// 2026-10-03 的现场：161 的新票打出来了，号池里却还留着 161 的旧票。这儿一度加过一道
-// 「新票比手上那张短命就不覆盖」的闸——错在它把**新鲜的 __oailb**（65 分钟）连带丢掉，
-// 旧票继续走向过期，这个网关等于丢了。
-//
-// 正解是换盆（mint.Rehome，判据覆盖在 mint.TestRehome）：拖后腿的只有借来的 `__cflb`，
-// 而 `__cflb` 是可以换的 ⇒ 换完的新票 ≥ 两张里任何一张，那道闸本来就不需要。
-// 这条只盯「替换真的发生了」和「TTL 按新票算」，不重复 Rehome 自己的格子。
-func TestMintReplacesTheOldPairEvenWhenItLivesLonger(t *testing.T) {
+// 新旧票在同一 donor 集合下按有效可交付期限保优。候选票更短时保留旧票，
+// 但独立留下其合法区域 cflb，不能把票的取舍等同于种子材料的取舍。
+func TestMintKeepsLongerPairWhileRetainingNewDonor(t *testing.T) {
 	s, st, mn, clk := throttleFixture(t)
-	putPair(st, "unified-1", cookiePrefix+"old", clk.now().Add(50*time.Minute))
+	oldCookie := inventoryTestCookie("unified-1", "old", clk.now().Add(50*time.Minute))
+	putPair(st, "unified-1", oldCookie, clk.now().Add(50*time.Minute))
 	mn.cflbLife = 10 * time.Minute // 带种子打的常态：借来的 __cflb 只剩 10 分钟
 
 	// cur 传零值 = 预铸那条路径（它不带现持的票出去，带的是种子那张）。
@@ -88,14 +82,14 @@ func TestMintReplacesTheOldPairEvenWhenItLivesLonger(t *testing.T) {
 		t.Fatalf("铸票失败: %v", err)
 	}
 	p, _ := st.Pair("unified-1")
-	if p.Cookie != cookiePrefix+"unified-1" {
-		t.Fatalf("旧票没被新票替换：Cookie=%q", p.Cookie)
+	if p.Cookie != oldCookie {
+		t.Fatal("shorter incoming ticket replaced usable longer stock")
 	}
-	if want := clk.now().Add(10 * time.Minute); !p.ExpiresAt.Equal(want) {
-		t.Fatalf("TTL 没按新票重算：ExpiresAt=%v，应为 %v", p.ExpiresAt, want)
+	if want := clk.now().Add(50 * time.Minute); !p.ExpiresAt.Equal(want) {
+		t.Fatalf("longer effective lifetime regressed: got=%v want=%v", p.ExpiresAt, want)
 	}
-	if p.MintedBy != st.accounts[0].ID {
-		t.Fatalf("来源号没更新成这一发的号：MintedBy=%d", p.MintedBy)
+	if len(st.donors) == 0 {
+		t.Fatal("incoming regional donor was discarded together with shorter ticket")
 	}
 }
 

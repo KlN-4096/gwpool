@@ -7,7 +7,6 @@ package mint
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +25,7 @@ import (
 	"gwpool/internal/geography"
 	"gwpool/internal/oauth"
 	"gwpool/internal/proxycatalog"
+	"gwpool/internal/ticket"
 	"gwpool/internal/types"
 )
 
@@ -1051,27 +1051,11 @@ func CflbOnly(pair string) string {
 func CflbOf(pair string) string { return parsePair(pair)[cookieCflb] }
 
 // CflbLease 是某个大区现有的、最长寿的那张 `__cflb`。
-type CflbLease struct {
-	Cflb string
-	Exp  time.Time
-}
+type CflbLease = ticket.CflbLease
 
 // BestCflb 按大区挑出最长寿的那张 `__cflb`。只看 `CflbExpiresAt`，不解 JWT。
 func BestCflb(pairs map[string]types.Pair, now time.Time) map[string]CflbLease {
-	out := map[string]CflbLease{}
-	for _, p := range pairs {
-		if p.RegionKey == "" || !p.CflbExpiresAt.After(now) {
-			continue
-		}
-		c := CflbOf(p.Cookie)
-		if c == "" {
-			continue
-		}
-		if cur, ok := out[p.RegionKey]; !ok || p.CflbExpiresAt.After(cur.Exp) {
-			out[p.RegionKey] = CflbLease{Cflb: c, Exp: p.CflbExpiresAt}
-		}
-	}
-	return out
+	return ticket.Best(pairs, nil, now)
 }
 
 // Rehome 把一张票的 `__cflb` 换成同大区最长寿的那张，寿命跟着延长。
@@ -1090,28 +1074,7 @@ func BestCflb(pairs map[string]types.Pair, now time.Time) map[string]CflbLease {
 //     那一份记下去，两边自洽；在别处偷偷改库，所有在途的票号全部失配。
 //   - `RegionKey` 为空的老记录原样走，不猜大区。
 func Rehome(p types.Pair, best map[string]CflbLease, now time.Time) types.Pair {
-	if p.Cookie == "" || p.RegionKey == "" {
-		return p
-	}
-	b, ok := best[p.RegionKey]
-	if !ok || !b.Exp.After(p.CflbExpiresAt) {
-		return p
-	}
-	_, oailbExp, err := PairInfo(p.Cookie)
-	if err != nil || !oailbExp.After(now) {
-		return p
-	}
-	swapped := SwapCflb(p.Cookie, b.Cflb)
-	if swapped == p.Cookie {
-		return p
-	}
-	p.Cookie = swapped
-	p.CflbExpiresAt = b.Exp
-	p.ExpiresAt = b.Exp
-	if oailbExp.Before(p.ExpiresAt) {
-		p.ExpiresAt = oailbExp
-	}
-	return p
+	return ticket.Rehome(p, best, now)
 }
 
 // SwapCflb 把 pair 的 `__cflb` 换成 cflb，`__oailb` 原样留着。
@@ -1124,29 +1087,11 @@ func Rehome(p types.Pair, best map[string]CflbLease, now time.Time) types.Pair {
 // 大区规则 ⇒ 这张票会把消费方送到他自己在那个大区的网关，而票上写的还是原来那个
 // ⇒ 降智票当满血票发出去。调用方见 `sched.rehome`。
 func SwapCflb(pair, cflb string) string {
-	kv := parsePair(pair)
-	if cflb == "" || kv[cookieOailb] == "" {
-		return pair
-	}
-	kv[cookieCflb] = cflb
-	parts := make([]string, 0, 2)
-	for _, k := range []string{cookieCflb, cookieOailb} {
-		if v := kv[k]; v != "" {
-			parts = append(parts, k+"="+v)
-		}
-	}
-	return strings.Join(parts, "; ")
+	return ticket.SwapCflb(pair, cflb)
 }
 
 func parsePair(pair string) map[string]string {
-	out := map[string]string{}
-	for _, seg := range strings.Split(pair, ";") {
-		k, v, ok := strings.Cut(strings.TrimSpace(seg), "=")
-		if ok && v != "" {
-			out[k] = v
-		}
-	}
-	return out
+	return ticket.Parse(pair)
 }
 
 // PairInfo 读一张**外面交进来的** cookie 头里的两件事实：落点（__oailb 的 host
@@ -1158,11 +1103,7 @@ func parsePair(pair string) map[string]string {
 // **缺 __cflb 也报错**：钉路由的是它（见 cookieCflb），没有它那张 cookie
 // 一个网关都钉不住，收下来只会在账本上记一张假票。
 func PairInfo(pair string) (gateway string, oailbExp time.Time, err error) {
-	kv := parsePair(pair)
-	if kv[cookieCflb] == "" {
-		return "", time.Time{}, errors.New("缺 " + cookieCflb + "，这张 cookie 钉不住任何网关")
-	}
-	return parseOailb(kv[cookieOailb])
+	return ticket.Info(pair)
 }
 
 // parseOailb 解 __oailb 这个 ES256 JWT：网关名 = payload.host 按 "." 分割的第三段。
@@ -1170,32 +1111,7 @@ func PairInfo(pair string) (gateway string, oailbExp time.Time, err error) {
 // 不校验签名：我们只是**读**上游给的东西，不自己签发；而且签名密钥在上游手里，
 // 校验不了（伪造 __oailb 这条路 2026-10-01 已证伪）。
 func parseOailb(token string) (gateway string, exp time.Time, err error) {
-	if token == "" {
-		return "", time.Time{}, errors.New("空的 __oailb")
-	}
-	parts := strings.Split(token, ".")
-	if len(parts) < 2 {
-		return "", time.Time{}, errors.New("__oailb 不是 JWT")
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("payload 不是 base64url: %w", err)
-	}
-	var payload struct {
-		Host string `json:"host"`
-		Exp  int64  `json:"exp"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", time.Time{}, fmt.Errorf("payload 不是 JSON: %w", err)
-	}
-	seg := strings.Split(payload.Host, ".")
-	if len(seg) < 3 || seg[2] == "" {
-		return "", time.Time{}, fmt.Errorf("host %q 里没有第三段", payload.Host)
-	}
-	if payload.Exp > 0 {
-		exp = time.Unix(payload.Exp, 0).UTC()
-	}
-	return seg[2], exp, nil
+	return ticket.OailbInfo(token)
 }
 
 func truncate(s string, n int) string {

@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/routes"
+	"gwpool/internal/ticket"
 	"gwpool/internal/types"
 )
 
@@ -55,6 +57,8 @@ type fakeStore struct {
 	gws      map[string]types.Gateway
 	slots    map[string]types.Slot
 	pairs    map[string]types.Pair
+	donors   map[string]types.RegionDonor
+	routes   map[string]types.RouteState
 	mints    map[string]types.RegionMint // (账号 × 区域) 终身台账，键同 slotKey
 	samples  []types.Sample
 	nextID   int64
@@ -243,6 +247,54 @@ func (f *fakeStore) PutPair(p types.Pair) error {
 	return nil
 }
 
+func (f *fakeStore) TicketInventory() (map[string]types.Pair, map[string]types.RegionDonor) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pairs := make(map[string]types.Pair, len(f.pairs))
+	donors := make(map[string]types.RegionDonor, len(f.donors))
+	for key, pair := range f.pairs {
+		pairs[key] = pair
+	}
+	for key, donor := range f.donors {
+		donors[key] = donor
+	}
+	return pairs, donors
+}
+
+func (f *fakeStore) CommitMint(commit types.MintCommit) (types.MintCommitResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	plan := ticket.StockPlan{Donors: f.donors}
+	if commit.Pair.Cookie != "" {
+		plan = ticket.PlanStock(f.pairs, f.donors, commit)
+	}
+	f.donors = plan.Donors
+	if plan.Result.PairChanged {
+		f.pairs[commit.Pair.Gateway] = plan.Result.Pair
+	}
+	if commit.Route != nil {
+		if f.routes == nil {
+			f.routes = map[string]types.RouteState{}
+		}
+		key := routes.Key(commit.Route.Route)
+		state := routes.Advance(f.routes[key], *commit.Route, plan.Result.Gain)
+		f.routes[key], plan.Result.Route = state, state
+	}
+	return plan.Result, nil
+}
+
+func (f *fakeStore) RouteStates(now time.Time) map[string]types.RouteState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]types.RouteState{}
+	for key, state := range f.routes {
+		if now.Before(state.LastAttempt.Add(routes.Retention)) {
+			out[key] = state
+		}
+	}
+	return out
+}
+
 func (f *fakeStore) Accounts() []types.Account {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -375,15 +427,11 @@ func gwOf(cookie string) string {
 
 // acctID 把凭据映射回账号序号：fake 里 AccountID 就写成 "acct-<n>"。
 func acctID(c types.Creds) int64 {
-	switch c.AccountID {
-	case "acct-1":
-		return 1
-	case "acct-2":
-		return 2
-	case "acct-3":
-		return 3
+	if !strings.HasPrefix(c.AccountID, "acct-") {
+		return 0
 	}
-	return 0
+	id, _ := strconv.ParseInt(strings.TrimPrefix(c.AccountID, "acct-"), 10, 64)
+	return id
 }
 
 func (m *fakeMinter) enter(id int64) {
@@ -571,6 +619,22 @@ func (m *fakeMinter) SeedBound(sid string) bool {
 
 func (m *fakeMinter) Provider(string) string              { return "test-dynamic" }
 func (m *fakeMinter) SupportsDynamicExit(types.Exit) bool { return true }
+func (m *fakeMinter) RouteSources(_ types.Exit, seed bool) []types.RouteSource {
+	kind := "test-dynamic"
+	if seed {
+		kind = "seed"
+	}
+	return []types.RouteSource{{ID: routes.Digest(kind), Kind: kind}}
+}
+func (m *fakeMinter) NewSIDForRoute(exit types.Exit, _ string, seed bool) (string, error) {
+	if seed {
+		return m.NewSeedSID()
+	}
+	return m.NewSIDFor(exit, true)
+}
+func (m *fakeMinter) RouteSource(sid string) types.RouteSource {
+	return m.RouteSources(types.Exit{}, m.SeedBound(sid))[0]
+}
 func (m *fakeMinter) Geo(ctx context.Context, e types.Exit, sid string) (types.Observed, error) {
 	m.mu.Lock()
 	country := m.geoCountry
@@ -686,6 +750,26 @@ func addAccount(st *fakeStore, id int64, upstream string) {
 	})
 }
 
+// Established-pool fixtures must supply real provenance, not rely on numerical
+// reserve pressure to bootstrap unrelated countries.
+func recordKnownRecovery(t *testing.T, st *fakeStore) {
+	t.Helper()
+	for gateway, known := range st.gws {
+		for _, exit := range known.ReachableExits {
+			for _, region := range types.Regions {
+				if region.Exit != exit {
+					continue
+				}
+				for _, account := range st.accounts {
+					if err := st.NoteRegionMint(account.ID, region.Key, gateway, st.clk.now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+		}
+	}
+}
+
 func mustDeliver(t *testing.T, s *Scheduler, acctID int64, hint string) types.Delivery {
 	t.Helper()
 	d, err := s.DeliverAnonymous(context.Background(), fmt.Sprint(acctID), Request{Gateway: hint}, true)
@@ -750,7 +834,7 @@ func TestSingleModeNeverWarms(t *testing.T) {
 func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
-	landEachRegionSomewhereNew(mn)
+	recordKnownRecovery(t, st)
 	s.opt.IdleAfter = 10 * time.Minute
 
 	s.warmOnce(context.Background())
@@ -763,9 +847,8 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	// 那是 premintBare 的正常行为，写死发数会让这个用例变成在测别的东西。
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := s.FreeGateways(); n < types.SpareTarget || n > types.SpareTarget+1 {
-		t.Fatalf("有需求时补到了 %d 张活票，库存目标是 %d，另允许一发探索（发数 %d）",
-			n, types.SpareTarget, len(mn.mintedGateways()))
+	if n := s.FreeGateways(); n != len(st.gws) {
+		t.Fatalf("有需求未恢复已知库存：live=%d known=%d calls=%d", n, len(st.gws), len(mn.mintedGateways()))
 	}
 
 	// 库存够数仍有独立的一发发现预算，不能无限追加。
@@ -785,8 +868,8 @@ func TestPoolModeWarmsOnlyOnDemand(t *testing.T) {
 	}
 	s.markDemand()
 	s.warmOnce(context.Background())
-	if n := s.FreeGateways(); n < types.SpareTarget || n > types.SpareTarget+1 {
-		t.Fatalf("需求回来后该补库存 %d 加至多一发探索，实际 %d 张活票", types.SpareTarget, n)
+	if n := s.FreeGateways(); n != len(st.gws) {
+		t.Fatalf("需求回来后未补回已知库存：live=%d known=%d", n, len(st.gws))
 	}
 }
 
@@ -885,7 +968,7 @@ func TestStalePairIsRemintedNotRenewed(t *testing.T) {
 	delete(st.gws, "unified-3")
 	st.pairs["unified-1"] = types.Pair{
 		Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
-		ExpiresAt: clk.now().Add(types.DeliverFloor - time.Minute), MintedBy: 1,
+		ExpiresAt: clk.now().Add(types.DeliverFloor - time.Minute), MintedBy: 1, RegionKey: types.Regions[0].Key,
 	}
 	s.premintBare(context.Background(), 1)
 	if n := len(mn.mintedGateways()); n != 1 {
@@ -990,10 +1073,10 @@ func TestPoolModeNeedsTwoAccounts(t *testing.T) {
 	}
 	// 第二个号进来就该恢复保温（量达成的深度，不量发数，见 TestPoolModeWarmsOnlyOnDemand）。
 	addAccount(st, 2, "acct-2")
+	recordKnownRecovery(t, st)
 	s.warmOnce(context.Background())
-	if n := s.FreeGateways(); n != types.SpareTarget {
-		t.Fatalf("两个号了却只补到 %d 张活票，目标深度是 %d（发数 %d）",
-			n, types.SpareTarget, len(mn.mintedGateways()))
+	if n := s.FreeGateways(); n != len(st.gws) {
+		t.Fatalf("两个号后未恢复已知库存：live=%d known=%d calls=%d", n, len(st.gws), len(mn.mintedGateways()))
 	}
 }
 
@@ -1317,6 +1400,7 @@ func TestRenewSpreadsAcrossAccounts(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
 	addAccount(st, 3, "acct-3")
+	recordKnownRecovery(t, st)
 	s.markDemand()
 	// 目标深度 = 最忙的号碰过的网关数 + SpareTarget。让 1 号碰过一个，目标就是 3，
 	// 三个网关各要一发，正好看得出摊不摊得开。
@@ -1340,6 +1424,7 @@ func TestRenewSpreadsAcrossAccounts(t *testing.T) {
 func TestRenewThrottlePerAccount(t *testing.T) {
 	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
+	recordKnownRecovery(t, st)
 	s.opt.RenewGap = 30 * time.Second
 	s.markDemand()
 	// 目标深度要够三个网关才看得出「第三个等下一轮」：让 1 号拿过一张票，目标 = 1+2。
@@ -1421,29 +1506,17 @@ func TestPublicThresholdIsDerivedFromCooldown(t *testing.T) {
 
 // 目标深度 = 最忙那个号**用过**的 pair 数 + SpareTarget，而且不能自激：
 // 预铸那一发本身也会 touch 槽位，拿 LastTouch 当基数就会一路把所有网关铸满。
-func TestPairTargetTracksBusiestConsumer(t *testing.T) {
-	s, st, mn, clk := rig(t, types.ModePool)
-	addAccount(st, 2, "acct-2")
-	s.markDemand()
-
-	if got := s.PairTarget(); got != types.SpareTarget {
-		t.Fatalf("没人用过票时目标应是 %d，实为 %d", types.SpareTarget, got)
-	}
-	s.warmOnce(context.Background())
-	if n := s.FreeGateways(); n != types.SpareTarget {
-		t.Fatalf("第一轮补到 %d 张活票，目标 %d（发数 %d）",
-			n, types.SpareTarget, len(mn.mintedGateways()))
-	}
-	// 关键的一条：铸票写的是 LastTouch，目标**不许**因此上涨。
-	if got := s.PairTarget(); got != types.SpareTarget {
-		t.Fatalf("预铸把目标顶高到 %d，自激了", got)
-	}
-
-	// 1 号真的拿到过一张票，目标才该 +1。
+func TestPairTargetTracksKnownGatewaysNotConsumerTouch(t *testing.T) {
+	s, st, _, clk := rig(t, types.ModePool)
+	known := len(st.gws)
 	st.slots[slotKey(1, "unified-1")] = types.Slot{AccountID: 1, Gateway: "unified-1",
 		LastTouch: clk.now(), LastDeliver: clk.now()}
-	if got, want := s.PairTarget(), types.SpareTarget+1; got != want {
-		t.Fatalf("用掉一张后目标应是 %d，实为 %d", want, got)
+	if got := s.PairTarget(); got != known {
+		t.Fatalf("consumer touch created numerical deficit: got=%d known=%d", got, known)
+	}
+	st.gws["new"] = types.Gateway{Name: "new"}
+	if s.PairTarget() != known+1 {
+		t.Fatal("new discovery did not become a maintenance objective")
 	}
 }
 
@@ -1452,63 +1525,57 @@ func TestPairTargetTracksBusiestConsumer(t *testing.T) {
 // LastDeliver 只写不清，按「曾经用过」数就单调递增、永不回落 ⇒ 目标一路爬到
 // GatewayCeiling，预铸每轮为追不上的那几张白打（10-02 线上 target=63 / live 53~58）。
 // 这条钉住窗口：过了一个 pair 寿命还没人再来取，那一格就不再算需求。
-func TestPairTargetForgetsStaleDemand(t *testing.T) {
+func TestPairTargetKeepsKnownObjectivesWhenDemandAges(t *testing.T) {
 	s, st, _, clk := rig(t, types.ModePool)
 	for _, gw := range []string{"unified-1", "unified-2", "unified-3"} {
 		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw,
 			LastTouch: clk.now(), LastDeliver: clk.now()}
 	}
-	if got, want := s.PairTarget(), types.SpareTarget+3; got != want {
-		t.Fatalf("刚取过三张时目标应是 %d，实为 %d", want, got)
+	if got := s.PairTarget(); got != len(st.gws) {
+		t.Fatal("recent demand changed the known-gateway objective")
 	}
 
 	// 窗口内（差一点到期）还得算：边界不许把正在用的需求抹掉。
 	clk.add(types.PairLifetime - time.Minute)
-	if got, want := s.PairTarget(), types.SpareTarget+3; got != want {
-		t.Fatalf("窗口内目标应仍是 %d，实为 %d", want, got)
+	if got := s.PairTarget(); got != len(st.gws) {
+		t.Fatal("time changed the known-gateway objective")
 	}
 
 	// 过了一个 pair 寿命，这三格全算陈旧需求，目标回落到纯富余。
 	clk.add(2 * time.Minute)
-	if got, want := s.PairTarget(), types.SpareTarget; got != want {
-		t.Fatalf("需求过期后目标应回落到 %d，实为 %d", want, got)
+	if got := s.PairTarget(); got != len(st.gws) {
+		t.Fatal("aging demand discarded known gateways")
 	}
 }
 
 // 目标深度封顶在上游网关总数：最忙的号快用遍全部网关时，再加富余也铸不出来，
 // 不封顶的话每轮保温都会为够不着的那几张白打。
-func TestPairTargetCappedAtGatewayCeiling(t *testing.T) {
-	s, st, _, clk := rig(t, types.ModePool)
-	for i := 1; i < types.GatewayCeiling; i++ {
+func TestPairTargetDoesNotTreatOldEstimateAsDiscoveryCeiling(t *testing.T) {
+	s, st, _, _ := rig(t, types.ModePool)
+	for i := 1; i <= types.GatewayCeiling+1; i++ {
 		gw := fmt.Sprintf("unified-%d", i)
-		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw, LastTouch: clk.now(), LastDeliver: clk.now()}
+		st.gws[gw] = types.Gateway{Name: gw}
 	}
-	if got := s.PairTarget(); got != types.GatewayCeiling {
-		t.Fatalf("最忙的号用过 %d 张时目标是 %d，应封顶在 %d", types.GatewayCeiling-1, got, types.GatewayCeiling)
+	if got := s.PairTarget(); got != len(st.gws) {
+		t.Fatalf("observed known gateways capped by obsolete estimate: got=%d known=%d", got, len(st.gws))
 	}
 }
 
 // min_pairs 是**下界**：池子空闲（没人用过票）时目标不塌到 SpareTarget，而是托在这个数上。
 // 和富余的区别就是这一格 —— 富余是相对量，跟着负载走。
-func TestMinPairsFloorsTheTarget(t *testing.T) {
-	s, st, _, clk := rig(t, types.ModePool)
+func TestMinPairsOnlyBoundsEmptyPoolBootstrap(t *testing.T) {
+	s, st, _, _ := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
 	c := s.opt.Live.Get()
 	c.MinPairs = 12
 	s.opt.Live = config.NewLive("", c)
 
-	// 没人用过票 ⇒ busiest=0 ⇒ 相对目标是 SpareTarget，下界把它顶到 12。
-	if got := s.PairTarget(); got != 12 {
-		t.Fatalf("空闲时目标应被下界托到 12，实为 %d", got)
+	if got := s.PairTarget(); got != len(st.gws) {
+		t.Fatal("legacy minimum created unknown maintenance targets")
 	}
-	// 负载超过下界之后下界就不再起作用（取较大者，不是取下界）。
-	for i := 1; i <= 20; i++ {
-		gw := fmt.Sprintf("unified-%d", i)
-		st.slots[slotKey(1, gw)] = types.Slot{AccountID: 1, Gateway: gw,
-			LastTouch: clk.now(), LastDeliver: clk.now()}
-	}
-	if got, want := s.PairTarget(), 20+types.SpareTarget; got != want {
-		t.Fatalf("负载高于下界时应按 busiest+富余 = %d，实为 %d", want, got)
+	st.gws = map[string]types.Gateway{}
+	if got := s.PairTarget(); got != inventoryBootstrapBudget {
+		t.Fatalf("cold bootstrap is not bounded: got=%d", got)
 	}
 }
 
@@ -1520,8 +1587,8 @@ func TestMinPairsOverCeilingCapsInsteadOfStopping(t *testing.T) {
 	c := s.opt.Live.Get()
 	c.MinPairs = types.GatewayCeiling + 50
 	s.opt.Live = config.NewLive("", c)
-	if got := s.PairTarget(); got != types.GatewayCeiling {
-		t.Fatalf("下界超过网关总数时应封顶在 %d，实为 %d", types.GatewayCeiling, got)
+	if got := s.PairTarget(); got != len(st.gws) {
+		t.Fatalf("legacy minimum either disabled or inflated known maintenance: got=%d", got)
 	}
 }
 
@@ -1992,7 +2059,11 @@ func TestPremintUsesDynamicExitEvenWhenSeedsExist(t *testing.T) {
 			RegionKey: r.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
 			CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
 	}
-	// 目标 = 大区数 + 1、已有大区数张活票 ⇒ 缺口 1 发。
+	// 一个已知缺票网关有历史US路线；现有种子不能改变补货的动态出口协议。
+	st.gws["unified-9"] = types.Gateway{Name: "unified-9", ReachableExits: []types.Exit{us.Exit}}
+	if err := st.NoteRegionMint(1, us.Key, "unified-9", clk.now()); err != nil {
+		t.Fatal(err)
+	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) + 1 })})
 	s.markDemand()
@@ -2078,6 +2149,10 @@ func TestPremintRefillsSeedlessRegionsFirst(t *testing.T) {
 			CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
 	}
 	// 缺口 1 发：那一发必须花在没有种子的那个大区上。
+	missing := fmt.Sprintf("unified-s%d", len(types.Regions)-1)
+	if err := st.NoteRegionMint(1, seedless.Key, missing, clk.now()); err != nil {
+		t.Fatal(err)
+	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) })})
 	s.markDemand()
@@ -2111,6 +2186,10 @@ func TestPremintFallsBackToResidentialWhenTheRegionHasNoSeed(t *testing.T) {
 	st.pairs["unified-1"] = types.Pair{Gateway: "unified-1", Cookie: cookiePrefix + "unified-1",
 		RegionKey: oc.Key, ExpiresAt: clk.now().Add(types.PairLifetime),
 		CflbExpiresAt: clk.now().Add(types.PairLifetime), MintedBy: 2}
+	st.gws["unified-9"] = types.Gateway{Name: "unified-9", ReachableExits: []types.Exit{us.Exit}}
+	if err := st.NoteRegionMint(1, us.Key, "unified-9", clk.now()); err != nil {
+		t.Fatal(err)
+	}
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now, MintGap: -1, RenewGap: -1,
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = 2 })})
 	s.markDemand()
@@ -2162,7 +2241,7 @@ func TestSeedPairIgnoresTicketsWhoseCflbIsAboutToDie(t *testing.T) {
 // 这是替掉旧「连续两发白烧就收手」的那条。旧规则数的是「随机撞上已有落点」，
 // 新规则数的是「预测错」；而台账空的时候一个组合都预测不出来，于是候选集
 // （账号数 × 9）会全部被当成值得一试 —— 没有这个预算就是一轮打上千发。
-func TestPremintCapsWastedShotsAtTheGap(t *testing.T) {
+func TestPremintDoesNotSpendAnUnknownNumericalGap(t *testing.T) {
 	clk := newClock()
 	st := newStore(clk)
 	mn := newMinter(clk)
@@ -2183,8 +2262,8 @@ func TestPremintCapsWastedShotsAtTheGap(t *testing.T) {
 	s.markDemand()
 
 	s.maintainInventory(context.Background())
-	if n := len(mn.mintedGateways()); n != 2 {
-		t.Fatalf("裸铸打了 %d 发，失手预算是缺口 2 发就该收手（候选组合 18 个）", n)
+	if n := len(mn.mintedGateways()); n != 0 {
+		t.Fatalf("healthy known stock still spent %d attempts chasing a numerical gap", n)
 	}
 }
 

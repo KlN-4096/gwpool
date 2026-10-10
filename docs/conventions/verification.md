@@ -9,6 +9,7 @@
 - `TestDashboardSettingsFixture`可通过`GWPOOL_PREVIEW_DIR`输出假数据HTML供本地静态预览；不要用生产凭据做截图或表单测试。
 - Windows 原生 Go 构建和测试；并发限定 `-p 2`，测试使用 `-timeout 60s`，不跑 `-race`。
 - 小改先跑定向用例；涉及共享铸票/调度行为时运行 `go test -p 2 -timeout 60s ./...`，再 lint。
+- 路线维护回归见`routes/route_test.go`、`store/inventory_test.go`、`sched/route_inventory_test.go`及`expiry_test.go`；现票契约仍由HTTP/consumer测试覆盖。收益来自原子提交，缺票快照不是请求样本；必须覆盖同值cflb延寿、过期同key、unknown-member刷新和bare→seed无额外尝试。
 - `tools/benchmark.ps1`使用远端先失效化凭据的真实快照，真实Store/Scheduler/HTTP、原生子进程隔离服务端与压测堆；每场记录全源码hash、同32消费者/非空tag、每响应校验与性能断言。CPU/IO只计server，Windows IO含控制管道，不称物理磁盘量；结果与线上/旧轻负载基线不能拼接。
 - 2026-10-05本地N1024每场验收：GET P95 9.006ms，single P95/P99 24.763/62.630ms，batch3 42.056/83.011ms。只适用于充足库存/本地回环，不承诺缺票、外网或模型验证延迟；线上2vCPU另列实测。
 - Linux 产物采用 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0`，`-trimpath -ldflags="-s -w"`。

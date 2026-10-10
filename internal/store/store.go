@@ -59,10 +59,12 @@ type State struct {
 	Accounts          []types.Account                            `json:"accounts"`
 	// Owners 是上传者。老文件里没这个键 ⇒ nil ⇒ Open 的一次性迁移给已有的托管行
 	// 补一个（见 migrateOwners）。
-	Owners   []types.Owner            `json:"owners"`
-	Gateways map[string]types.Gateway `json:"gateways"` // key = "unified-142"
-	Slots    map[string]types.Slot    `json:"slots"`    // key = SlotKey()
-	Pairs    map[string]types.Pair    `json:"pairs"`    // key = gateway
+	Owners   []types.Owner                `json:"owners"`
+	Gateways map[string]types.Gateway     `json:"gateways"` // key = "unified-142"
+	Slots    map[string]types.Slot        `json:"slots"`    // key = SlotKey()
+	Pairs    map[string]types.Pair        `json:"pairs"`    // key = gateway
+	Donors   map[string]types.RegionDonor `json:"region_donors,omitempty"`
+	Routes   map[string]types.RouteState  `json:"route_states,omitempty"`
 	// Mints 是 (账号 × 区域) 的终身铸票台账，key = MintKey()。
 	// 必须落盘：它是「这个号还有哪个区域没走过」的唯一依据，而那正是发现新网关的
 	// 全部线索。记在内存里的话每次重启所有号的九个格子一起归零，于是重启后的
@@ -184,6 +186,9 @@ func Open(dir string) (*Store, error) {
 			_ = s.journal.file.Close()
 		}
 	}()
+	if err := s.prepareRouteInventory(time.Now().UTC()); err != nil {
+		return nil, err
+	}
 	// Replay before migrations: a journal may already contain the migration or
 	// a newer pair, so neither must be silently reverted by snapshot-only reads.
 	{

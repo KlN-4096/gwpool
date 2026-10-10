@@ -28,6 +28,7 @@ func TestMintExpiredCredentialRecovery(t *testing.T) {
 		name, code                      string
 		localExpired, noRT, refreshFail bool
 		repeat401                       bool
+		bound                           bool
 		limit, wantCalls, wantRefresh   int
 		wantEnabled                     bool
 	}{
@@ -41,6 +42,8 @@ func TestMintExpiredCredentialRecovery(t *testing.T) {
 		{name: "retry obeys quota", code: "token_expired", limit: 1, wantCalls: 1, wantRefresh: 1, wantEnabled: true},
 		{name: "revoked unchanged", code: "token_revoked", limit: 2, wantCalls: 1},
 		{name: "invalidated unchanged", code: "token_invalidated", limit: 2, wantCalls: 1},
+		{name: "route-bound unknown-member expiry recovery", bound: true, code: "token_expired", limit: 2, wantCalls: 2, wantRefresh: 1, wantEnabled: true},
+		{name: "route-bound retry obeys quota", bound: true, code: "token_expired", limit: 1, wantCalls: 1, wantRefresh: 1, wantEnabled: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, err := store.Open(t.TempDir())
@@ -93,7 +96,11 @@ func TestMintExpiredCredentialRecovery(t *testing.T) {
 				}
 				return st.CommitRefreshedTokens(expected, fresh, "rotated-fake-refresh", false)
 			}})
-			_, gotErr := backgroundMint(context.Background(), s, a.ID, "")
+			run := backgroundMint
+			if tc.bound {
+				run = routeBoundBackgroundMint
+			}
+			_, gotErr := run(context.Background(), s, a.ID, "")
 			got, _ := st.Account(a.ID)
 			if calls != tc.wantCalls || refreshes != tc.wantRefresh || got.Enabled != tc.wantEnabled {
 				t.Fatalf("calls=%d refreshes=%d enabled=%v err=%v", calls, refreshes, got.Enabled, gotErr)
@@ -124,6 +131,22 @@ func TestMintExpiredCredentialRecovery(t *testing.T) {
 			}
 		})
 	}
+}
+
+func routeBoundBackgroundMint(ctx context.Context, s *Scheduler, id int64, expected string) (minted, error) {
+	unlock := s.st.LockAccount(id)
+	defer unlock()
+	a, enabled := s.account(id)
+	if !enabled {
+		return minted{}, ErrAccountUnusable
+	}
+	exit := types.Regions[0].Exit
+	ctx, a, sid, release, err := s.bindRoute(ctx, a, exit, types.Pair{}, expected, types.PurposeInventory, false)
+	if err != nil {
+		return minted{}, err
+	}
+	defer release()
+	return s.mintOnceFor(ctx, a, exit, sid, types.Pair{}, expected, expected, types.PurposeInventory)
 }
 
 func TestConcurrentExpiredMintsRefreshOnceAndUseCurrentToken(t *testing.T) {

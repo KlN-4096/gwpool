@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"gwpool/internal/routes"
 	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
@@ -29,8 +30,52 @@ type inventoryEvidenceCache struct {
 // Keep stored ticket provenance as well as the latest country landing: one
 // drift must not erase the only historical way back to an expired rare ticket.
 func (s *Scheduler) inventoryEvidence() []inventoryRoute {
-	routes, _ := s.inventoryEvidenceSnapshot()
-	return routes
+	legacy, _ := s.inventoryEvidenceSnapshot()
+	out := slices.Clone(legacy)
+	seen := map[string]bool{}
+	for _, route := range out {
+		seen[comboKey(route.account, route.region)+"|"+route.gateway] = true
+	}
+	accounts := map[string][]types.Account{}
+	for _, account := range s.usable() {
+		identity := routes.CredentialIdentity(account.Creds)
+		accounts[identity] = append(accounts[identity], account)
+	}
+	type routeLocation struct {
+		source string
+		exit   types.Exit
+	}
+	available := map[routeLocation][]types.Region{}
+	for _, region := range s.dynamicRegions(types.Exit{}) {
+		for _, source := range s.mint.RouteSources(region.Exit, false) {
+			descriptor := routes.DescribeIdentity("", region.Exit, source, routes.Bare, "")
+			key := routeLocation{source: source.ID, exit: descriptor.Exit}
+			available[key] = append(available[key], region)
+		}
+	}
+	known, now := s.st.Gateways(), s.now()
+	for _, state := range s.st.RouteStates(now) {
+		if state.Route.Mode != routes.Bare || state.Gateway == "" || state.ObservedAt.IsZero() ||
+			now.Before(state.ObservedAt) || now.Sub(state.ObservedAt) >= routes.Retention {
+			continue
+		}
+		// Older observations remain limited-recheck clues, not recent source
+		// preferences. bindRoute uses RetryMax for positive preference and
+		// rechecks the route's shared NextCheck before spending any attempt.
+		if _, exists := known[state.Gateway]; !exists {
+			continue
+		}
+		for _, region := range available[routeLocation{source: state.Route.Source, exit: state.Route.Exit}] {
+			for _, account := range accounts[state.Route.Identity] {
+				key := comboKey(account.ID, region.Key) + "|" + state.Gateway
+				if !seen[key] {
+					seen[key] = true
+					out = append(out, inventoryRoute{account: account.ID, region: region.Key, gateway: state.Gateway})
+				}
+			}
+		}
+	}
+	return out
 }
 
 func countRecoverable(routes []inventoryRoute) int {
@@ -112,10 +157,7 @@ func (s *Scheduler) inventoryRoutes() (map[string]string, int) {
 		old := routes[key]
 		prefer := old == "" || (live[old] && !live[route.gateway])
 		if old != "" && live[old] == live[route.gateway] {
-			oldDeferred := s.workDeferred("inventory|" + key + "|" + old)
-			nextDeferred := s.workDeferred("inventory|" + key + "|" + route.gateway)
-			prefer = (oldDeferred && !nextDeferred) ||
-				(oldDeferred == nextDeferred && route.gateway < old)
+			prefer = route.gateway < old
 		}
 		if prefer {
 			routes[key] = route.gateway
@@ -127,18 +169,18 @@ func (s *Scheduler) inventoryRoutes() (map[string]string, int) {
 func (s *Scheduler) inventoryGap() (live, target, gap int) {
 	available := s.liveGateways()
 	missing := make(map[string]bool)
-	for _, route := range s.inventoryEvidence() {
-		if !available[route.gateway] {
-			missing[route.gateway] = true
+	for name := range s.st.Gateways() {
+		if !available[name] {
+			missing[name] = true
 		}
 	}
 	live, target = len(available), s.PairTarget()
 	if target == 0 {
 		return live, target, 0 // Explicit maintenance-off remains authoritative.
 	}
-	// Unrelated live tickets cannot substitute for a missing recoverable
-	// gateway. Still respect the pre-existing total inventory ceiling.
-	gap = max(0, min(max(target-live, len(missing)), types.GatewayCeiling-live))
+	// Unrelated live tickets cannot substitute for a missing known gateway.
+	// Actual work is bounded separately, not by an assumed upstream total.
+	gap = max(0, max(target-live, len(missing)))
 	return live, target, gap
 }
 
@@ -162,5 +204,5 @@ func (s *Scheduler) maintainOnDemand(ctx context.Context) {
 		return
 	}
 	s.opt.Log.Info("取票需求唤醒补货", "live", live, "target", target)
-	s.runInventory(ctx, gap, false)
+	s.runMaintenance(ctx, false)
 }

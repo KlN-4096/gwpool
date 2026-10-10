@@ -136,6 +136,9 @@ type fakeStore struct {
 func (f *fakeStore) Gateways() map[string]types.Gateway { return f.gws }
 
 func (f *fakeStore) Pairs() map[string]types.Pair { return f.pairs }
+func (f *fakeStore) TicketInventory() (map[string]types.Pair, map[string]types.RegionDonor) {
+	return f.pairs, nil
+}
 func (f *fakeStore) Slots() map[string]types.Slot { return f.slots }
 func (f *fakeStore) Accounts() []types.Account    { return f.accounts }
 

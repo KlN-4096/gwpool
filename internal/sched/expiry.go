@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"gwpool/internal/oauth"
+	"gwpool/internal/routes"
 	"gwpool/internal/types"
 )
 
@@ -44,14 +45,14 @@ func markExpiryRefreshed(ctx context.Context, id int64) {
 // All callers hold the store's account lock, including pre-bound background
 // attempts. Refresh before reserving/binding so a known expired AT is not sent.
 func (s *Scheduler) prepareAccount(ctx context.Context, a types.Account) (context.Context, types.Account, error) {
-	if s.opt.RefreshExpired == nil {
-		return ctx, a, nil
-	}
-	ctx = withExpiryRecovery(ctx)
 	current, enabled := s.account(a.ID)
 	if !enabled {
 		return ctx, a, ErrAccountUnusable
 	}
+	if s.opt.RefreshExpired == nil {
+		return ctx, current, nil
+	}
+	ctx = withExpiryRecovery(ctx)
 	if !oauth.AccessExpired(current.Creds.AccessToken, s.now()) {
 		return ctx, current, nil
 	}
@@ -130,11 +131,28 @@ func (s *Scheduler) mintOnceFor(ctx context.Context, a types.Account, e types.Ex
 	if err != nil {
 		return minted{}, err
 	}
-	// The first reservation has been consumed by Mint. BeginAttempt must spend
-	// another slot, and may reject this retry without making another request.
-	ctx, err = s.beginAttempt(ctx, a, e)
-	if err != nil {
-		return minted{}, err
+	if work, planned := ctx.Value(routeWorkKey{}).(routeWork); planned &&
+		work.attempt.Route.Identity != routes.CredentialIdentity(a.Creds) {
+		// A credential without stable member claims intentionally gets a new
+		// identity after refresh. Replan and claim it rather than attributing
+		// the new request to old evidence or rejecting the allowed recovery.
+		var release func()
+		ctx, a, sid, release, err = s.bindRoute(ctx, a, e, cur, work.attempt.Expected, purpose, work.attempt.Donor)
+		if err != nil {
+			return minted{}, err
+		}
+		defer release()
+	} else {
+		// The first reservation has been consumed by Mint. BeginAttempt must
+		// spend another slot, and can reject the retry without sending it.
+		ctx, err = s.beginAttempt(ctx, a, e)
+		if err != nil {
+			return minted{}, err
+		}
+		if planned {
+			work.attempt.StartedAt = s.now()
+			ctx = context.WithValue(ctx, routeWorkKey{}, work)
+		}
 	}
 	got, err = s.mintAttempt(ctx, a, e, sid, cur, want, bias, purpose)
 	if errors.Is(err, oauth.ErrAccessExpired) {

@@ -3,7 +3,7 @@
 - `internal/store` 保存 `state.json`＋`state.wal`（GWPWAL02提交头/序号/CRC）和独立`samples.jsonl`，不使用数据库；关键增量Sync成功才ACK，不再每次重写全快照。
 - 接入Key元数据/撤销/生成防重ID/单调序号及统计汇总走同一snapshot/WAL；生成只存SHA256和尾号，批量管理一次提交、失败回滚，已撤销不可启用，旧上传Key未覆盖策略时默认原权限。
 - 管理员Key最多10000、总策略/统计各20000；IP保留8、显式account摘要64、小时桶168，只有七API枚举计数、不记录请求/响应正文。统计快照深克隆，串行flush且按版本保留写盘期间的新计数，失败不清dirty。
-- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage`，已有新Key策略/统计后禁止直接启动旧版；回滚检查须停服务、用新版`-checkpoint-only`重放后判断，保留最新数据并采用识别新字段的修复版，不能恢复升级前快照。
+- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage/external_usage/region_donors/route_states`，strict decoder拒未知字段。先停服务，对一致私有副本用新/旧`-checkpoint-only`验证全部既有字段；回滚必须兼容当前snapshot/WAL，不能恢复旧快照丢ACK数据；不兼容时用识别新字段的修复版。
 - 提交头记录可信结束偏移；已ACK区间缺失/截断/CRC错拒绝启动，只清理提交边界外残尾。写失败截断并还原提交头、Sync后回滚；回滚不确定即冻结写入，不静默续跑。
 - 快照每分钟或WAL≥4MiB触发：锁内克隆、锁外编码/持久替换、锁内保留并发增量再换WAL。快照切换失败不丢已ACK记录；`checkpoint_failure_test.go`覆盖8处故障。
 - `UpdateSlot`128项有界队列，最多64项/1ms合并一次Sync；组失败还原全部槽位，Close等已准入请求结束。索引/revisions仅在提交成功后更新；不以异步ACK换性能。
@@ -11,7 +11,8 @@
 - 历史无凭据占位行的Store写入上限400，与托管500独立；仅保历史存储兼容，不再参与/cookie准入、限频或补货。现行消费不调用AddAccount，不可将这个旧上限重新当成外部成员数量限制。
 - 所有账号出站共用 Store 的账号锁；调度需要同时持锁时先网关、后账号。
 - `Pair.RegionKey`、`MintedBy` 是后续种子和续票的来源信息，不能从网关名或随机出口反推。
-- 新票按响应中的真实 `Gateway` 保存；漂移不应覆盖原目标网关的票。
+- `CommitMint`在同一Store锁/WAL事务中比较并提交实际Gateway票、独立区域donor和RouteState；任一失败全部回滚，revisions只在成功后推进。原始期限不代表实际可交付期，新旧同合法donor投影保优，迟到短票不盖长票；漂移不能写回原目标。
+- `TicketInventory`同锁克隆Pair/donor供目录与交付共用；donor最多512、只按真实期限裁剪，变化推进Pairs revision。路线最多16384/24h，写入及启动持久回收；同key过期先清零再Advance，不能隐藏后又复活旧退避。迟到观察只累计实际收益，不改较新映射。
 - cookie、凭据、身份串、票号不进诊断输出；运维脚本只输出显式允许的计数、区域、网关和本地账号 ID。
 - 不直接编辑运行中的状态，也不把运行中分别复制的snapshot/WAL当一致备份。旧snapshot-only二进制回滚必须先停新服务，用新binary `-checkpoint-only`重放并落完整最新快照，再保留归档WAL并转换旧快照；不得恢复升级前快照丢新ACK。维护入口没有跨进程锁，严禁在线执行。
 - 冷却报告独立于票/槽位：仅接收已鉴权匿名观察，保留 7 天/全局 8192/每 consumer 1024 条；同事件同载荷幂等、冲突 409，写失败恢复内存。

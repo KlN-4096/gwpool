@@ -151,6 +151,15 @@ func TestDashboardSettingsFixture(t *testing.T) {
 	if admin.Code != 200 {
 		t.Fatal(admin.Body.String())
 	}
+	for _, explanation := range []string{"冷启动富余", "空池每轮最多2个引导任务",
+		"目标为已知网关数", "每轮最多12个获票任务", "同一路线的近期退避跨任务共享"} {
+		if !strings.Contains(admin.Body.String(), explanation) {
+			t.Errorf("route-aware maintenance contract missing from rendered settings: %s", explanation)
+		}
+	}
+	if strings.Contains(admin.Body.String(), "已知可恢复网关数」的较大者，封顶190") {
+		t.Fatal("settings still describe the retired numerical stock-pressure formula")
+	}
 	for _, field := range []string{"models", "public_base_url", "models_extra", "upstream_per_region_hour",
 		"upstream_per_account_hour", "slot_cooldown_minutes", "spare_target",
 		"min_pairs", "min_accounts", "public_enabled", "renew_pairs",

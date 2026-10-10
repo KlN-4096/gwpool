@@ -10,13 +10,13 @@ import (
 
 	"gwpool/internal/config"
 	"gwpool/internal/mint"
+	"gwpool/internal/routes"
 	"gwpool/internal/types"
 )
 
 // Run 跑后台保温，直到 ctx 取消。
 //
-// **单账号模式直接返回，一发都不打**：扫描者 = 消费者时，保温那一发恰好烧掉
-// 你马上要用的那个窗口（SPEC 红线 5）。单账号模式按需现铸、用完即弃。
+// 单账号模式不运行后台保温；消费者始终只取现票，不在 HTTP 请求内补铸。
 func (s *Scheduler) Run(ctx context.Context) {
 	if s.opt.Mode != types.ModePool {
 		s.opt.Log.Info("单账号模式：不保温", "mode", s.opt.Mode)
@@ -57,10 +57,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// warmOnce 巡检一轮，把快过期的 pair 续上。
-//
-// 保温成本 = 每网关每 65 分钟一发 ping；烧掉的是**扫描账号**的窗口，
-// 消费账号的首次接触不受影响，这正是多账号模式成立的前提。
+// warmOnce 安排一轮按真实供给需要构成的维护任务和独立低频探索。
 func (s *Scheduler) warmOnce(ctx context.Context) {
 	s.backgroundMu.Lock()
 	defer s.backgroundMu.Unlock()
@@ -69,23 +66,17 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 	if s.idle() {
 		return
 	}
+	if s.maintenanceOff() {
+		return
+	}
 	// 只有一个号的「池子模式」就是红线 5 本身：保温那一发必然烧它自己的窗口，
 	// 它再来取就全是 degraded ⇒ 全 503。所以凑不够两个号就不保温，
-	// 行为自动退化成单账号模式（按需现铸），等第二个号进来再恢复。
+	// 继续交付现票，等第二个可用账号进来再恢复后台维护。
 	if n := len(s.usable()); n < 2 {
 		s.opt.Log.Warn("可用账号不足两个，暂不保温（保温会烧掉这个号自己要用的窗口）", "accounts", n)
 		return
 	}
-	// 这里原先有一道 premintWasted：「全员在全部已知网关上都还在消费冷却里 ⇒ 预铸出来的票
-	// 交给谁都是降级的」。消费冷却那条闸 2026-10-03 删了（见 sched.burning），这个状态
-	// 不再存在 —— 剩下的那条闸是 183 秒量级、自己会过去，拿它判「本轮别铸」等于让池子
-	// 在最该补货的时候停工。那道闸 24 小时内触发 279 次，是铸票慢的三个原因之一。
-	//
-	// 刹车没有少：目标深度（PairTarget）仍然封顶，组合挑完 premintPick 就收尾。
-	//
-	// 目标活 pair 数 = 最忙那个号用过的 pair 数 + SpareTarget。够了就一发不打：
-	// 铸票不是免费的，每一发都在烧执行者的窗口、吃它那个区域的速率预算。
-	// 维护内部先补缺失已知网关，再续临期票；专门探索独立降频，不拖慢维护。
+	// 维护按有效库存和区域种子建立有界任务，不因虚高的数量目标盲打。
 	// 交替先行，既防维护吃光探索机会，也避免少账号时探索长期占住续票账号。
 	// 专门探索每15分钟最多一次机会，共用全部原配额；这不是新增独立速率额度。
 	if s.maintenanceFirst {
@@ -98,14 +89,9 @@ func (s *Scheduler) warmOnce(ctx context.Context) {
 	s.maintenanceFirst = !s.maintenanceFirst
 }
 
-// maintainInventory 先恢复缺货，再续临期票；探索有独立的一发预算。
+// maintainInventory schedules concrete stock and regional-donor needs.
 func (s *Scheduler) maintainInventory(ctx context.Context) {
-	live, target, gap := s.inventoryGap()
-	if gap > 0 {
-		s.opt.Log.Info("预铸：补到目标深度", "live", live, "target", target, "missing", gap)
-		s.premintBare(ctx, gap)
-	}
-	s.renewExpiring(ctx)
+	s.runMaintenance(ctx, true)
 }
 
 // renewPairLead 是「剩这么多就该续了」。
@@ -129,43 +115,36 @@ type renewTarget struct {
 	exit    types.Exit
 	pair    types.Pair
 	source  types.Pair // 锁前原始记录；pair 已装上捐赠者，不能拿它比对库里的票。
-	// reach 是台账里有几个**不同的号**最近落到过这个网关。越小越难再摸到。
+	// reach 是台账中仍可用的不同凭据身份数，只是恢复来源稀缺程度的线索。
 	reach int
 }
 
-// renewExpiring 给快到点的 pair 续命：拿**铸出它那个号**和**它自己的 `__cflb`** 重打一发。
-//
-// 为什么非得是来源账号：网关 =(大区 × 账号)，而 `__cflb` 只钉大区。换个号去打，落点是
-// *那个号*在这个大区的网关，不是手上这一张。2026-10-03 删掉的那版续期正是栽在这儿 ——
-// 它用 minterFor 挑「本小时打得最少的号」（见 git 里 renewStalePairs），实测 51 发漂 44 发，
-// 于是结论被记成「定向续期在这个上游不成立」。**真正不成立的是「拿别的号去续别人的网关」。**
-//
-// **先续难到的。** 一个网关只有少数几个号能落上去，它的票一过期就等于丢了：裸铸再碰到它
-// 的概率就是那几个号在那个大区被挑中的概率。按台账里「有几个号落到过它」升序排，
-// 一样稀有就先救快死的那张。
-//
-// 和换盆（mint.Rehome）不重复：换盆是零成本地借同大区最长寿的那张 `__cflb`，整个大区都老了
-// 就借不到 —— 那时每个大区至少要有一发真续，而这就是它。
+// renewExpiring 沿已有票的来源账号及同区合法 cflb 尝试恢复，不把历史
+// 来源当永久映射。路线退避、实际落点与原子保优均走共享路径。
+// 独立入口保留有界续票预算；自动维护由 maintenancePlan 与缺票/种子任务排序。
 func (s *Scheduler) renewExpiring(ctx context.Context) {
-	if !s.cfg().RenewPairs {
+	if !s.cfg().RenewPairs || s.maintenanceOff() {
 		return
 	}
 	due, noDonor := s.pairsDueForRenew()
+	s.renewCandidates(ctx, due, noDonor)
+}
+
+func (s *Scheduler) renewCandidates(ctx context.Context, due []renewTarget, noDonor int) int {
 	if len(due) == 0 {
 		if noDonor > 0 {
 			// 不打这一行的话「整池 30 张等着续但一张活 cflb 都借不到」和「没票到期」
 			// 在日志里长得一模一样，而前者要人去看大区分布、后者什么都不用做。
 			s.opt.Log.Info("续票：到期的票一张都借不到活 __cflb，本轮跳过", "no_donor", noDonor)
 		}
-		return
+		return 0
 	}
-	attempted, renewed, unchanged, failed, skipped, deferred := 0, 0, 0, 0, 0, 0
+	attempted, renewed, unchanged, failed, skipped, deferred, drifted, productive := 0, 0, 0, 0, 0, 0, 0, 0
 	for _, t := range due {
 		if ctx.Err() != nil || attempted >= renewBudgetPerRound {
 			break
 		}
-		retryKey := "renew|" + comboKey(t.acct.ID, t.pair.RegionKey) + "|" + t.gateway
-		if s.workDeferred(retryKey) {
+		if !s.routeAvailable(t.acct, t.exit, t.pair, t.gateway, false) {
 			deferred++
 			continue
 		}
@@ -185,41 +164,41 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 		unlock := s.st.LockAccount(t.acct.ID)
 		current, present := s.st.Pair(t.gateway)
 		acct, enabled := s.account(t.acct.ID)
+		effective, _ := s.freshPair(t.gateway, types.DeliverFloor)
 		if !present || current != t.source || !enabled || ctx.Err() != nil ||
-			t.pair.CflbExpiresAt.Sub(s.now()) < seedCflbFloor {
+			t.pair.CflbExpiresAt.Sub(s.now()) < seedCflbFloor || effective.ExpiresAt.Sub(s.now()) > renewPairLead ||
+			!s.cfg().RenewPairs || s.maintenanceOff() {
 			// 等锁时可能已经换票、停号或耗尽种子寿命；不能拿旧快照再盖回去。
 			unlock()
 			relGW()
 			skipped++
 			continue
 		}
-		attemptCtx, err := s.beginAttempt(ctx, acct, t.exit)
-		sid := ""
-		if err == nil {
-			attempted++
-			sid, err = s.renewSID()
-			if err != nil {
-				s.sampleAttemptFailure(acct, t.exit, "", types.PurposeRenew, types.Observed{}, err)
-			}
-		}
+		attemptCtx, acct, sid, releaseRoute, err := s.bindRoute(ctx, acct, t.exit, t.pair, t.gateway, types.PurposeRenew, false)
 		var got minted
+		if _, reserved := attemptCtx.Value(routeWorkKey{}).(routeWork); reserved {
+			attempted++
+		}
 		if err == nil {
 			// want 和 bias 都填这个网关：这是一发**定向**铸票，落点漂了要被当成漂移处理
 			// （mintOnce 自己判），别静悄悄把别的网关的票记成这一张续好了。
 			got, err = s.mintOnceFor(attemptCtx, acct, t.exit, sid, t.pair, t.gateway, t.gateway, types.PurposeRenew)
 		}
+		if releaseRoute != nil {
+			releaseRoute()
+		}
 		unlock()
 		relGW()
+		if got.gain.Productive() {
+			productive++
+		}
 		switch {
-		case err == nil && !got.pair.ExpiresAt.After(t.source.ExpiresAt):
+		case err == nil && !got.gain.CoverageAdded && got.gain.ExtendedMS == 0:
 			unchanged++
-			retry := s.noteWorkYield(retryKey, false)
 			s.opt.Log.Info("续票未延长", "gateway", t.gateway, "account", t.acct.ID,
-				"region", t.pair.RegionKey, "remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()),
-				"retry_in_s", int(retry.Seconds()))
+				"region", t.pair.RegionKey, "remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()))
 		case err == nil:
 			renewed++
-			s.noteWorkYield(retryKey, true)
 			s.opt.Log.Info("续票", "gateway", t.gateway, "account", t.acct.ID,
 				"region", t.pair.RegionKey, "reach", t.reach, "landed", got.pair.Gateway,
 				"remaining_s", int(got.pair.ExpiresAt.Sub(s.now()).Seconds()))
@@ -227,31 +206,24 @@ func (s *Scheduler) renewExpiring(ctx context.Context) {
 			// 本号本区限流不是全池故障；也覆盖预检后刚被其他请求用完配额的竞态。
 			skipped++
 			s.opt.Log.Info("续票账号限流，跳过", "gateway", t.gateway, "account", t.acct.ID)
+		case errors.Is(err, errRouteDeferred):
+			deferred++
+		case errors.Is(err, errLandingDrift):
+			drifted++
+			s.opt.Log.Info("续票目标漂移", "gateway", t.gateway, "landed", got.pair.Gateway,
+				"account", t.acct.ID, "region", t.pair.RegionKey, "stock_gain", got.gain)
 		case errors.Is(err, types.ErrNoExit):
 			s.opt.Log.Warn("续票无种子出口，本轮停", "gateway", t.gateway, "reason", err)
-			return
+			return attempted
 		default:
 			failed++
-			retry := time.Duration(0)
-			if errors.Is(err, errLandingDrift) {
-				retry = s.noteWorkYield(retryKey, false)
-			}
 			s.opt.Log.Info("续票失败", "gateway", t.gateway, "account", t.acct.ID,
-				"region", t.pair.RegionKey, "reach", t.reach, "reason", err, "retry_in_s", int(retry.Seconds()))
+				"region", t.pair.RegionKey, "reach", t.reach, "reason", err, "stock_gain", got.gain)
 		}
 	}
 	s.opt.Log.Info("续票一轮结束", "due", len(due), "attempted", attempted, "renewed", renewed, "unchanged", unchanged, "failed", failed,
-		"throttled", skipped, "deferred", deferred, "no_donor", noDonor)
-}
-
-// renewSID 只走种子出口（便宜机房），**没配就不续**。
-//
-// 不回落住宅不是为了省流量，是因为续票必须**只送 `__cflb`**：两件齐送上游一个 cookie
-// 都不回（10-02 实测）⇒ 落点读不出来，这一发白打。摘 `__oailb` 这个动作钉在
-// mint.Mint 的 SeedBound 分支里（见那儿的注释），走住宅那条就不摘 ——
-// 而等着续的票手上那个 `__oailb` 多半已经死了，送出去纯粹是毒。
-func (s *Scheduler) renewSID() (string, error) {
-	return s.mint.NewSeedSID()
+		"drifted", drifted, "productive", productive, "throttled", skipped, "deferred", deferred, "no_donor", noDonor)
+	return attempted
 }
 
 // pairsDueForRenew 列出该续的票，难到的排前面。
@@ -267,24 +239,33 @@ func (s *Scheduler) pairsDueForRenew() ([]renewTarget, int) {
 	best := s.bestCflb()
 	// 台账里每个网关被几个**不同的号**落到过。只数「上次落点」是因为台账就只记这个
 	// （types.RegionMint.Gateway），它是现有数据里离「这个网关好不好摸」最近的量。
-	reach := map[string]map[int64]bool{}
+	identities := map[int64]string{}
+	for _, account := range s.usable() {
+		identities[account.ID] = routes.CredentialIdentity(account.Creds)
+	}
+	reach := map[string]map[string]bool{}
 	for _, m := range s.st.RegionMints() {
-		if m.Gateway == "" {
+		identity := identities[m.AccountID]
+		if m.Gateway == "" || identity == "" || s.accountHeldFor(m.AccountID) > 0 {
 			continue
 		}
 		if reach[m.Gateway] == nil {
-			reach[m.Gateway] = map[int64]bool{}
+			reach[m.Gateway] = map[string]bool{}
 		}
-		reach[m.Gateway][m.AccountID] = true
+		reach[m.Gateway][identity] = true
 	}
 	var out []renewTarget
 	noDonor := 0
 	for name := range s.st.Gateways() {
 		p, ok := s.st.Pair(name)
-		if !ok || p.ExpiresAt.Sub(now) > renewPairLead {
+		if !ok {
 			continue
 		}
 		source := p
+		p = mint.Rehome(p, best, now)
+		if p.ExpiresAt.Sub(now) > renewPairLead {
+			continue
+		}
 		// 种子出口靠 cookie 路由；e 仅用于速率桶、样本和新票的区域标签。
 		// 不要求存在住宅历史出口，更不能从 ReachableExits 随机挑另一区。
 		exit, ok := s.renewalExit(p.RegionKey)
@@ -372,43 +353,26 @@ func (s *Scheduler) seedPairFor(regionKey string) (types.Pair, bool) {
 	return best, best.Cookie != ""
 }
 
-// premintBare 裸铸补深度：挑一个 (账号 × 大区) 组合打一发，**落到哪个网关算哪个**。
-//
-// 为什么这是默认而续期是选项：续期能让一张票一直活着，但每续一发都要烧掉执行者在
-// 那个网关上的窗口，换来的只是「同一个落点的新 cookie」——而池子缺的是落点不是票。
-// 同样一发上游花在裸铸上，至少有机会摸到一个没见过的网关。
-//
-// 挑组合而不是「挑号、让它随便落」：(账号 × 大区) 基本是一对一的，所以台账上
-// 「这个组合上次落在哪」就是「再派它会落到哪」的预测（types.RegionMint.Gateway）。
-// 据此分成三类：
-//
-//	预测落点没有活票  → 挑它。这正好覆盖了「整批票同时到期」那种缺口
-//	这个组合没铸过    → 挑它。这是唯一可能摸出新网关的地方
-//	预测落点已有活票  → 跳过，连一发都不用打就知道是白打
-//
-// 旧版靠「连续两发没让活 pair 总数涨就整轮收手」止损。那个计数器是全轮全局的、
-// 不分账号不分区域，而 2026-10-02 现网 105 个网关里 64% 本来就有活票 ⇒ 连着两发
-// 撞上的概率约 41%，差不多一半的轮次在第二发就死了（24 小时触发 279 次、至少 578
-// 发白打）。按组合筛掉了其中**可预测**的那部分：预测落点已有活票的组合一发都不用打。
-//
-// 但止损闸不能直接删掉，**台账是空的时候筛不动**：没铸过的组合预测不出落点，
-// 于是「账号数 × 9」个组合会全部被当成值得一试，一轮就能打出上千发
-// （113 个号 × 9 = 1017）。所以留一个预算，但口径换成「失手」：
-// 一轮里最多容忍和缺口一样多的失手（missBudget = n）⇒ 总发数封顶 2n。
-// 和旧版的差别在于它数的是**预测错**，不是「随机撞上」——台账热了之后基本不触发。
-//
-// 于是停止条件四条：补到目标、失手用完、没有可挑的组合（穷举，候选集有限）、撞上闸门。
-//
-// 种子票那一格是成本上的关键：某个大区手上有活 `__cflb` 时，这一发走我们自己的普通
-// 机房出口（config.KindSeed），不花住宅代理 ⇒ 「去摸新落点」基本免费。
-// 没有种子票的大区照旧走住宅。
+// premintBare restores known routes through dynamic exits. Unproven bootstrap
+// is allowed only for an empty pool and remains separately bounded.
 func (s *Scheduler) premintBare(ctx context.Context, n int) {
 	s.runInventory(ctx, n, true)
 }
 
-func (s *Scheduler) runInventory(ctx context.Context, n int, allowBootstrap bool) {
+func (s *Scheduler) runInventory(ctx context.Context, n int, allowBootstrap bool) int {
+	return s.runInventorySelection(ctx, n, inventorySelection{bootstrap: allowBootstrap && len(s.st.Gateways()) == 0})
+}
+
+type inventorySelection struct {
+	gateway   string
+	donor     string
+	bootstrap bool
+}
+
+func (s *Scheduler) runInventorySelection(ctx context.Context, n int, selection inventorySelection) int {
 	workers := s.premintWorkers(n)
-	r := &premintRound{want: n, tried: map[string]bool{}, aimed: map[string]bool{}, allowBootstrap: allowBootstrap}
+	r := &premintRound{want: n, tried: map[string]bool{}, aimed: map[string]bool{},
+		allowBootstrap: selection.bootstrap, selection: selection}
 	r.routing = s.newInventoryRoutingRound()
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -421,7 +385,9 @@ func (s *Scheduler) runInventory(ctx context.Context, n int, allowBootstrap bool
 	wg.Wait()
 	got, missed, combos := r.result()
 	s.opt.Log.Info("预铸一轮结束", "want", n, "got", got, "missed", missed,
-		"combos_tried", combos, "workers", workers)
+		"productive", r.productive, "attempted", r.attempted, "extended_ms", r.extendedMS,
+		"donor_extended_ms", r.donorMS, "combos_tried", combos, "workers", workers)
+	return r.attempted
 }
 
 // premintWorkers 是这一轮派几个 worker 去铸。三道封顶：
@@ -449,9 +415,14 @@ const premintPickTries = 4
 type premintRound struct {
 	routing        *inventoryRoutingRound // immutable model; prediction cache protected by mu
 	mu             sync.Mutex
-	want           int             // 缺口，同时也是失手预算
-	got            int             // 补上的格子数
-	missed         int             // 落回了已有活票的网关的发数
+	want           int // 缺口，同时也是失手预算
+	got            int // 补上的格子数
+	missed         int // 没有库存收益的结果，含失败。
+	productive     int
+	attempted      int
+	extendedMS     int64
+	donorMS        int64
+	selection      inventorySelection
 	halt           bool            // 整池同病：组合挑完了、要不到出口、撞上闸
 	tried          map[string]bool // 本轮试过的 (账号 × 大区)
 	aimed          map[string]bool // 本轮已经有人冲着去的网关，别两个组合撞同一个
@@ -462,7 +433,7 @@ type premintRound struct {
 func (r *premintRound) more() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return !r.halt && r.got < r.want && r.missed < r.want
+	return !r.halt && r.productive < r.want && r.missed < r.want
 }
 
 func (r *premintRound) stop() {
@@ -477,17 +448,14 @@ func (r *premintRound) result() (got, missed, combos int) {
 	return r.got, r.missed, len(r.tried)
 }
 
-// premintPlan 是挑出来的一发：谁、经哪个大区、以及**出手前**哪些网关有活票。
-//
-// live 必须是出手前的快照：铸完再数的话自己刚落下的那张票也在里面，
-// 「这一发有没有补上一格」就永远答「没有」。并发之后更要紧——别的 worker 的新落点
-// 会把读数一起抬高，原先那个「全局活票数比铸票前多了没有」的判据会直接失效。
+// premintPlan selects an attempt. Actual coverage/lifetime gain is measured
+// atomically at commit, never inferred from a pre-request inventory count.
 type premintPlan struct {
 	acct       types.Account
 	region     types.Region
-	live       map[string]bool
 	expected   string // 历史恢复预测；空值是受限的冷池引导，不是已证实恢复路线。
 	prediction *types.InventoryPrediction
+	donor      bool
 	// release 放掉这个大区的裸铸标记，铸完**必须**调（见 claimRegion）。
 	release func()
 }
@@ -506,7 +474,7 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 		// A queued plan is not permission to use disabled accounts/exits or to
 		// remint a gateway another worker has already restored while we waited.
 		acct, enabled := s.account(plan.acct.ID)
-		if !enabled || !s.RegionEnabled(plan.region) || ctx.Err() != nil {
+		if !enabled || !s.RegionEnabled(plan.region) || ctx.Err() != nil || s.maintenanceOff() {
 			unlock()
 			plan.release()
 			continue
@@ -522,21 +490,31 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 				continue
 			}
 		}
-		attemptCtx, err := s.beginAttempt(ctx, plan.acct, plan.region.Exit)
-		var sid string
-		var seed types.Pair
-		var got minted
-		if err == nil {
-			attemptCtx = withInventoryPrediction(attemptCtx, plan.acct.ID, plan.region.Exit, plan.prediction)
-			sid, seed, err = s.premintSID(plan.region.Key)
-			if err != nil {
-				s.sampleAttemptFailure(plan.acct, plan.region.Exit, "", types.PurposeInventory, types.Observed{}, err, plan.prediction)
+		if plan.donor {
+			if _, needed := s.donorNeeds()[plan.region.Key]; !needed {
+				unlock()
+				plan.release()
+				continue
 			}
 		}
-		// want 留空：裸铸就是去看它能落到哪，谈不上「落点漂移」。带种子也一样——
-		// 种子只钉大区，具体网关是这个号自己的，出手前并不知道是哪个。
+		var seed types.Pair
+		predictionCtx := withInventoryPrediction(ctx, plan.acct.ID, plan.region.Exit, plan.prediction)
+		attemptCtx, selected, sid, releaseRoute, err := s.bindRoute(predictionCtx, plan.acct, plan.region.Exit, seed,
+			plan.expected, types.PurposeInventory, plan.donor)
+		plan.acct = selected
+		if _, reserved := attemptCtx.Value(routeWorkKey{}).(routeWork); reserved {
+			r.mu.Lock()
+			r.attempted++
+			r.mu.Unlock()
+		}
+		var got minted
+		// want 留空避免把有收益的副落点当普通错误；真正的目标留在
+		// routeWork.Expected 中，由共享路线证据单独记录是否命中。
 		if err == nil {
 			got, err = s.mintOnceFor(attemptCtx, plan.acct, plan.region.Exit, sid, seed, "", "", types.PurposeInventory)
+		}
+		if releaseRoute != nil {
+			releaseRoute()
 		}
 		unlock()
 		plan.release()
@@ -559,16 +537,31 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 	live, landed, seedless := s.liveGateways(), s.lastLandings(), s.seedlessRegions()
 	recovery, recoverable := s.inventoryRoutes()
-	allowBootstrap := r.allowBootstrap && recoverable < s.PairTarget()
+	if r.selection.gateway != "" {
+		recovery = map[string]string{}
+		for _, route := range s.inventoryEvidence() {
+			if route.gateway == r.selection.gateway {
+				recovery[comboKey(route.account, route.region)] = route.gateway
+			}
+		}
+	}
+	allowBootstrap := r.allowBootstrap && (recoverable < s.PairTarget() || r.selection.bootstrap)
+	donorNeeds := map[string]bool{}
+	if r.selection.donor != "" {
+		donorNeeds[r.selection.donor] = true
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.halt || r.got >= r.want || r.missed >= r.want {
+	if r.halt || r.productive >= r.want || r.missed >= r.want {
 		return premintPlan{}, false
 	}
 	baseSkip := func(id int64, key string) bool {
 		combo := comboKey(id, key)
 		if r.tried[combo] {
 			return true
+		}
+		if r.selection.donor != "" {
+			return key != r.selection.donor
 		}
 		gw := recovery[combo]
 		if gw == "" {
@@ -577,11 +570,12 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 		if live[gw] || r.aimed[gw] {
 			return true
 		}
-		return s.workDeferred("inventory|" + combo + "|" + gw)
+		return false
 	}
 	pol := &premintPolicy{
+		route: s.routeFilter(recovery, donorNeeds),
 		skip: func(id int64, key string) bool {
-			return baseSkip(id, key) || recovery[comboKey(id, key)] == ""
+			return baseSkip(id, key) || (r.selection.donor == "" && recovery[comboKey(id, key)] == "")
 		},
 		// 丢了种子票的大区优先补：它一掉，那个大区的所有账号都回落到住宅出口，
 		// 而**一张**票就能把整个大区的便宜路径恢复（种子不绑账号，见 seedPairFor）。
@@ -599,7 +593,7 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 		// First restrict selection to a missing, historically reachable gateway.
 		// Lifetime country fairness only ranks within that recovery cohort.
 		pol.skip = func(id int64, key string) bool {
-			return baseSkip(id, key) || recovery[comboKey(id, key)] == ""
+			return baseSkip(id, key) || (r.selection.donor == "" && recovery[comboKey(id, key)] == "")
 		}
 		a, reg, ok := s.minterFor(types.Exit{}, 0, s.opt.RenewGap, pol)
 		if !ok && allowBootstrap && r.unproven < inventoryBootstrapBudget {
@@ -634,10 +628,13 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 		}
 		if s.claimAccount(a.ID, s.opt.RenewGap) {
 			expected := recovery[combo]
-			if expected == "" {
+			if r.selection.donor != "" {
+				expected = ""
+			}
+			if expected == "" && r.selection.donor == "" {
 				r.unproven++
 			}
-			plan := premintPlan{acct: a, region: reg, live: live, expected: expected, release: release}
+			plan := premintPlan{acct: a, region: reg, expected: expected, release: release, donor: r.selection.donor != ""}
 			if r.routing != nil && mode != config.InventoryRoutingOff {
 				prediction := r.routing.forecast(a, reg)
 				prediction.Mode, prediction.DecidedAt = mode, s.now()
@@ -654,28 +651,27 @@ func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
 func (s *Scheduler) premintNote(r *premintRound, plan premintPlan,
 	got minted, err error, seeded bool,
 ) bool {
-	if plan.expected != "" {
-		s.noteWorkYield("inventory|"+comboKey(plan.acct.ID, plan.region.Key)+"|"+plan.expected,
-			err == nil && got.pair.Gateway == plan.expected &&
-				got.pair.ExpiresAt.Sub(s.now()) >= types.DeliverFloor)
-	}
 	switch {
 	case err == nil:
 		s.opt.Log.Info("裸铸拿到落点", "account", plan.acct.ID, "label", plan.acct.Label,
 			"region", plan.region.Key, "gateway", got.pair.Gateway, "seeded", seeded)
-		// 只有「落到一个出手前没有活票的网关」才算补上了一格。落回已有活票的网关
-		// 说明预测错了（区域划分随 cohort 变，SPEC 第 4 节）——台账已经按实际落点
-		// 更新过了，这个组合也标成试过了，所以不会原地打转，接着挑下一个。
+		// Use the atomic commit result, not a stale pre-request snapshot.
+		// Extending B is productive even when the intended A remains missing.
 		r.mu.Lock()
-		if !plan.live[got.pair.Gateway] && got.pair.ExpiresAt.Sub(s.now()) >= types.DeliverFloor {
-			r.got++
+		if got.gain.Productive() {
+			r.productive++
+			if got.gain.CoverageAdded {
+				r.got++
+			}
+			r.extendedMS += got.gain.ExtendedMS
+			r.donorMS += got.gain.DonorExtendedMS
 			r.mu.Unlock()
 			return true
 		}
 		r.missed++
 		missed, budget := r.missed, r.want
 		r.mu.Unlock()
-		s.opt.Log.Info("落回了已有活票的网关，算一次失手，换下一个组合",
+		s.opt.Log.Info("本次铸票未增加可交付库存或寿命",
 			"account", plan.acct.ID, "region", plan.region.Key, "gateway", got.pair.Gateway,
 			"missed", missed, "budget", budget)
 		return true
@@ -685,6 +681,8 @@ func (s *Scheduler) premintNote(r *premintRound, plan premintPlan,
 			"account", plan.acct.ID, "region", plan.region.Key, "reason", err)
 		r.stop()
 		return false
+	case errors.Is(err, errRouteDeferred):
+		return true
 	default:
 		// ErrRateLimited 也到这里：可能已打到上游并收到429，因此保留失手预算，
 		// 但不设置全局 halt。tried/账号退避确保下一次选择别的可用组合。
@@ -771,43 +769,24 @@ func (s *Scheduler) idle() bool {
 // 用两把尺子量同一件事。
 func (s *Scheduler) livePairs() int { return s.FreeGateways() }
 
-// PairTarget 是目标活 pair 数：最忙那个号**最近真的用过**几张 pair，再加 SpareTarget。
-//
-// 「用过」= 槽位上有 LastDeliver，也就是真的有人在这个网关上取走过一张票。
-// **只数最近一个 PairLifetime 之内的**：LastDeliver 只写不清（整个项目里只有
-// deliver 那一处写它），按「终身用过」数的话这个基数单调递增、永不回落 ⇒ 目标一路
-// 爬到 GatewayCeiling，预铸每轮都在追一个追不上的数（10-02 线上 target=63 而 live
-// 只有 53~58，而当时真正在取票的号远没用到 43 个网关）。
-// 窗口取 PairLifetime 是因为两者问的是同一件事：一张票只活这么久，所以「它这一小时
-// 取过几个网关」就是「它此刻同时需要几张活票」。需求停了，目标跟着回落。
-// **两条交付路径都算**：上传者自己取（验过满血的）和外部账号拿一把 key 替自己取
-// （池子没它的凭据、答不了它的满血，但它确实用掉了一张票，一样是供给压力）。
-// 早先按 LastVerdict 判，那会漏掉整条外部消费者的路——池子对外服务得越多，
-// 目标深度反而不涨。
-//
-// **刻意不用 LastTouch**：铸票本身也是一次 touch，拿它当基数就成了自激——预铸一张
-// 让目标 +1、于是再铸一张、再 +1，一路把所有网关铸满，+2 的闸等于不存在。
-//
-// 目标高于已知网关数时，缺口靠裸铸、探索扫描摸新网关来补；但上游网关总共就那么多，
-// 所以封顶在 types.GatewayCeiling——不封的话最忙的号用遍全部网关之后目标永远够不着，
-// 每一轮保温都会为它白打几发。
+// PairTarget reports known coverage, including gateways awaiting a new route.
+// It is not a count of runnable attempts. Discovery and bootstrap have their
+// own bounds, and idle protection is independent of this display value.
 func (s *Scheduler) PairTarget() int {
-	// IsZero 要单独判：零值表示「从没交付过」，而测试里的假时钟可能把 cutoff
-	// 推到零值之前，那时 After 会把它算成「刚取过」。
-	cutoff := s.now().Add(-types.PairLifetime)
-	busiest := s.busiestDeliveries(cutoff)
-	// 富余张数是配置项：0 就是「全按需，只补被人用掉的」。见 config.Config.SpareTarget。
-	spare := s.cfg().SpareTarget
-	// 填得比网关总数还大 = 停止预铸，不报错（用户 10-03 定的）：那个数本来就铸不出来，
-	// 照着它补只会每轮白打。目标归零，warmOnce 一发都不打；交付路径的现铸不受影响。
-	if spare > types.GatewayCeiling {
+	if s.maintenanceOff() {
 		return 0
 	}
-	// 下界：不管有没有人在用，手上至少备这么多张（见 config.Config.MinPairs）。
-	// 在 spare 那条「停止预铸」的早返回**之后**：那是运营方显式关掉预铸，下界不该把它打开。
-	_, recoverable := s.inventoryEvidenceSnapshot()
-	return min(max(busiest+spare, s.cfg().MinPairs, recoverable), types.GatewayCeiling)
+	if known := len(s.st.Gateways()); known > 0 {
+		return known
+	}
+	// Numerical reserve settings only bound the initial empty-pool bootstrap.
+	// Once a landing exists, ordinary maintenance addresses known stock only.
+	cfg := s.cfg()
+	busiest := s.busiestDeliveries(s.now().Add(-types.PairLifetime))
+	return min(max(busiest+cfg.SpareTarget, cfg.MinPairs), inventoryBootstrapBudget)
 }
+
+func (s *Scheduler) maintenanceOff() bool { return s.cfg().SpareTarget > types.GatewayCeiling }
 
 // 「挑谁去铸」只有 minterFor 一份了。
 //

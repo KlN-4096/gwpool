@@ -176,24 +176,13 @@ type Config struct {
 	// 默认的 4 小时是保守估算。做成配置项就是为了能按当天的观测调。
 	SlotCooldownMinutes int `json:"slot_cooldown_minutes"`
 
-	// SpareTarget 是池子要比「最忙的那个号用过的 pair 数」多留几张活 pair。
-	//
-	// **0 是合法值，意思是全按需、不预铸**（而不是「用默认值」——只有键缺着才回默认 2）。
-	// 这个旋钮买的东西很具体：首次取票不用现等铸票（一发上游要几秒到几十秒）。
-	// 代价同样具体：预铸出来没人取、65 分钟后自然过期的那几张就是纯浪费的请求和槽位。
-	// 想把上游请求压到最低就调 0。
+	// SpareTarget is a legacy empty-pool bootstrap hint. Zero adds no reserve;
+	// established pools maintain concrete known gateways. Above GatewayCeiling
+	// preserves the explicit maintenance-off sentinel.
 	SpareTarget int `json:"spare_target"`
 
-	// MinPairs 是活 pair 数的**下界**：目标深度取 max(最忙那个号用过的张数 + SpareTarget, MinPairs)。
-	//
-	// 和 SpareTarget 的区别是它**不跟着负载走**。SpareTarget 是相对量（比最忙那个号多留几张），
-	// 所以池子空闲下来时目标会跟着塌到 SpareTarget 本身；真有人来的第一发就要现等铸票
-	// （一发上游几秒到几十秒）。MinPairs 回答的是「不管有没有人用，手上至少备着这么多张」。
-	//
-	// 0 = 不设下界（默认，行为与接这个键之前逐字一致）。
-	// 填得比 GatewayCeiling 大按 GatewayCeiling 算 —— 那个数本来就铸不出来，而这里
-	// **不走 SpareTarget 那条「超了就停止预铸」的路**：下界的语义是「至少」，
-	// 把「要得太多」解释成「一张都不要」正好反过来。
+	// MinPairs is another retained bootstrap hint, capped by the scheduler's
+	// two-task empty-pool budget. It never creates unknown maintenance targets.
 	MinPairs int `json:"min_pairs"`
 
 	// RenewPairs 打开「给快到点的票续命」（见 sched.renewExpiring）。

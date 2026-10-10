@@ -51,6 +51,10 @@ type stateChange struct {
 	Mints             map[string]types.RegionMint                `json:"mints,omitempty"`
 	Pairs             map[string]types.Pair                      `json:"pairs,omitempty"`
 	DropPairs         []string                                   `json:"drop_pairs,omitempty"`
+	Donors            map[string]types.RegionDonor               `json:"region_donors,omitempty"`
+	DropDonors        []string                                   `json:"drop_region_donors,omitempty"`
+	Routes            map[string]types.RouteState                `json:"route_states,omitempty"`
+	DropRoutes        []string                                   `json:"drop_route_states,omitempty"`
 	Attempts          map[string]map[string]types.CountryAttempt `json:"attempts,omitempty"`
 	ReplaceAttempts   bool                                       `json:"replace_attempts,omitempty"`
 	Contacts          []types.ContactReport                      `json:"contacts,omitempty"`
@@ -68,6 +72,7 @@ type reportKey struct {
 // commits. Consumers must still evaluate time-dependent readiness at read time.
 type Revisions struct {
 	Accounts, Owners, Gateways, Slots, Pairs, Mints, Contacts, Cooldowns uint64
+	Routes                                                               uint64
 }
 
 func (s *Store) Revisions() Revisions {
@@ -95,11 +100,14 @@ func (s *Store) noteChange(c stateChange) {
 	if len(c.Slots)+len(c.DropAccounts) > 0 {
 		s.revisions.Slots++
 	}
-	if len(c.Pairs)+len(c.DropPairs) > 0 {
+	if len(c.Pairs)+len(c.DropPairs)+len(c.Donors)+len(c.DropDonors) > 0 {
 		s.revisions.Pairs++
 	}
 	if len(c.Mints)+len(c.DropAccounts) > 0 {
 		s.revisions.Mints++
+	}
+	if len(c.Routes)+len(c.DropRoutes) > 0 {
+		s.revisions.Routes++
 	}
 	if len(c.Contacts)+len(c.DropContacts) > 0 {
 		s.revisions.Contacts++
@@ -432,6 +440,24 @@ func applyChange(state *State, change stateChange) {
 	for key, row := range change.Pairs {
 		state.Pairs[key] = row
 	}
+	if len(change.Donors) > 0 && state.Donors == nil {
+		state.Donors = map[string]types.RegionDonor{}
+	}
+	for _, key := range change.DropDonors {
+		delete(state.Donors, key)
+	}
+	for key, donor := range change.Donors {
+		state.Donors[key] = donor
+	}
+	if len(change.Routes) > 0 && state.Routes == nil {
+		state.Routes = map[string]types.RouteState{}
+	}
+	for _, key := range change.DropRoutes {
+		delete(state.Routes, key)
+	}
+	for key, route := range change.Routes {
+		state.Routes[key] = route
+	}
 	if (state.CountryAttempts == nil && len(change.Attempts) > 0) || change.ReplaceAttempts {
 		state.CountryAttempts = map[string]map[string]types.CountryAttempt{}
 	}
@@ -656,6 +682,8 @@ func cloneState(state State) State {
 	}
 	state.Slots = cloneMap(state.Slots)
 	state.Pairs = cloneMap(state.Pairs)
+	state.Donors = cloneMap(state.Donors)
+	state.Routes = cloneMap(state.Routes)
 	state.Mints = cloneMap(state.Mints)
 	state.CountryAttempts = cloneMap(state.CountryAttempts)
 	for key, countries := range state.CountryAttempts {

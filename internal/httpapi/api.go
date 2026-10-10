@@ -38,6 +38,7 @@ import (
 	"gwpool/internal/oauth"
 	"gwpool/internal/reauth"
 	"gwpool/internal/sched"
+	"gwpool/internal/ticket"
 	"gwpool/internal/types"
 	"gwpool/web"
 )
@@ -67,6 +68,7 @@ type Pool interface {
 type Store interface {
 	Gateways() map[string]types.Gateway
 	Pairs() map[string]types.Pair
+	TicketInventory() (map[string]types.Pair, map[string]types.RegionDonor)
 	Slots() map[string]types.Slot
 	Accounts() []types.Account
 	AccountByViewToken(tok string) (types.Account, bool)
@@ -646,8 +648,8 @@ const supplyWindow = 15 * time.Minute
 // 寿命和交付路径看到的一致（`sched.freshPair` 走同一对函数）。不这么做页面会显示
 // 「这张票 5 分钟后过期」而交付实际发出去的是一张还有 50 分钟的。
 func (s *Server) effectivePairs(now time.Time) map[string]types.Pair {
-	raw := s.st.Pairs()
-	best := mint.BestCflb(raw, now)
+	raw, donors := s.st.TicketInventory()
+	best := ticket.Best(raw, donors, now)
 	out := make(map[string]types.Pair, len(raw))
 	for k, p := range raw {
 		out[k] = mint.Rehome(p, best, now)

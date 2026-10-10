@@ -1,13 +1,14 @@
 # 调度
 
-- `warmOnce` 交替让维护或探索先行；维护先补缺失已知网关、再续临期票，专门探索每15分钟最多一次机会（进程内计时，失败/无候选也消耗机会，重启后重新计时）。不限制库存/续票/需求唤醒；无近期需求或不足两个可用账号不执行。
+- `warmOnce` 交替让维护或探索先行；维护按已知缺票、有效临期、来源稀缺与区域donor缺口建任务，共享每轮12个任务，不按虚高数量追普通补货。稀缺临期/种子、普通缺票、普通续票分层，各层按实际交付截止排序；无近期需求或不足两个可用账号不执行。
+- 专门探索每15分钟最多一次机会（进程内计时，失败/无候选也消耗，重启重新计时），仍受全部原预算。空池最多2个引导任务；新发现自动纳入维护，无来源网关保留待恢复，不硬编码发现总数。
 - `renew_pairs` 默认关；开启后使用 `Pair.MintedBy`，不是另挑最空闲账号。
 - 种子出口通过 `NewSeedSID` 绑定；`internal/mint/mint.go` 在 `SeedBound` 路径只发送 `__cflb`。
 - 种子铸票的逻辑区域来自所用票据，不是机房实际出口，也不能随机借用网关的历史出口标签。
 - 新铸/库存/探索必须 `NewSIDFor`+空票走动态实际出口；seed只用于已有票续票。seeded请求不新增 `ReachableExits`，即使机房恰好同国；RegionMint仍保留逻辑标签。
 - `Store.BeginAttempt`持久化原子预留：凭证域×国家滚动1h默认2次，独立账号总50；城市别名共桶，失败/未连通也计次。所有scan/delivery/inventory/renew/explore/manual/Verify入口在绑定前预留，mint兜底幂等消费，一次额外Verify另扣；写失败不出站。
-- `mintOnce` 按响应实际落点保存新票并更新触碰；定向续票漂移仍报失败，不能把意外落点称为目标续成功。
-- `renewed` 还要求新票 `ExpiresAt` 严格晚于原票；同落点但 TTL 不变单列 `unchanged`。借同区长寿 cflb 的换盆与持久化保留，不承诺每次同账号同区必落原网关。
+- `mintOnce` 按实际落点原子保优保存；A→B可产生B覆盖/延寿/种子收益，但A仍未恢复，`drifted`与`productive`独立计数。只按已提交的有效寿命算`renewed`，不以HTTP200、票新鲜度或原始ExpiresAt宣称恢复/收益。
+- `ticket.PlanStock`同一时刻、新旧双方用同一合法donor集合；短票不盖长票，候选有价值的同区cflb独立保留。同值cflb的真实新租期也更新投影；必须有尚有效oailb，不伪造期限。
 - `Mint` 同时返回 HTTP 状态与解析错误时，非 200 状态优先；否则 401/429 缺少 __oailb 会掩盖停用/退避，循环白打。回归见 `mint_status_test.go`。
 - 明确删除/清空cookie、新oailb已过期、仅更新cflb均不能沿用旧网关；无新cookie仅在实际发送完整pair且两件都在响应时有效才可沿用，不增TTL。见 `mint/renew_response_test.go`。
 - `mint.Rehome` 只在旧 `__oailb` 尚有效时借同区长寿 `__cflb`；TTL 是两个组件的较早到期时间。
@@ -17,16 +18,18 @@
 - `RegionEnabled` 同时检查稳定 key/出口/启用态，两种延迟队列出手前复查；无上游验证的现成票交付不要求出口继续启用。
 - `premintNote` 只有全池 `ErrNoExit` 才停整轮，局部 `ErrRateLimited` 走原失手预算但不设置全局 halt。
 - OAuth 刷新与铸票共用 Store 账号锁，锁后重读凭据；已持锁的请求恢复不得重入锁。出站前本地 AT 到期、或 HTTP401 精确 `error.code=token_expired` 可用 RT 恢复；其它401沿用原处理。
-- 一次后台铸票每账号至多一次过期恢复；scan恢复后的失败不再进入传输重试。每次实际重试独立扣原国家/账号预算、保留失败样本；无RT不出站刷新。消费不出站刷新/铸票/echo。
+- 一次后台铸票每账号至多一次过期恢复；scan恢复后的失败不再传输重试。每次实际重试独立扣原预算并留失败样本；无RT不刷新。账号锁后无论有无刷新hook都重读；未知成员刷新后重新选路/claim，不冒用旧身份。消费不刷新/铸票/echo。
 - 未知国家探索公平性按持久尝试数推进；不能把低次数国家优先套到全部库存恢复。未知/不支持Geo（包括seed）不得铸票；地区403不笼统停号，确切401凭据失效仍停用。
-- `inventoryEvidence` 合并最新RegionMint与旧/过期Pair来源，要求启用有凭据账号、启用动态出口及匹配ReachableExits；按组合＋网关去重，一次漂移不抹掉唯一旧路线。
-- `PairTarget=max(busiest+spare,minPairs,recoverable)`封顶190；busiest取托管历史需求与独立外部1小时交付需求较大值，排除旧anon槽位；spare>190仍关闭补货，缺口按集合计算。
+- `inventoryEvidence`保留RegionMint/旧Pair来源线索，不为旧记录反推凭据身份；额外合并24h内真实裸铸路线，复查现身份、完整地区和稳定source。仅1h内观察用于正面source优先，较老记录只是有限重检线索，不升级为地理匹配事实。
+- `PairTarget`为全部已知网关数（含待恢复）；MinPairs/Spare只作空池引导提示，`spare>190`仍明确关闭维护。190只是旧关闭哨兵，不是发现上限；`renew_pairs`仍控制健康票续期及主动donor补充，动态地区停用不使现票或既有seed路线失效。
 - 托管需求统计按Slots/Accounts revision与LastDeliver cutoff复用；外部需求只保近期gateway集合，过期回收且乱序请求不能回退时间。恢复证据按账户/网关/票/铸票revision与启用出口复用，TTL不静态缓存。
 - 所有Key复用`/cookie`、`/gateways`原路径，仅接受新契约；明确member+gateway，只读与目录相同的freshPair/Rehome有效票。无Account/Slot准入、183秒避让、池端品质、代选/force/wait/count/消费现场铸票；缺参/旧参数400提示升级，只有release/消费者renew退役426，后台铸票保留。
 - 外部限频为完整成员摘要跨Key共享12/1秒、444/60秒；成功/缺票计数，拒绝不延窗，统计与准入分离。时间必须在限频锁内采样，保持窗口时序；并发/回收回归在external_delivery_test.go。
-- 普通库存周期先已知缺票路线，只有已知数不足target才最多2个未知bootstrap；总尝试仍≤2×缺口，短票/预测错/失败消耗失手预算，路线5分钟至1小时退避。
+- `routes`按身份摘要＋完整规范化地区＋bare/seed＋稳定出口配置摘要＋seed指纹建证据，随机SID/本地ID不重置。已知member跨AT刷新稳定；member未知按凭据摘要隔离，不声称跨刷新稳定。失败/低收益5min倍增至1h、24h过期、最多16384；这些是成本参数，不是测得固定期。
+- 续票/补货/探索共享路线在途与退避；换目标/用途不能绕过。最近B确实缺票/临期或需要donor可放行，连续同目标/同供给无收益仍等重检；B收益不清A未命中。bare不可执行且未花尝试时才可回退已有独立seed路线，不在真失败后追加第二任务。
 - 取票`markDemand`合并唤醒，最短5秒，走原后台锁/预算；唤醒绝不bootstrap或追加专门探索，匿名仍不在HTTP中自行铸票。
 - 点名恢复优先历史来源账号＋出口整体，优先非消费者；无可用历史路线才回落原单发路径。账号锁后重读启用态/凭据，另一任务已补齐则不重复发。回归见 `sched/inventory_recovery_test.go`。
 - `inventory_routing` 为 `off/shadow/assist`，默认shadow只记预测；assist只在原库存候选内、小时负载/国家公平与既有偏好之后打破平局，不影响交付/续票/专门探索。热修改对后续选择生效，不撤销已排定的请求。
 - 国家预测为滚动生产变体，不等于离线冻结模型的已验证收益；选前地理由同请求出口的历史实际国家估计，至少5条且一致率≥80%，身份/国家各≥5条才预测。未知、混合或不支持的地理弃权，不能用本次后验Geo冒充选前信息。
 - 模型每库存轮冻结；`Sample.InventoryPrediction`保留决策时刻、训练截至时刻、模式及支持数，绑定/Geo/HTTP失败也保留预测。预测不得写入inventoryEvidence、替代expected或免掉bootstrap失手预算。
+- `Sample.Route`记哈希条件、目标/真实落点、命中、已提交覆盖/延寿/donor增益、失败分类和NextCheck及前后有效期限；维护前/有尝试后另记逐网关可交付快照，不能混入请求分母。缺票持续时间按相邻观测界定，未观测/idle区间不假造精确起点。

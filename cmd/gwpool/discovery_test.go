@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/routes"
 	"gwpool/internal/scan"
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
@@ -44,6 +45,21 @@ func (stubMinter) NewSID(bool) (string, error)                { return "sid", ni
 func (stubMinter) NewSIDFor(types.Exit, bool) (string, error) { return "sid", nil }
 
 func (stubMinter) NewSeedSID() (string, error) { return "", errors.New("没配种子出口") }
+func (stubMinter) RouteSources(_ types.Exit, seed bool) []types.RouteSource {
+	if seed {
+		return nil
+	}
+	return []types.RouteSource{{ID: routes.Digest("discovery-test-source"), Kind: "test-dynamic"}}
+}
+func (m stubMinter) NewSIDForRoute(exit types.Exit, _ string, seed bool) (string, error) {
+	if seed {
+		return m.NewSeedSID()
+	}
+	return m.NewSIDFor(exit, true)
+}
+func (m stubMinter) RouteSource(string) types.RouteSource {
+	return m.RouteSources(types.Exit{}, false)[0]
+}
 
 // 没配种子出口 ⇒ 任何 sid 都不可能绑在它上面。
 func (stubMinter) SeedBound(string) bool { return false }

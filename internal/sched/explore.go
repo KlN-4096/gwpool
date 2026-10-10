@@ -13,7 +13,7 @@ const dedicatedExplorationInterval = 15 * time.Minute
 // exploreNewGateway 每15分钟最多获得一次机会；库存已满也可低频发现。
 // 必须由持有 backgroundMu 且有近期需求的 warmOnce 调用；所有锁、限额、落账沿用铸票主路径。
 func (s *Scheduler) exploreNewGateway(ctx context.Context) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || s.maintenanceOff() {
 		return
 	}
 	now := s.now()
@@ -43,9 +43,9 @@ func (s *Scheduler) exploreNewGateway(ctx context.Context) {
 		var ok bool
 		// Within the next country's turn, prefer an unseen account combination.
 		for _, onlyUnseen := range []bool{true, false} {
-			policy := &premintPolicy{skip: func(id int64, key string) bool {
+			policy := &premintPolicy{route: s.routeFilter(nil, nil), skip: func(id int64, key string) bool {
 				combo := comboKey(id, key)
-				return s.workDeferred("explore|"+combo) || (onlyUnseen && landed[combo] != "")
+				return onlyUnseen && landed[combo] != ""
 			}}
 			account, region, ok = s.minterFor(target.Exit, 0, s.opt.RenewGap, policy)
 			if ok {
@@ -65,17 +65,14 @@ func (s *Scheduler) exploreNewGateway(ctx context.Context) {
 		}
 		// Dedicated discovery never borrows a seed route.
 		unlock := s.st.LockAccount(account.ID)
-		attemptCtx, err := s.beginAttempt(ctx, account, region.Exit)
-		var sid string
+		attemptCtx, account, sid, releaseRoute, err := s.bindRoute(ctx, account, region.Exit,
+			types.Pair{}, "", types.PurposeExplore, false)
 		var got minted
 		if err == nil {
-			sid, err = s.mint.NewSIDFor(region.Exit, true)
-			if err != nil {
-				s.sampleAttemptFailure(account, region.Exit, "", types.PurposeExplore, types.Observed{}, err)
-			}
-		}
-		if err == nil {
 			got, err = s.mintOnceFor(attemptCtx, account, region.Exit, sid, types.Pair{}, "", "", types.PurposeExplore)
+		}
+		if releaseRoute != nil {
+			releaseRoute()
 		}
 		unlock()
 		release()
@@ -85,7 +82,6 @@ func (s *Scheduler) exploreNewGateway(ctx context.Context) {
 			_, existed := before[gateway]
 			isNew = !existed
 		}
-		s.noteWorkYield("explore|"+comboKey(account.ID, region.Key), isNew)
 		s.opt.Log.Info("新网关探索一发", "account", account.ID, "region", region.Key,
 			"gateway", gateway, "new_gateway", isNew, "succeeded", err == nil)
 		return // At most one upstream attempt, on success or failure.

@@ -323,7 +323,7 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 		// 见 types.MintResult.RouteDeadline）。扫描恒为裸铸 ⇒ 没有「上一张的 __cflb」
 		// 可继承，传零值让它走响应头 / 兜底那两级。
 		route, cflb := res.RouteDeadline(time.Time{})
-		if err := s.Store.PutPair(types.Pair{
+		if _, err := s.Store.CommitMint(types.MintCommit{At: now, Pair: types.Pair{
 			Gateway:       res.Gateway,
 			Cookie:        res.NewPair,
 			ExpiresAt:     route,
@@ -338,7 +338,7 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 			// —— 它的出口取自 ReachableExits，不保证正好是 Regions 里那九个代表出口。
 			// 扫描恒从 r.Exit 出去，r.Key 本来就是那九个之一，不需要兜底。
 			RegionKey: regionKey,
-		}); err != nil {
+		}}); err != nil {
 			return Landing{}, fmt.Errorf("记 pair: %w", err)
 		}
 	}

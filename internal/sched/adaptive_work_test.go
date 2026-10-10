@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gwpool/internal/config"
+	"gwpool/internal/routes"
 	"gwpool/internal/types"
 )
 
@@ -67,23 +68,30 @@ func TestWarmReservesFirstShotForExploration(t *testing.T) {
 }
 
 func TestLowYieldRetryIsBoundedAndSuccessResets(t *testing.T) {
-	s, _, _, clk := rig(t, types.ModePool)
+	_, _, _, clk := rig(t, types.ModePool)
+	descriptor := routes.Describe(types.Creds{AccountID: "one"}, types.Exit{Region: "US"},
+		types.RouteSource{ID: routes.Digest("source")}, routes.Bare, "")
+	var state types.RouteState
 	for i := 0; i < 20; i++ {
-		delay := s.noteWorkYield("explore|one", false)
+		attempt := types.RouteAttempt{Route: descriptor, StartedAt: clk.now(), At: clk.now(),
+			Status: 200, Gateway: "one"}
+		state = routes.Advance(state, attempt, types.StockGain{})
+		delay := state.NextCheck.Sub(clk.now())
 		if delay < 5*time.Minute || delay > time.Hour {
 			t.Fatal(delay)
 		}
 		clk.add(delay)
-		if s.workDeferred("explore|one") {
+		if !routes.Allowed(state, clk.now(), false) {
 			t.Fatal("retry did not reopen at its deadline")
 		}
 	}
-	s.noteWorkYield("explore|one", true)
-	if got := s.noteWorkYield("explore|one", false); got != 5*time.Minute {
-		t.Fatal("productive result did not reset", got)
+	state = routes.Advance(state, types.RouteAttempt{Route: descriptor, StartedAt: clk.now(), At: clk.now(),
+		Status: 200, Gateway: "one"}, types.StockGain{ExtendedMS: 1})
+	if state.LowYieldStreak != 0 {
+		t.Fatal("productive result without unresolved target miss did not reset streak")
 	}
-	if s.workDeferred("renew|one") {
-		t.Fatal("exploration hold leaked to renewal")
+	if routes.Allowed(state, clk.now(), false) {
+		t.Fatal("switching task kind bypassed route hold")
 	}
 }
 
@@ -118,11 +126,12 @@ func (m *regionCapabilityMinter) NewSIDFor(e types.Exit, sticky bool) (string, e
 
 func TestUnsupportedExitDoesNotStarveExplorationOrInventory(t *testing.T) {
 	for _, explore := range []bool{true, false} {
-		s, _, mn, _ := rig(t, types.ModePool)
+		s, st, mn, _ := rig(t, types.ModePool)
 		s.mint = &regionCapabilityMinter{mn}
 		if explore {
 			s.exploreNewGateway(context.Background())
 		} else {
+			recordKnownRecovery(t, st)
 			s.premintBare(context.Background(), 1)
 		}
 		if len(mn.mintedGateways()) == 0 {

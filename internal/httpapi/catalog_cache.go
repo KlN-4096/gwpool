@@ -9,6 +9,7 @@ import (
 	"gwpool/internal/cooldown"
 	"gwpool/internal/mint"
 	"gwpool/internal/store"
+	"gwpool/internal/ticket"
 	"gwpool/internal/types"
 )
 
@@ -36,10 +37,13 @@ func (s *Server) cachedCatalogPairs(now time.Time) map[string]types.Pair {
 	if cache.ready && cache.revision == revision && cacheValid(cache.from, cache.until, now) {
 		return cache.pairs
 	}
-	raw := s.st.Pairs()
-	best := mint.BestCflb(raw, now)
+	raw, donors := s.st.TicketInventory()
+	best := ticket.Best(raw, donors, now)
 	pairs := make(map[string]types.Pair, len(raw))
 	var from, until time.Time
+	for _, donor := range donors {
+		from, until = cacheBoundary(from, until, donor.ExpiresAt, now)
+	}
 	for key, pair := range raw {
 		_, fruitExpiry, _ := mint.PairInfo(pair.Cookie)
 		for _, boundary := range []time.Time{pair.CflbExpiresAt, fruitExpiry} {

@@ -86,6 +86,35 @@ func TestCatalogPairCacheTracksDonorFruitExpiryAndReplacement(t *testing.T) {
 	check(now)
 }
 
+func TestCatalogPairCacheUsesIndependentCommittedDonor(t *testing.T) {
+	s, st := cacheTestServer(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	old := types.Pair{Gateway: "target", RegionKey: "us-east",
+		Cookie:        routeCookie("old", "target", now.Add(time.Hour)),
+		CflbExpiresAt: now.Add(10 * time.Minute), ExpiresAt: now.Add(10 * time.Minute)}
+	if err := st.PutPair(old); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.cachedCatalogPairs(now)["target"]; got.ExpiresAt != old.ExpiresAt {
+		t.Fatal("unexpected initial projection")
+	}
+	candidate := types.Pair{Gateway: "target", RegionKey: "us-east",
+		Cookie:        routeCookie("fresh-donor", "target", now.Add(12*time.Minute)),
+		CflbExpiresAt: now.Add(40 * time.Minute), ExpiresAt: now.Add(12 * time.Minute)}
+	result, err := st.CommitMint(types.MintCommit{Pair: candidate, At: now})
+	if err != nil || result.PairChanged {
+		t.Fatalf("shorter fruit replaced incumbent: err=%v changed=%v", err, result.PairChanged)
+	}
+	for _, at := range []time.Time{now, now.Add(40 * time.Minute), now.Add(time.Hour), now.Add(time.Minute)} {
+		if !reflect.DeepEqual(s.cachedCatalogPairs(at), s.effectivePairs(at)) {
+			t.Fatal("independent donor revision/expiry did not invalidate catalog")
+		}
+	}
+	if got := s.cachedCatalogPairs(now)["target"]; got.ExpiresAt != now.Add(40*time.Minute) {
+		t.Fatal("independent donor not included in catalog")
+	}
+}
+
 func (s *countedCatalogStore) ContactReports() []types.ContactReport {
 	s.contacts.Add(1)
 	return s.Store.ContactReports()

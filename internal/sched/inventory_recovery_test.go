@@ -48,15 +48,20 @@ func TestInventoryTargetIncludesKnownRecoverableGateways(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	st.gws["unified-4"] = types.Gateway{Name: "unified-4"} // 没有恢复路线不能凑目标。
+	st.gws["unified-4"] = types.Gateway{Name: "unified-4"} // 保留待恢复目标，不创造路线。
 	s := New(st, mn, Options{Mode: types.ModePool, Now: clk.now,
 		Live: liveCfg(func(c *config.Config) { c.MinPairs, c.SpareTarget = 2, 0 })})
-	if got := s.PairTarget(); got != 3 {
-		t.Fatalf("目标未覆盖全部已知可恢复网关：got=%d, want=3", got)
+	if got := s.PairTarget(); got != 4 {
+		t.Fatalf("known pending gateway disappeared from objective: got=%d", got)
+	}
+	_, pending := s.maintenancePlan(false)
+	if pending != 1 {
+		t.Fatalf("missing route not distinguished from runnable work: %d", pending)
 	}
 	st.accounts[2].Enabled = false
-	if got := s.PairTarget(); got != 2 {
-		t.Fatalf("来源账号停用后仍将其唯一恢复路线计入目标：%d", got)
+	_, pending = s.maintenancePlan(false)
+	if got := s.PairTarget(); got != 4 || pending != 2 {
+		t.Fatalf("disabled source should suspend work, not erase the objective: target=%d pending=%d", got, pending)
 	}
 }
 
@@ -67,14 +72,14 @@ func TestPairTargetIncludesExternalConsumerDemand(t *testing.T) {
 	for _, gw := range []string{"unified-1", "unified-2", "unified-3", "unified-4"} {
 		st.slots[slotKey(50, gw)] = types.Slot{AccountID: 50, Gateway: gw, LastDeliver: clk.now()}
 	}
-	if got := s.PairTarget(); got != types.SpareTarget {
+	if got := s.PairTarget(); got != len(st.gws) || s.busiestDeliveries(clk.now().Add(-time.Hour)) != 0 {
 		t.Fatalf("legacy external slots changed supply demand: %d", got)
 	}
 	for _, gw := range []string{"unified-1", "unified-2", "unified-3", "unified-4"} {
 		s.external.delivered(types.ExternalConsumerID("external"), gw, clk.now())
 	}
-	if got, want := s.PairTarget(), types.SpareTarget+4; got != want {
-		t.Fatalf("跨账号消费者真实需求未计入库存目标：got=%d, want=%d", got, want)
+	if s.PairTarget() != len(st.gws) || s.busiestDeliveries(clk.now().Add(-time.Hour)) != 4 {
+		t.Fatal("consumer demand should remain recorded without inflating known inventory")
 	}
 }
 
@@ -136,9 +141,8 @@ func TestInventoryDefersBadPredictionAndDoesNotCountShortPair(t *testing.T) {
 	s.premintNote(round, plan, minted{pair: types.Pair{
 		Gateway: "unified-7", ExpiresAt: clk.now().Add(types.DeliverFloor - time.Second),
 	}}, nil, false)
-	if round.got != 0 || round.missed != 1 ||
-		!s.workDeferred("inventory|"+comboKey(1, plan.region.Key)+"|unified-7") {
-		t.Fatal("短票被当作补货成功，或无效恢复路线没有退避")
+	if round.got != 0 || round.missed != 1 {
+		t.Fatal("短票被当作补货成功")
 	}
 }
 

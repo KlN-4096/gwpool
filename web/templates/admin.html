@@ -439,13 +439,13 @@
           <fieldset class="setting-group">
             <legend>库存恢复与续票</legend>
             <div class="fields">
-              <label>需求富余 <span class="hint">0–100；0不关闭已知网关恢复。</span>
+              <label>冷启动富余 <span class="hint">兼容原配置；只用于空池引导，0不关闭已知网关恢复。</span>
                 <div class="input-unit"><input type="number" min="0" max="100" name="spare_target" value="{{.SpareTarget}}"><span>张</span></div></label>
-              <label>最低目标 <span class="hint">0–190；0仅表示不设这项下界。</span>
+              <label>冷启动最低目标 <span class="hint">兼容原配置；空池每轮最多2个引导任务，不追未知数量。</span>
                 <div class="input-unit"><input type="number" min="0" max="190" name="min_pairs" value="{{.MinPairs}}"><span>张</span></div></label>
             </div>
             <label class="choice setting-toggle"><input type="checkbox" name="renew_pairs" value="1"{{if .RenewPairs}} checked{{end}}><span>尝试续票<span class="hint">来源账号经静态出口续临期票；漂移会退避，不保证永久续住。</span></span></label>
-            <details><summary>目标如何计算</summary><p class="foot">取「近期最忙消费者需求＋富余」「最低目标」「已知可恢复网关数」的较大者，封顶190（实现上限，不是上游全集）。先补缺失已知网关，再续临期票；有需求且至少两个可用账号才维护，始终受预算限制。</p></details>
+            <details><summary>目标如何计算</summary><p class="foot">目标为已知网关数，缺少恢复路线的保留待恢复，不为虚高数量反复打票。维护按有效寿命、路线稀缺程度和区域种子供给安排，每轮最多12个获票任务；漂移票有实际延寿收益也会保留，同一路线的近期退避跨任务共享。有需求且至少两个可用账号才维护，预算与独立低频探索保持不变。</p></details>
           </fieldset>
           <fieldset class="setting-group">
             <legend>客户端调度</legend>

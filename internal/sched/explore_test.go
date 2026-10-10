@@ -80,6 +80,10 @@ func (m *explorationBindingFailure) NewSIDFor(exit types.Exit, _ bool) (string, 
 	return "", types.ErrNoExit
 }
 
+func (m *explorationBindingFailure) NewSIDForRoute(exit types.Exit, _ string, _ bool) (string, error) {
+	return m.NewSIDFor(exit, true)
+}
+
 func TestExploreRotatesGlobalCountriesEvenWhenEveryAttemptFails(t *testing.T) {
 	for _, bindingFailure := range []bool{false, true} {
 		t.Run(map[bool]string{false: "mint-failure", true: "binding-failure"}[bindingFailure], func(t *testing.T) {
