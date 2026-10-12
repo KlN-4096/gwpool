@@ -2,10 +2,11 @@
 
 - `internal/store` 保存 `state.json`＋`state.wal`（GWPWAL02提交头/序号/CRC）和独立`samples.jsonl`，不使用数据库；关键增量Sync成功才ACK，不再每次重写全快照。
 - 接入Key元数据/撤销/生成防重ID/单调序号及统计汇总走同一snapshot/WAL；生成只存SHA256和尾号，批量管理一次提交、失败回滚，已撤销不可启用，旧上传Key未覆盖策略时默认原权限。
-- 管理员Key最多10000、总策略/统计各20000；IP保留8、显式account摘要64、小时桶168，只有七API枚举计数、不记录请求/响应正文。统计快照深克隆，串行flush且按版本保留写盘期间的新计数，失败不清dirty。
-- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage/external_usage/region_donors/route_states`，strict decoder拒未知字段。先停服务，对一致私有副本用新/旧`-checkpoint-only`验证全部既有字段；回滚必须兼容当前snapshot/WAL，不能恢复旧快照丢ACK数据；不兼容时用识别新字段的修复版。
+- 管理员Key最多10000、总策略/统计各20000；IP保留8、显式account摘要64、小时桶168，只有已注册机器API路径计数、不记录请求/响应正文。统计快照深克隆，串行flush且按版本保留写盘期间的新计数，失败不清dirty。
+- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage/external_usage/region_donors/route_states/admin_auth`，strict decoder拒未知字段。先停服务，对一致私有副本用新/旧`-checkpoint-only`验证全部既有字段；回滚必须兼容当前snapshot/WAL，不能恢复旧快照丢ACK数据；不兼容时用识别新字段的修复版。
+- `admin_auth`存WebAuthn公钥凭证及随机会话SHA256，最多32凭证/128会话；Revision条件提交、深克隆、失败还原。已写认证状态后即使退出清空会话也不能降级旧schema，禁止保存原密钥/私钥/原会话令牌。
 - 提交头记录可信结束偏移；已ACK区间缺失/截断/CRC错拒绝启动，只清理提交边界外残尾。写失败截断并还原提交头、Sync后回滚；回滚不确定即冻结写入，不静默续跑。
-- 快照每分钟或WAL≥4MiB触发：锁内克隆、锁外编码/持久替换、锁内保留并发增量再换WAL。快照切换失败不丢已ACK记录；`checkpoint_failure_test.go`覆盖8处故障。
+- 后台脏快照最多5分钟或WAL≥4MiB触发，显式Checkpoint不节流；锁内克隆、锁外紧凑编码/持久替换、锁内保留并发增量再换WAL。失败保已ACK增量并独立1分钟重试；`checkpoint_failure_test.go`覆盖8处故障，`checkpoint_loop_test.go`覆盖触发/退避/Close前重放。
 - `UpdateSlot`128项有界队列，最多64项/1ms合并一次Sync；组失败还原全部槽位，Close等已准入请求结束。索引/revisions仅在提交成功后更新；不以异步ACK换性能。
 - `State` 顶层 JSON 键是小写；`types.Pair` 等嵌套结构使用 Go 字段名，如 `RegionKey`、`MintedBy`。
 - 历史无凭据占位行的Store写入上限400，与托管500独立；仅保历史存储兼容，不再参与/cookie准入、限频或补货。现行消费不调用AddAccount，不可将这个旧上限重新当成外部成员数量限制。
@@ -16,6 +17,7 @@
 - cookie、凭据、身份串、票号不进诊断输出；运维脚本只输出显式允许的计数、区域、网关和本地账号 ID。
 - 不直接编辑运行中的状态，也不把运行中分别复制的snapshot/WAL当一致备份。旧snapshot-only二进制回滚必须先停新服务，用新binary `-checkpoint-only`重放并落完整最新快照，再保留归档WAL并转换旧快照；不得恢复升级前快照丢新ACK。维护入口没有跨进程锁，严禁在线执行。
 - 冷却报告独立于票/槽位：仅接收已鉴权匿名观察，保留 7 天/全局 8192/每 consumer 1024 条；同事件同载荷幂等、冲突 409，写失败恢复内存。
+- 两类报告直接记录新增/更新/淘汰WAL项，不复制整表再diff；contact窗口补报锁内改一行、失败还原原行，已发布读副本不变。仍保逆序配额筛选后的插入顺序、幂等不剪枝；`report_retention_test.go`用旧算法oracle/Sync故障/重放验证，不能为省扫描改变语义。
 - 推荐阶梯1/2/4/6/8/10/12/16/20/24h，下界高于失败证据，24h仍失败不给更短建议；个人至少两次成功，全池至少三个独立consumer、每consumer一票。无能力头按旧10h上限重算证据，不截断新建议。
 - 成功样本实际静置超过计划档+60s时，不参与个人/全池推荐及稳定上报判定；稀疏流量不能证明最短恢复档。原报告与成功计数保留，失败下限仍按实际静置处理，不能一起过滤。
 - 冷却报告`observed_at`保原事件时间，旧报告回退ReceivedAt；同ID事件时间也不可变。POST批量最多32条逐项ACK，部分失败不丢成功；个人>=6报告、最近3条成功同推荐档且跨度>=24h才建议6h上报，新失败/过期撤回策略。
@@ -31,5 +33,6 @@
 - 库存快照与请求样本分母独立，不由cflb期限倒推铸票或预测涨跌；网关接触full/refreshed/unknown保留模型等分层，不与冷却报告数量相加。
 - `GET /gateways?model=…`从7天接触报告派生priority，仅同model/foreground/state-echo-v1且full或refreshed、至少5样本；未知/业务复验不进分母。统计按报告revision＋精确证据有效时间区间复用，乱序时间不能按“缓存建立时刻”误失效；个人期限仍逐请求计算，客户端ceiling缓存最多8项。
 - 清单鉴权只在单次请求内复用，不跨请求缓存授权；不读取旧消费Slot，真实票TTL与配置逐次检查。换盆投影按Pairs revision＋donor/fruit到期边界失效，目录与交付版本/期限必须一致；JSON仅复用内部标准编码片段与有界buffer。
+- 目录只取网关名/存在性；个人报告按reporter/tag索引且懒编码，全模型priority直接单遍聚合，保revision及准确时间边界。页面5秒缓存只解码固定fd长度内新增行，完整类型校验后投影；EOF无换行行下轮重读，文件替换/可见截短重建，错误不发布、旧reader不可变。样本正常只追加，不支持任意同inode copytruncate；完整`Samples()`不变。
 - 外部消费者累计摘要保存在独立`ExternalUsage` map与WAL增量，只有身份SHA256/请求/交付/限频/最近网关时间，不创建Account/Slot、不设数量准入门槛。写失败回滚摘要并ERROR日志，但有效票仍可交付；不可把统计故障伪装成no_live_pair。
 - 选路辅助缓存最多8192条近7天有效裸铸；启动仅流式读samples末16MiB，64KiB以上单行不训练，初始截断/坏行可见。固定文件快照在Store锁外读取，期间追加由有界pending合并；I/O失败1min退避并回退原策略，不发布半缓存。它不是完整历史数据库，重启不承诺恢复尾部范围外证据。

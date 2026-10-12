@@ -112,10 +112,11 @@ func run(path string, log *slog.Logger) error {
 	mintAll := sched.NewMintAllQueue(pool)
 
 	api, err := httpapi.New(pool, st, queue, httpapi.Options{
-		ConsumerKey: cfg.ConsumerKey.Reveal(),
-		AdminKey:    cfg.AdminKey.Reveal(),
-		SiteKey:     cfg.SiteKey.Reveal(),
-		Model:       cfg.Model,
+		AdminTrustLoopbackProxy: true,
+		ConsumerKey:             cfg.ConsumerKey.Reveal(),
+		AdminKey:                cfg.AdminKey.Reveal(),
+		SiteKey:                 cfg.SiteKey.Reveal(),
+		Model:                   cfg.Model,
 		// 接了 Live 之后页面现读它，这个只是启动时那一份兜底（见 Server.publicBaseURL）。
 		PublicBaseURL: cfg.PublicBaseURL,
 		Live:          live,

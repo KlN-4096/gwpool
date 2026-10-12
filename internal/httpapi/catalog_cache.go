@@ -75,15 +75,25 @@ type contactCache struct {
 	ready       bool
 	revision    uint64
 	from, until time.Time
-	byConsumer  map[reportConsumer]map[string][]types.ContactStats
-	priorities  map[string]map[string]types.GatewayPriority
-	encoded     map[reportConsumer]map[string]json.RawMessage
+	data        *contactCacheData
+}
+
+// Rows/priorities are immutable after publication. Encoding is lazy per actual
+// consumer and belongs to this snapshot, so replacing a revision never mutates
+// maps being used by an earlier request.
+type contactCacheData struct {
+	byConsumer map[reportConsumer]map[string][]types.ContactStats
+	priorities map[string]map[string]types.GatewayPriority
+	encodedMu  sync.Mutex
+	encoded    map[reportConsumer]map[string]json.RawMessage
 }
 
 type cooldownCacheEntry struct {
 	from, until time.Time
 	stats       []types.CooldownStats
 	bounds      map[policyKey]policyBounds
+	accounts    map[policyKey]types.CooldownAccountStats
+	gateways    map[string]int
 }
 
 type cooldownCache struct {
@@ -114,22 +124,22 @@ func cacheBoundary(from, until, event, now time.Time) (time.Time, time.Time) {
 // a concurrent newer copy then merely causes an extra rebuild next time, never
 // labels old data with a newer revision. Fake stores deliberately bypass caches.
 func (s *Server) contactData(now time.Time) (map[reportConsumer]map[string][]types.ContactStats, map[string]map[string]types.GatewayPriority) {
-	contacts, priorities, _ := s.contactDataEncoded(now)
-	return contacts, priorities
+	data := s.contactSnapshot(now)
+	return data.byConsumer, data.priorities
 }
 
-func (s *Server) contactDataEncoded(now time.Time) (map[reportConsumer]map[string][]types.ContactStats, map[string]map[string]types.GatewayPriority, map[reportConsumer]map[string]json.RawMessage) {
+func (s *Server) contactSnapshot(now time.Time) *contactCacheData {
 	versioned, ok := s.st.(interface{ Revisions() store.Revisions })
 	if !ok {
 		contacts, priorities := buildContactData(s.st.ContactReports(), now)
-		return contacts, priorities, encodeContacts(contacts)
+		return &contactCacheData{byConsumer: contacts, priorities: priorities}
 	}
 	cache := &s.contacts
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	revision := versioned.Revisions().Contacts
 	if cache.ready && cache.revision == revision && cacheValid(cache.from, cache.until, now) {
-		return cache.byConsumer, cache.priorities, cache.encoded
+		return cache.data
 	}
 	reports := s.st.ContactReports()
 	var from, until time.Time
@@ -137,25 +147,33 @@ func (s *Server) contactDataEncoded(now time.Time) (map[reportConsumer]map[strin
 		from, until = cacheBoundary(from, until, report.At.Add(-5*time.Minute), now)
 		from, until = cacheBoundary(from, until, report.At.Add(contact.Retention+time.Nanosecond), now)
 	}
-	cache.byConsumer, cache.priorities = buildContactData(reports, now)
-	cache.encoded = encodeContacts(cache.byConsumer)
+	contacts, priorities := buildContactData(reports, now)
+	cache.data = &contactCacheData{byConsumer: contacts, priorities: priorities}
 	cache.revision, cache.from, cache.until, cache.ready = revision, from, until, true
-	return cache.byConsumer, cache.priorities, cache.encoded
+	return cache.data
 }
 
-func encodeContacts(contacts map[reportConsumer]map[string][]types.ContactStats) map[reportConsumer]map[string]json.RawMessage {
-	out := make(map[reportConsumer]map[string]json.RawMessage, len(contacts))
-	for consumer, gateways := range contacts {
-		rows := make(map[string]json.RawMessage, len(gateways))
-		for gateway, stats := range gateways {
-			// ContactStats contains only strings and integers, no fallible
-			// MarshalJSON hooks. Encoding is shared by every read of this version.
-			body, _ := json.Marshal(stats)
-			rows[gateway] = body
-		}
-		out[consumer] = rows
+func (data *contactCacheData) encodedFor(consumer reportConsumer) map[string]json.RawMessage {
+	gateways, exists := data.byConsumer[consumer]
+	if !exists {
+		return nil // arbitrary client tags must not grow a cache of empty rows
 	}
-	return out
+	data.encodedMu.Lock()
+	defer data.encodedMu.Unlock()
+	if encoded, ok := data.encoded[consumer]; ok {
+		return encoded
+	}
+	rows := make(map[string]json.RawMessage, len(gateways))
+	for gateway, stats := range gateways {
+		// ContactStats contains only strings and integers, no fallible hooks.
+		body, _ := json.Marshal(stats)
+		rows[gateway] = body
+	}
+	if data.encoded == nil {
+		data.encoded = make(map[reportConsumer]map[string]json.RawMessage)
+	}
+	data.encoded[consumer] = rows
+	return rows
 }
 
 func buildContactData(reports []types.ContactReport, now time.Time) (map[reportConsumer]map[string][]types.ContactStats, map[string]map[string]types.GatewayPriority) {
@@ -167,17 +185,7 @@ func buildContactData(reports []types.ContactReport, now time.Time) (map[reportC
 		}
 		byConsumer[key][row.Gateway] = append(byConsumer[key][row.Gateway], row)
 	}
-	models := map[string][]types.ContactReport{}
-	for _, report := range reports {
-		if report.Model != "" {
-			models[report.Model] = append(models[report.Model], report)
-		}
-	}
-	priorities := map[string]map[string]types.GatewayPriority{}
-	for model, rows := range models {
-		priorities[model] = contact.Priorities(rows, model, now)
-	}
-	return byConsumer, priorities
+	return byConsumer, contact.AllPriorities(reports, now)
 }
 
 func (s *Server) contactPriorities(model string, now time.Time) map[string]types.GatewayPriority {
@@ -190,7 +198,15 @@ func (s *Server) contactPriorities(model string, now time.Time) map[string]types
 
 func buildCooldownData(reports []types.CooldownReport, now time.Time, ceiling int) cooldownCacheEntry {
 	out := cooldownCacheEntry{stats: cooldown.SummarizeWithin(reports, now, ceiling),
-		bounds: map[policyKey]policyBounds{}}
+		bounds:   map[policyKey]policyBounds{},
+		accounts: map[policyKey]types.CooldownAccountStats{},
+		gateways: map[string]int{}}
+	for i, stats := range out.stats {
+		out.gateways[stats.Gateway] = i
+		for _, account := range stats.Accounts {
+			out.accounts[policyKey{reportConsumer{account.ReporterID, account.AccountTag}, stats.Gateway}] = account
+		}
+	}
 	for _, report := range reports {
 		at := report.EventAt()
 		out.from, out.until = cacheBoundary(out.from, out.until, at.Add(-time.Minute), now)
@@ -241,9 +257,17 @@ func (s *Server) cooldownData(now time.Time, ceiling int) cooldownCacheEntry {
 }
 
 func (entry cooldownCacheEntry) forAccount(stats types.CooldownStats, reporterID int64, tag string, now time.Time) types.CooldownRecommendation {
-	rec := cooldown.ForAccount(stats, reporterID, tag)
+	key := policyKey{reportConsumer{reporterID, tag}, stats.Gateway}
+	rec := stats.Recommendation
+	if account, ok := entry.accounts[key]; ok {
+		if account.Recommendation.Seconds > 0 {
+			rec = account.Recommendation
+		} else if rec.Seconds < account.FailureFloorSeconds {
+			return types.CooldownRecommendation{}
+		}
+	}
 	if rec.ReportIntervalSeconds > 0 {
-		bounds := entry.bounds[policyKey{reportConsumer{reporterID, tag}, stats.Gateway}]
+		bounds := entry.bounds[key]
 		// The policy's rolling TTL changes even if no report changes. Keep its
 		// evidence cap separate; freezing the original expiry changes the API.
 		rec.ReportPolicyExpiresAt = now.Add(cooldown.ReportPolicyTTL)
@@ -252,4 +276,13 @@ func (entry cooldownCacheEntry) forAccount(stats types.CooldownStats, reporterID
 		}
 	}
 	return rec
+}
+
+func (entry cooldownCacheEntry) recommendation(gateway string, reporterID int64, tag string, now time.Time) *types.CooldownRecommendation {
+	if index, ok := entry.gateways[gateway]; ok {
+		if rec := entry.forAccount(entry.stats[index], reporterID, tag, now); rec.Seconds > 0 {
+			return &rec
+		}
+	}
+	return nil
 }

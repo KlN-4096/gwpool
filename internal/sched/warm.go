@@ -776,7 +776,13 @@ func (s *Scheduler) PairTarget() int {
 	if s.maintenanceOff() {
 		return 0
 	}
-	if known := len(s.st.Gateways()); known > 0 {
+	var known int
+	if narrow, ok := s.st.(interface{ GatewayCount() int }); ok {
+		known = narrow.GatewayCount()
+	} else {
+		known = len(s.st.Gateways())
+	}
+	if known > 0 {
 		return known
 	}
 	// Numerical reserve settings only bound the initial empty-pool bootstrap.

@@ -31,20 +31,29 @@ func (s *Scheduler) newInventoryRoutingRound() *inventoryRoutingRound {
 	if s.cfg().InventoryRoutingMode() == config.InventoryRoutingOff {
 		return nil
 	}
-	source, ok := s.st.(routingObservationSource)
-	if !ok {
+	var snapshot routing.ModelSnapshot
+	var err error
+	if source, ok := s.st.(interface {
+		RoutingModel(time.Time) (routing.ModelSnapshot, error)
+	}); ok {
+		snapshot, err = source.RoutingModel(s.now())
+	} else if source, ok := s.st.(routingObservationSource); ok {
+		var history routing.History
+		history, err = source.RoutingObservations(s.now())
+		snapshot = routing.ModelSnapshot{Model: routing.New(history.Observations),
+			Loaded: history.Loaded, Clipped: history.Clipped, SkippedLines: history.SkippedLines}
+	} else {
 		return nil
 	}
-	history, err := source.RoutingObservations(s.now())
 	if err != nil {
 		s.opt.Log.Warn("库存选路历史不可用，保留原选择", "err", err)
 		return nil
 	}
-	if history.Loaded && (history.Clipped || history.SkippedLines > 0) {
+	if snapshot.Loaded && (snapshot.Clipped || snapshot.SkippedLines > 0) {
 		s.opt.Log.Warn("库存选路仅使用有界可读历史",
-			"tail_clipped", history.Clipped, "skipped_lines", history.SkippedLines)
+			"tail_clipped", snapshot.Clipped, "skipped_lines", snapshot.SkippedLines)
 	}
-	return &inventoryRoutingRound{model: routing.New(history.Observations),
+	return &inventoryRoutingRound{model: snapshot.Model,
 		predictions: map[routingCandidate]types.InventoryPrediction{}}
 }
 

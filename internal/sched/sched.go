@@ -226,6 +226,7 @@ type Scheduler struct {
 	lastDeliver   time.Time
 	inventoryWake chan struct{} // 合并真实取票需求；仅唤醒维护，不增加专门探索轮次。
 	evidenceCache inventoryEvidenceCache
+	routeCache    routeStateCache
 	external      externalConsumers
 	// gwLocks 是「同一个网关一次只许有一发在铸」，见 lockGateway。
 	gwLocks map[string]*sync.Mutex

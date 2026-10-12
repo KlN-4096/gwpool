@@ -39,3 +39,40 @@ func Priorities(reports []types.ContactReport, model string, now time.Time) map[
 	}
 	return out
 }
+
+// AllPriorities aggregates directly by model and gateway. Do not group full
+// report structs into per-model copies merely to immediately scan them again.
+func AllPriorities(reports []types.ContactReport, now time.Time) map[string]map[string]types.GatewayPriority {
+	out := map[string]map[string]types.GatewayPriority{}
+	oldest, newest := now.Add(-Retention), now.Add(5*time.Minute)
+	for _, report := range reports {
+		if report.Model == "" {
+			continue
+		}
+		rows := out[report.Model]
+		if rows == nil {
+			rows = map[string]types.GatewayPriority{}
+			out[report.Model] = rows
+		}
+		if report.Criterion != "state-echo-v1" || report.Source != "foreground" ||
+			report.At.Before(oldest) || report.At.After(newest) ||
+			(report.Outcome != "full" && report.Outcome != "refreshed") {
+			continue
+		}
+		p := rows[report.Gateway]
+		p.Model = report.Model
+		p.Samples++
+		if report.Outcome == "full" {
+			p.Full++
+		}
+		rows[report.Gateway] = p
+	}
+	for _, rows := range out {
+		for gateway, p := range rows {
+			if p.Samples < PriorityMinSamples {
+				delete(rows, gateway)
+			}
+		}
+	}
+	return out
+}

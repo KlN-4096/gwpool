@@ -50,10 +50,14 @@ var defaultRegionNames = map[string]string{
 func DefaultRegions() []ExplorationRegion {
 	out := make([]ExplorationRegion, 0, len(types.Regions))
 	for _, r := range types.Regions {
-		out = append(out, ExplorationRegion{Key: r.Key, Name: defaultRegionNames[r.Key],
-			Country: r.Exit.Region, City: r.Exit.City, Enabled: true})
+		out = append(out, defaultRegion(r))
 	}
 	return out
+}
+
+func defaultRegion(r types.Region) ExplorationRegion {
+	return ExplorationRegion{Key: r.Key, Name: defaultRegionNames[r.Key],
+		Country: r.Exit.Region, City: r.Exit.City, Enabled: true}
 }
 
 func (c Config) RegionDefinitions() []ExplorationRegion {
@@ -64,7 +68,15 @@ func (c Config) RegionDefinitions() []ExplorationRegion {
 }
 
 func (c Config) RegionByKey(key string) (ExplorationRegion, bool) {
-	for _, r := range c.RegionDefinitions() {
+	if c.Regions == nil {
+		for _, r := range types.Regions {
+			if r.Key == key {
+				return defaultRegion(r), true
+			}
+		}
+		return ExplorationRegion{}, false
+	}
+	for _, r := range c.Regions {
 		if r.Key == key {
 			return r, true
 		}
@@ -73,7 +85,15 @@ func (c Config) RegionByKey(key string) (ExplorationRegion, bool) {
 }
 
 func (c Config) RegionKeyOf(exit types.Exit) string {
-	for _, r := range c.RegionDefinitions() {
+	if c.Regions == nil {
+		for _, r := range types.Regions {
+			if defaultRegion(r).Exit() == exit {
+				return r.Key
+			}
+		}
+		return ""
+	}
+	for _, r := range c.Regions {
 		if r.Exit() == exit {
 			return r.Key // 停用仅阻止新探索，历史/配额反查仍保留原键。
 		}

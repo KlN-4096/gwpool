@@ -1,0 +1,25 @@
+{{define "content"}}
+<div class="page-head"><h1>登录与安全</h1><p>Passkey 主登录 · 管理员密钥备用 · 登录保持30天</p></div>
+<section class="card"><header class="card-head"><h2>我的 Passkey</h2></header><div class="card-body">
+  <p>服务器只保存公钥。指纹、面容和私钥由你的设备或密码管理器保管。</p>
+  {{if .Origin}}<p class="muted">绑定站点：<code>{{.Origin}}</code></p>{{else}}<p class="bad">请先在设置中配置固定的 HTTPS 公共地址，才能绑定 Passkey。</p>{{end}}
+  {{if not .Fresh}}<p class="warn">新增或移除 Passkey 前需要重新验证身份。</p><a class="button" href="/admin/login?next=%2Fadmin%2Fsecurity">重新验证</a>{{end}}
+  {{range .Passkeys}}
+  <article class="card" style="margin-top:1rem"><div class="card-body">
+    <h3 style="overflow-wrap:anywhere">{{.Name}}</h3>
+    <p class="muted">绑定：{{.CreatedAt}}<br>最近登录：{{.LastUsedAt}}</p>
+    <form method="post" action="/admin/passkeys/delete" onsubmit="return confirm('移除此 Passkey？通过它建立的登录也会退出。')">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <button type="submit" class="danger" {{if not $.Fresh}}disabled{{end}}>移除 Passkey</button>
+    </form>
+  </div></article>
+  {{else}}<p class="muted">尚未绑定。可添加多把 Passkey，方便不同设备使用。</p>{{end}}
+  <div style="margin-top:1.5rem">
+    <label>Passkey 名称<input id="admin-passkey-name" type="text" maxlength="40" placeholder="例如：我的电脑"></label>
+    <button type="button" class="primary" id="admin-passkey-register" {{if or (not .Fresh) (not .Origin)}}disabled{{end}}>添加 Passkey</button>
+    <p id="admin-auth-status" role="status" aria-live="polite"></p>
+  </div>
+  <p class="muted">新增与移除需要5分钟内验证的登录。请保留管理员密钥作为备用；更换管理员密钥或公共地址后，旧登录与 Passkey 绑定失效，需要重新绑定。</p>
+</div></section>
+{{template "admin-auth-script" .}}
+{{end}}

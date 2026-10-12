@@ -19,15 +19,19 @@ import (
 )
 
 const (
-	journalFile          = "state.wal"
-	journalVersion       = 2
-	journalMagic         = "GWPWAL02"
-	journalHeaderSize    = 36
-	journalRecordHeader  = 12
-	maxJournalRecord     = 64 << 20
-	checkpointBytes      = 4 << 20
-	checkpointInterval   = time.Minute
-	checkpointQueueDepth = 1
+	journalFile         = "state.wal"
+	journalVersion      = 2
+	journalMagic        = "GWPWAL02"
+	journalHeaderSize   = 36
+	journalRecordHeader = 12
+	maxJournalRecord    = 64 << 20
+	checkpointBytes     = 4 << 20
+	// The WAL is already durable before acknowledgement. Small mutations do
+	// not need a full multi-megabyte snapshot every minute. The byte threshold
+	// still preempts this timer and bounds the normal replay work.
+	checkpointMaxInterval   = 5 * time.Minute
+	checkpointRetryInterval = time.Minute
+	checkpointQueueDepth    = 1
 )
 
 // A journal entry contains the exact mutation, never a time-dependent command.
@@ -40,6 +44,7 @@ type stateChange struct {
 	AccessKeys        map[string]types.AccessKey                 `json:"access_keys,omitempty"`
 	KeyUsage          map[string]types.KeyUsage                  `json:"key_usage,omitempty"`
 	ExternalUsage     map[string]types.ExternalConsumerUsage     `json:"external_usage,omitempty"`
+	AdminAuth         *types.AdminAuthState                      `json:"admin_auth,omitempty"`
 	OwnerKeysMigrated bool                                       `json:"owner_keys_migrated,omitempty"`
 	AttemptsMigrated  bool                                       `json:"attempts_migrated,omitempty"`
 	Accounts          []types.Account                            `json:"accounts,omitempty"`
@@ -370,6 +375,10 @@ func writeJournalHeader(file journalIO, header []byte) error {
 
 func applyChange(state *State, change stateChange) {
 	state.JournalSequence = change.Sequence
+	if change.AdminAuth != nil {
+		auth := change.AdminAuth.Clone()
+		state.AdminAuth = &auth
+	}
 	state.NextAccountID = max(state.NextAccountID, change.NextAccountID)
 	state.NextOwnerID = max(state.NextOwnerID, change.NextOwnerID)
 	state.NextAccessKeyID = max(state.NextAccessKeyID, change.NextAccessKeyID)
@@ -500,27 +509,9 @@ func applyReports[T any](rows, updates []T, dropped []reportKey, key func(T) rep
 	return rows
 }
 
-func diffReports[T comparable](before, after []T, key func(T) reportKey) (updates []T, dropped []reportKey) {
-	old := make(map[reportKey]T, len(before))
-	for _, row := range before {
-		old[key(row)] = row
-	}
-	for _, row := range after {
-		id := key(row)
-		if prev, ok := old[id]; !ok || prev != row {
-			updates = append(updates, row)
-		}
-		delete(old, id)
-	}
-	for id := range old {
-		dropped = append(dropped, id)
-	}
-	return updates, dropped
-}
-
 func (s *Store) checkpointLoop() {
 	defer close(s.journal.done)
-	timer := time.NewTicker(checkpointInterval)
+	timer := time.NewTimer(checkpointMaxInterval)
 	defer timer.Stop()
 	var retryAt time.Time
 	for {
@@ -538,7 +529,11 @@ func (s *Store) checkpointLoop() {
 			s.journal.checkpointErr = err
 			s.mu.Unlock()
 			slog.Error("state checkpoint failed; committed journal retained", "error", err)
-			retryAt = time.Now().Add(checkpointInterval)
+			retryAt = time.Now().Add(checkpointRetryInterval)
+			timer.Reset(checkpointRetryInterval)
+		} else {
+			retryAt = time.Time{}
+			timer.Reset(checkpointMaxInterval)
 		}
 	}
 }
@@ -566,7 +561,7 @@ func (s *Store) Checkpoint() error {
 	snapshot := cloneState(s.st)
 	boundary := s.journal.offset
 	s.mu.RUnlock()
-	body, err := json.MarshalIndent(snapshot, "", "  ")
+	body, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
 	}
@@ -666,6 +661,10 @@ func cloneMap[K comparable, V any](from map[K]V) map[K]V {
 }
 
 func cloneState(state State) State {
+	if state.AdminAuth != nil {
+		auth := state.AdminAuth.Clone()
+		state.AdminAuth = &auth
+	}
 	state.AccessKeys = cloneMap(state.AccessKeys)
 	state.KeyUsage = cloneMap(state.KeyUsage)
 	state.ExternalUsage = cloneMap(state.ExternalUsage)

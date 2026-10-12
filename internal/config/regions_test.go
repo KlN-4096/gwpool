@@ -11,6 +11,52 @@ import (
 	"gwpool/internal/types"
 )
 
+func TestRegionLookupsMatchDefinitionsWithoutAllocatingDefaultList(t *testing.T) {
+	for _, cfg := range []Config{
+		{}, {Regions: []ExplorationRegion{}},
+		{Regions: []ExplorationRegion{{Key: "custom", Name: "自定义", Country: "US", State: "state", City: "city"}}},
+	} {
+		for _, row := range append(cfg.RegionDefinitions(), ExplorationRegion{Key: "missing", Country: "XX"}) {
+			var want ExplorationRegion
+			ok := false
+			for _, candidate := range cfg.RegionDefinitions() {
+				if candidate.Key == row.Key {
+					want, ok = candidate, true
+					break
+				}
+			}
+			if got, exists := cfg.RegionByKey(row.Key); got != want || exists != ok {
+				t.Fatal("key lookup differs", got, want)
+			}
+			wantKey := ""
+			for _, candidate := range cfg.RegionDefinitions() {
+				if candidate.Exit() == row.Exit() {
+					wantKey = candidate.Key
+					break
+				}
+			}
+			if cfg.RegionKeyOf(row.Exit()) != wantKey {
+				t.Fatal("exit lookup changed nil/empty/disabled/custom semantics")
+			}
+		}
+	}
+	cfg := Config{}
+	var row ExplorationRegion
+	var key string
+	allocs := testing.AllocsPerRun(100, func() {
+		row, _ = cfg.RegionByKey("us-west")
+		key = cfg.RegionKeyOf(types.Exit{Region: "US", City: "Seattle"})
+	})
+	if allocs != 0 || row.Key != "us-west" || key != "us-west" {
+		t.Fatalf("single-value lookups allocate whole default lists: allocations=%v", allocs)
+	}
+	mutable := cfg.RegionDefinitions()
+	mutable[0].Name = "mutated"
+	if got, _ := cfg.RegionByKey(mutable[0].Key); got.Name == "mutated" {
+		t.Fatal("mutable defaults leaked across Config values")
+	}
+}
+
 func TestGlobalCountryDefinitionsFitWithoutIncreasingMintBudget(t *testing.T) {
 	old := Defaults()
 	next := old

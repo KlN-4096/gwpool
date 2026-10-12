@@ -36,6 +36,7 @@ type routingHistoryCache struct {
 	next         int
 	clipped      bool
 	skippedLines int
+	revision     uint64
 }
 
 func (c *routingHistoryCache) append(sample types.Sample) {
@@ -48,6 +49,7 @@ func (c *routingHistoryCache) append(sample types.Sample) {
 }
 
 func (c *routingHistoryCache) appendEntry(row routingHistoryEntry) {
+	c.revision++
 	if len(c.rows) < routing.HistoryLimit {
 		c.rows = append(c.rows, row)
 		return
@@ -65,25 +67,52 @@ func (s *Store) RoutingObservations(now time.Time) (routing.History, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	accounts := make(map[int64]types.Account, len(s.st.Accounts))
+	out, _, _ := s.routingObservationsLocked(now)
+	return routing.History{Observations: out, Loaded: loaded, Clipped: s.routingHistory.clipped,
+		SkippedLines: s.routingHistory.skippedLines}, nil
+}
+
+// Caller holds Store.mu. The boundaries capture future admission and strict
+// retention expiry, including eligible rows outside the current window.
+func (s *Store) routingObservationsLocked(now time.Time) ([]routing.Observation, time.Time, time.Time) {
+	type donor struct {
+		key     string
+		created time.Time
+	}
+	accounts := make(map[int64]donor, len(s.st.Accounts))
 	for _, account := range s.st.Accounts {
-		accounts[account.ID] = account
+		if account.Creds.AccountID != "" {
+			accounts[account.ID] = donor{routing.DonorKey(account.Creds.AccountID), account.CreatedAt}
+		}
 	}
 	cutoff := now.Add(-routing.HistoryRetention)
 	out := make([]routing.Observation, 0, len(s.routingHistory.rows))
+	var from, until time.Time
+	boundary := func(at time.Time) {
+		if at.After(now) {
+			if until.IsZero() || at.Before(until) {
+				until = at
+			}
+		} else if from.IsZero() || at.After(from) {
+			from = at
+		}
+	}
 	for _, row := range s.routingHistory.rows {
 		account, ok := accounts[row.account]
 		// Local IDs must not silently join history to a different current
 		// identity. Deleted accounts and samples predating creation abstain.
-		if !ok || account.Creds.AccountID == "" || row.at.Before(account.CreatedAt) ||
-			row.at.Before(cutoff) || row.at.After(now) {
+		if !ok || row.at.Before(account.created) {
 			continue
 		}
-		out = append(out, routing.Observation{Donor: routing.DonorKey(account.Creds.AccountID),
+		boundary(row.at)
+		boundary(row.at.Add(routing.HistoryRetention + time.Nanosecond))
+		if row.at.Before(cutoff) || row.at.After(now) {
+			continue
+		}
+		out = append(out, routing.Observation{Donor: account.key,
 			Country: row.country, Gateway: row.gateway, Requested: row.requested, At: row.at})
 	}
-	return routing.History{Observations: out, Loaded: loaded, Clipped: s.routingHistory.clipped,
-		SkippedLines: s.routingHistory.skippedLines}, nil
+	return out, from, until
 }
 
 func (s *Store) ensureRoutingHistory(now time.Time) (bool, error) {

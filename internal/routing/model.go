@@ -37,6 +37,13 @@ type History struct {
 	SkippedLines int
 }
 
+type ModelSnapshot struct {
+	Model        *Model
+	Loaded       bool
+	Clipped      bool
+	SkippedLines int
+}
+
 // DonorKey is stable across local rows and token refreshes. Neither the
 // credential identifier nor token is included in forecasts or diagnostics.
 func DonorKey(account string) string {

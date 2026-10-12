@@ -121,7 +121,7 @@ func TestCooldownBatchAcknowledgesEachItemAndPreservesEventTime(t *testing.T) {
 	}{
 		{string(raw), "", http.StatusUnauthorized},
 		{`{"reports":[]}`, "akey", http.StatusBadRequest},
-		{`{"reports":[{"token":"must-not-collect"}]}`, "akey", http.StatusBadRequest},
+		{`{"reports":[{"token":"must-not-collect"}]}`, "akey", http.StatusOK},
 		{`{"reports":[]} {}`, "akey", http.StatusBadRequest},
 	} {
 		w := do(handler, authed(httptest.NewRequest(http.MethodPost, "/cooldown/reports", strings.NewReader(test.body)), test.key))

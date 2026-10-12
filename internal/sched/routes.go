@@ -59,7 +59,7 @@ func (s *Scheduler) claimRoute(key string) (func(), bool) {
 // routeAvailable filters a candidate without reserving an attempt or rotating
 // a proxy. bindRoute rechecks after the shared account lock is acquired.
 func (s *Scheduler) routeAvailable(a types.Account, exit types.Exit, seed types.Pair, expected string, donorNeeded bool) bool {
-	states := s.st.RouteStates(s.now())
+	states := s.routeStates(s.now())
 	for _, source := range s.mint.RouteSources(exit, seed.Cookie != "") {
 		descriptor := s.describeRoute(a, exit, source, seed)
 		if s.routeCanWork(states[routes.Key(descriptor)], expected, donorNeeded) {
@@ -71,7 +71,7 @@ func (s *Scheduler) routeAvailable(a types.Account, exit types.Exit, seed types.
 
 // Snapshot once per selection, not once per account×country candidate.
 func (s *Scheduler) routeFilter(expected map[string]string, donorNeeds map[string]bool) func(types.Account, types.Region) bool {
-	states := s.st.RouteStates(s.now())
+	states := s.routeStates(s.now())
 	sources := map[types.Exit][]types.RouteSource{}
 	identities := map[int64]string{}
 	return func(account types.Account, region types.Region) bool {
@@ -112,7 +112,7 @@ func (s *Scheduler) bindRoute(ctx context.Context, a types.Account, exit types.E
 	}
 	// Prefer an actual recent match under the exact source/seed conditions.
 	// Keep the provider's rotation order within equally supported options.
-	states := s.st.RouteStates(s.now())
+	states := s.routeStates(s.now())
 	sort.SliceStable(sources, func(i, j int) bool {
 		matches := func(source types.RouteSource) bool {
 			state := states[routes.Key(s.describeRoute(a, exit, source, seed))]
@@ -128,7 +128,7 @@ func (s *Scheduler) bindRoute(ctx context.Context, a types.Account, exit types.E
 		if !claimed {
 			continue
 		}
-		state := s.st.RouteStates(s.now())[key]
+		state := s.currentRouteState(key, s.now())
 		if !s.routeCanWork(state, expected, donorNeeded) {
 			release()
 			continue

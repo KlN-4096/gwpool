@@ -38,6 +38,7 @@ import (
 	"gwpool/internal/oauth"
 	"gwpool/internal/reauth"
 	"gwpool/internal/sched"
+	"gwpool/internal/store"
 	"gwpool/internal/ticket"
 	"gwpool/internal/types"
 	"gwpool/web"
@@ -66,6 +67,8 @@ type Pool interface {
 
 // Store 是视图需要的读写面。
 type Store interface {
+	AdminAuthState() types.AdminAuthState
+	CommitAdminAuthState(expected uint64, next types.AdminAuthState) error
 	Gateways() map[string]types.Gateway
 	Pairs() map[string]types.Pair
 	TicketInventory() (map[string]types.Pair, map[string]types.RegionDonor)
@@ -133,6 +136,9 @@ type MintAllQueue interface {
 
 // Options 是服务端参数。两个 key 为空时对应路由**全拒**，不是全放。
 type Options struct {
+	// Only enable with the loopback Caddy deployment that overwrites X-Real-IP.
+	// External TCP peers are never allowed to supply the authentication client IP.
+	AdminTrustLoopbackProxy bool
 	// ConsumerKey 有两个身份：管理员兜底凭证，以及**每账号 key 的派生密钥**。
 	// 换掉它等于把所有账号的 key 一起换掉。见 consumerKeyFor。
 	ConsumerKey string
@@ -182,12 +188,13 @@ type Server struct {
 	scan Scanner
 	opt  Options
 
-	// 账本缓存。回读 samples.jsonl 是全量的，而上传者页对外、谁都能反复刷，
-	// 每刷一次就在存储的读锁里压一次全量读 ⇒ 刷页即可堵住所有写。
-	// 账本晚几秒无所谓，这几秒换的是「刷不垮」。
-	smu  sync.Mutex
-	sm   []types.Sample
-	smAt time.Time
+	// Single page-only sample cache, refreshed from an append-only cursor.
+	// Previously published elements are immutable; no second full mirror.
+	smu      sync.Mutex
+	sm       []types.Sample
+	smAt     time.Time
+	smCursor store.PageSampleCursor
+	smTail   bool
 
 	// 最近的交付失败，给页面回答「为什么客户端报 502」。
 	fails failLog
@@ -199,9 +206,11 @@ type Server struct {
 	publicAdmission publicAdmission
 	keyMetrics      keyMetrics
 	uploadJobs      uploadJobManager
+	admin           adminAuthentication
 
 	tplPool, tplAccount, tplOwner, tplAdmin, tplGate, tplCoverage *template.Template
 	tplMintAll, tplCleanup, tplKeys                               *template.Template
+	tplAdminLogin, tplAdminSecurity                               *template.Template
 }
 
 // probeEffort 必须跟 mint 包实际发出去的 payload 一致（SPEC 第 2 节）：
@@ -232,6 +241,7 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 		opt.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{pool: p, st: st, scan: sc, opt: opt, started: time.Now().UTC()}
+	s.admin.now = time.Now
 	var err error
 	// 每个页面单独和 layout 一起解析：三份 "content" 定义放一个集合里会撞名。
 	if s.tplPool, err = parse("pool.html"); err != nil {
@@ -261,6 +271,12 @@ func New(p Pool, st Store, sc Scanner, opt Options) (*Server, error) {
 	if s.tplKeys, err = parse("keys.html"); err != nil {
 		return nil, err
 	}
+	if s.tplAdminLogin, err = parse("admin-login.html"); err != nil {
+		return nil, err
+	}
+	if s.tplAdminSecurity, err = parse("admin-security.html"); err != nil {
+		return nil, err
+	}
 	s.initKeyMetrics()
 	return s, nil
 }
@@ -270,6 +286,9 @@ func parse(page string) (*template.Template, error) {
 		"templates/upload-style.html", "templates/" + page}
 	if page == "keys.html" {
 		files = append(files, "templates/keys-style.html", "templates/keys-script.html")
+	}
+	if page == "admin-login.html" || page == "admin-security.html" {
+		files = append(files, "templates/admin-auth-script.html")
 	}
 	return template.ParseFS(web.Templates, files...)
 }
@@ -301,10 +320,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /cooldown/report", s.consumerAPI(s.handleCooldownReport))
 	mux.Handle("POST /cooldown/reports", s.consumerAPI(s.handleCooldownReports))
 	mux.Handle("POST /contact/report", s.consumerAPI(s.handleContactReport))
+	mux.Handle("POST /contact/reports", s.consumerAPI(s.handleContactReports))
 	mux.Handle("GET /gateways", s.consumerAPI(s.handleGateways))
-	// 管理面的 POST 也要罩 sameOrigin：authAdmin 走 HTTP Basic，而浏览器一旦缓存了
-	// 这个 realm 的凭据，**跨站请求照样会自动带上**——和 cookie 一样是「环境凭证」。
-	// 不罩的话一个第三方页面就能让管理员的浏览器替他删号或改配置。
+	// 管理面的 Cookie 和脚本 Basic 都是环境凭证；所有改状态的入口保留跨站保护。
+	s.adminRoutes(mux)
 	mux.Handle("POST /admin/rescan", s.sameOrigin(http.HandlerFunc(s.handleAdminRescan)))
 	mux.Handle("POST /admin/mint-all", s.sameOrigin(http.HandlerFunc(s.handleAdminMintAll)))
 	mux.HandleFunc("GET /admin/mint-all", s.handleAdminMintAll)
@@ -475,6 +494,12 @@ func noStore(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		if strings.HasPrefix(r.URL.Path, "/admin/") {
+			// Admin URLs never contain credentials. Preserve the same-origin
+			// Origin on browser form POSTs; no-referrer turns it into "null".
+			// Cross-origin destinations still receive no referrer.
+			w.Header().Set("Referrer-Policy", "same-origin")
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		h.ServeHTTP(w, r)
 	})
@@ -617,23 +642,6 @@ func (s *Server) accountByUpstream(id string) (types.Account, bool) {
 	return types.Account{}, false
 }
 
-func (s *Server) authAdmin(w http.ResponseWriter, r *http.Request) bool {
-	got := bearer(r)
-	if got == "" {
-		// 浏览器开管理页用得上 Basic：用户名随意，口令就是 admin key。
-		// 比 ?key= 好——密钥不进 URL、不进 Referer、不进访问日志。
-		if _, pass, ok := r.BasicAuth(); ok {
-			got = pass
-		}
-	}
-	if keyOK(s.opt.AdminKey, got) {
-		return true
-	}
-	w.Header().Set("WWW-Authenticate", `Basic realm="gwpool admin", charset="UTF-8"`)
-	http.Error(w, "需要 admin key", http.StatusUnauthorized)
-	return false
-}
-
 // ---------- 公开池视图 ----------
 
 // supplyWindow 是供给账前后两个数共用的窗口（见 supplyLedger）。
@@ -665,7 +673,7 @@ func (s *Server) handlePool(w http.ResponseWriter, r *http.Request) {
 
 	v := poolView{base: base{Title: "池子", Mode: s.pool.Mode()}}
 	v.Health = summarizeAccounts(accounts, accountEvidence(s.st.RegionMints()), s.pool.AccountHolds(), now)
-	samples, sampleErr := s.st.Samples()
+	samples, sampleErr := s.samples()
 	if sampleErr != nil {
 		s.opt.Log.Warn("公开页读采样账本失败", "err", sampleErr)
 	}
@@ -1293,11 +1301,15 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 	v.NewGateways = s.foundBy(a.ID)
 	v.Activity = summarizeAccountActivity(a.ID, samples, time.Now())
 	v.Regions = regionCells(s.opt.Live.Get(), a.ID, s.st.RegionMints(), samples, s.st.Gateways(), s.slotCooldown())
-	for _, sm := range samples {
+	for i := len(samples) - 1; i >= 0; i-- {
+		sm := samples[i]
 		if sm.AccountID != a.ID {
 			continue
 		}
 		v.Requests++
+		if len(v.Rows) >= accountSampleLimit {
+			continue
+		}
 		v.Rows = append(v.Rows, sampleRow{
 			At: sm.At.Format(time.DateTime), Where: geoLabel(sm),
 			Gateway: dash(sm.Gateway), Status: sm.Status,
@@ -1308,11 +1320,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 	// Detail 不给上传者：里面是出口名、上游状态码这类内部读数。
 	v.Fails = s.fails.failRows(a.ID, 20, false)
 	// 新的在上面，太长就截断——这是给人看的凭证，不是日志系统。
-	reverse(v.Rows)
-	if len(v.Rows) > 500 {
-		v.Truncated = len(v.Rows) - 500
-		v.Rows = v.Rows[:500]
-	}
+	v.Truncated = v.Requests - len(v.Rows)
 	s.render(w, s.tplAccount, v)
 }
 
@@ -1401,6 +1409,12 @@ func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) 
 	mintStats := summarizeAccountMints(samples, now)
 	mints := s.st.RegionMints()
 	gws := s.st.Gateways()
+	cfg := s.opt.Live.Get()
+	evidence := accountRegionEvidence(accs, mints, samples)
+	found := make(map[int64]int)
+	for _, gateway := range gws {
+		found[gateway.FirstSeenBy]++
+	}
 	// 九宫格的滑窗 = 槽位冷却：和调度那把尺子同一个值（见 regionCells）。
 	window := s.slotCooldown()
 	var newest time.Time
@@ -1413,8 +1427,8 @@ func (s *Server) ownerAccountRows(accs []types.Account, samples []types.Sample) 
 			ViewToken:    a.ViewToken,
 			MintAttempts: mintStats[a.ID].attempts,
 			Minted:       mintStats[a.ID].minted,
-			NewGateways:  s.foundBy(a.ID),
-			Regions:      regionCells(s.opt.Live.Get(), a.ID, mints, samples, gws, window),
+			NewGateways:  found[a.ID],
+			Regions:      regionCellsFromEvidence(cfg, a.ID, evidence[a.ID], gws, window),
 			Fails:        s.fails.failRows(a.ID, 20, false),
 		}
 		if t := mintStats[a.ID].lastAt; !t.IsZero() {
@@ -1457,9 +1471,40 @@ func ago(now, t time.Time) string {
 // 「这个网关是不是记在别人名下」。两者为 nil 时格子照画，只是列不出名字。
 func regionCells(cfg config.Config, accountID int64, mints map[string]types.RegionMint,
 	samples []types.Sample, gws map[string]types.Gateway, window time.Duration) regionGrid {
+	evidence := accountRegionEvidence([]types.Account{{ID: accountID}}, mints, samples)
+	return regionCellsFromEvidence(cfg, accountID, evidence[accountID], gws, window)
+}
+
+type regionEvidence struct {
+	mints   []types.RegionMint
+	samples []*types.Sample
+}
+
+// Index only the authorized account set, once per page. Sample pointers refer
+// to the immutable page-cache snapshot, not mutable Store state.
+func accountRegionEvidence(accounts []types.Account, mints map[string]types.RegionMint, samples []types.Sample) map[int64]*regionEvidence {
+	out := make(map[int64]*regionEvidence, len(accounts))
+	for _, account := range accounts {
+		out[account.ID] = &regionEvidence{}
+	}
+	for _, row := range mints {
+		if rows := out[row.AccountID]; rows != nil {
+			rows.mints = append(rows.mints, row)
+		}
+	}
+	for i := range samples {
+		row := &samples[i]
+		if rows := out[row.AccountID]; rows != nil {
+			rows.samples = append(rows.samples, row)
+		}
+	}
+	return out
+}
+
+func regionCellsFromEvidence(cfg config.Config, accountID int64, evidence *regionEvidence, gws map[string]types.Gateway, window time.Duration) regionGrid {
 	byRegion := map[string]types.RegionMint{}
-	for _, m := range mints {
-		if m.AccountID == accountID && m.RegionKey != "" {
+	for _, m := range evidence.mints {
+		if m.RegionKey != "" {
 			key := displayAreaForKey(cfg, m.RegionKey).Key
 			merged := byRegion[key]
 			merged.Count += m.Count
@@ -1480,10 +1525,10 @@ func regionCells(cfg config.Config, accountID int64, mints map[string]types.Regi
 	enabled := enabledDisplayAreas(cfg)
 	firstRegion := map[string]string{}
 	inRegion := map[string]map[string]bool{}
-	for _, sm := range samples {
+	for _, sm := range evidence.samples {
 		// Gateway 非空就是「这一发真取到了路由」——照 types.MintResult 的语义，
 		// 取不到的那几发 Gateway 为空。
-		if sm.AccountID != accountID || sm.Status != http.StatusOK || sm.Gateway == "" {
+		if sm.Status != http.StatusOK || sm.Gateway == "" {
 			continue
 		}
 		key := displayAreaForKey(cfg, sm.RegionKey).Key
@@ -1990,18 +2035,15 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(v.Gateways, func(i, j int) bool { return v.Gateways[i].Name < v.Gateways[j].Name })
 	attachGatewayStats(v.Gateways, v.ContactStats, v.CooldownStats)
 
-	for _, sm := range samples {
+	v.TotalSamples = len(samples)
+	for i := len(samples) - 1; i >= max(0, len(samples)-adminSampleLimit); i-- {
+		sm := samples[i]
 		v.Samples = append(v.Samples, adminSampleRow{
 			At: sm.At.Format(time.DateTime), AccountID: sm.AccountID, Region: dash(sm.RegionKey),
 			Where: geoLabel(sm), ASN: dash(sm.Observed.ASN), Gateway: dash(sm.Gateway), Status: sm.Status,
 			Provider: dash(sm.Provider), Purpose: samplePurpose(sm.Purpose),
 			Requested: dash(exitLabel(sm.Requested)), Match: sampleMatch(sm.TargetMatch), DurationMS: sm.DurationMS,
 		})
-	}
-	reverse(v.Samples)
-	v.TotalSamples = len(v.Samples)
-	if len(v.Samples) > 300 {
-		v.Samples = v.Samples[:300]
 	}
 	for i := range v.Samples {
 		v.Samples[i].Account = name(v.Samples[i].AccountID)
@@ -2303,20 +2345,46 @@ func (s *Server) renderGate(w http.ResponseWriter, wrong bool) {
 }
 
 // samplesTTL 是账本缓存的窗口。够短，人看不出来；够长，刷新按不垮。
-const samplesTTL = 5 * time.Second
+const (
+	samplesTTL         = 5 * time.Second
+	accountSampleLimit = 500
+	adminSampleLimit   = 300
+)
 
 func (s *Server) samples() ([]types.Sample, error) {
 	s.smu.Lock()
 	defer s.smu.Unlock()
-	if s.sm != nil && time.Since(s.smAt) < samplesTTL {
-		return s.sm, nil
+	if !s.smAt.IsZero() && time.Since(s.smAt) < samplesTTL {
+		return s.sm[:len(s.sm):len(s.sm)], nil
+	}
+	if reader, ok := s.st.(interface {
+		ReadPageSamples(store.PageSampleCursor) (store.PageSampleDelta, error)
+	}); ok {
+		delta, err := reader.ReadPageSamples(s.smCursor)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case delta.Reset:
+			s.sm = delta.Rows
+		case s.smTail:
+			// A valid non-newline EOF record was provisional. Replacing it
+			// must not overwrite the backing array held by an older request.
+			next := make([]types.Sample, 0, len(s.sm)-1+len(delta.Rows))
+			next = append(next, s.sm[:len(s.sm)-1]...)
+			s.sm = append(next, delta.Rows...)
+		default:
+			s.sm = append(s.sm, delta.Rows...)
+		}
+		s.smCursor, s.smTail, s.smAt = delta.Cursor, delta.Tail, time.Now()
+		return s.sm[:len(s.sm):len(s.sm)], nil
 	}
 	sm, err := s.st.Samples()
 	if err != nil {
 		return nil, err
 	}
 	s.sm, s.smAt = sm, time.Now()
-	return sm, nil
+	return sm[:len(sm):len(sm)], nil
 }
 
 // writeJSON 的入参只能是本包自己的视图结构体或 map。

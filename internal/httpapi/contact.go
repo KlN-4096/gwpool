@@ -60,24 +60,63 @@ func (s *Server) handleContactReport(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, http.StatusBadRequest, "只接受一个接触样本")
 		return
 	}
-	in.ID, in.AccountTag = strings.ToLower(in.ID), strings.ToLower(in.AccountTag)
 	now := time.Now().UTC()
-	_, known := s.st.Gateways()[in.Gateway]
-	if !known || !validContactObservation(in, now) {
-		s.badRequest(w, http.StatusBadRequest, "接触样本字段无效")
-		return
-	}
-	added, err := s.st.AddContactReport(types.ContactReport{ContactObservation: in, ReporterID: caller.reporterID(), ReceivedAt: now})
-	if errors.Is(err, types.ErrContactReportConflict) {
+	added, status := s.saveContactObservation(in, caller.reporterID(), now)
+	switch status {
+	case http.StatusBadRequest:
+		s.badRequest(w, status, "接触样本字段无效")
+	case http.StatusConflict:
 		s.badRequest(w, http.StatusConflict, "接触 ID 已用于不同内容")
-		return
+	case http.StatusInternalServerError:
+		http.Error(w, "接触样本暂存失败", http.StatusInternalServerError)
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+	}
+}
+
+func (s *Server) saveContactObservation(in types.ContactObservation, reporterID int64, now time.Time) (bool, int) {
+	in.ID, in.AccountTag = strings.ToLower(in.ID), strings.ToLower(in.AccountTag)
+	if !s.hasGateway(in.Gateway) || !validContactObservation(in, now) {
+		return false, http.StatusBadRequest
+	}
+	added, err := s.st.AddContactReport(types.ContactReport{ContactObservation: in, ReporterID: reporterID, ReceivedAt: now})
+	if errors.Is(err, types.ErrContactReportConflict) {
+		return false, http.StatusConflict
 	}
 	if err != nil {
 		s.opt.Log.Error("接触样本写盘失败", "err", err)
-		http.Error(w, "接触样本暂存失败", http.StatusInternalServerError)
+		return false, http.StatusInternalServerError
+	}
+	return added, http.StatusOK
+}
+
+func (s *Server) handleContactReports(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.resolveCaller(r)
+	if !ok || caller.admin {
+		s.unauthorized(w, "接触上报需要有效的 consumer key")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+	items, ok := s.readReportBatch(w, r)
+	if !ok {
+		return
+	}
+	type acknowledgement struct {
+		ID     string `json:"id"`
+		Status int    `json:"status"`
+	}
+	results := make([]acknowledgement, len(items))
+	now := time.Now().UTC()
+	for i, item := range items {
+		results[i] = acknowledgement{ID: item.id, Status: http.StatusBadRequest}
+		var report types.ContactObservation
+		if decodeReportItem(item.raw, contactBodyMax, &report) {
+			_, results[i].Status = s.saveContactObservation(report, caller.reporterID(), now)
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		OK      bool              `json:"ok"`
+		Results []acknowledgement `json:"results"`
+	}{true, results})
 }
 
 func (s *Server) contactStats(r *http.Request, now time.Time) map[string][]types.ContactStats {
@@ -115,14 +154,27 @@ func (s *Server) encodedContactStats(r *http.Request, now time.Time) map[string]
 	if !ok || caller.admin {
 		return nil
 	}
-	if _, ok := s.st.(interface{ Revisions() store.Revisions }); !ok {
-		rows := s.contactStats(r, now)
-		out := make(map[string]json.RawMessage, len(rows))
-		for gateway, stats := range rows {
-			out[gateway], _ = json.Marshal(stats)
+	return s.contactSnapshot(now).encodedFor(reportConsumer{caller.reporterID(), tag})
+}
+
+func (s *Server) catalogContacts(r *http.Request, model string, now time.Time) (map[string]json.RawMessage, map[string]types.GatewayPriority) {
+	tag := strings.ToLower(r.Header.Get("X-Gwpool-Account-Tag"))
+	var consumer reportConsumer
+	hasConsumer := false
+	if validCooldownTag(tag) {
+		if caller, ok := s.resolveCaller(r); ok && !caller.admin {
+			consumer, hasConsumer = reportConsumer{caller.reporterID(), tag}, true
 		}
-		return out
 	}
-	_, _, encoded := s.contactDataEncoded(now)
-	return encoded[reportConsumer{caller.reporterID(), tag}]
+	if !hasConsumer && model == "" {
+		return nil, nil
+	}
+	// Both fields come from one immutable snapshot, rather than independently
+	// locking/rechecking a possibly changing revision twice in this request.
+	data := s.contactSnapshot(now)
+	var contacts map[string]json.RawMessage
+	if hasConsumer {
+		contacts = data.encodedFor(consumer)
+	}
+	return contacts, data.priorities[model]
 }

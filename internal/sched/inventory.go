@@ -54,7 +54,7 @@ func (s *Scheduler) inventoryEvidence() []inventoryRoute {
 		}
 	}
 	known, now := s.st.Gateways(), s.now()
-	for _, state := range s.st.RouteStates(now) {
+	for _, state := range s.routeStates(now) {
 		if state.Route.Mode != routes.Bare || state.Gateway == "" || state.ObservedAt.IsZero() ||
 			now.Before(state.ObservedAt) || now.Sub(state.ObservedAt) >= routes.Retention {
 			continue

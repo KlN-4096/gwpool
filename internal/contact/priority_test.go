@@ -1,11 +1,63 @@
 package contact
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"gwpool/internal/types"
 )
+
+func TestAllPrioritiesMatchPerModelReference(t *testing.T) {
+	now := time.Now().UTC()
+	var reports []types.ContactReport
+	for i := range 500 {
+		r := types.ContactReport{ContactObservation: types.ContactObservation{
+			Gateway: fmt.Sprintf("unified-%d", i%3), Model: fmt.Sprintf("model-%d", i%2),
+			Criterion: "state-echo-v1", Source: "foreground", Outcome: "full", At: now,
+		}}
+		switch i % 11 {
+		case 0:
+			r.At = now.Add(-Retention - time.Nanosecond)
+		case 1:
+			r.At = now.Add(-Retention)
+		case 2:
+			r.At = now.Add(5*time.Minute + time.Nanosecond)
+		case 3:
+			r.At = now.Add(5 * time.Minute)
+		case 4:
+			r.Outcome = "refreshed"
+		case 5:
+			r.Outcome = "unknown"
+		case 6:
+			r.Source = "business"
+		case 7:
+			r.Criterion = "other"
+		case 8:
+			r.Model = ""
+		}
+		reports = append(reports, r)
+	}
+	for _, model := range []string{"sparse", "only-invalid"} {
+		row := reports[10]
+		row.Model = model
+		if model == "only-invalid" {
+			row.Outcome = "unknown"
+		}
+		reports = append(reports, row)
+	}
+	before := append([]types.ContactReport(nil), reports...)
+	got := AllPriorities(reports, now)
+	for _, model := range []string{"model-0", "model-1", "sparse", "only-invalid"} {
+		if !reflect.DeepEqual(got[model], Priorities(reports, model, now)) {
+			t.Fatalf("model %q differs from per-model oracle", model)
+		}
+	}
+	if _, exists := got[""]; exists || !reflect.DeepEqual(reports, before) {
+		t.Fatal("empty model admitted or input mutated")
+	}
+}
 
 func TestPrioritiesExcludeUnknownAndOtherModelsAndSources(t *testing.T) {
 	now := time.Now()

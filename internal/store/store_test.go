@@ -839,7 +839,9 @@ func TestSaveKeepsBackups(t *testing.T) {
 	}
 	daily := filepath.Join(dir, "state.json.daily-"+time.Now().UTC().Format("20060102"))
 	initial, err := os.ReadFile(filepath.Join(dir, "state.json.bak"))
-	if err != nil || strings.Contains(string(initial), "一号") || !strings.Contains(string(initial), `"owner_keys_migrated": true`) {
+	var initialState State
+	if err != nil || json.Unmarshal(initial, &initialState) != nil ||
+		!initialState.OwnerKeysMigrated || len(initialState.Accounts) != 0 {
 		t.Fatalf("没有备份初始化状态: %v", err)
 	}
 

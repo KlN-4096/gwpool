@@ -31,5 +31,5 @@
 - 点名恢复优先历史来源账号＋出口整体，优先非消费者；无可用历史路线才回落原单发路径。账号锁后重读启用态/凭据，另一任务已补齐则不重复发。回归见 `sched/inventory_recovery_test.go`。
 - `inventory_routing` 为 `off/shadow/assist`，默认shadow只记预测；assist只在原库存候选内、小时负载/国家公平与既有偏好之后打破平局，不影响交付/续票/专门探索。热修改对后续选择生效，不撤销已排定的请求。
 - 国家预测为滚动生产变体，不等于离线冻结模型的已验证收益；选前地理由同请求出口的历史实际国家估计，至少5条且一致率≥80%，身份/国家各≥5条才预测。未知、混合或不支持的地理弃权，不能用本次后验Geo冒充选前信息。
-- 模型每库存轮冻结；`Sample.InventoryPrediction`保留决策时刻、训练截至时刻、模式及支持数，绑定/Geo/HTTP失败也保留预测。预测不得写入inventoryEvidence、替代expected或免掉bootstrap失手预算。
+- 模型每库存轮冻结，跨轮只按历史revision/账号身份revision/准确证据时间区间复用；路线状态按Routes revision及最早过期边界复用，claim后仍单项重读实时状态。`Sample.InventoryPrediction`保留决策时刻、训练截至时刻、模式及支持数，失败也保留；不替代expected或免预算。
 - `Sample.Route`记哈希条件、目标/真实落点、命中、已提交覆盖/延寿/donor增益、失败分类和NextCheck及前后有效期限；维护前/有尝试后另记逐网关可交付快照，不能混入请求分母。缺票持续时间按相邻观测界定，未观测/idle区间不假造精确起点。

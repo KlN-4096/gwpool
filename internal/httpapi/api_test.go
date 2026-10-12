@@ -113,17 +113,18 @@ func TestAdminShowsUpstreamHold(t *testing.T) {
 }
 
 type fakeStore struct {
-	accounts []types.Account
-	owners   []types.Owner
-	mints    map[string]types.RegionMint
-	gws      map[string]types.Gateway
-	pairs    map[string]types.Pair
-	slots    map[string]types.Slot
-	samples  []types.Sample
-	reports  []types.CooldownReport
-	contacts []types.ContactReport
-	added    []types.Account
-	deleted  []int64
+	adminAuth types.AdminAuthState
+	accounts  []types.Account
+	owners    []types.Owner
+	mints     map[string]types.RegionMint
+	gws       map[string]types.Gateway
+	pairs     map[string]types.Pair
+	slots     map[string]types.Slot
+	samples   []types.Sample
+	reports   []types.CooldownReport
+	contacts  []types.ContactReport
+	added     []types.Account
+	deleted   []int64
 	// addedOwners 留住每一次 AddOwner：「贴了一份已经属于别人的凭据」那条路上**不许**
 	// 凭空长出一个空 owner，而响应里看不出来。
 	addedOwners []types.Owner
@@ -131,6 +132,17 @@ type fakeStore struct {
 	// 多出一行，光看响应（两边都是 200）区分不出来。
 	puts   []types.Pair
 	putErr error
+}
+
+func (f *fakeStore) AdminAuthState() types.AdminAuthState { return f.adminAuth.Clone() }
+
+func (f *fakeStore) CommitAdminAuthState(expected uint64, next types.AdminAuthState) error {
+	if f.adminAuth.Revision != expected {
+		return errors.New("admin state changed")
+	}
+	f.adminAuth = next.Clone()
+	f.adminAuth.Revision = expected + 1
+	return nil
 }
 
 func (f *fakeStore) Gateways() map[string]types.Gateway { return f.gws }

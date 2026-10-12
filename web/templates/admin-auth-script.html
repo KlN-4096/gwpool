@@ -1,0 +1,82 @@
+{{define "admin-auth-script"}}
+<script>
+(() => {
+  'use strict';
+  const status = document.getElementById('admin-auth-status');
+  const login = document.getElementById('admin-passkey-login');
+  const register = document.getElementById('admin-passkey-register');
+  function message(text) { if (status) status.textContent = text; }
+  if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials) {
+    if (login) login.disabled = true;
+    if (register) register.disabled = true;
+    message('当前浏览器或连接不支持 Passkey，请使用管理员密钥登录。');
+    return;
+  }
+  const decode = text => {
+    const padded = text.replace(/-/g, '+').replace(/_/g, '/');
+    return Uint8Array.from(atob(padded.padEnd(Math.ceil(padded.length / 4) * 4, '=')), c => c.charCodeAt(0)).buffer;
+  };
+  const encode = buffer => {
+    let text = '';
+    for (const byte of new Uint8Array(buffer)) text += String.fromCharCode(byte);
+    return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  function options(value) {
+    const publicKey = value.publicKey;
+    publicKey.challenge = decode(publicKey.challenge);
+    if (publicKey.user) publicKey.user.id = decode(publicKey.user.id);
+    for (const key of ['allowCredentials', 'excludeCredentials']) {
+      for (const credential of publicKey[key] || []) credential.id = decode(credential.id);
+    }
+    return { publicKey };
+  }
+  function serialize(credential) {
+    const response = credential.response;
+    const out = {
+      id: credential.id, rawId: encode(credential.rawId), type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment,
+      clientExtensionResults: credential.getClientExtensionResults(),
+      response: { clientDataJSON: encode(response.clientDataJSON) }
+    };
+    for (const key of ['attestationObject', 'authenticatorData', 'signature']) {
+      if (response[key]) out.response[key] = encode(response[key]);
+    }
+    if (response.userHandle) out.response.userHandle = encode(response.userHandle);
+    if (response.getTransports) out.response.transports = response.getTransports();
+    return out;
+  }
+  async function post(path, value) {
+    const response = await fetch(path, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(value)
+    });
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch (_) { data = { error: text || '服务器未返回有效结果' }; }
+    if (!response.ok) throw new Error(data.error || '验证失败，请重试');
+    return data;
+  }
+  async function ceremony(button, kind) {
+    button.disabled = true;
+    try {
+      message('请在系统弹窗中完成验证…');
+      const input = kind === 'register' ? { name: document.getElementById('admin-passkey-name').value } : {};
+      const start = await post('/admin/passkeys/' + kind + '/begin', input);
+      const credential = kind === 'register'
+        ? await navigator.credentials.create(options(start))
+        : await navigator.credentials.get(options(start));
+      if (!credential) throw new Error('未收到 Passkey，请重新尝试');
+      const result = await post('/admin/passkeys/' + kind + '/finish', serialize(credential));
+      // Only server-rendered, validated local paths are used for navigation.
+      location.assign(kind === 'login' ? button.dataset.next || '/admin/' : result.redirect);
+    } catch (error) {
+      message(error.name === 'NotAllowedError' ? '验证已取消或超时，可以重试或使用管理员密钥。' : error.message);
+      button.disabled = false;
+    }
+  }
+  if (login) login.addEventListener('click', () => ceremony(login, 'login'));
+  if (register) register.addEventListener('click', () => ceremony(register, 'register'));
+})();
+</script>
+{{end}}

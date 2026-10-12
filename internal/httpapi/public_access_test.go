@@ -25,6 +25,7 @@ var publicEndpoints = []struct{ method, path string }{
 	{"POST", "/cooldown/report"},
 	{"POST", "/cooldown/reports"},
 	{"POST", "/contact/report"},
+	{"POST", "/contact/reports"},
 }
 
 func TestPublicAccessRequiresValidKeyWhenOpen(t *testing.T) {
@@ -106,6 +107,7 @@ func TestPublicAccessReportsAndAccountIsolation(t *testing.T) {
 			body any
 		}{
 			{"/contact/report", c},
+			{"/contact/reports", map[string]any{"reports": []types.ContactObservation{c}}},
 			{"/cooldown/report", cd},
 			{"/cooldown/reports", map[string]any{"reports": []cooldownObservation{cd}}},
 		} {

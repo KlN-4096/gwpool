@@ -16,8 +16,6 @@ import (
 
 const (
 	cooldownBodyMax        = 2048
-	cooldownBatchMax       = 32
-	cooldownBatchBodyMax   = 64 * 1024
 	cooldownObservedHeader = "X-Gwpool-Observed-At"
 )
 
@@ -78,8 +76,8 @@ func (s *Server) handleCooldownReport(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, ack.Status, "冷却样本无效、冲突或暂存失败")
 		return
 	}
-	ack.Recommendation = cooldownRecommendationFor(cooldown.SummarizeWithin(s.st.CooldownReports(), now, cooldownClientCeiling(r)),
-		in.Gateway, caller.reporterID(), strings.ToLower(in.AccountTag))
+	ack.Recommendation = s.cooldownData(now, cooldownClientCeiling(r)).
+		recommendation(in.Gateway, caller.reporterID(), strings.ToLower(in.AccountTag), now)
 	writeJSON(w, http.StatusOK, struct {
 		OK bool `json:"ok"`
 		cooldownAcknowledgement
@@ -94,28 +92,32 @@ func (s *Server) handleCooldownReports(w http.ResponseWriter, r *http.Request) {
 		s.unauthorized(w, "冷却上报需要有效的 consumer key")
 		return
 	}
-	var in struct {
-		Reports []cooldownObservation `json:"reports"`
-	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, cooldownBatchBodyMax))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&in); err != nil {
-		s.badRequest(w, http.StatusBadRequest, "批量样本格式错误")
-		return
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF || len(in.Reports) == 0 || len(in.Reports) > cooldownBatchMax {
-		s.badRequest(w, http.StatusBadRequest, "批量样本应为1至32条")
+	items, ok := s.readReportBatch(w, r)
+	if !ok {
 		return
 	}
 	now := time.Now().UTC()
-	results := make([]cooldownAcknowledgement, 0, len(in.Reports))
-	for _, report := range in.Reports {
-		results = append(results, s.saveCooldownObservation(report, caller.reporterID(), now))
+	results := make([]cooldownAcknowledgement, len(items))
+	reports := make([]cooldownObservation, len(items))
+	for i, item := range items {
+		results[i] = cooldownAcknowledgement{ID: item.id, Status: http.StatusBadRequest}
+		if !decodeReportItem(item.raw, cooldownBodyMax, &reports[i]) {
+			continue
+		}
+		if at := r.Header.Get(cooldownObservedHeader); at != "" && reports[i].ObservedAt.IsZero() {
+			var err error
+			reports[i].ObservedAt, err = time.Parse(time.RFC3339Nano, at)
+			if err != nil {
+				continue
+			}
+		}
+		results[i] = s.saveCooldownObservation(reports[i], caller.reporterID(), now)
+		results[i].ID = item.id
 	}
-	stats := cooldown.SummarizeWithin(s.st.CooldownReports(), now, cooldownClientCeiling(r))
-	for i, report := range in.Reports {
+	entry := s.cooldownData(now, cooldownClientCeiling(r))
+	for i, report := range reports {
 		if results[i].Status == http.StatusOK {
-			results[i].Recommendation = cooldownRecommendationFor(stats, report.Gateway, caller.reporterID(), strings.ToLower(report.AccountTag))
+			results[i].Recommendation = entry.recommendation(report.Gateway, caller.reporterID(), strings.ToLower(report.AccountTag), now)
 		}
 	}
 	writeJSON(w, http.StatusOK, struct {
@@ -127,7 +129,7 @@ func (s *Server) handleCooldownReports(w http.ResponseWriter, r *http.Request) {
 func (s *Server) saveCooldownObservation(in cooldownObservation, reporterID int64, now time.Time) cooldownAcknowledgement {
 	in.ID, in.AccountTag = strings.ToLower(in.ID), strings.ToLower(in.AccountTag)
 	ack := cooldownAcknowledgement{ID: in.ID, Status: http.StatusBadRequest}
-	_, knownGateway := s.st.Gateways()[in.Gateway]
+	knownGateway := s.hasGateway(in.Gateway)
 	if !validCooldownTag(in.ID) || !validCooldownTag(in.AccountTag) || !knownGateway ||
 		in.WindowSeconds < cooldown.MinSeconds || in.WindowSeconds > cooldown.MaxSeconds ||
 		in.ElapsedSeconds < max(1, in.WindowSeconds-cooldown.GraceSeconds) ||
@@ -153,18 +155,6 @@ func (s *Server) saveCooldownObservation(in cooldownObservation, reporterID int6
 	}
 	ack.Status, ack.Added = http.StatusOK, added
 	return ack
-}
-
-func cooldownRecommendationFor(all []types.CooldownStats, gateway string, reporterID int64, tag string) *types.CooldownRecommendation {
-	for _, stats := range all {
-		if stats.Gateway == gateway {
-			if rec := cooldown.ForAccount(stats, reporterID, tag); rec.Seconds > 0 {
-				return &rec
-			}
-			break
-		}
-	}
-	return nil
 }
 
 func (s *Server) cooldownRecommendations(r *http.Request, now time.Time) map[string]types.CooldownRecommendation {

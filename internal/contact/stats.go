@@ -69,17 +69,25 @@ func Summarize(reports []types.ContactReport, now time.Time) []types.ContactStat
 			sums[k] += r.FullWindowMS
 		}
 	}
-	out := make([]types.ContactStats, 0, len(rows))
+	type sortableRow struct {
+		row types.ContactStats
+		key string
+	}
+	sorted := make([]sortableRow, 0, len(rows))
 	for k, row := range rows {
 		if row.WindowSamples > 0 {
 			row.WindowMeanMS = sums[k] / int64(row.WindowSamples)
 		}
-		out = append(out, *row)
+		sorted = append(sorted, sortableRow{*row,
+			row.Gateway + "|" + strconv.FormatInt(row.ReporterID, 10) + "|" + row.AccountTag + "|" +
+				row.Model + "|" + row.Criterion + "|" + row.Source + "|" + row.First + "|" + row.Interval})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		return a.Gateway+"|"+strconv.FormatInt(a.ReporterID, 10)+"|"+a.AccountTag+"|"+a.Model+"|"+a.Criterion+"|"+a.Source+"|"+a.First+"|"+a.Interval <
-			b.Gateway+"|"+strconv.FormatInt(b.ReporterID, 10)+"|"+b.AccountTag+"|"+b.Model+"|"+b.Criterion+"|"+b.Source+"|"+b.First+"|"+b.Interval
-	})
+	// Preserve the established compound-string ordering, but build each key
+	// once rather than allocating both keys for every sort comparison.
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].key < sorted[j].key })
+	out := make([]types.ContactStats, len(sorted))
+	for i := range sorted {
+		out[i] = sorted[i].row
+	}
 	return out
 }

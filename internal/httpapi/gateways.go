@@ -34,21 +34,20 @@ func (s *Server) handleGateways(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeCatalogFor(w http.ResponseWriter, r *http.Request, upstream string) {
 	now := time.Now()
-	recommendations := s.cooldownRecommendations(r, now)
-	contactStats := s.encodedContactStats(r, now)
 	model := strings.TrimSpace(r.URL.Query().Get("model"))
 	if model != "" && !validContactToken(model) {
 		s.badRequest(w, http.StatusBadRequest, "model 格式错误")
 		return
 	}
-	priorities := s.contactPriorities(model, now)
+	recommendations := s.cooldownRecommendations(r, now)
+	contactStats, priorities := s.catalogContacts(r, model, now)
 	pairs := s.cachedCatalogPairs(now)
 	out := gatewayCatalogResponse{gatewayCatalogHeader: gatewayCatalogHeader{
 		Account: upstream, Target: s.pool.PairTarget(),
 		SnapshotAt:    now.UTC(),
 		DeliverFloorS: int(types.DeliverFloor / time.Second)}}
 
-	for name := range s.st.Gateways() {
+	for _, name := range s.gatewayNames() {
 		p, hasPair := pairs[name]
 		left := p.ExpiresAt.Sub(now)
 		// **只列此刻真能拿到票的网关**：客户端是照这张清单点名的，而点名一个没有活
@@ -75,6 +74,26 @@ func (s *Server) writeCatalogFor(w http.ResponseWriter, r *http.Request, upstrea
 		s.opt.Log.Error("encode gateway catalog failed", "error", err)
 		http.Error(w, "清单编码失败", http.StatusInternalServerError)
 	}
+}
+
+func (s *Server) gatewayNames() []string {
+	if narrow, ok := s.st.(interface{ GatewayNames() []string }); ok {
+		return narrow.GatewayNames()
+	}
+	all := s.st.Gateways()
+	names := make([]string, 0, len(all))
+	for name := range all {
+		names = append(names, name)
+	}
+	return names
+}
+
+func (s *Server) hasGateway(name string) bool {
+	if narrow, ok := s.st.(interface{ HasGateway(string) bool }); ok {
+		return narrow.HasGateway(name)
+	}
+	_, ok := s.st.Gateways()[name]
+	return ok
 }
 
 // slotCooldown 是当前生效的槽位冷却时长。没接配置文件（测试）就用默认值。

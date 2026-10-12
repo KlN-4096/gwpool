@@ -1,6 +1,7 @@
 # 验证与部署
 
-- Go 标准库项目；入口为 `cmd/gwpool`，模板由 `web` 嵌入。
+- Go 项目；入口为 `cmd/gwpool`，模板由 `web` 嵌入。管理员WebAuthn采用`go-webauthn/webauthn v0.17.4`，最低Go1.25，本机用Go1.27.2；旧golangci-lint不能解码其导出数据时须报告未通过，不改全局安装。
+- 管理员认证用`httpapi/admin_auth_test.go/admin_passkey_test.go`及`store/admin_auth_test.go`验证真实签名、RP/origin/UV、重放、过期/撤销/改密钥、慢体与退出交错、代理限流、WAL故障/重启。`GWPOOL_ADMIN_AUTH_BROWSER_READY`+`TestAdminAuthOfflineBrowser`提供55秒假池供Edge虚拟认证器注册/登录/关闭重开验收；不在生产自动建立测试Passkey。
 - 测试用 fake/httptest，不能请求真实上游；非平凡 bug 先添加能失败的回归用例。
 - 上传页面解析与部分成功/重试用 `node --test web/upload_parser.test.cjs` 离线验证；`web/testdata/sub2api-export.json` 是假凭据契约样本，不是真实账号验收。
 - 重登用`internal/reauth`假传输、`httpapi/upload_jobs_test.go`真Store任务测试；`GWPOOL_UPLOAD_PREVIEW_DIR`+`TestUploadWorkspaceFixture`导出假页面。opt-in `reauth_probe`标签单账号探针仅显式授权后运行，配置stdin、账号文件按行读取，输出固定阶段/失败码，不保存Token或写池；遇人机挑战停止。
@@ -12,6 +13,8 @@
 - 上传者/管理账号卡片的铸票尝试、获票次数及最近成功时间只读样本，不读旧消费Slot/Via。`owner_mint_test.go`覆盖非200/空落点/明确失败不计成功、验票排除、结构化漂移/no_gain、历史无Route、乱序/缺时/未来与owner隔离；不得把HTTP200或客户端交付当作铸票成功。`GWPOOL_OWNER_MINT_PREVIEW_DIR`导出假页面验收。
 - 路线维护回归见`routes/route_test.go`、`store/inventory_test.go`、`sched/route_inventory_test.go`及`expiry_test.go`；现票契约仍由HTTP/consumer测试覆盖。收益来自原子提交，缺票快照不是请求样本；必须覆盖同值cflb延寿、过期同key、unknown-member刷新和bare→seed无额外尝试。
 - `tools/benchmark.ps1`使用远端先失效化凭据的真实快照，真实Store/Scheduler/HTTP、原生子进程隔离服务端与压测堆；每场记录全源码hash、同32消费者/非空tag、每响应校验与性能断言。CPU/IO只计server，Windows IO含控制管道，不称物理磁盘量；结果与线上/旧轻负载基线不能拼接。
+- Linux全量A/B用`tools/build-performance.ps1`原生交叉构建同一`performance_linux_test.go`夹具、`benchmark-linux.py`独立驱动；保全部状态表/样本前缀，JSON时间平移必须UseNumber保int64 reporter、重算未知成员路线ID和cookie-version，不能清历史换快结果。
+- 测量分无profile ABBA与独立profile；PrivateNetwork/2核/1200MiB，32既有身份、逐响应校验，按端点报P95/P99、server CPU/分配/IO/峰值RSS。加速WarmInterval与显式checkpoint必须披露，不称自然周期；`performance_recovery_linux_test.go`按独立成功回执表重放实测WAL，故障边界另用Store测试。
 - 2026-10-05本地N1024每场验收：GET P95 9.006ms，single P95/P99 24.763/62.630ms，batch3 42.056/83.011ms。只适用于充足库存/本地回环，不承诺缺票、外网或模型验证延迟；线上2vCPU另列实测。
 - Linux 产物采用 `GOOS=linux GOARCH=amd64 CGO_ENABLED=0`，`-trimpath -ldflags="-s -w"`。
 - bytevirt 的服务和二进制是 `gwpool`、`/opt/gwpool/gwpool`；配置在 `/opt/gwpool/data/config.json`。

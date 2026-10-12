@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -180,11 +181,12 @@ func TestCatalogContactCacheMatchesVersionsAndTimeBoundaries(t *testing.T) {
 		if !reflect.DeepEqual(gotContacts, wantContacts) || !reflect.DeepEqual(gotPriority, wantPriority) {
 			t.Fatalf("cached contact result differs at offset %v", at.Sub(now))
 		}
-		_, _, encoded := s.contactDataEncoded(at)
+		data := s.contactSnapshot(at)
 		for consumer, gateways := range wantContacts {
+			encoded := data.encodedFor(consumer)
 			for gateway, want := range gateways {
 				var got []types.ContactStats
-				if err := json.Unmarshal(encoded[consumer][gateway], &got); err != nil {
+				if err := json.Unmarshal(encoded[gateway], &got); err != nil {
 					t.Fatal(err)
 				}
 				// These two fields are intentionally omitted from the API.
@@ -211,6 +213,82 @@ func TestCatalogContactCacheMatchesVersionsAndTimeBoundaries(t *testing.T) {
 	want, _ := buildContactData(st.ContactReports(), now)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal("contact completion returned stale window duration")
+	}
+}
+
+func TestCatalogContactEncodingIsLazyBoundedAndRevisionLocal(t *testing.T) {
+	s, st := cacheTestServer(t)
+	now := time.Now().UTC()
+	for i := range 12 {
+		if _, err := st.AddContactReport(types.ContactReport{ReporterID: int64(i),
+			ContactObservation: types.ContactObservation{
+				ID: fmt.Sprint(i), AccountTag: "tag", Gateway: "g", At: now, Outcome: "full",
+			}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := s.contactSnapshot(now)
+	if len(data.encoded) != 0 {
+		t.Fatal("unused consumers were encoded during a cache rebuild")
+	}
+	consumer := reportConsumer{1, "tag"}
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() { data.encodedFor(consumer) })
+	}
+	wg.Wait()
+	if len(data.encoded) != 1 {
+		t.Fatal("encoding did not coalesce concurrent reads of one consumer")
+	}
+	for i := range 100 {
+		if data.encodedFor(reportConsumer{1, fmt.Sprint(i)}) != nil {
+			t.Fatal("unknown tag exposed another consumer's history")
+		}
+	}
+	if len(data.encoded) != 1 {
+		t.Fatal("untrusted absent tags grew the encoding cache")
+	}
+	before := string(data.encodedFor(consumer)["g"])
+	report := st.ContactReports()[1]
+	report.WindowFinal, report.FullWindowMS = true, 1234
+	if _, err := st.AddContactReport(report); err != nil {
+		t.Fatal(err)
+	}
+	next := s.contactSnapshot(now)
+	if next == data || string(next.encodedFor(consumer)["g"]) == before {
+		t.Fatal("new revision reused stale window encoding")
+	}
+	if string(data.encodedFor(consumer)["g"]) != before {
+		t.Fatal("publishing a newer revision mutated an in-flight snapshot")
+	}
+}
+
+func TestCooldownAccountIndexMatchesPersonalAndPoolFallback(t *testing.T) {
+	now := time.Now().UTC()
+	var reports []types.CooldownReport
+	for reporter := int64(1); reporter <= 4; reporter++ {
+		for i := range 3 {
+			outcome, seconds := "full", 3600
+			if reporter == 4 {
+				outcome, seconds = "degraded", 7200
+			}
+			reports = append(reports, types.CooldownReport{
+				ID: fmt.Sprintf("%d-%d", reporter, i), ReporterID: reporter,
+				AccountTag: "same-tag", Gateway: "g", Result: outcome,
+				WindowSeconds: seconds, ElapsedSeconds: seconds,
+				ObservedAt: now.Add(-time.Duration(i+1) * time.Hour), ReceivedAt: now,
+			})
+		}
+	}
+	entry := buildCooldownData(reports, now, cooldown.MaxSeconds)
+	stats := entry.stats[0]
+	for _, consumer := range []reportConsumer{{1, "same-tag"}, {4, "same-tag"}, {1, "other"}, {99, "same-tag"}} {
+		want := cooldown.ForAccount(stats, consumer.reporter, consumer.tag)
+		withoutAccounts := stats
+		withoutAccounts.Accounts = nil // the cached lookup must not scan this slice
+		if got := entry.forAccount(withoutAccounts, consumer.reporter, consumer.tag, now); got != want {
+			t.Fatalf("personal/fallback identity separation changed for %+v", consumer)
+		}
 	}
 }
 

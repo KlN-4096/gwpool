@@ -565,7 +565,9 @@ table.gateway-cards tr.nomatch td::before { content:none; }
     <a href="/admin/keys"{{if eq .AdminPage "keys"}} aria-current="page"{{end}}>接入 Key</a>
     <a href="/admin/coverage"{{if eq .AdminPage "coverage"}} aria-current="page"{{end}}>目录覆盖</a>
     <a href="/admin/mint-all"{{if eq .AdminPage "mint"}} aria-current="page"{{end}}>范围打票</a>
+    <a href="/admin/security"{{if eq .AdminPage "security"}} aria-current="page"{{end}}>登录与安全</a>
   </nav>
+  <form method="post" action="/admin/logout" style="margin-top:.75rem"><button type="submit" class="sm">退出管理员</button></form>
   <p class="foot">管理员专属<br>与站点访问码独立鉴权</p>
 </aside>
 {{end}}

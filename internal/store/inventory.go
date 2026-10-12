@@ -127,6 +127,16 @@ func (s *Store) RouteStates(now time.Time) map[string]types.RouteState {
 	return out
 }
 
+func (s *Store) RouteState(key string, now time.Time) types.RouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	state := s.st.Routes[key]
+	if !now.Before(state.LastAttempt.Add(routes.Retention)) {
+		return types.RouteState{}
+	}
+	return state
+}
+
 func pruneRouteStates(states map[string]types.RouteState, now time.Time) []string {
 	var dropped []string
 	for key, state := range states {

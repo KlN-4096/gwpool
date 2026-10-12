@@ -1,0 +1,22 @@
+{{define "content"}}
+<div class="page-head"><h1>管理员登录</h1><p>优先使用 Passkey，验证后在此浏览器保持登录30天。</p></div>
+<section class="card" style="max-width:560px;margin:0 auto">
+  <div class="card-body">
+    {{if .Error}}<p class="bad" role="alert">{{.Error}}</p>{{end}}
+    <button type="button" class="primary" id="admin-passkey-login" data-next="{{.Next}}" {{if not .PasskeyReady}}disabled{{end}}>使用 Passkey 登录</button>
+    <p class="muted">使用设备指纹、面容、Windows Hello 或安全密钥验证。</p>
+    {{if not .PasskeyReady}}<p class="muted">{{.PasskeyReason}}</p>{{end}}
+    <p id="admin-auth-status" role="status" aria-live="polite"></p>
+    <details {{if not .PasskeyReady}}open{{end}}>
+      <summary>使用管理员密钥（首次绑定或备用登录）</summary>
+      <form method="post" action="/admin/login" style="margin-top:1rem">
+        <input type="hidden" name="next" value="{{.Next}}">
+        <label>管理员密钥<input type="password" name="password" required autocomplete="current-password" maxlength="4096"></label>
+        <button type="submit" class="primary">登录并记住30天</button>
+      </form>
+    </details>
+    <p class="muted">关闭浏览器无需重新输入。主动退出、清除站点数据或登录到期后需要重新验证。</p>
+  </div>
+</section>
+{{template "admin-auth-script" .}}
+{{end}}

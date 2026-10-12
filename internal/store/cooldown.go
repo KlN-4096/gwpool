@@ -26,20 +26,19 @@ func (s *Store) AddCooldownReport(report types.CooldownReport) (bool, error) {
 		}
 	}
 	before := s.st.CooldownReports
-	next := make([]types.CooldownReport, 0, len(before)+1)
+	kept := make([]types.CooldownReport, 0, min(len(before)+1, cooldown.MaxReports))
 	cutoff := time.Now().Add(-cooldown.Retention)
-	for _, prev := range before {
-		if !prev.EventAt().Before(cutoff) {
-			next = append(next, prev)
-		}
-	}
-	next = append(next, report)
 	// 各 consumer 单独留存最近样本，避免一个报告者挤掉其他人的全部证据。
-	kept := make([]types.CooldownReport, 0, len(next))
-	counts := map[int64]int{}
-	for i := len(next) - 1; i >= 0; i-- {
-		prev := next[i]
-		if counts[prev.ReporterID] >= cooldown.MaxReporterReports {
+	// Unlike contact observations, a new cooldown report is retained even if
+	// already old; only existing rows are age-pruned by this mutation.
+	kept = append(kept, report)
+	counts := map[int64]int{report.ReporterID: 1}
+	var dropped []reportKey
+	for i := len(before) - 1; i >= 0; i-- {
+		prev := before[i]
+		if len(kept) >= cooldown.MaxReports || prev.EventAt().Before(cutoff) ||
+			counts[prev.ReporterID] >= cooldown.MaxReporterReports {
+			dropped = append(dropped, cooldownKey(prev))
 			continue
 		}
 		counts[prev.ReporterID]++
@@ -48,13 +47,8 @@ func (s *Store) AddCooldownReport(report types.CooldownReport) (bool, error) {
 	for left, right := 0, len(kept)-1; left < right; left, right = left+1, right-1 {
 		kept[left], kept[right] = kept[right], kept[left]
 	}
-	next = kept
-	if len(next) > cooldown.MaxReports {
-		next = append([]types.CooldownReport(nil), next[len(next)-cooldown.MaxReports:]...)
-	}
-	s.st.CooldownReports = next
-	updates, dropped := diffReports(before, next, cooldownKey)
-	if err := s.save(stateChange{Cooldowns: updates, DropCooldowns: dropped}); err != nil {
+	s.st.CooldownReports = kept
+	if err := s.save(stateChange{Cooldowns: []types.CooldownReport{report}, DropCooldowns: dropped}); err != nil {
 		s.st.CooldownReports = before
 		return false, err
 	}

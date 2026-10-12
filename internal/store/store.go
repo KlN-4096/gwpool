@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -78,6 +79,7 @@ type State struct {
 	AccessKeys      map[string]types.AccessKey             `json:"access_keys,omitempty"`
 	KeyUsage        map[string]types.KeyUsage              `json:"key_usage,omitempty"`
 	ExternalUsage   map[string]types.ExternalConsumerUsage `json:"external_usage,omitempty"`
+	AdminAuth       *types.AdminAuthState                  `json:"admin_auth,omitempty"`
 }
 
 // bumpID 发一个**永不回收**的 ID：计数器只增不减，max 只在老文件还没有计数器时兜底一次。
@@ -117,6 +119,7 @@ type Store struct {
 	routingLoadMu  sync.Mutex
 	routingLoadErr error // routingLoadMu protects load/retry state
 	routingRetryAt time.Time
+	routingModel   routingModelCache
 
 	// 账号锁独立于 mu：持账号锁的人要打上游（几十秒），不能把状态读写一起挡住。
 	accMu    sync.Mutex
@@ -917,6 +920,31 @@ func (s *Store) Gateways() map[string]types.Gateway {
 	return out
 }
 
+// GatewayNames and GatewayCount do not copy historical reachable exits just to
+// enumerate known landings. Callers still evaluate live ticket readiness.
+func (s *Store) GatewayNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	names := make([]string, 0, len(s.st.Gateways))
+	for name := range s.st.Gateways {
+		names = append(names, name)
+	}
+	return names
+}
+
+func (s *Store) GatewayCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.st.Gateways)
+}
+
+func (s *Store) HasGateway(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.st.Gateways[name]
+	return ok
+}
+
 func cloneGateway(g types.Gateway) types.Gateway {
 	g.ReachableExits = append([]types.Exit(nil), g.ReachableExits...)
 	return g
@@ -1161,18 +1189,15 @@ func (s *Store) AppendSample(sm types.Sample) error {
 
 // Samples 回读全部样本，供 admin 视图和 cohort 分析用。坏行跳过，不让一行脏数据毁掉整个视图。
 func (s *Store) Samples() ([]types.Sample, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	f, err := os.Open(filepath.Join(s.dir, samplesFile))
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
+	f, size, err := s.sampleSnapshot()
+	if err != nil || f == nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
 	var out []types.Sample
-	sc := bufio.NewScanner(f)
+	// Decode a complete, fixed prefix outside Store.mu. Appending samples or
+	// committing inventory must not wait for a multi-megabyte page read.
+	sc := bufio.NewScanner(io.NewSectionReader(f, 0, size))
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
 		line := sc.Bytes()
@@ -1185,6 +1210,32 @@ func (s *Store) Samples() ([]types.Sample, error) {
 		}
 	}
 	return out, sc.Err()
+}
+
+func (s *Store) sampleSnapshot() (*os.File, int64, error) {
+	f, info, err := s.sampleFileSnapshot()
+	if info == nil {
+		return f, 0, err
+	}
+	return f, info.Size(), err
+}
+
+func (s *Store) sampleFileSnapshot() (*os.File, fs.FileInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	f, err := os.Open(filepath.Join(s.dir, samplesFile))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	return f, info, nil
 }
 
 // newToken 生成一个进 URL 的随机令牌。128 bit，URL 安全。
