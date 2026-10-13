@@ -1,5 +1,10 @@
 # 开发日志
 
+## 2026-10-13 — 邮箱密码上传已推送上线
+- `45eeac2badff`已推main，精确commit构建SHA`3b57809a68bafd850e8a67549dbf61f6b42be87c0e62124597512c6fcde79afd`，15:11:06Z部署bytevirt；配置和最新WAL不变，冷备`/opt/gwpool/backup-route-aware-45eeac2badff-attempt3`。
+- 前两次串行重放恰逢路线24h过期（各差1条与一次journal_sequence），均自动恢复旧binary且保最新状态；改为独立副本并行重放仍严格全字段比较，离线实证及第二轮工具审查通过后切换成功。失败备份未覆盖；工具测试15项及并行修改后compatible5项通过。
+- 线上root/admin/owner/account均200，8端点与升级提示400/400/426/426保持；旧上传login在两入口均400，验证码input404，gwpool/Sub2API均active、ERROR0、自然交付9。公网检查仍为Cloudflare403，未改防护；无主动取票/模型探测。
+
 ## 2026-10-13 — 邮箱密码上传退役（已获准推送部署）
 - 移除单条/批量邮箱密码输入、前端解析与验证码交互、后端登录执行及input路由；同步/异步表单在建任务或出站前拒绝旧模式与密码/TOTP字段。保留Token/JSON、RT刷新、归属冻结、查询/取消和版本条件入库，独立reauth试验代码不接HTTP入口。
 - 最小复现先红（旧请求202/303），修后HTTP全包5.254s、前端24项及diff检查通过；14个旧请求变体覆盖两入口无出站/任务/持久副作用，桌面/390px离线页面通过。独立只读审查无blocker/should-fix；真实账号登录不测试。

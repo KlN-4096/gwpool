@@ -9,6 +9,7 @@
 - Key管理回归：`store/access_key_test.go`、`httpapi/managed_keys_test.go`、`node --test web/keys.test.cjs`；`GWPOOL_KEYS_PREVIEW_DIR`从离线测试输出列表/生成/详情假数据页面，禁止用生产Key做UI截图。
 - `TestDashboardSettingsFixture`可通过`GWPOOL_PREVIEW_DIR`输出假数据HTML供本地静态预览；不要用生产凭据做截图或表单测试。
 - Windows 原生 Go 构建和测试；并发限定 `-p 2`，测试使用 `-timeout 60s`，不跑 `-race`。
+- 同schema部署在停服冷备的两个独立目录并行跑旧/新checkpoint-only，仍要求全字段相等；串行重放可能跨过路线24h过期点并多一次journal_sequence，不能忽略字段放行。失败恢复旧binary但保最新WAL；重试用独立备份目录，不覆盖失败证据。
 - 小改先跑定向用例；涉及共享铸票/调度行为时运行 `go test -p 2 -timeout 60s ./...`，再 lint。
 - 上传者/管理账号卡片的铸票尝试、获票次数及最近成功时间只读样本，不读旧消费Slot/Via。`owner_mint_test.go`覆盖非200/空落点/明确失败不计成功、验票排除、结构化漂移/no_gain、历史无Route、乱序/缺时/未来与owner隔离；不得把HTTP200或客户端交付当作铸票成功。`GWPOOL_OWNER_MINT_PREVIEW_DIR`导出假页面验收。
 - 路线维护回归见`routes/route_test.go`、`store/inventory_test.go`、`sched/route_inventory_test.go`及`expiry_test.go`；现票契约仍由HTTP/consumer测试覆盖。收益来自原子提交，缺票快照不是请求样本；必须覆盖同值cflb延寿、过期同key、unknown-member刷新和bare→seed无额外尝试。
