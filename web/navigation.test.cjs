@@ -79,3 +79,16 @@ test('pool prefixed anchors and ordinary tabs stay compatible', () => {
   f.click('tab-gateways');
   assert.deepEqual(f.visible(), ['tab-gateways']);
 });
+
+test('owner integration guide supports direct links and return to accounts', () => {
+  const f = fixture(['accounts', 'usage', 'import'], [
+    ['accounts'], ['usage'], ['import'],
+  ], '#usage');
+  assert.deepEqual(f.visible(), ['tab-usage']);
+  f.click('accounts');
+  assert.deepEqual(f.visible(), ['tab-accounts']);
+  f.pop('tab-usage');
+  assert.deepEqual(f.visible(), ['tab-usage']);
+  f.click('import');
+  assert.deepEqual(f.visible(), ['tab-import']);
+});

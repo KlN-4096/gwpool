@@ -1,0 +1,50 @@
+{{define "integration-guide"}}
+<div class="card" data-integration-guide>
+  <header class="card-head"><div><h2>HTTP 端点速查</h2><p>查目录 → 点名取票；反馈接口按需使用。</p></div></header>
+  <div class="card-body">
+    {{if .BaseURL}}<p>本实例根地址：<code>{{.BaseURL}}</code></p>{{else}}<p>请向管理员确认根地址，例如 <code>https://pool.example.com</code>。</p>{{end}}
+    <p>统一鉴权：<code>Authorization: Bearer &lt;接入Key&gt;</code>；反馈正文使用 <code>Content-Type: application/json</code>。</p>
+    <p><code>account</code> 填实际用票成员 OAuth 凭据中的 <code>chatgpt_account_id/chatgpt_user_id</code>（两值用 <code>/</code> 拼接），不是本地编号或 Key。同一成员保持稳定；非空、≤128字节、无控制字符，池端只校验格式。命令行直接拼接含 <code>&amp;</code> 的 URL 时，整个 URL 必须加引号。</p>
+    <div class="table-wrap"><table class="spec">
+      <thead><tr><th>端点</th><th>用法</th><th>限制</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>GET /gateways</code></td>
+          <td>查网关目录；必填 <code>account</code>。可选 <code>model</code> 获取模型统计、<code>X-Gwpool-Account-Tag</code> 请求头获取个人统计。</td>
+          <td>只返回元数据，不含 Cookie；建议缓存≤30秒并按票期缩短，个人统计按 Key/tag 隔离。</td>
+        </tr>
+        <tr>
+          <td><code>GET /cookie</code></td>
+          <td>点名取票；必填 <code>account</code>、<code>gateway</code>。可选 <code>min_remaining</code>（默认300秒，整数钳至30–3600）、<code>exclude</code>/<code>exclude_versions</code>（逗号分隔，各≤64项）。</td>
+          <td>仅交付现票，不代选、不等待、不现场铸票。<code>force/wait/count</code> 一律400。同成员跨 Key 共享12次/秒、444次/分钟，成功与缺票均计数。</td>
+        </tr>
+        <tr>
+          <td><code>POST /contact/report</code></td>
+          <td>上报接触结果；JSON 含 <code>id/account_tag/gateway/model/criterion/source/first/at/outcome</code>。<code>outcome</code> 为 <code>full/refreshed/unknown</code>。</td>
+          <td>≤4096字节；每轮接触一次，时间为近7天至未来5分钟。仅 full 可用原 ID 补报结束窗口；管理员/root 不能上报。</td>
+        </tr>
+        <tr>
+          <td><code>POST /cooldown/report</code></td>
+          <td>上报静置验证；JSON 含 <code>id/account_tag/gateway/window_seconds/elapsed_seconds/result</code>，可选 <code>observed_at</code>。<code>result</code> 为 <code>full/degraded</code>。</td>
+          <td>≤2048字节；计划静置3600–86400秒，实际间隔≥计划减60秒且≤604800秒。</td>
+        </tr>
+        <tr>
+          <td><code>POST /contact/reports</code></td>
+          <td>批量接触反馈：<code>{"reports":[单条对象,…]}</code>。</td>
+          <td>1–32条、整批≤64KiB、单项≤4096字节；检查 <code>results</code> 每项的 <code>id/status</code>，外层200不代表全部成功。</td>
+        </tr>
+        <tr>
+          <td><code>POST /cooldown/reports</code></td>
+          <td>批量冷却反馈：<code>{"reports":[单条对象,…]}</code>。</td>
+          <td>1–32条、整批≤64KiB、单项≤2048字节；同样按逐项结果重试。</td>
+        </tr>
+        <tr><td><code>POST /release</code></td><td>旧归还接口，已停用。</td><td>返回426 <code>upgrade_required</code>，保留原升级提示。</td></tr>
+        <tr><td><code>POST /pair/renew</code></td><td>旧续期接口，已停用。</td><td>返回426 <code>upgrade_required</code>，保留原升级提示。</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>用票：</strong>返回的 <code>cookie</code> 原样放入上游 <code>Cookie</code> 头，上游仍使用自己的凭据；遵守票期，取票成功不保证模型品质。</p>
+    <p><strong>反馈：</strong><code>id/account_tag</code> 均为64位hex，tag按成员保持稳定，gateway须已知；重试保留原ID、时间与载荷。拒绝未知字段；批内重复ID、非法外层或整批超限会整批拒绝，其余按单项结果处理。</p>
+    <p><strong>错误与限额：</strong>400修参数，401检查Key，409核对事件冲突，缺票503刷新目录后退避；限流遵守 <code>Retry-After</code>。所有接口另受适用的Key限额与公共开放门槛约束。</p>
+  </div>
+</div>
+{{end}}

@@ -33,7 +33,7 @@
     </div>
   </div>
   <div class="card">
-    <header class="card-head"><div><h2>接口地址</h2><p>填进 sub2api 的<strong>根地址</strong>。</p></div></header>
+    <header class="card-head"><div><h2>接口地址</h2><p>填入接入客户端的网关池<strong>根地址</strong>。</p></div></header>
     <div class="card-body">
       {{if .BaseURL}}
       <div class="copy"><pre class="mono" id="base-url">{{.BaseURL}}</pre><button type="button" data-copy="#base-url" hidden data-js>复制</button></div>
@@ -148,19 +148,11 @@
 <section id="tab-usage">
   <div class="{{if .PublicEnabled}}grid-2{{end}}">
     <div class="card">
-      <header class="card-head"><div><h2>调用流程</h2><p>适用于已上传账号的调用方。</p></div></header>
+      <header class="card-head"><div><h2>获取接入 Key</h2><p>任意 HTTP 客户端均可接入，完整流程见下方说明。</p></div></header>
       <div class="card-body">
-        <h3>1. 获取接入 key</h3>
         <p>在「上传账号」提交凭据，完成后点击结果卡片的「打开账号总览」，接入 key 在总览页中。</p>
-        <h3>2. 请求路由 Cookie</h3>
-        <pre class="mono">curl -G -H 'Authorization: Bearer &lt;接入 key&gt;' \
-  --data-urlencode 'account=&lt;account_id/user_id&gt;' \
-  --data-urlencode 'gateway=unified-142' \
-  <span class="origin">https://&lt;站点地址&gt;</span>/cookie</pre>
-        <p>先通过 <code>/gateways?account=…</code> 获取目录，由客户端按本地品质/冷却选定网关。取票必须带完整成员标识和网关；不支持 force、wait、count 或裸取代选。</p>
-        <h3>3. 携带 Cookie 请求上游</h3>
-        <p>把 <code>cookie</code> 字段原样放进上游请求的 <code>Cookie</code> 头，在 <code>valid_for_s</code> 秒内用完，到期重新取。</p>
-        <p class="foot">完整字段与状态码见账号页的「接入说明」。</p>
+        <p>已有管理员发放的接入 Key，或公共接入开放时使用公共 Key，也可直接调用；无需为了查看协议进入他人的账号页。</p>
+        <p class="foot">网页访问码与个人页面令牌不是机器接口的接入 Key。请勿将页面地址填作接口根地址。</p>
       </div>
     </div>
     {{if .PublicEnabled}}
@@ -179,17 +171,18 @@
         <h3>公共 Key</h3>
         {{if .PublicKey}}<div class="copy"><pre class="mono" id="public-key">{{.PublicKey}}</pre><button type="button" data-copy="#public-key" hidden data-js>复制</button></div>
         {{else}}<p class="hint">实例未配置接入根密钥，公共 Key 暂不可用。</p>{{end}}
-        <p>在客户端的网关池设置中，分别填写以上 URL 和 Key。由客户端传入上游账号标识，按账号分别记账。</p>
+        <p>支持本协议的客户端可填写以上 URL 和 Key；脚本也可直接使用 HTTP 接口。每次传入实际消费成员的 chatgpt_account_id/chatgpt_user_id，不是本地账号编号。</p>
         <p class="foot">所有公共用户共享：{{.PublicLimits.RequestsPerMinute}} 次/分钟、并发 {{.PublicLimits.MaxConcurrent}}、排队 {{.PublicLimits.MaxQueued}}、最长等待 {{.PublicLimits.QueueWaitMS}} 毫秒。超限按 Retry-After 退避，普通 Key 不受这条队列影响。</p>
         <details><summary>接口与业务规则</summary>
-          <pre class="mono">GET /cookie?account=&lt;account_id/user_id&gt;&amp;gateway=&lt;网关名&gt;
+          <pre class="mono">GET /cookie?account=&lt;chatgpt_account_id/chatgpt_user_id&gt;&amp;gateway=&lt;网关名&gt;
 Authorization: Bearer &lt;公共 Key&gt;</pre>
-          <p class="foot">所有 Key 只交付指定现成票，不做池端品质验证。成员取票另受12次/秒、444次/分钟滚动限频，超限429与Retry-After；取票/目录复用原路径但不兼容旧请求，归还/消费者续期端点426提示停用升级。公共 Key 不授予管理权限，缺失或错误 Key 返回401。</p>
+          <p class="foot">所有 Key 只交付指定现成票，不做池端品质验证。成员取票另受12次/秒、444次/分钟滚动限频，超限429与Retry-After；归还/消费者续期端点已停用并返回426。公共 Key 不授予管理权限，缺失或错误 Key 返回401。</p>
         </details>
       </div>
     </div>
     {{end}}
   </div>
+  {{template "integration-guide" .}}
 </section>
 
 <section id="tab-submit">

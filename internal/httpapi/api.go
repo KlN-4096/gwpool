@@ -290,6 +290,9 @@ func parse(page string) (*template.Template, error) {
 	if page == "admin-login.html" || page == "admin-security.html" {
 		files = append(files, "templates/admin-auth-script.html")
 	}
+	if page == "pool.html" || page == "account.html" || page == "owner.html" {
+		files = append(files, "templates/integration-guide.html")
+	}
 	return template.ParseFS(web.Templates, files...)
 }
 

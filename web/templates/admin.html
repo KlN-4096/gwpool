@@ -450,7 +450,7 @@
           </fieldset>
           <fieldset class="setting-group">
             <legend>客户端调度</legend>
-            <p class="foot">所有 Key 通过 /cookie 明确点名取票。选择、品质验证、冷却和重试均由 Sub2api 负责；池端不替消费者铸票或验证。</p>
+            <p class="foot">所有 Key 通过 /cookie 明确点名取票。选择、品质验证、冷却和重试均由接入客户端负责；池端不替消费者铸票或验证。任意客户端均可按首页接入说明实现。</p>
             <p class="foot">每个完整成员标识共享滚动限频：12 次/秒、444 次/分钟；跨 Key 合并，缺票请求也计数。超限返回 429 与 Retry-After。</p>
           </fieldset>
           <fieldset class="setting-group">
