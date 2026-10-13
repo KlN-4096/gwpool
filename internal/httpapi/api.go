@@ -36,7 +36,6 @@ import (
 	"gwpool/internal/geography"
 	"gwpool/internal/mint"
 	"gwpool/internal/oauth"
-	"gwpool/internal/reauth"
 	"gwpool/internal/sched"
 	"gwpool/internal/store"
 	"gwpool/internal/ticket"
@@ -161,10 +160,6 @@ type Options struct {
 	// 存在的唯一理由是测试：测试绝不打真实上游（SPEC 红线 8），而换票是
 	// parseCreds 里唯一会出网的一步。生产永远不设它。
 	Refresh func(ctx context.Context, refreshToken string) (oauth.Tokens, error)
-	// Login is an offline-test injection. Production uses an isolated dynamic
-	// transport and reauth's bounded, challenge-aware login state machine.
-	Login func(context.Context, reauth.Input, reauth.Hooks) (oauth.Tokens, error)
-
 	// Live 非 nil 时管理页可以改配置并热重载；为空则那一节只读（测试走这条路）。
 	Live *config.Live
 
@@ -308,7 +303,6 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /upload", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUpload))))
 	mux.Handle("POST /upload/jobs", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUploadJobStart))))
 	mux.Handle("GET /upload/jobs/{id}", s.gate(http.HandlerFunc(s.handleUploadJobStatus)))
-	mux.Handle("POST /upload/jobs/{id}/input", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUploadJobInput))))
 	mux.Handle("POST /upload/jobs/{id}/cancel", s.gate(s.sameOrigin(http.HandlerFunc(s.handleUploadJobCancel))))
 	mux.Handle("GET /a/{token}", s.gate(http.HandlerFunc(s.handleAccount)))
 	mux.Handle("POST /a/{token}/enabled", s.gate(s.sameOrigin(http.HandlerFunc(s.handleAccountEnabled))))
@@ -1091,6 +1085,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		form, ferr := parseForm(raw)
 		if ferr != nil {
 			http.Error(w, "表单解析失败", http.StatusBadRequest)
+			return
+		}
+		if rejectRetiredUploadLogin(w, form) {
 			return
 		}
 		raw = []byte(strings.TrimSpace(form.Get("creds")))

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"gwpool/internal/oauth"
-	"gwpool/internal/reauth"
 	"gwpool/internal/store"
 	"gwpool/internal/types"
 )
@@ -84,64 +83,54 @@ func waitUploadJob(t *testing.T, h http.Handler, job map[string]string, want str
 	return uploadJobView{}
 }
 
-func fakeLoginTokens() oauth.Tokens {
-	return oauth.Tokens{AccessToken: fakeToken("login-fixture", "free", time.Now().Add(time.Hour)),
-		RefreshToken: "rt.offline-login-never-valid"}
+func fakeUploadTokens() oauth.Tokens {
+	return oauth.Tokens{AccessToken: fakeToken("upload-fixture", "free", time.Now().Add(time.Hour)),
+		RefreshToken: "rt.offline-upload-never-valid"}
 }
 
-func loginForm() url.Values {
-	return url.Values{"mode": {"login"}, "email": {"test@example.com"}, "password": {"offline-password"}}
+func credentialForm() url.Values {
+	return url.Values{"mode": {"credentials"}, "kind": {"refresh"}, "creds": {"rt.offline-upload-input"}}
 }
 
-func promptedLogin(ctx context.Context, _ reauth.Input, hooks reauth.Hooks) (oauth.Tokens, error) {
-	hooks.Progress("password")
-	_, err := hooks.Prompt(ctx, reauth.Challenge{Kind: "email_code"})
-	if err != nil {
-		return oauth.Tokens{}, err
-	}
-	hooks.Progress("exchange")
-	return fakeLoginTokens(), nil
-}
-
-func answerPrompt(t *testing.T, h http.Handler, job map[string]string, prompt uint64) {
-	t.Helper()
-	body, _ := json.Marshal(map[string]any{"prompt_id": prompt, "value": "123456"})
-	w := jobRequest(h, job, "POST", "/input", string(body))
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("input rejected: %d %s", w.Code, w.Body.String())
+func heldUploadRefresh(release <-chan struct{}) func(context.Context, string) (oauth.Tokens, error) {
+	return func(ctx context.Context, _ string) (oauth.Tokens, error) {
+		select {
+		case <-release:
+			return fakeUploadTokens(), nil
+		case <-ctx.Done():
+			return oauth.Tokens{}, ctx.Err()
+		}
 	}
 }
 
-func TestUploadJobsKeepSecretsPrivateAndBindPrompts(t *testing.T) {
-	_, st, h := uploadJobRig(t, Options{Login: promptedLogin})
-	job := startUploadJob(t, h, loginForm())
-	view := waitUploadJob(t, h, job, "waiting")
+func TestUploadJobsKeepSecretsPrivateAndBindCapabilities(t *testing.T) {
+	release := make(chan struct{})
+	_, st, h := uploadJobRig(t, Options{Refresh: heldUploadRefresh(release)})
+	job := startUploadJob(t, h, credentialForm())
+	waitUploadJob(t, h, job, "refresh")
 	if len(st.Owners()) != 0 {
-		t.Fatal("allocated an owner before successful login")
+		t.Fatal("allocated an owner before successful refresh")
 	}
 	w := jobRequest(h, map[string]string{"id": job["id"], "key": "wrong"}, "GET", "", "")
 	if w.Code != http.StatusNotFound {
 		t.Fatal("job ID alone grants access")
 	}
 	w = jobRequest(h, job, "GET", "", "")
-	for _, secret := range []string{"offline-password", "test@example.com", "rt.offline", job["key"]} {
+	for _, secret := range []string{"rt.offline", job["key"]} {
 		if strings.Contains(w.Body.String(), secret) {
 			t.Fatal("job status disclosed a secret")
 		}
 	}
-	if w = jobRequest(h, job, "POST", "/input", `{"prompt_id":999,"value":"123456"}`); w.Code != http.StatusConflict {
-		t.Fatal("stale prompt accepted")
+	if w = jobRequest(h, job, "POST", "/input", `{"prompt_id":1,"value":"123456"}`); w.Code != http.StatusNotFound {
+		t.Fatal("retired verification endpoint still registered")
 	}
-	if w = jobRequest(h, job, "POST", "/input", `{"prompt_id":1,"value":"not-a-code"}`); w.Code != http.StatusBadRequest {
-		t.Fatal("invalid code accepted")
-	}
-	answerPrompt(t, h, job, view.PromptID)
-	view = waitUploadJob(t, h, job, "completed")
+	close(release)
+	view := waitUploadJob(t, h, job, "completed")
 	if len(st.Accounts()) != 1 || view.Receipt["owner_token"] == "" || view.Receipt["status"] != "created" {
 		t.Fatal("missing successful owner/account receipt")
 	}
 	w = jobRequest(h, job, "GET", "", "")
-	if strings.Contains(w.Body.String(), fakeLoginTokens().RefreshToken) || len(w.Result().Cookies()) == 0 {
+	if strings.Contains(w.Body.String(), fakeUploadTokens().RefreshToken) || len(w.Result().Cookies()) == 0 {
 		t.Fatal("secret leaked or explicitly established owner not remembered")
 	}
 }
@@ -151,7 +140,7 @@ func TestUploadJobsExposeActualRTProgress(t *testing.T) {
 	_, st, h := uploadJobRig(t, Options{Refresh: func(ctx context.Context, _ string) (oauth.Tokens, error) {
 		select {
 		case <-release:
-			return fakeLoginTokens(), nil
+			return fakeUploadTokens(), nil
 		case <-ctx.Done():
 			return oauth.Tokens{}, ctx.Err()
 		}
@@ -169,11 +158,11 @@ func TestUploadJobsExposeActualRTProgress(t *testing.T) {
 }
 
 func TestUploadJobsDoNotPlantPageOwnerCookie(t *testing.T) {
-	_, st, h := uploadJobRig(t, Options{Login: func(context.Context, reauth.Input, reauth.Hooks) (oauth.Tokens, error) {
-		return fakeLoginTokens(), nil
+	_, st, h := uploadJobRig(t, Options{Refresh: func(context.Context, string) (oauth.Tokens, error) {
+		return fakeUploadTokens(), nil
 	}})
 	owner, _ := st.AddOwner("fixture")
-	form := loginForm()
+	form := credentialForm()
 	form.Set("page_owner", owner.Token)
 	job := startUploadJob(t, h, form)
 	waitUploadJob(t, h, job, "completed")
@@ -185,17 +174,18 @@ func TestUploadJobsDoNotPlantPageOwnerCookie(t *testing.T) {
 	}
 }
 
-func TestUploadJobsRejectChangesDuringOTPWait(t *testing.T) {
+func TestUploadJobsRejectChangesDuringRefresh(t *testing.T) {
 	for _, change := range []string{"pause", "delete", "credentials"} {
 		t.Run(change, func(t *testing.T) {
-			_, st, h := uploadJobRig(t, Options{Login: promptedLogin})
+			release := make(chan struct{})
+			_, st, h := uploadJobRig(t, Options{Refresh: heldUploadRefresh(release)})
 			owner, _ := st.AddOwner("fixture")
 			a, _ := st.AddAccount(types.Account{OwnerID: owner.ID, Enabled: true,
-				Creds: types.Creds{AccountID: "login-fixture", AccessToken: "old", RefreshToken: "old-rt"}})
-			form := loginForm()
+				Creds: types.Creds{AccountID: "upload-fixture", AccessToken: "old", RefreshToken: "old-rt"}})
+			form := credentialForm()
 			form.Set("owner_token", owner.Token)
 			job := startUploadJob(t, h, form)
-			view := waitUploadJob(t, h, job, "waiting")
+			waitUploadJob(t, h, job, "refresh")
 			switch change {
 			case "pause":
 				_ = st.SetAccountEnabled(a.ID, false)
@@ -204,8 +194,8 @@ func TestUploadJobsRejectChangesDuringOTPWait(t *testing.T) {
 			case "credentials":
 				_ = st.SetTokens(a.ID, "newer", "newer-rt")
 			}
-			answerPrompt(t, h, job, view.PromptID)
-			view = waitUploadJob(t, h, job, "failed")
+			close(release)
+			view := waitUploadJob(t, h, job, "failed")
 			if view.Receipt != nil || !strings.Contains(view.Message, "没有覆盖") {
 				t.Fatal("concurrent mutation was lost", view.State, view.Message)
 			}
@@ -214,22 +204,22 @@ func TestUploadJobsRejectChangesDuringOTPWait(t *testing.T) {
 }
 
 func TestUploadJobsAdmissionCancellationAndCSRF(t *testing.T) {
-	_, st, h := uploadJobRig(t, Options{Login: promptedLogin})
+	_, st, h := uploadJobRig(t, Options{Refresh: heldUploadRefresh(make(chan struct{}))})
 	var jobs []map[string]string
 	for range maxClientUploads {
-		job := startUploadJob(t, h, loginForm())
-		waitUploadJob(t, h, job, "waiting")
+		job := startUploadJob(t, h, credentialForm())
+		waitUploadJob(t, h, job, "refresh")
 		jobs = append(jobs, job)
 	}
-	r := httptest.NewRequest("POST", "/upload/jobs", strings.NewReader(loginForm().Encode()))
+	r := httptest.NewRequest("POST", "/upload/jobs", strings.NewReader(credentialForm().Encode()))
 	if w := do(h, r); w.Code != http.StatusTooManyRequests {
 		t.Fatal("per-client admission not bounded")
 	}
-	r = httptest.NewRequest("POST", "/upload/jobs/"+jobs[0]["id"]+"/input", strings.NewReader(`{"prompt_id":1,"value":"123456"}`))
+	r = httptest.NewRequest("POST", "/upload/jobs/"+jobs[0]["id"]+"/cancel", nil)
 	r.Header.Set("Authorization", "Bearer "+jobs[0]["key"])
 	r.Header.Set("Origin", "https://attacker.invalid")
 	if w := do(h, r); w.Code != http.StatusForbidden {
-		t.Fatal("cross-origin prompt submission allowed")
+		t.Fatal("cross-origin cancellation allowed")
 	}
 	for _, job := range jobs {
 		if w := jobRequest(h, job, "POST", "/cancel", "{}"); w.Code != http.StatusAccepted {
@@ -238,7 +228,7 @@ func TestUploadJobsAdmissionCancellationAndCSRF(t *testing.T) {
 		waitUploadJob(t, h, job, "canceled")
 	}
 	if len(st.Accounts()) != 0 || len(st.Owners()) != 0 {
-		t.Fatal("canceled OTP waits wrote accounts/owners")
+		t.Fatal("canceled refreshes wrote accounts/owners")
 	}
 }
 
@@ -253,15 +243,6 @@ func (s *delayedImportStore) AddAccountIfVersion(ctx context.Context, a types.Ac
 	close(s.entered)
 	<-s.release
 	return s.actual.AddAccountIfVersion(ctx, a, id, revision)
-}
-
-func TestUploadJobsMissingLiveFailsWithoutNetworkOrPanic(t *testing.T) {
-	_, st, h := uploadJobRig(t, Options{})
-	job := startUploadJob(t, h, loginForm())
-	view := waitUploadJob(t, h, job, "failed")
-	if !strings.Contains(view.Message, "动态登录出口") || len(st.Accounts()) != 0 {
-		t.Fatal("nil Live should be an explicit unavailable transport", view.Message)
-	}
 }
 
 func TestUploadWorkspaceFixture(t *testing.T) {
@@ -283,13 +264,13 @@ func TestUploadWorkspaceFixture(t *testing.T) {
 }
 
 func TestUploadJobsCancellationBeforeStoreCommit(t *testing.T) {
-	s, st, _ := uploadJobRig(t, Options{Login: func(context.Context, reauth.Input, reauth.Hooks) (oauth.Tokens, error) {
-		return fakeLoginTokens(), nil
+	s, st, _ := uploadJobRig(t, Options{Refresh: func(context.Context, string) (oauth.Tokens, error) {
+		return fakeUploadTokens(), nil
 	}})
 	delayed := &delayedImportStore{Store: st, actual: st, entered: make(chan struct{}), release: make(chan struct{})}
 	s.st = delayed
 	h := s.Handler()
-	job := startUploadJob(t, h, loginForm())
+	job := startUploadJob(t, h, credentialForm())
 	select {
 	case <-delayed.entered:
 	case <-time.After(time.Second):

@@ -4,7 +4,7 @@
 - 管理员认证用`httpapi/admin_auth_test.go/admin_passkey_test.go`及`store/admin_auth_test.go`验证真实签名、RP/origin/UV、重放、过期/撤销/改密钥、慢体与退出交错、代理限流、WAL故障/重启。`GWPOOL_ADMIN_AUTH_BROWSER_READY`+`TestAdminAuthOfflineBrowser`提供55秒假池供Edge虚拟认证器注册/登录/关闭重开验收；不在生产自动建立测试Passkey。
 - 测试用 fake/httptest，不能请求真实上游；非平凡 bug 先添加能失败的回归用例。
 - 上传页面解析与部分成功/重试用 `node --test web/upload_parser.test.cjs` 离线验证；`web/testdata/sub2api-export.json` 是假凭据契约样本，不是真实账号验收。
-- 重登用`internal/reauth`假传输、`httpapi/upload_jobs_test.go`真Store任务测试；`GWPOOL_UPLOAD_PREVIEW_DIR`+`TestUploadWorkspaceFixture`导出假页面。opt-in `reauth_probe`标签单账号探针仅显式授权后运行，配置stdin、账号文件按行读取，输出固定阶段/失败码，不保存Token或写池；遇人机挑战停止。
+- 上传用`httpapi/upload_jobs_test.go`真Store验证Token/JSON、RT进度、归属/取消/并发条件提交；`upload_login_retired_test.go`验证旧登录请求无任务/出站/存储副作用。`GWPOOL_UPLOAD_PREVIEW_DIR`+`TestUploadWorkspaceFixture`导出假页面；`internal/reauth`仅保留独立离线/opt-in探针代码，无HTTP上传入口，真实探针仍须显式授权。
 - 管理页分组/旧锚点/历史导航用 `node --test web/navigation.test.cjs`；无JS仍展示所有分区。
 - Key管理回归：`store/access_key_test.go`、`httpapi/managed_keys_test.go`、`node --test web/keys.test.cjs`；`GWPOOL_KEYS_PREVIEW_DIR`从离线测试输出列表/生成/详情假数据页面，禁止用生产Key做UI截图。
 - `TestDashboardSettingsFixture`可通过`GWPOOL_PREVIEW_DIR`输出假数据HTML供本地静态预览；不要用生产凭据做截图或表单测试。

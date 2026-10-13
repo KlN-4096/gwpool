@@ -944,15 +944,10 @@ table.gateway-cards tr.nomatch td::before { content:none; }
      认出身份时只给链接、认不出才给输入框。两页共用一份，免得改一处漏一处。 */}}
 {{define "upload" -}}
 <form id="upload" method="post" action="/upload" class="upload-workspace" autocomplete="off">
-  <div class="upload-intro"><div><strong>添加或更新账号</strong><p class="hint">导入现有凭据，或登录账号获取 RT。所有结果留在本页。</p></div><span class="pill upload-recommendation">推荐上传 Free 账号。</span></div>
+  <div class="upload-intro"><div><strong>添加或更新账号</strong><p class="hint">导入现有 Token 或 JSON 凭据，所有结果留在本页。</p></div><span class="pill upload-recommendation">推荐上传 Free 账号。</span></div>
   <details id="upload-editor" class="upload-editor" open>
-  <summary><span id="upload-editor-title">输入账号信息</span><small>点击展开 / 收起</small></summary>
+  <summary><span id="upload-editor-title">输入账号凭据</span><small>点击展开 / 收起</small></summary>
   <div class="upload-editor-body">
-  <div class="upload-modes" role="tablist" aria-label="上传方式" hidden data-js>
-    <button type="button" id="upload-mode-credentials" role="tab" aria-selected="true" aria-controls="upload-credentials-panel">凭据 / RT <small>已有 Token 或 JSON</small></button>
-    <button type="button" id="upload-mode-login" role="tab" aria-selected="false" aria-controls="upload-login-panel" tabindex="-1">邮箱密码 <small>协议登录获取 RT</small></button>
-  </div>
-  <section id="upload-credentials-panel" role="tabpanel" aria-labelledby="upload-mode-credentials">
   <label>账号凭据 <span class="hint">支持 sub2api 导出、auth.json、凭据 JSON，或每行一个 Token；单文件上限 1 MB，每批最多 100 项</span>
     <textarea name="creds" required spellcheck="false" autocapitalize="off" placeholder="粘贴 JSON、access_token 或 refresh_token，也可拖入文件"></textarea></label>
   <details class="upload-help"><summary>导入规则与凭据类型</summary>
@@ -965,20 +960,6 @@ table.gateway-cards tr.nomatch td::before { content:none; }
       <label class="choice"><input type="radio" name="kind" value="refresh"><span>refresh_token<small>先换取 AT，再校验入库</small></span></label>
     </div>
   </fieldset></details>
-  </section>
-  <section id="upload-login-panel" role="tabpanel" aria-labelledby="upload-mode-login" hidden>
-    <div class="login-fields">
-      <label>邮箱<input name="login_email" type="email" autocomplete="off" placeholder="name@example.com" maxlength="254"></label>
-      <label>账号密码<input name="login_password" type="password" autocomplete="new-password" maxlength="1024"></label>
-      <label class="login-totp">2FA 密钥 <span class="hint">选填；不是六位动态码</span><input name="login_totp" type="password" autocomplete="new-password" placeholder="验证器密钥或 otpauth:// 地址" maxlength="2048"></label>
-    </div>
-    <details id="login-batch"><summary>批量粘贴 / 导入文件</summary>
-      <label>每行一个账号 <span class="hint">第三项可空；密码含分隔符时请使用上方单账号表单。不能同时填写两种输入。</span>
-        <textarea name="login_batch" spellcheck="false" autocapitalize="off" placeholder="邮箱----密码----2FA密钥&#10;邮箱----密码"></textarea></label>
-    </details>
-    <p class="note info">使用动态出口登录。邮箱验证码或工作区选项会显示在对应任务卡片；手机、人机验证等不支持的流程直接失败。密码和 2FA 密钥不落盘、不进日志；仅成功后保存 AT / RT。</p>
-    <p class="hint">协议登录为实验功能，可能被上游风控拒绝，不保证获取 RT。请使用自己的或已获授权的账号。</p>
-  </section>
   <label>备注名称 <span class="hint">选填，仅单份普通凭据生效；sub2api 导入使用各账号原名称，不填则使用 token 邮箱</span>
     <input name="label" maxlength="64" autocomplete="off"></label>
   {{if .PageToken}}<input type="hidden" name="page_owner" value="{{.PageToken}}">
@@ -996,7 +977,7 @@ table.gateway-cards tr.nomatch td::before { content:none; }
   <p class="hint" id="upload-summary" role="status" hidden></p>
   <p class="note warn" id="upload-leave-note" hidden>任务进行中，请保留本页；刷新或关闭会丢失本页的任务访问凭证，任务最长 10 分钟后停止。不要重复提交同一个账号或 RT。</p>
   <ol class="upload-results" id="upload-results" aria-label="逐项上传结果" hidden></ol>
-  <noscript><p class="hint">未启用 JavaScript：仅支持单份凭据上传；账号密码登录、批量任务和实时进度需启用 JavaScript。</p></noscript>
+  <noscript><p class="hint">未启用 JavaScript：仅支持单份凭据上传；批量任务和实时进度需启用 JavaScript。</p></noscript>
 </form>
 {{- end}}
 

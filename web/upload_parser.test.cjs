@@ -128,20 +128,16 @@ function uploadHarness(input, responses, options = {}) {
     set innerHTML(_) { throw new Error('不得用凭据或名称构造 HTML'); }
   }
   const ids = Object.fromEntries(['upload', 'upload-err', 'upload-results', 'creds-file', 'pick',
-    'upload-summary', 'upload-leave-note', 'upload-mode-credentials', 'upload-mode-login',
-    'upload-credentials-panel', 'upload-login-panel', 'login-batch', 'upload-editor', 'upload-editor-title'].map(id => [id, new Element()]));
+    'upload-summary', 'upload-leave-note', 'upload-editor', 'upload-editor-title'].map(id => [id, new Element()]));
   const box = new Element(), button = new Element();
   box.value = input;
   button.textContent = '上传';
   const form = ids.upload;
   form.action = '/upload';
-  form.elements = { creds: box, kind: { value: 'auto' }, label: { value: 'manual label' },
-    login_batch: new Element(), login_email: new Element(), login_password: new Element(), login_totp: new Element() };
+  form.elements = { creds: box, kind: { value: 'auto' }, label: { value: 'manual label' } };
   if (options.ownerToken) form.elements.owner_token = { value: options.ownerToken };
   form.querySelector = () => button;
-  form.querySelectorAll = () => [box, form.elements.login_batch, form.elements.login_email,
-    form.elements.login_password, form.elements.login_totp,
-    ...descendants(ids['upload-results']).filter(x => x.tag === 'input')];
+  form.querySelectorAll = () => [box, ...descendants(ids['upload-results']).filter(x => x.tag === 'input')];
   form.reset = () => { box.value = ''; };
   const document = {
     getElementById: id => ids[id],
@@ -377,50 +373,16 @@ test('whitespace owner input cannot shadow the confirmed owner on partial retry'
   assert.equal(ui.requests[2].data.owner_token, 'owner-test');
 });
 
-test('login parser supports optional TOTP and preserves password whitespace without interpreting surrounding text', () => {
-  const parsed = JSON.parse(JSON.stringify(parser.parseLogins(
-    '\ufefftest@example.com---- password \nsecond@example.com----secret----\nthird@example.com----pw----otpauth://totp/test?secret=TEST\nan unrelated instruction'
-  )));
-  assert.equal(parsed.items.length, 3);
-  assert.equal(parsed.items[0].login.password, ' password ');
-  assert.equal(parsed.items[1].login.totp, '');
-  assert.equal(parsed.items[2].login.totp, 'otpauth://totp/test?secret=TEST');
-  assert.equal(parsed.skipped.length, 1);
-  assert.doesNotMatch(JSON.stringify(parsed.skipped), /password|instruction/);
-  assert.match(parser.parseLogins(Array.from({ length: 101 }, () => 'x@example.com----pw').join('\n')).error, /100/);
-});
-
-test('login mode deduplicates email, supports empty 2FA, and clears secrets instead of retaining failed login retries', async () => {
-  const ui = uploadHarness('', [uploadReceipt(1), { error: 'offline rejection' }]);
-  ui.ids['upload-mode-login'].listeners.click();
-  ui.form.elements.login_batch.value = 'first@example.com----pw-one\nfirst@example.com----pw-two----\nlast@example.com----pw-three----';
+test('upload only exposes credentials mode without password or verification controls', async () => {
+  const template = readFileSync(path.join(__dirname, 'templates/layout.html'), 'utf8');
+  assert.doesNotMatch(template, /upload-mode-login|login_password|login_totp|login_batch|upload-login-panel/);
+  assert.equal(parser.parseLogins, undefined);
+  const ui = uploadHarness(refresh, [uploadReceipt(1)]);
   await ui.submit();
-  assert.equal(ui.requests.length, 2);
-  assert.equal(ui.requests[0].data.mode, 'login');
-  assert.equal(ui.requests[0].data.password, 'pw-one');
-  assert.equal(ui.requests[0].data.totp, '');
-  assert.equal(ui.requests[1].data.owner_token, 'owner-test');
-  assert.equal(ui.form.elements.login_batch.value, '');
-  assert.equal(ui.form.elements.login_password.value, '');
-  assert.doesNotMatch(rowMessages(ui), /pw-one|pw-two|pw-three/);
-  await ui.submit();
-  assert.equal(ui.requests.length, 2, '点击提交不能暗中保留并重试密码');
-});
-
-test('single login accepts delimiters in password and rejects simultaneous batch input', async () => {
-  const ui = uploadHarness('', [uploadReceipt(1)]);
-  ui.ids['upload-mode-login'].listeners.click();
-  ui.form.elements.login_email.value = 'test@example.com';
-  ui.form.elements.login_password.value = ' password----with-separator ';
-  ui.form.elements.login_batch.value = 'other@example.com----pw';
-  await ui.submit();
-  assert.equal(ui.requests.length, 0);
-  assert.match(rowMessages(ui), /不要同时填写/);
-  ui.form.elements.login_batch.value = '';
-  await ui.submit();
-  assert.equal(ui.requests[0].data.password, ' password----with-separator ');
-  assert.equal(ui.form.elements.login_password.value, '');
-  assert.deepEqual(ui.redirects, []);
+  assert.equal(ui.requests[0].data.mode, 'credentials');
+  for (const field of ['email', 'password', 'totp']) {
+    assert.equal(field in ui.requests[0].data, false);
+  }
 });
 
 test('receipt identity guard rejects another owner without providing its links', async () => {
@@ -433,43 +395,15 @@ test('receipt identity guard rejects another owner without providing its links',
 
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const buttonNamed = (node, name) => descendants(node).find(x => x.tag === 'button' && x.textContent === name);
-const waitingView = job => ({ id: job.id, state: 'waiting', stage: 'password', stages: ['queued', 'password'],
-  expires: new Date(Date.now() + 60000).toISOString(), prompt_id: 1, submitted: false, challenge: { kind: 'email_code' } });
-
-test('same email prompt becomes visible after status connection recovers', async () => {
-  let reads = 0;
-  const ui = uploadHarness('', [uploadReceipt(1)], { onTaskRequest: (_url, _options, job) => {
-    reads++;
-    return reads === 2 ? { networkError: true } : { data: waitingView(job) };
-  } });
-  ui.ids['upload-mode-login'].listeners.click();
-  ui.form.elements.login_batch.value = 'test@example.com----pw';
-  const batch = ui.submit();
-  await flushPromises();
-  await ui.poll();
-  await batch;
+test('legacy waiting state never renders or submits a verification challenge', async () => {
+  const ui = uploadHarness(refresh, [uploadReceipt(1)], { onTaskRequest: (_url, _options, job) => ({
+    data: { id: job.id, state: 'waiting', stages: ['queued'], challenge: { kind: 'email_code' } }
+  }) });
+  await ui.submit();
+  assert.match(rowMessages(ui), /未确认/);
   const root = ui.ids['upload-results'].children[0];
-  buttonNamed(root, '重新查询此任务').listeners.click();
-  await flushPromises();
-  const challenge = root.children.find(x => x.className === 'upload-challenge');
-  assert.equal(challenge.hidden, false, '同一 prompt 必须恢复显示');
-});
-
-test('unsent OTP can be retried only after status confirms it was not accepted', async () => {
-  const ui = uploadHarness('', [uploadReceipt(1)], { onTaskRequest: (url, _options, job) =>
-    url.endsWith('/input') ? { networkError: true } : { data: waitingView(job) } });
-  ui.ids['upload-mode-login'].listeners.click();
-  ui.form.elements.login_batch.value = 'test@example.com----pw';
-  ui.submit();
-  await flushPromises();
-  const root = ui.ids['upload-results'].children[0];
-  const input = descendants(root).find(x => x.tag === 'input');
-  input.value = '123456';
-  const send = buttonNamed(root, '确认并继续');
-  await send.listeners.click();
-  assert.equal(send.disabled, true, '结果未确认时不可盲目重复');
-  await ui.poll();
-  assert.equal(send.disabled, false, '服务端明确尚未接收后可人工重试');
+  assert.equal(descendants(root).some(x => x.tag === 'input' || x.tag === 'select'), false);
+  assert.ok(buttonNamed(root, '取消任务'));
 });
 
 test('new batch preserves the only controls for an unresolved job', async () => {
@@ -492,25 +426,4 @@ test('late owner confirmation binds the unsubmitted remainder even without a coo
   await buttonNamed(original, '重新查询此任务').listeners.click();
   await ui.submit();
   assert.equal(ui.requests[1].data.owner_token, 'owner-test', '延迟确认的归属不能丢给可能已变化的 cookie');
-});
-
-test('a new batch cannot make the restored older OTP input read-only', async () => {
-  let reads = 0;
-  const ui = uploadHarness('', [uploadReceipt(1), () => new Promise(() => {})], {
-    onTaskRequest: (_url, _options, job) => ++reads === 2 ? { networkError: true } : { data: waitingView(job) }
-  });
-  ui.ids['upload-mode-login'].listeners.click();
-  ui.form.elements.login_batch.value = 'first@example.com----pw';
-  const first = ui.submit();
-  await flushPromises();
-  await ui.poll();
-  await first;
-  const original = ui.ids['upload-results'].children[0];
-  buttonNamed(original, '重新查询此任务').listeners.click();
-  await flushPromises();
-  const input = descendants(original).find(x => x.tag === 'input');
-  ui.form.elements.login_batch.value = 'second@example.com----pw';
-  ui.submit();
-  await flushPromises();
-  assert.equal(input.readOnly, false, '新批次只能锁上传字段，不能锁已有验证码框');
 });
