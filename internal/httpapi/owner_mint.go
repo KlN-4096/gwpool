@@ -21,7 +21,7 @@ func summarizeAccountMints(samples []types.Sample, now time.Time) map[int64]acco
 	for _, sample := range samples {
 		switch sample.Purpose {
 		case "", types.PurposeScan, types.PurposeDelivery, types.PurposeRenew,
-			types.PurposeInventory, types.PurposeExplore, types.PurposeMintAll:
+			types.PurposeInventory, types.PurposeRecovery, types.PurposeExplore, types.PurposeMintAll:
 		default:
 			continue // Verification and unknown purposes are not mint evidence.
 		}

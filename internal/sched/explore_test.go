@@ -121,10 +121,11 @@ func TestExploreRotatesGlobalCountriesEvenWhenEveryAttemptFails(t *testing.T) {
 }
 
 func TestExploreWithFullInventoryPrefersIncompleteAndNeverExceedsOneShot(t *testing.T) {
-	s, st, mn, _ := rig(t, types.ModePool)
+	s, st, mn, clk := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
+	seedPairs(st, clk) // A full inventory needs tickets, not just known names.
 	cfg := config.Defaults()
-	cfg.SpareTarget = 0 // 明确让库存层零发，下面数的是专门探索。
+	cfg.SpareTarget = 0 // 不追数字储备；已有票充足，下面只数专门探索。
 	cfg.Regions = cfg.RegionDefinitions()
 	for i := range cfg.Regions {
 		cfg.Regions[i].Enabled = cfg.Regions[i].Key == "us-east" || cfg.Regions[i].Key == "us-west"

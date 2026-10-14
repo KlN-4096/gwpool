@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"gwpool/internal/mint"
 	"gwpool/internal/routes"
@@ -106,20 +107,43 @@ func (s *Scheduler) bindRoute(ctx context.Context, a types.Account, exit types.E
 		return ctx, a, "", nil, err
 	}
 	a = current
+	if purpose == types.PurposeRecovery && !s.recoveryCandidateAllowed(a, exit, expected) {
+		return ctx, a, "", nil, errRouteDeferred
+	}
 	sources := s.mint.RouteSources(exit, seed.Cookie != "")
 	if len(sources) == 0 {
 		return ctx, a, "", nil, types.ErrNoExit
 	}
-	// Prefer an actual recent match under the exact source/seed conditions.
-	// Keep the provider's rotation order within equally supported options.
+	// A recent exact match outranks an older recovery clue. Older clues retain
+	// their exact provider, but never become recent evidence or bypass the
+	// shared route hold checked below.
 	states := s.routeStates(s.now())
-	sort.SliceStable(sources, func(i, j int) bool {
-		matches := func(source types.RouteSource) bool {
-			state := states[routes.Key(s.describeRoute(a, exit, source, seed))]
-			return expected != "" && state.Gateway == expected && !state.ObservedAt.IsZero() &&
-				!s.now().Before(state.ObservedAt) && s.now().Sub(state.ObservedAt) < routes.RetryMax
+	historical := map[string]bool{}
+	if expected != "" && seed.Cookie == "" {
+		if reader, ok := s.st.(interface {
+			RecoverySources(time.Time) map[string]types.RecoverySource
+		}); ok {
+			for _, observation := range reader.RecoverySources(s.now()) {
+				if observation.Gateway == expected && routes.RecoveryFresh(observation, s.now()) {
+					historical[routes.Key(observation.Route)] = true
+				}
+			}
 		}
-		return matches(sources[i]) && !matches(sources[j])
+	}
+	rank := func(source types.RouteSource) int {
+		key := routes.Key(s.describeRoute(a, exit, source, seed))
+		state := states[key]
+		if expected != "" && state.Gateway == expected && !state.ObservedAt.IsZero() &&
+			!s.now().Before(state.ObservedAt) && s.now().Sub(state.ObservedAt) < routes.RetryMax {
+			return 2
+		}
+		if historical[key] {
+			return 1
+		}
+		return 0
+	}
+	sort.SliceStable(sources, func(i, j int) bool {
+		return rank(sources[i]) > rank(sources[j])
 	})
 	for _, source := range sources {
 		descriptor := s.describeRoute(a, exit, source, seed)
@@ -141,6 +165,9 @@ func (s *Scheduler) bindRoute(ctx context.Context, a types.Account, exit types.E
 		start := s.now()
 		work := routeWork{attempt: types.RouteAttempt{Route: descriptor, StartedAt: start, Expected: expected, Donor: donorNeeded}}
 		ctx = context.WithValue(ctx, routeWorkKey{}, work)
+		if purpose == types.PurposeRecovery {
+			s.noteRecoveryAttempt(expected, a)
+		}
 		sid, err := s.mint.NewSIDForRoute(exit, source.ID, seed.Cookie != "")
 		if err != nil {
 			attempt := work.attempt

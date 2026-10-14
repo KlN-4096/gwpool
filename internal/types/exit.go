@@ -13,6 +13,7 @@ const (
 	PurposeDelivery  = "delivery"
 	PurposeRenew     = "renew"
 	PurposeInventory = "inventory"
+	PurposeRecovery  = "recovery"
 	PurposeExplore   = "explore"
 	PurposeMintAll   = "mint-all"
 	PurposeVerify    = "verify"

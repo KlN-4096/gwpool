@@ -302,7 +302,7 @@ func TestRecentRouteEvidenceRequiresCurrentIdentityLocationAndSource(t *testing.
 				if len(s.inventoryEvidence()) != 1 {
 					t.Fatal("initial evidence not available")
 				}
-				clk.add(routes.Retention)
+				clk.add(routes.RecoveryRetention)
 			case "future":
 				clk.add(-time.Minute)
 			case "disabled-account":
@@ -353,7 +353,9 @@ func TestBindRoutePrefersOnlyRecentExactSourceMatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Permit rechecking both sources; this test isolates source
-			// preference from temporary low-yield eligibility.
+			// preference from temporary low-yield eligibility and the separate
+			// historical-source tier (covered in recovery_sources_test.go).
+			st.recovery = nil
 			if recent {
 				clk.add(routes.RetryBase)
 			} else {

@@ -2,6 +2,14 @@ package types
 
 import "time"
 
+// RecoverySource remembers one observed bare landing, not a routing guarantee.
+// Identity and source are hashes; no token, cookie or proxy credential is stored.
+type RecoverySource struct {
+	Gateway  string
+	Route    RouteDescriptor
+	LastSeen time.Time
+}
+
 // RegionDonor is private ticket material, stored with the same protection as
 // Pair.Cookie. Diagnostics must only use its expiry and region, never Cflb.
 type RegionDonor struct {

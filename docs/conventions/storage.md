@@ -3,7 +3,7 @@
 - `internal/store` 保存 `state.json`＋`state.wal`（GWPWAL02提交头/序号/CRC）和独立`samples.jsonl`，不使用数据库；关键增量Sync成功才ACK，不再每次重写全快照。
 - 接入Key元数据/撤销/生成防重ID/单调序号及统计汇总走同一snapshot/WAL；生成只存SHA256和尾号，批量管理一次提交、失败回滚，已撤销不可启用，旧上传Key未覆盖策略时默认原权限。
 - 管理员Key最多10000、总策略/统计各20000；IP保留8、显式account摘要64、小时桶168，只有已注册机器API路径计数、不记录请求/响应正文。统计快照深克隆，串行flush且按版本保留写盘期间的新计数，失败不清dirty。
-- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage/external_usage/region_donors/route_states/admin_auth`，strict decoder拒未知字段。先停服务，对一致私有副本用新/旧`-checkpoint-only`验证全部既有字段；回滚必须兼容当前snapshot/WAL，不能恢复旧快照丢ACK数据；不兼容时用识别新字段的修复版。
+- WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage/external_usage/region_donors/route_states/recovery_sources/admin_auth`，strict decoder拒未知字段。snapshot能启动也可能静默丢未知字段；先停服务，对一致私有副本用新/旧`-checkpoint-only`验证全部字段。回滚必须识别当前schema，不能恢复旧快照丢ACK数据。
 - `admin_auth`存WebAuthn公钥凭证及随机会话SHA256，最多32凭证/128会话；Revision条件提交、深克隆、失败还原。已写认证状态后即使退出清空会话也不能降级旧schema，禁止保存原密钥/私钥/原会话令牌。
 - 提交头记录可信结束偏移；已ACK区间缺失/截断/CRC错拒绝启动，只清理提交边界外残尾。写失败截断并还原提交头、Sync后回滚；回滚不确定即冻结写入，不静默续跑。
 - 后台脏快照最多5分钟或WAL≥4MiB触发，显式Checkpoint不节流；锁内克隆、锁外紧凑编码/持久替换、锁内保留并发增量再换WAL。失败保已ACK增量并独立1分钟重试；`checkpoint_failure_test.go`覆盖8处故障，`checkpoint_loop_test.go`覆盖触发/退避/Close前重放。
@@ -12,7 +12,8 @@
 - 历史无凭据占位行的Store写入上限400，与托管500独立；仅保历史存储兼容，不再参与/cookie准入、限频或补货。现行消费不调用AddAccount，不可将这个旧上限重新当成外部成员数量限制。
 - 所有账号出站共用 Store 的账号锁；调度需要同时持锁时先网关、后账号。
 - `Pair.RegionKey`、`MintedBy` 是后续种子和续票的来源信息，不能从网关名或随机出口反推。
-- `CommitMint`在同一Store锁/WAL事务中比较并提交实际Gateway票、独立区域donor和RouteState；任一失败全部回滚，revisions只在成功后推进。原始期限不代表实际可交付期，新旧同合法donor投影保优，迟到短票不盖长票；漂移不能写回原目标。
+- `CommitMint`在同一Store锁/WAL事务中提交实际Gateway票、区域donor、RouteState与RecoverySource；任一失败全回滚，revisions仅成功后推进。原始期限不代表实际可交付期，新旧同合法donor投影保优，迟到短票不盖长票；漂移不能写回原目标。
+- `recovery_sources`仅存成功bare的网关＋身份摘要＋完整请求出口＋source摘要＋原观察时间；独立保留7天/全局4096/每网关16，确定性裁剪，迟到观察不回退时间。启动只迁尚存RouteState的原ObservedAt，不从Pair/Mints或最新账号凭据补造身份，seed/失败不算bare来源。
 - `TicketInventory`同锁克隆Pair/donor供目录与交付共用；donor最多512、只按真实期限裁剪，变化推进Pairs revision。路线最多16384/24h，写入及启动持久回收；同key过期先清零再Advance，不能隐藏后又复活旧退避。迟到观察只累计实际收益，不改较新映射。
 - cookie、凭据、身份串、票号不进诊断输出；运维脚本只输出显式允许的计数、区域、网关和本地账号 ID。
 - 不直接编辑运行中的状态，也不把运行中分别复制的snapshot/WAL当一致备份。旧snapshot-only二进制回滚必须先停新服务，用新binary `-checkpoint-only`重放并落完整最新快照，再保留归档WAL并转换旧快照；不得恢复升级前快照丢新ACK。维护入口没有跨进程锁，严禁在线执行。

@@ -71,12 +71,25 @@ func (s *Store) CommitMint(commit types.MintCommit) (types.MintCommitResult, err
 			delete(change.Routes, dropped)
 		}
 	}
-	if len(change.Pairs)+len(change.Donors)+len(change.DropDonors)+len(change.Routes)+len(change.DropRoutes) == 0 {
+	oldRecovery, nextRecovery := s.st.Recovery, s.st.Recovery
+	if commit.Route != nil {
+		if source, ok := routes.RecoveryObservation(*commit.Route); ok {
+			nextRecovery = cloneMap(oldRecovery)
+			if nextRecovery == nil {
+				nextRecovery = map[string]types.RecoverySource{}
+			}
+			rememberRecovery(nextRecovery, source)
+			routes.PruneRecoverySources(nextRecovery, commit.At)
+			recoveryDelta(oldRecovery, nextRecovery, &change)
+		}
+	}
+	if len(change.Pairs)+len(change.Donors)+len(change.DropDonors)+len(change.Routes)+len(change.DropRoutes)+len(change.Recovery)+len(change.DropRecovery) == 0 {
 		return plan.Result, nil
 	}
 	oldDonors := s.st.Donors
 	s.st.Donors = plan.Donors
 	s.st.Routes = nextRoutes
+	s.st.Recovery = nextRecovery
 	if err := s.save(change); err != nil {
 		if had {
 			s.st.Pairs[commit.Pair.Gateway] = old
@@ -85,6 +98,7 @@ func (s *Store) CommitMint(commit types.MintCommit) (types.MintCommitResult, err
 		}
 		s.st.Donors = oldDonors
 		s.st.Routes = oldRoutes
+		s.st.Recovery = oldRecovery
 		return types.MintCommitResult{}, err
 	}
 	return plan.Result, nil
@@ -179,6 +193,9 @@ func (s *Store) prepareRouteInventory(now time.Time) error {
 			len(donor.Cflb) > 64<<10 || strings.ContainsAny(donor.Cflb, "\r\n;") || donor.ExpiresAt.IsZero() {
 			return errors.New("invalid persisted region donor")
 		}
+	}
+	if err := s.prepareRecoverySources(now); err != nil {
+		return err
 	}
 	oldRoutes, oldDonors := s.st.Routes, s.st.Donors
 	nextRoutes, nextDonors := cloneMap(oldRoutes), cloneMap(oldDonors)

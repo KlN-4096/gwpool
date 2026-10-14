@@ -364,16 +364,19 @@ func (s *Scheduler) runInventory(ctx context.Context, n int, allowBootstrap bool
 }
 
 type inventorySelection struct {
-	gateway   string
-	donor     string
-	bootstrap bool
+	gateway         string
+	donor           string
+	bootstrap       bool
+	recoveryExplore bool
 }
 
 func (s *Scheduler) runInventorySelection(ctx context.Context, n int, selection inventorySelection) int {
 	workers := s.premintWorkers(n)
 	r := &premintRound{want: n, tried: map[string]bool{}, aimed: map[string]bool{},
 		allowBootstrap: selection.bootstrap, selection: selection}
-	r.routing = s.newInventoryRoutingRound()
+	if !selection.recoveryExplore {
+		r.routing = s.newInventoryRoutingRound()
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -498,9 +501,13 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 			}
 		}
 		var seed types.Pair
+		purpose := types.PurposeInventory
+		if r.selection.recoveryExplore {
+			purpose = types.PurposeRecovery
+		}
 		predictionCtx := withInventoryPrediction(ctx, plan.acct.ID, plan.region.Exit, plan.prediction)
 		attemptCtx, selected, sid, releaseRoute, err := s.bindRoute(predictionCtx, plan.acct, plan.region.Exit, seed,
-			plan.expected, types.PurposeInventory, plan.donor)
+			plan.expected, purpose, plan.donor)
 		plan.acct = selected
 		if _, reserved := attemptCtx.Value(routeWorkKey{}).(routeWork); reserved {
 			r.mu.Lock()
@@ -511,13 +518,19 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 		// want 留空避免把有收益的副落点当普通错误；真正的目标留在
 		// routeWork.Expected 中，由共享路线证据单独记录是否命中。
 		if err == nil {
-			got, err = s.mintOnceFor(attemptCtx, plan.acct, plan.region.Exit, sid, seed, "", "", types.PurposeInventory)
+			got, err = s.mintOnceFor(attemptCtx, plan.acct, plan.region.Exit, sid, seed, "", "", purpose)
 		}
 		if releaseRoute != nil {
 			releaseRoute()
 		}
 		unlock()
 		plan.release()
+		if r.selection.recoveryExplore {
+			hit := err == nil && got.pair.Gateway == plan.expected
+			s.opt.Log.Info("缺票新身份探索", "target", plan.expected, "account", plan.acct.ID,
+				"region", plan.region.Key, "landed", got.pair.Gateway,
+				"target_hit", hit, "target_restored", hit && got.gain.CoverageAdded, "err", err)
+		}
 		if !s.premintNote(r, plan, got, err, seed.Cookie != "") {
 			return
 		}
@@ -535,6 +548,9 @@ func (s *Scheduler) premintLoop(ctx context.Context, r *premintRound) {
 // 锁序恒为 r.mu → s.mu，反向不存在：r.mu 只有本文件这几个方法碰，而 minterFor 自己
 // 那把 s.mu 在候选循环**之前**就放掉了（skip 不在它里面跑）。
 func (s *Scheduler) premintPick(r *premintRound) (premintPlan, bool) {
+	if r.selection.recoveryExplore {
+		return s.pickRecoveryExploration(r)
+	}
 	live, landed, seedless := s.liveGateways(), s.lastLandings(), s.seedlessRegions()
 	recovery, recoverable := s.inventoryRoutes()
 	if r.selection.gateway != "" {

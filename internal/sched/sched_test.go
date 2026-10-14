@@ -59,6 +59,7 @@ type fakeStore struct {
 	pairs    map[string]types.Pair
 	donors   map[string]types.RegionDonor
 	routes   map[string]types.RouteState
+	recovery map[string]types.RecoverySource
 	mints    map[string]types.RegionMint // (账号 × 区域) 终身台账，键同 slotKey
 	samples  []types.Sample
 	nextID   int64
@@ -279,6 +280,16 @@ func (f *fakeStore) CommitMint(commit types.MintCommit) (types.MintCommitResult,
 		key := routes.Key(commit.Route.Route)
 		state := routes.Advance(f.routes[key], *commit.Route, plan.Result.Gain)
 		f.routes[key], plan.Result.Route = state, state
+		if source, ok := routes.RecoveryObservation(*commit.Route); ok {
+			if f.recovery == nil {
+				f.recovery = map[string]types.RecoverySource{}
+			}
+			key := routes.RecoveryKey(source)
+			if source.LastSeen.After(f.recovery[key].LastSeen) {
+				f.recovery[key] = source
+			}
+			routes.PruneRecoverySources(f.recovery, commit.At)
+		}
 	}
 	return plan.Result, nil
 }
@@ -290,6 +301,18 @@ func (f *fakeStore) RouteStates(now time.Time) map[string]types.RouteState {
 	for key, state := range f.routes {
 		if now.Before(state.LastAttempt.Add(routes.Retention)) {
 			out[key] = state
+		}
+	}
+	return out
+}
+
+func (f *fakeStore) RecoverySources(now time.Time) map[string]types.RecoverySource {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]types.RecoverySource{}
+	for key, source := range f.recovery {
+		if routes.RecoveryFresh(source, now) {
+			out[key] = source
 		}
 	}
 	return out
@@ -2157,7 +2180,9 @@ func TestPremintRefillsSeedlessRegionsFirst(t *testing.T) {
 		Live: liveCfg(func(c *config.Config) { c.SpareTarget = len(types.Regions) })})
 	s.markDemand()
 
-	s.maintainInventory(context.Background())
+	// Isolate normal route/seed priority. Periodic recovery can now use one
+	// remaining task for a new identity after this historical route drifts.
+	s.runMaintenance(context.Background(), false)
 	want := fmt.Sprintf("unified-n%d", len(types.Regions)-1)
 	if got := mn.mintedGateways(); len(got) != 1 || got[0] != want {
 		t.Fatalf("该先补没种子的 %s（落点 %s），实际打了 %v", seedless.Key, want, got)
@@ -2348,16 +2373,17 @@ func TestPremintRefillsCombosWhosePairExpired(t *testing.T) {
 	}
 }
 
-// F 条：spare_target=0 就是「全按需，一发预铸都不打」。
-func TestSpareTargetZeroDisablesPremint(t *testing.T) {
+// Numeric reserve zero does not erase an established pool's known missing stock.
+func TestSpareTargetZeroStillRepairsKnownMissingGateway(t *testing.T) {
 	s, st, mn, _ := rig(t, types.ModePool)
 	addAccount(st, 2, "acct-2")
 	s.opt.Live = liveCfg(func(c *config.Config) { c.SpareTarget = 0 })
 	s.markDemand()
 
 	s.maintainInventory(context.Background())
-	if n := len(mn.mintedGateways()); n != 0 {
-		t.Fatalf("spare_target=0 还预铸了 %d 发", n)
+	if n := len(mn.mintedGateways()); n != 1 || len(st.samples) != 1 ||
+		st.samples[0].Purpose != types.PurposeRecovery || st.samples[0].Route.Target != "unified-1" {
+		t.Fatalf("零储备下已知缺票应限额恢复，而不是追数字目标：mints=%d", n)
 	}
 }
 

@@ -2468,6 +2468,8 @@ func samplePurpose(value string) string {
 		return "定向续票"
 	case types.PurposeInventory:
 		return "库存补铸"
+	case types.PurposeRecovery:
+		return "缺票新身份探索"
 	case types.PurposeMintAll:
 		return "全量打票"
 	case types.PurposeVerify:

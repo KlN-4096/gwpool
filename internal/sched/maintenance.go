@@ -190,7 +190,6 @@ func (s *Scheduler) runMaintenance(ctx context.Context, allowBootstrap bool) {
 		if pending > 0 {
 			s.opt.Log.Info("已知缺票等待恢复路线", "gateways", pending)
 		}
-		return
 	}
 	round := &maintenanceRound{tasks: tasks}
 	var workers sync.WaitGroup
@@ -209,6 +208,11 @@ func (s *Scheduler) runMaintenance(ctx context.Context, allowBootstrap bool) {
 		}()
 	}
 	workers.Wait()
+	// Normal recovery/renewal must finish first. This is not a thirteenth
+	// maintenance task, nor an extra opportunity on a consumer wake.
+	if allowBootstrap && round.attempted < maintenanceTasksPerRound {
+		round.attempted += s.exploreRecovery(ctx)
+	}
 	if round.attempted > 0 {
 		s.logInventorySnapshot("after")
 	}

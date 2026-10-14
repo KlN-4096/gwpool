@@ -1,5 +1,11 @@
 # 开发日志
 
+## 2026-10-14 — 多来源恢复与有界新身份探索（仅本地）
+- 增加有界持久裸铸来源，A→B漂移仍保A；旧来源按完整provider/身份/出口参与恢复，普通维护后每15分钟至多一新身份任务，共用原12任务/配额/退避，不改429或消费协议。
+- 两个原始最小复现先红；独立审查另复现并修复provider偏好丢失、短票命中误报恢复，第二轮无剩余blocker/should-fix。覆盖迁移/重放/失败回滚、别名/轮换、锁后变更、旧源优先、预算/hold及短票。
+- 全量`go test -p 2 -timeout 60s ./...`通过（sched4.593s/store6.850s/httpapi4.806s）；定向lint因现有工具不支持Go1.27导出格式失败，未更改全局工具。未推送部署，未以离线测试宣称线上109补齐。
+- 发布需新增schema兼容/回滚守卫，旧binary能读snapshot不等于保留`recovery_sources`；生产配置与数据未触碰。
+
 ## 2026-10-14 — 账号 Key 关联已推送上线
 - `fcf5ce2897a3`已推main并从精确commit构建，SHA`d725ce3a765e2ac6edacb2c6290a3baac9f19867d2d582b4003ef15e5fbaf260`，04:36:25Z部署bytevirt；冷备`/opt/gwpool/backup-route-aware-fcf5ce2897a3`，新旧私有副本并行重放全部字段一致，配置与最新WAL保留。
 - 源站root/keys/detail/owner/account均200、未授权keys401；抽查141账号在列表/详情/Owner一致，分类与身份Cookie隔离正常；两服务active、ERROR0、自然交付16，无主动取票/上游探针。本轮未做公网浏览器验收。

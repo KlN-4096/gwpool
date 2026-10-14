@@ -60,6 +60,8 @@ type stateChange struct {
 	DropDonors        []string                                   `json:"drop_region_donors,omitempty"`
 	Routes            map[string]types.RouteState                `json:"route_states,omitempty"`
 	DropRoutes        []string                                   `json:"drop_route_states,omitempty"`
+	Recovery          map[string]types.RecoverySource            `json:"recovery_sources,omitempty"`
+	DropRecovery      []string                                   `json:"drop_recovery_sources,omitempty"`
 	Attempts          map[string]map[string]types.CountryAttempt `json:"attempts,omitempty"`
 	ReplaceAttempts   bool                                       `json:"replace_attempts,omitempty"`
 	Contacts          []types.ContactReport                      `json:"contacts,omitempty"`
@@ -78,6 +80,7 @@ type reportKey struct {
 type Revisions struct {
 	Accounts, Owners, Gateways, Slots, Pairs, Mints, Contacts, Cooldowns uint64
 	Routes                                                               uint64
+	Recovery                                                             uint64
 }
 
 func (s *Store) Revisions() Revisions {
@@ -113,6 +116,9 @@ func (s *Store) noteChange(c stateChange) {
 	}
 	if len(c.Routes)+len(c.DropRoutes) > 0 {
 		s.revisions.Routes++
+	}
+	if len(c.Recovery)+len(c.DropRecovery) > 0 {
+		s.revisions.Recovery++
 	}
 	if len(c.Contacts)+len(c.DropContacts) > 0 {
 		s.revisions.Contacts++
@@ -467,6 +473,15 @@ func applyChange(state *State, change stateChange) {
 	for key, route := range change.Routes {
 		state.Routes[key] = route
 	}
+	if len(change.Recovery) > 0 && state.Recovery == nil {
+		state.Recovery = map[string]types.RecoverySource{}
+	}
+	for _, key := range change.DropRecovery {
+		delete(state.Recovery, key)
+	}
+	for key, source := range change.Recovery {
+		state.Recovery[key] = source
+	}
 	if (state.CountryAttempts == nil && len(change.Attempts) > 0) || change.ReplaceAttempts {
 		state.CountryAttempts = map[string]map[string]types.CountryAttempt{}
 	}
@@ -683,6 +698,7 @@ func cloneState(state State) State {
 	state.Pairs = cloneMap(state.Pairs)
 	state.Donors = cloneMap(state.Donors)
 	state.Routes = cloneMap(state.Routes)
+	state.Recovery = cloneMap(state.Recovery)
 	state.Mints = cloneMap(state.Mints)
 	state.CountryAttempts = cloneMap(state.CountryAttempts)
 	for key, countries := range state.CountryAttempts {

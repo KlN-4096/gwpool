@@ -54,6 +54,29 @@ func (s *Scheduler) inventoryEvidence() []inventoryRoute {
 		}
 	}
 	known, now := s.st.Gateways(), s.now()
+	addObservation := func(descriptor types.RouteDescriptor, gateway string) {
+		if _, exists := known[gateway]; !exists {
+			return
+		}
+		for _, region := range available[routeLocation{source: descriptor.Source, exit: descriptor.Exit}] {
+			for _, account := range accounts[descriptor.Identity] {
+				key := comboKey(account.ID, region.Key) + "|" + gateway
+				if !seen[key] {
+					seen[key] = true
+					out = append(out, inventoryRoute{account: account.ID, region: region.Key, gateway: gateway})
+				}
+			}
+		}
+	}
+	if reader, ok := s.st.(interface {
+		RecoverySources(time.Time) map[string]types.RecoverySource
+	}); ok {
+		for _, source := range reader.RecoverySources(now) {
+			if source.Route.Mode == routes.Bare && routes.RecoveryFresh(source, now) {
+				addObservation(source.Route, source.Gateway)
+			}
+		}
+	}
 	for _, state := range s.routeStates(now) {
 		if state.Route.Mode != routes.Bare || state.Gateway == "" || state.ObservedAt.IsZero() ||
 			now.Before(state.ObservedAt) || now.Sub(state.ObservedAt) >= routes.Retention {
@@ -62,18 +85,7 @@ func (s *Scheduler) inventoryEvidence() []inventoryRoute {
 		// Older observations remain limited-recheck clues, not recent source
 		// preferences. bindRoute uses RetryMax for positive preference and
 		// rechecks the route's shared NextCheck before spending any attempt.
-		if _, exists := known[state.Gateway]; !exists {
-			continue
-		}
-		for _, region := range available[routeLocation{source: state.Route.Source, exit: state.Route.Exit}] {
-			for _, account := range accounts[state.Route.Identity] {
-				key := comboKey(account.ID, region.Key) + "|" + state.Gateway
-				if !seen[key] {
-					seen[key] = true
-					out = append(out, inventoryRoute{account: account.ID, region: region.Key, gateway: state.Gateway})
-				}
-			}
-		}
+		addObservation(state.Route, state.Gateway)
 	}
 	return out
 }

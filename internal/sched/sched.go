@@ -215,7 +215,8 @@ type Scheduler struct {
 	backgroundMu        sync.Mutex // 自动保温与管理员全量队列共享后台并发预算。
 	maintenanceFirst    bool       // backgroundMu 保护；交替优先，探索与续票互不长期挤掉机会。
 	nextExploration     time.Time  // backgroundMu 保护；只限制专门探索机会，不限制维护。
-	exploreRegionCursor int        // mu保护；按尝试轮转，不因失败或小时配额重置而回到首国。
+	recoveryExploration recoveryExplorationState
+	exploreRegionCursor int // mu保护；按尝试轮转，不因失败或小时配额重置而回到首国。
 	mu                  sync.Mutex
 	routesInFlight      map[string]bool
 	// lastMintedAt 记每个账号最近一次被用作铸票者，用来把铸票摊到各个号上。
