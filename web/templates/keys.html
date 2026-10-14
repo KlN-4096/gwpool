@@ -31,17 +31,18 @@
     <form method="post" action="{{.ListURL}}" id="key-batch">
       <input type="hidden" name="source" value="{{.Source}}">
       <div class="table-wrap"><table class="keys-table">
-        <thead><tr><th class="key-check"><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>名称 / 标识</th><th>状态</th>{{if .IsAdminSource}}<th>限额</th>{{end}}<th class="key-number">近 60 秒</th><th class="key-number">累计请求</th><th>最后请求 <small data-key-timezone>UTC</small></th><th><span class="key-sr-only">详情</span></th></tr></thead>
+        <thead><tr><th class="key-check"><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>名称 / 标识</th><th>状态</th>{{if eq .Source "upload"}}<th class="key-number">上传账号数</th>{{end}}{{if .IsAdminSource}}<th>限额</th>{{end}}<th class="key-number">近 60 秒</th><th class="key-number">累计请求</th><th>最后请求 <small data-key-timezone>UTC</small></th><th><span class="key-sr-only">详情</span></th></tr></thead>
         <tbody>{{range .Rows}}<tr data-key-row>
           <td class="key-check">{{if .Editable}}<input type="checkbox" name="ids" value="{{.Key.ID}}" aria-label="选择 {{.Key.Label}}">{{else}}<span class="key-muted" title="不可操作">—</span>{{end}}</td>
           <td class="key-identity"><div class="key-identity-inner"><span class="key-avatar" aria-hidden="true">{{template "key-icon"}}</span><div><a class="key-name" href="{{.DetailURL}}" data-key-detail>{{.Key.Label}}</a><div class="key-subline"><span class="key-source key-source-{{.Key.Source}}">{{.Source}}</span><span class="key-mask">{{.Mask}}</span></div></div></div></td>
           <td><span class="key-status key-status-{{.Status}}"><i aria-hidden="true"></i>{{.StatusText}}</span></td>
+          {{if eq $.Source "upload"}}<td class="key-number">{{template "key-uploaded-accounts" .}}</td>{{end}}
           {{if $.IsAdminSource}}<td><span class="key-limit">{{.LimitBrief}}</span><small class="key-secondary">{{.LimitHint}}</small></td>{{end}}
           <td class="key-number"><strong>{{.Metrics.RPM}}</strong><small class="key-secondary">在途 {{.Metrics.Active}}</small></td>
           <td class="key-number"><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small class="key-secondary">2xx · {{.Metrics.Usage.Totals.OK}}</small></td>
           <td class="key-date"><time data-key-last-time="{{.LastISO}}"{{if .LastISO}} datetime="{{.LastISO}}"{{end}}><span data-key-clock>{{.LastClock}}</span><small class="key-secondary" data-key-date>{{.LastDate}}</small></time></td>
           <td><a class="key-row-open" href="{{.DetailURL}}" data-key-detail aria-label="查看 {{.Key.Label}} 详情">↗</a></td>
-        </tr>{{else}}<tr><td colspan="{{if .IsAdminSource}}8{{else}}7{{end}}"><div class="keys-empty">{{template "key-icon"}}<h3>没有匹配的 {{.SourceLabel}}</h3><p>试试调整当前分类的筛选条件{{if .IsAdminSource}}，或生成一把新的 Key{{end}}。</p><a href="/admin/keys?source={{.Source}}">清除筛选</a></div></td></tr>{{end}}</tbody>
+        </tr>{{else}}<tr><td colspan="{{if or .IsAdminSource (eq .Source "upload")}}8{{else}}7{{end}}"><div class="keys-empty">{{template "key-icon"}}<h3>没有匹配的 {{.SourceLabel}}</h3><p>试试调整当前分类的筛选条件{{if .IsAdminSource}}，或生成一把新的 Key{{end}}。</p><a href="/admin/keys?source={{.Source}}">清除筛选</a></div></td></tr>{{end}}</tbody>
       </table></div>
       <div id="key-batchbar" class="key-batchbar">
         <span id="key-selection-count" role="status">勾选 Key 后批量操作</span>
@@ -52,7 +53,7 @@
     </form>
     <footer class="keys-pagination"><span>筛选命中 {{.Matched}} / {{.Total}}<span class="key-pagination-extra"> · 每页 50 条</span></span><div>{{if .Previous}}<a class="btn sm" href="{{.Previous}}" aria-label="上一页">←</a>{{end}}<span>第 {{.Page}} / {{.Pages}} 页</span>{{if .Next}}<a class="btn sm" href="{{.Next}}" aria-label="下一页">→</a>{{end}}</div></footer>
   </section>
-  <div class="keys-foot"><span>列表与统计仅限{{.SourceLabel}}</span><details><summary>统计口径与说明</summary><p>统计覆盖当前分类的七个机器 API，从本功能启用后开始累计；HTTP 成功不代表模型能力或满血。票数仅记完整响应写入成功，不保证客户端收到。近 60 秒 / 5 分钟为秒桶近似且重启清空；累计与小时数据每 30 秒保存，正常关闭补存，异常退出可能丢失尚未保存的统计。未知错误 Key 不归因，公共 Key 和根管理员 Key 不在此列表。</p></details></div>
+  <div class="keys-foot"><span>列表与统计仅限{{.SourceLabel}}</span><details><summary>统计口径与说明</summary>{{if eq .Source "upload"}}<p>上传账号数按当前归属且仍存在的账号计数，包含停用、过期账号；已删除不计，重复上传更新不重复计数。点击数量进入账号列表，再点击具体账号的信息页。</p>{{end}}<p>统计覆盖当前分类的七个机器 API，从本功能启用后开始累计；HTTP 成功不代表模型能力或满血。票数仅记完整响应写入成功，不保证客户端收到。近 60 秒 / 5 分钟为秒桶近似且重启清空；累计与小时数据每 30 秒保存，正常关闭补存，异常退出可能丢失尚未保存的统计。未知错误 Key 不归因，公共 Key 和根管理员 Key 不在此列表。</p></details></div>
 </div>
 
 {{if .IsAdminSource}}
@@ -91,7 +92,7 @@
   <header class="key-panel-heading"><div><span class="key-eyebrow">{{.Source}} · {{.Key.ID}}</span><h2 id="key-detail-title">{{.Key.Label}}</h2><p><span class="key-status key-status-{{.Status}}"><i aria-hidden="true"></i>{{.StatusText}}</span><span class="key-mask">{{.Mask}}</span></p></div><a class="key-close" href="{{$.ListURL}}" data-key-close aria-label="关闭详情">×</a></header>
   <div class="key-panel-body">
     <div class="key-detail-stats"><div><span>近 60 秒</span><strong>{{.Metrics.RPM}}</strong><small>5 分钟 {{.Metrics.FiveMinutes}} 次</small></div><div><span>累计请求</span><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small>在途 {{.Metrics.Active}}</small></div><div><span>成功写出票</span><strong>{{.Metrics.Usage.Totals.Tickets}}</strong><small>HTTP 2xx {{.Metrics.Usage.Totals.OK}}</small></div></div>
-    <dl class="key-facts"><div><dt>归属</dt><dd>{{.Owner}}</dd></div><div><dt>访问限额</dt><dd>{{.Limits}}</dd></div><div><dt>创建时间</dt><dd>{{.Created}} UTC</dd></div><div><dt>最后请求</dt><dd><time data-key-last-time="{{.LastISO}}" data-key-full-time{{if .LastISO}} datetime="{{.LastISO}}"{{end}}>{{.Last}}</time> <span data-key-timezone>UTC</span></dd></div></dl>
+    <dl class="key-facts"><div><dt>归属</dt><dd>{{.Owner}}</dd></div>{{if eq .Key.Source "upload"}}<div><dt>上传账号数</dt><dd>{{template "key-uploaded-accounts" .}}</dd></div>{{end}}<div><dt>访问限额</dt><dd>{{.Limits}}</dd></div><div><dt>创建时间</dt><dd>{{.Created}} UTC</dd></div><div><dt>最后请求</dt><dd><time data-key-last-time="{{.LastISO}}" data-key-full-time{{if .LastISO}} datetime="{{.LastISO}}"{{end}}>{{.Last}}</time> <span data-key-timezone>UTC</span></dd></div></dl>
     {{if .Key.Note}}<div class="key-detail-note"><span>备注</span><p>{{.Key.Note}}</p></div>{{end}}
     {{if .Editable}}<details class="key-detail-section" id="key-edit"><summary>编辑 Key <span>名称、备注{{if .AdminIssued}}与限额{{end}}</span></summary>
       <form method="post" action="{{$.ListURL}}" class="key-form">
@@ -123,3 +124,5 @@
 {{end}}
 
 {{define "key-icon"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8.5" cy="8.5" r="4.5"/><path d="m12 12 8 8m-3-3 3-3m-6 0 3-3"/></svg>{{end}}
+
+{{define "key-uploaded-accounts"}}{{if .AccountsURL}}<a href="{{.AccountsURL}}" aria-label="查看 {{.Key.Label}} 的 {{.UploadedAccounts}} 个上传账号">{{.UploadedAccounts}} 个</a>{{else}}<span class="key-muted">{{.UploadedAccounts}} 个</span>{{end}}{{end}}

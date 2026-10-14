@@ -26,6 +26,8 @@ type managedKeyRow struct {
 	Key                                             types.AccessKey
 	Source, Status, StatusText, Mask, Owner, Limits string
 	Created, Last, DetailURL                        string
+	UploadedAccounts                                int
+	AccountsURL                                     string
 	Metrics                                         keyMetricView
 	Editable, AdminIssued                           bool
 }
@@ -113,6 +115,8 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 	active := map[string]bool{}
 	owners := map[string]string{}
 	masks := map[string]string{}
+	accountCounts := map[int64]int{}
+	accountURLs := map[string]string{}
 	for _, owner := range s.st.Owners() {
 		id := types.AccessKeyID(types.AccessKeyUpload, owner.ID)
 		keys[id] = types.AccessKey{ID: id, Source: types.AccessKeyUpload, SubjectID: owner.ID, Label: owner.Label, CreatedAt: owner.CreatedAt}
@@ -120,11 +124,18 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 		secret := s.OwnerKeyFor(owner)
 		active[id] = ready && secret != ""
 		owners[id] = fmt.Sprintf("上传者 #%d · %s", owner.ID, owner.Label)
+		if owner.Token != "" {
+			accountURLs[id] = "/u/" + url.PathEscape(owner.Token)
+		}
 		if len(secret) >= 6 {
 			masks[id] = "gwp_a_…" + secret[len(secret)-6:]
 		}
 	}
 	for _, account := range s.st.Accounts() {
+		// Count current ownership, not active credentials or request account hashes.
+		if account.OwnerID != 0 {
+			accountCounts[account.OwnerID]++
+		}
 		if !account.LegacyConsumerKey {
 			continue
 		}
@@ -160,6 +171,10 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 			Created: keyTime(key.CreatedAt), Last: keyTime(metrics[id].Usage.LastAt),
 			DetailURL: "/admin/keys?key=" + url.QueryEscape(id), AdminIssued: key.Source == types.AccessKeyAdmin}
 		row.Source = keySourceLabel(key.Source)
+		if key.Source == types.AccessKeyUpload {
+			row.UploadedAccounts = accountCounts[key.SubjectID]
+			row.AccountsURL = accountURLs[id]
+		}
 		row.LastDate, row.LastClock = "尚无请求", "—"
 		if !row.Metrics.Usage.LastAt.IsZero() {
 			row.LastISO = row.Metrics.Usage.LastAt.UTC().Format(time.RFC3339)

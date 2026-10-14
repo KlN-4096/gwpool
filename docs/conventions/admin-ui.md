@@ -4,6 +4,7 @@
 - `admin_auth.go/admin_passkey.go`固定配置origin/RP、必需用户验证、5分钟一次性挑战与新增/移除前新鲜验证；会话仅存摘要，退出/过期/删除关联Passkey/管理员密钥或公共地址变化均失效。只在持久提交成功后发Cookie。
 - 认证读体限64KiB/10秒，必须在认证锁外；挑战消费/校验/提交与退出同锁，CeremonyHash撤销迟到登录。反代限流仅显式信任loopback且Caddy覆盖的单IP X-Real-IP；管理员页Referrer-Policy保留同源表单Origin，不能放宽接受Origin:null。
 - `/admin/keys`只用管理员鉴权；账号Key(upload，默认)/凭证Key(legacy，旧版兼容)/管理员生成Key(admin)三个互斥页签，统计和搜索/分页/详情都按来源隔离，无全部混合列表；生成入口与独立限额列仅admin可见。
+- 仅upload列表/详情显示上传账号数：按当前OwnerID计现存账号，含停用/过期，已删不计、重传不重复；与HTTP account摘要数分离。数量链接复用`/u/{token}`→`/a/{view_token}`，来源已移除不造死链，不加Key抽屉拦截属性；回归`keys_accounts_test.go`。
 - 同源POST批量先校验全部ID同来源，显式来源不匹配/跨类拒绝后才调用原子更新；缺source旧表单只允许推导单一来源，旧详情链接按KeyID推导。返回链接保分类和筛选，生成结果固定admin；撤销需确认且不可恢复，不影响上传凭据本身。
 - Key主屏只放紧凑统计/筛选/列表，生成与一次性结果用dialog、详情/编辑用右侧drawer；未选中隐藏批量条，撤销确认冻结本页所选ID。无JS/无dialog保留原生表单与详情链接；专属控件不交给layout通用`data-js`显示。
 - 详情只GET原鉴权页面，abort＋版本号拒迟到响应，关闭恢复焦点；列表/分页URL去掉`key`以免重开已关闭详情。页级表格显式覆盖通用1%列宽；屏幕阅读器隐藏标签需固定绝对位置，不能从横向表格泄出页面宽度。
