@@ -10,6 +10,7 @@
 - `TestDashboardSettingsFixture`可通过`GWPOOL_PREVIEW_DIR`输出假数据HTML供本地静态预览；不要用生产凭据做截图或表单测试。
 - Windows 原生 Go 构建和测试；并发限定 `-p 2`，测试使用 `-timeout 60s`，不跑 `-race`。
 - 同schema部署在停服冷备的两个独立目录并行跑旧/新checkpoint-only，仍要求全字段相等；串行重放可能跨过路线24h过期点并多一次journal_sequence，不能忽略字段放行。失败恢复旧binary但保最新WAL；重试用独立备份目录，不覆盖失败证据。
+- recovery_sources升级从冷备完整已提交WAL还原剪枝前RouteState，独立核验7天/4096/每网关16、完整descriptor/原时间和精确hash；新旧并行checkpoint仅允许确证非空迁移多一次sequence，其余字段全等。发布先将candidate固定到私有备份并核SHA，安装后启动前再核SHA；异常仅输出类型，禁止凭据随header错误进入traceback。新schema已写时禁止旧版回滚，即使新快照为空也须旧reader接受原始最新WAL。
 - 小改先跑定向用例；涉及共享铸票/调度行为时运行 `go test -p 2 -timeout 60s ./...`，再 lint。
 - 上传者/管理账号卡片的铸票尝试、获票次数及最近成功时间只读样本，不读旧消费Slot/Via。`owner_mint_test.go`覆盖非200/空落点/明确失败不计成功、验票排除、结构化漂移/no_gain、历史无Route、乱序/缺时/未来与owner隔离；不得把HTTP200或客户端交付当作铸票成功。`GWPOOL_OWNER_MINT_PREVIEW_DIR`导出假页面验收。
 - 路线维护回归见`routes/route_test.go`、`store/inventory_test.go`、`sched/route_inventory_test.go`及`expiry_test.go`；现票契约仍由HTTP/consumer测试覆盖。收益来自原子提交，缺票快照不是请求样本；必须覆盖同值cflb延寿、过期同key、unknown-member刷新和bare→seed无额外尝试。
