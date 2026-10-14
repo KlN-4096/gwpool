@@ -1,0 +1,22 @@
+# Local routing experiments; excluded from normal production builds.
+/cmd/routing-study/
+/internal/mint/routing_study.go
+/internal/mint/routing_study_test.go
+/docs/routing-research-findings.md
+
+# Existing local task notes only; new task notes remain visible to Git.
+/docs/tasks/admin-passkey-20261012.md
+/docs/tasks/delivery-performance-20261005.md
+/docs/tasks/embedded-reauth-20261009.md
+/docs/tasks/expired-credential-refresh-20261009.md
+/docs/tasks/gateway-cluster-research-20261007.md
+/docs/tasks/integration-guide-20261013.md
+/docs/tasks/managed-access-keys-20261007.md
+/docs/tasks/performance-20261012.md
+/docs/tasks/route-aware-inventory-20261010.md
+/docs/tasks/routing-optimization-20261005.md
+
+# Existing generated previews and test binary.
+/docs/admin-settings-preview.png
+/docs/pool-dashboard-preview.png
+/httpapi.test.exe

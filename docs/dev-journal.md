@@ -1,5 +1,10 @@
 # 开发日志
 
+## 2026-10-14 — 账号 Key 关联已推送上线
+- `fcf5ce2897a3`已推main并从精确commit构建，SHA`d725ce3a765e2ac6edacb2c6290a3baac9f19867d2d582b4003ef15e5fbaf260`，04:36:25Z部署bytevirt；冷备`/opt/gwpool/backup-route-aware-fcf5ce2897a3`，新旧私有副本并行重放全部字段一致，配置与最新WAL保留。
+- 源站root/keys/detail/owner/account均200、未授权keys401；抽查141账号在列表/详情/Owner一致，分类与身份Cookie隔离正常；两服务active、ERROR0、自然交付16，无主动取票/上游探针。本轮未做公网浏览器验收。
+- 经用户确认，`.gitignore`仅忽略已列出的本地研究、十份旧任务笔记、两张预览图及测试exe；已跟踪的SPEC/journal原有研究修改保留，不用skip-worktree/assume-unchanged隐藏，不忽略未来新任务文件。
+
 ## 2026-10-14 — 账号 Key 关联上传账号
 - 经确认在upload列表/详情显示当前归属账号数，复用现有Owner总览和单账号信息页；同次Accounts遍历计数，不改上传/鉴权/存储。
 - 覆盖停用/过期、重传去重、删除、空Owner/已移除来源、跨归属及分类隔离，与请求account摘要数分离；定向Go测试1.113s、Key前端5项通过。
