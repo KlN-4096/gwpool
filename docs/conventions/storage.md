@@ -11,7 +11,7 @@
 - `State` 顶层 JSON 键是小写；`types.Pair` 等嵌套结构使用 Go 字段名，如 `RegionKey`、`MintedBy`。
 - 历史无凭据占位行的Store写入上限400，与托管500独立；仅保历史存储兼容，不再参与/cookie准入、限频或补货。现行消费不调用AddAccount，不可将这个旧上限重新当成外部成员数量限制。
 - 所有账号出站共用 Store 的账号锁；调度需要同时持锁时先网关、后账号。
-- `Pair.RegionKey`、`MintedBy` 是后续种子和续票的来源信息，不能从网关名或随机出口反推。
+- `Pair.RegionKey`、`MintedBy` 是后续种子和续票的来源信息，不能从网关名或随机出口反推。`Pair.MintExit`保存当前保留oailb的IANA时区与Geo观测时刻，只有粘性配对且时区合法才填写；旧票/缺数据/非粘性seed保持未知，随同Pair事务保存/回滚，换cflb donor不得改来源；新增嵌套schema不能向旧reader无损降级。
 - `CommitMint`在同一Store锁/WAL事务中提交实际Gateway票、区域donor、RouteState与RecoverySource；任一失败全回滚，revisions仅成功后推进。原始期限不代表实际可交付期，新旧同合法donor投影保优，迟到短票不盖长票；漂移不能写回原目标。
 - `recovery_sources`仅存成功bare的网关＋身份摘要＋完整请求出口＋source摘要＋原观察时间；独立保留7天/全局4096/每网关16，确定性裁剪，迟到观察不回退时间。启动只迁尚存RouteState的原ObservedAt，不从Pair/Mints或最新账号凭据补造身份，seed/失败不算bare来源。
 - `TicketInventory`同锁克隆Pair/donor供目录与交付共用；donor最多512、只按真实期限裁剪，变化推进Pairs revision。路线最多16384/24h，写入及启动持久回收；同key过期先清零再Advance，不能隐藏后又复活旧退避。迟到观察只累计实际收益，不改较新映射。

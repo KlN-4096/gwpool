@@ -150,5 +150,6 @@ func (s *Scheduler) deliverExternal(ctx context.Context, member string, req Requ
 		Gateway: req.Gateway, Region: pair.RegionKey, Cookie: pair.Cookie,
 		ExpiresAt: pair.ExpiresAt, ValidForS: int(pair.ExpiresAt.Sub(s.now()).Seconds()),
 		VerifiedFull: false,
+		MintExit:     pair.MintExit,
 	}, nil
 }

@@ -59,12 +59,13 @@ type Exit struct {
 // Observed 是一次请求实际用到的出口地理，由 ipinfo 查得。
 // 一切统计都按它来，不按 Exit。
 type Observed struct {
-	IP      string
-	Country string
-	State   string
-	City    string
-	ASN     string
-	ISP     string
+	IP       string
+	Country  string
+	State    string
+	City     string
+	ASN      string
+	ISP      string
+	Timezone string `json:",omitempty"` // Optional IANA name from the same Geo response.
 }
 
 // Region 是一个区域及其代表出口。
@@ -388,6 +389,13 @@ type Slot struct {
 	PrevDeliverVersion string
 }
 
+// ExitTimezoneObservation is optional metadata from a paired Geo/mint request.
+// It never identifies the gateway datacenter or a consumer's current network.
+type ExitTimezoneObservation struct {
+	Timezone   string
+	ObservedAt time.Time
+}
+
 // Pair 是池子里一张活的路由 cookie。
 //
 // 寿命看 PairLifetime（= 钉路由那个 __cflb 的 Max-Age），不是 __oailb 的 3900 s。
@@ -431,6 +439,8 @@ type Pair struct {
 	// 当前种子续票只认配置中保留的稳定 key，并用本字段选择逻辑区域；不能从网关的
 	// ReachableExits 随机反推，否则会把新票和配额记到另一区。
 	RegionKey string
+	// Provenance follows the retained oailb, never a replacement cflb donor.
+	MintExit ExitTimezoneObservation `json:",omitzero"`
 }
 
 // CookieVersionLen 是 cookie_version 的长度（十六进制字符数）。
@@ -633,4 +643,7 @@ type Delivery struct {
 	ExpiresAt    time.Time `json:"expires_at"`
 	ValidForS    int       `json:"valid_for_s"`
 	VerifiedFull bool      `json:"verified_full"`
+	// Carry the exact selected pair's provenance to the HTTP response builder;
+	// rereading the gateway's current inventory after selection would race.
+	MintExit ExitTimezoneObservation `json:"-"`
 }

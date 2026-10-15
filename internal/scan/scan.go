@@ -212,10 +212,14 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 		return recordFailure("", types.Observed{}, err)
 	}
 	var obs types.Observed
+	var mintExit types.ExitTimezoneObservation
 	// 非粘性出口每连接换 IP，查到的地理不是铸票那一发的，宁可留空也不记一个假的。
 	if s.Mint.Sticky(sid) {
 		if obs, err = s.Mint.Geo(ctx, r.Exit, sid); err != nil {
 			return recordFailure(sid, obs, fmt.Errorf("查 geo: %w", err))
+		}
+		if obs.Timezone != "" {
+			mintExit = types.ExitTimezoneObservation{Timezone: obs.Timezone, ObservedAt: time.Now().UTC()}
 		}
 		if !geography.Supported(obs.Country) {
 			return recordFailure(sid, obs, types.ErrUnsupportedCountry)
@@ -329,6 +333,7 @@ func (s *Scanner) attempt(ctx context.Context, acct types.Account, r types.Regio
 			ExpiresAt:     route,
 			CflbExpiresAt: cflb,
 			MintedBy:      acct.ID,
+			MintExit:      mintExit,
 			// 和上面那条区域台账、那条样本同一个口径：这一发是从 r.Exit 出去的，
 			// 它的区域就是 r.Key。漏了它的那一版（到 2026-10-03）让扫描铸出来的票
 			// 整片没有大区 ⇒ 消费端收到空 RegionKey、九宫格画成「未归类」

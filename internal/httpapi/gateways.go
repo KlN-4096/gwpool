@@ -59,6 +59,7 @@ func (s *Server) writeCatalogFor(w http.ResponseWriter, r *http.Request, upstrea
 		out.Live++
 		it := gatewayCatalogRow{Name: name, PairReady: true, ValidForS: int(left.Seconds()), Contacts: contactStats[name]}
 		it.DatacenterCountry = coverage.DatacenterCountry(name)
+		it.gatewayTimezones = timezonesForTicket(name, p.MintExit)
 		if priority, ok := priorities[name]; ok {
 			it.Priority = &priority
 		}

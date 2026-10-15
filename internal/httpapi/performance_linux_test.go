@@ -85,6 +85,7 @@ func (*mixFakeMinter) NewSIDForRoute(_ types.Exit, source string, seed bool) (st
 	return "bare:" + source, nil
 }
 func (*mixFakeMinter) SeedBound(sid string) bool { return strings.HasPrefix(sid, "seed:") }
+func (m *mixFakeMinter) Sticky(sid string) bool  { return !m.SeedBound(sid) }
 func (m *mixFakeMinter) RouteSource(sid string) types.RouteSource {
 	for _, s := range m.sources[m.SeedBound(sid)] {
 		if strings.HasSuffix(sid, s.ID) {

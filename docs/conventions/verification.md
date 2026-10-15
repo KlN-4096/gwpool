@@ -14,6 +14,7 @@
 - 小改先跑定向用例；涉及共享铸票/调度行为时运行 `go test -p 2 -timeout 60s ./...`，再 lint。
 - 上传者/管理账号卡片的铸票尝试、获票次数及最近成功时间只读样本，不读旧消费Slot/Via。`owner_mint_test.go`覆盖非200/空落点/明确失败不计成功、验票排除、结构化漂移/no_gain、历史无Route、乱序/缺时/未来与owner隔离；不得把HTTP200或客户端交付当作铸票成功。`GWPOOL_OWNER_MINT_PREVIEW_DIR`导出假页面验收。
 - 路线维护回归见`routes/route_test.go`、`store/inventory_test.go`、`sched/route_inventory_test.go`及`expiry_test.go`；现票契约仍由HTTP/consumer测试覆盖。收益来自原子提交，缺票快照不是请求样本；必须覆盖同值cflb延寿、过期同key、unknown-member刷新和bare→seed无额外尝试。
+- 时区回归在`{coverage,geography,mint,sched,scan,store}/timezone_test.go`及`httpapi/gateway_timezone_test.go`；`/cookie`与目录三字段固定可空，验证IANA/夏令时、无额外Geo、旧票/非粘性未知、观测时间、WAL/回滚、短票/换donor保来源、目录缓存失效及响应绑定实际票；契约见SPEC“票绑定的时区元数据”。
 - `tools/benchmark.ps1`使用远端先失效化凭据的真实快照，真实Store/Scheduler/HTTP、原生子进程隔离服务端与压测堆；每场记录全源码hash、同32消费者/非空tag、每响应校验与性能断言。CPU/IO只计server，Windows IO含控制管道，不称物理磁盘量；结果与线上/旧轻负载基线不能拼接。
 - Linux全量A/B用`tools/build-performance.ps1`原生交叉构建同一`performance_linux_test.go`夹具、`benchmark-linux.py`独立驱动；保全部状态表/样本前缀，JSON时间平移必须UseNumber保int64 reporter、重算未知成员路线ID和cookie-version，不能清历史换快结果。
 - 测量分无profile ABBA与独立profile；PrivateNetwork/2核/1200MiB，32既有身份、逐响应校验，按端点报P95/P99、server CPU/分配/IO/峰值RSS。加速WarmInterval与显式checkpoint必须披露，不称自然周期；`performance_recovery_linux_test.go`按独立成功回执表重放实测WAL，故障边界另用Store测试。

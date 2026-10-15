@@ -36,6 +36,7 @@ func (stubMinter) VerifyFull(context.Context, types.Creds, types.Exit, string, s
 }
 
 func (stubMinter) Provider(string) string              { return "test-dynamic" }
+func (stubMinter) Sticky(string) bool                  { return true }
 func (stubMinter) SupportsDynamicExit(types.Exit) bool { return true }
 func (stubMinter) Geo(context.Context, types.Exit, string) (types.Observed, error) {
 	return types.Observed{}, nil

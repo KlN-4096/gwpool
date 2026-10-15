@@ -1,5 +1,10 @@
 # 开发日志
 
+## 2026-10-15 — 票绑定时区元数据（仅本地）
+- `/cookie`与`/gateways`统一返回可空`datacenter_timezone/mint_exit_timezone/mint_exit_observed_at`；机房取历史城市映射，出口取现有粘性Geo响应并随保留oailb保存；不加消费现场探测，旧票/缺失/非粘性seed及歧义城市不猜。
+- 两个最小回归先红；所有Go包测试通过（首轮漏补cmd测试桩的Sticky方法，修正后该包单独通过），定向vet、原生交叉编译Linux HTTP测试及独立静态审查通过；覆盖夏令时/非法时区、观测时刻、扫描/续票、短票/donor、WAL/回滚、目录缓存及两接口一致。
+- lint仍因旧工具不支持Go1.27导出格式失败，未改全局工具；未commit/push/deploy或发真实探针。SPEC时区契约已同步“sub2二开进展”；新增Pair.MintExit嵌套schema，未来发布回滚须守护完整字段。
+
 ## 2026-10-15 — AdminKey 已推送部署
 - `acc3af1a9059`已推main，精确归档构建SHA`01dc106b5c860715531133f8abecc01d9e8686daf672daeb2a28009e1ea35004`；09:22:44Z部署bytevirt，冷备`/opt/gwpool/backup-route-aware-acc3af1a9059`，新旧私有副本并行重放全部字段一致，配置及最新WAL保留。
 - 复用compatible全字段升级/回滚判据与脱敏入口；专项检查确认嵌套AdminKey丢失会阻止回滚、异常内容不外泄。旧版不理解已生成AdminKey时禁止降级，不恢复旧快照。

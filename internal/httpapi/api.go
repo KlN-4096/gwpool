@@ -1621,6 +1621,7 @@ func (s *Server) handleCookie(w http.ResponseWriter, r *http.Request) {
 // 包一层而不是改 types：那边签名是冻结的。嵌入是匿名字段，JSON 会摊平成同一层。
 type deliveryResponse struct {
 	types.Delivery
+	gatewayTimezones
 	DatacenterCountry string `json:"datacenter_country,omitempty"`
 	// TTLIsAdvisory 恒为 true：valid_for_s 是**建议值**不是承诺。
 	// Whether to rotate is a local consumer decision, never a pool lease.
@@ -1641,6 +1642,7 @@ type deliveryResponse struct {
 
 func (s *Server) delivered(d types.Delivery) deliveryResponse {
 	return deliveryResponse{Delivery: d, TTLIsAdvisory: true,
+		gatewayTimezones:  timezonesForTicket(d.Gateway, d.MintExit),
 		DatacenterCountry: coverage.DatacenterCountry(d.Gateway),
 		CookieVersion:     types.CookieVersion(d.Cookie), RouteExpiresAt: d.ExpiresAt,
 		PairRemainingS: int(max(time.Until(d.ExpiresAt), 0) / time.Second)}

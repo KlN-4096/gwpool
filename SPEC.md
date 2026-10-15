@@ -29,6 +29,15 @@
 - 首页、账号总览与凭据详情共用 `web/templates/integration-guide.html`：简短端点速查表列出用法、参数和限制，保留完整成员身份、URL引号与鉴权说明，不展开教程。公开Key使用者无需进入私人账号页查看；旧设计记录不能覆盖当前协议。
 - 客户端与池必须同时升级；本次不删除历史Account/Slot/观察报告，后台托管凭据、铸票预算、扫描/库存/续票机制保留。
 
+### 票绑定的时区元数据（2026-10-15）
+
+- `/cookie`成功响应顶层与`/gateways`的每个`gateways[]`行都返回`datacenter_timezone`、`mint_exit_timezone`、`mint_exit_observed_at`三个字段，未知显式为JSON `null`；消费者连接旧版本遇到缺字段也必须按未知处理。
+- `datacenter_timezone`为2026-10-01历史DNS/IP目录中的国家×城市映射到的IANA时区，例如`Europe/Warsaw`。不是实时机房定位或代理出口；目录外及缺州信息无法消歧的US Des Moines/Quincy/Richmond为`null`。
+- `mint_exit_timezone`为**当前实际保留的oailb票**生成时，同绑定SID且可保证粘性配对的Geo响应中的IANA时区，例如`Asia/Tokyo`。读取现有Geo端点（默认`https://ipinfo.io/json`）的可选顶层`timezone`，格式依据[IPinfo API文档](https://ipinfo.io/developers/core-api)，缺失/非法不影响原地理成功；不代表消费者出口或上游服务器出网IP，不按配置国家、机房地域或网关最新样本猜值。
+- `mint_exit_observed_at`为该次Geo成功后的观测时间，RFC3339 UTC（`Z`，可带小数秒），不是下发/落账时刻；有效时区缺失时两项均`null`。旧票不回填；非粘性/seed出口无可靠配对也为`null`，不改变原铸票准入。
+- 正常铸票/扫描才采集和持久保存；取票/目录不增加Geo、上游/模型请求。短票未保留、失败、无新oailb均不能覆盖旧来源；只换`__cflb` donor仍保持原oailb的来源，真正保留新票才更新或变为未知。
+- 两类时区是IANA名称而非固定UTC偏移，消费者应按实验时刻处理夏令时。目录仅是其快照时的库存提示；实际测试以随后`/cookie`返回的票及这三个字段为准，冻结到本次票/任务，不回写账号配置。
+
 ### 目录共享与批量反馈（2026-10-12）
 
 - 同一个接入Key、model，在相同库存/报告版本与观察时刻下，`gateways`行集合、名称升序及每行`name/pair_ready/valid_for_s/datacenter_country/priority`与`account`、`X-Gwpool-Account-Tag`无关；寿命随实际时间递减、库存及报告更新正常生效，不保证跨时刻逐字相同。

@@ -12,6 +12,7 @@ import (
 )
 
 type gatewayCatalogRow struct {
+	gatewayTimezones
 	Name              string                        `json:"name"`
 	PairReady         bool                          `json:"pair_ready"`
 	ValidForS         int                           `json:"valid_for_s"`

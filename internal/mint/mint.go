@@ -580,11 +580,12 @@ func readGeo(resp *http.Response) (types.Observed, error) {
 		return types.Observed{}, fmt.Errorf("查 geo 返回 HTTP %d", resp.StatusCode)
 	}
 	var body struct {
-		IP      string `json:"ip"`
-		Country string `json:"country"`
-		State   string `json:"region"`
-		City    string `json:"city"`
-		Org     string `json:"org"`
+		IP       string          `json:"ip"`
+		Country  string          `json:"country"`
+		State    string          `json:"region"`
+		City     string          `json:"city"`
+		Org      string          `json:"org"`
+		Timezone json.RawMessage `json:"timezone"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
 		return types.Observed{}, fmt.Errorf("解 geo 响应: %w", err)
@@ -593,6 +594,12 @@ func readGeo(resp *http.Response) (types.Observed, error) {
 		return types.Observed{}, errors.New("geo 响应里没有 ip")
 	}
 	obs := types.Observed{IP: body.IP, Country: body.Country, State: body.State, City: body.City}
+	// Optional timezone metadata must not turn an otherwise valid Geo lookup
+	// into a minting failure. Unknown, malformed or local names remain empty.
+	var timezone string
+	if json.Unmarshal(body.Timezone, &timezone) == nil {
+		obs.Timezone = geography.IANATimezone(timezone)
+	}
 	// ipinfo 的 org 是 "AS12345 Some ISP Name"，首段是 ASN。
 	if asn, isp, ok := strings.Cut(body.Org, " "); ok {
 		obs.ASN, obs.ISP = asn, truncate(isp, 40)

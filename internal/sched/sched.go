@@ -88,6 +88,7 @@ type Store interface {
 type Minter interface {
 	types.Minter
 	NewSIDFor(exit types.Exit, sticky bool) (string, error)
+	Sticky(sid string) bool
 
 	// NewSeedSID 要一个绑在普通机房出口上的 sid，给「带种子 `__cflb` 铸票」用。
 	//
@@ -561,6 +562,10 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 		trace.failure = "geo"
 		return minted{}, fmt.Errorf("出口地理检查: %w", gerr)
 	}
+	var mintExit types.ExitTimezoneObservation
+	if obs.Timezone != "" && s.mint.Sticky(sid) {
+		mintExit = types.ExitTimezoneObservation{Timezone: obs.Timezone, ObservedAt: s.now().UTC()}
+	}
 
 	start := s.now()
 	s.mu.Lock()
@@ -709,6 +714,7 @@ func (s *Scheduler) mintAttempt(ctx context.Context, a types.Account, e types.Ex
 		}
 		p = types.Pair{Gateway: res.Gateway, Cookie: res.NewPair,
 			ExpiresAt: route, CflbExpiresAt: cflb, MintedBy: a.ID,
+			MintExit: mintExit,
 			// 区域取**这一发实际用的出口**，和上面那条区域台账同一个口径。
 			// 走 sampleRegion 的兜底：续期型铸票的出口取自 ReachableExits，不保证
 			// 正好等于 Regions 里那九个代表出口，RegionKeyOf 会回空串 ⇒ 消费端整片

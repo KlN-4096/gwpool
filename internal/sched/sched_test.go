@@ -641,6 +641,7 @@ func (m *fakeMinter) SeedBound(sid string) bool {
 }
 
 func (m *fakeMinter) Provider(string) string              { return "test-dynamic" }
+func (m *fakeMinter) Sticky(sid string) bool              { return !m.SeedBound(sid) }
 func (m *fakeMinter) SupportsDynamicExit(types.Exit) bool { return true }
 func (m *fakeMinter) RouteSources(_ types.Exit, seed bool) []types.RouteSource {
 	kind := "test-dynamic"
