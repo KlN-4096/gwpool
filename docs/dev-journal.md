@@ -1,5 +1,10 @@
 # 开发日志
 
+## 2026-10-15 — AdminKey 已推送部署
+- `acc3af1a9059`已推main，精确归档构建SHA`01dc106b5c860715531133f8abecc01d9e8686daf672daeb2a28009e1ea35004`；09:22:44Z部署bytevirt，冷备`/opt/gwpool/backup-route-aware-acc3af1a9059`，新旧私有副本并行重放全部字段一致，配置及最新WAL保留。
+- 复用compatible全字段升级/回滚判据与脱敏入口；专项检查确认嵌套AdminKey丢失会阻止回滚、异常内容不外泄。旧版不理解已生成AdminKey时禁止降级，不恢复旧快照。
+- 源站AdminKey生成选项/不可改类型/仅消费说明200，root/admin/keys200、未授权keys401、cookie/gateways缺参400；两服务active、ERROR0，自然交付2、库存成功延寿1，可交付107/109。未自动生成真实Key、未主动取票/探测上游；公网浏览器未验收，回执在chat `work/admin-key-deploy-receipts-acc3af1a9059/`。
+
 ## 2026-10-15 — AdminKey（仅本地）
 - 管理员面板显式生成AdminKey，免Key/成员消费限额及公共门槛/排队，保统计/停用/撤销/有效票；独立不可变权限位，不授后台登录或托管权限，普通限额0与root Key不升级。
 - 最小复现先红；全量Go测试、Key前端6项、定向vet及独立审查通过，离线浏览器验证类型选择禁用普通限额、详情仅编辑名称/备注。覆盖12/s与444/min、伪造/未授权、取消/无票、防重及WAL重放/故障回滚。
