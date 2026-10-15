@@ -1,5 +1,10 @@
 # 开发日志
 
+## 2026-10-15 — 时区元数据兼容旧Sub2API并部署
+- 远端`origin/klno`与`v0.2.15-klno.4`同为`c555ad918b08`；导出其5个真实客户端文件，离线验证字符串/null/部分已知三字段均被忽略且旧解析结果不变。109张快照票保守响应上界1113B<4KiB，目录投影61687B<2MiB；未修改Sub2API。
+- `fcf124581e33`已推main，精确归档构建SHA`42a978283dee8dcfd7675d2b448112e5778c73dfa017ccb8c3e782df0dbac9cc`，台北22:45:07部署bytevirt；冷备`/opt/gwpool/backup-route-aware-fcf124581e33`，新旧私有副本重放全部字段相等，配置/最新WAL保留。
+- 两服务active、源站鉴权与旧协议检查通过、ERROR0、自然交付23和库存成功延寿1；目录101行均含三键、92有机房时区/6有新票出口时区，响应18440B。验收脚本适配Python3.10不接受9位小数的限制后通过RFC3339纳秒校验；零主动取票/上游探针，公网浏览器未验收，回执在chat `work/timezone-deploy-receipts-fcf124581e33/`。
+
 ## 2026-10-15 — 票绑定时区元数据（仅本地）
 - `/cookie`与`/gateways`统一返回可空`datacenter_timezone/mint_exit_timezone/mint_exit_observed_at`；机房取历史城市映射，出口取现有粘性Geo响应并随保留oailb保存；不加消费现场探测，旧票/缺失/非粘性seed及歧义城市不猜。
 - 两个最小回归先红；所有Go包测试通过（首轮漏补cmd测试桩的Sticky方法，修正后该包单独通过），定向vet、原生交叉编译Linux HTTP测试及独立静态审查通过；覆盖夏令时/非法时区、观测时刻、扫描/续票、短票/donor、WAL/回滚、目录缓存及两接口一致。
