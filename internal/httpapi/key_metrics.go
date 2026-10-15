@@ -82,8 +82,9 @@ func (m *keyMetrics) begin(key types.AccessKey, authorized bool, now time.Time) 
 	if !authorized {
 		return false, 0
 	}
-	// Upload and grandfathered keys never enter independent admission logic.
-	if key.Source == types.AccessKeyAdmin {
+	// AdminKey, upload and grandfathered keys skip independent admission,
+	// but retain telemetry and the same authorization/revocation checks.
+	if key.Source == types.AccessKeyAdmin && !key.IsAdminKey() {
 		// Independent admission has its own bounded namespace (at most 10,000
 		// issued keys), so exhausted telemetry never denies or bypasses a limit.
 		a := m.admissions[key.ID]

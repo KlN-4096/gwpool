@@ -14,6 +14,7 @@ type accessKeyStore interface {
 	ResolveIssuedAccessKey(string) (types.AccessKey, bool)
 	CreateAccessKeys(int, string, string, int, int) ([]types.CreatedAccessKey, error)
 	CreateAccessKeysOnce(string, int, string, string, int, int) ([]types.CreatedAccessKey, error)
+	CreateAdminKeysOnce(string, int, string, string) ([]types.CreatedAccessKey, error)
 	UpdateAccessKeys([]string, types.AccessKeyPatch) error
 	AccessKeyUsage() map[string]types.KeyUsage
 	SaveAccessKeyUsage(map[string]types.KeyUsage) error

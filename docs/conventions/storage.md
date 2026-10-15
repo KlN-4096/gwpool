@@ -1,7 +1,7 @@
 # 状态与边界
 
 - `internal/store` 保存 `state.json`＋`state.wal`（GWPWAL02提交头/序号/CRC）和独立`samples.jsonl`，不使用数据库；关键增量Sync成功才ACK，不再每次重写全快照。
-- 接入Key元数据/撤销/生成防重ID/单调序号及统计汇总走同一snapshot/WAL；生成只存SHA256和尾号，批量管理一次提交、失败回滚，已撤销不可启用，旧上传Key未覆盖策略时默认原权限。
+- 接入Key元数据/撤销/生成防重ID/单调序号及统计汇总走同一snapshot/WAL；生成只存SHA256和尾号，批量管理一次提交、失败回滚，已撤销不可启用，旧上传Key未覆盖策略时默认原权限。AdminKey用不可变嵌套字段`access_keys.*.admin_key`，旧缺省false；普通创建不得设置，AdminKey限额固定0且拒非零更新，回滚旧binary须核对此嵌套schema不可丢失。
 - 管理员Key最多10000、总策略/统计各20000；IP保留8、显式account摘要64、小时桶168，只有已注册机器API路径计数、不记录请求/响应正文。统计快照深克隆，串行flush且按版本保留写盘期间的新计数，失败不清dirty。
 - WAL版本相同不等于可向旧schema降级：旧binary不识别`access_keys/key_usage/external_usage/region_donors/route_states/recovery_sources/admin_auth`，strict decoder拒未知字段。snapshot能启动也可能静默丢未知字段；先停服务，对一致私有副本用新/旧`-checkpoint-only`验证全部字段。回滚必须识别当前schema，不能恢复旧快照丢ACK数据。
 - `admin_auth`存WebAuthn公钥凭证及随机会话SHA256，最多32凭证/128会话；Revision条件提交、深克隆、失败还原。已写认证状态后即使退出清空会话也不能降级旧schema，禁止保存原密钥/私钥/原会话令牌。

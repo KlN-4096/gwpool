@@ -6,7 +6,7 @@
 - 上传页面解析与部分成功/重试用 `node --test web/upload_parser.test.cjs` 离线验证；`web/testdata/sub2api-export.json` 是假凭据契约样本，不是真实账号验收。
 - 上传用`httpapi/upload_jobs_test.go`真Store验证Token/JSON、RT进度、归属/取消/并发条件提交；`upload_login_retired_test.go`验证旧登录请求无任务/出站/存储副作用。`GWPOOL_UPLOAD_PREVIEW_DIR`+`TestUploadWorkspaceFixture`导出假页面；`internal/reauth`仅保留独立离线/opt-in探针代码，无HTTP上传入口，真实探针仍须显式授权。
 - 管理页分组/旧锚点/历史导航用 `node --test web/navigation.test.cjs`；无JS仍展示所有分区。
-- Key管理回归：`store/access_key_test.go`、`httpapi/managed_keys_test.go`、`node --test web/keys.test.cjs`；`GWPOOL_KEYS_PREVIEW_DIR`从离线测试输出列表/生成/详情假数据页面，禁止用生产Key做UI截图。
+- Key管理回归：`store/access_key_test.go`、`httpapi/managed_keys_test.go`、`{httpapi,sched,store}/admin_key_test.go`、`node --test web/keys.test.cjs`；`GWPOOL_KEYS_PREVIEW_DIR`/`GWPOOL_ADMIN_KEY_PREVIEW_DIR`从离线测试输出假页面，禁止用生产Key做UI截图。AdminKey覆盖豁免/普通桶隔离、伪造/撤销/登录权限、不可变类型、防重与WAL回滚。
 - `TestDashboardSettingsFixture`可通过`GWPOOL_PREVIEW_DIR`输出假数据HTML供本地静态预览；不要用生产凭据做截图或表单测试。
 - Windows 原生 Go 构建和测试；并发限定 `-p 2`，测试使用 `-timeout 60s`，不跑 `-race`。
 - 同schema部署在停服冷备的两个独立目录并行跑旧/新checkpoint-only，仍要求全字段相等；串行重放可能跨过路线24h过期点并多一次journal_sequence，不能忽略字段放行。失败恢复旧binary但保最新WAL；重试用独立备份目录，不覆盖失败证据。

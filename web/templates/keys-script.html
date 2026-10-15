@@ -38,6 +38,18 @@
     });
   }
   localizeKeyLastRequests(document);
+  const keyType = document.getElementById('key-create-type');
+  if (keyType) {
+    const updateKeyType = function () {
+      const adminKey = keyType.value === 'admin_key';
+      ['key-create-rpm', 'key-create-concurrency'].forEach(function (id) {
+        const input = document.getElementById(id);
+        if (input) input.disabled = adminKey;
+      });
+    };
+    keyType.addEventListener('change', updateKeyType);
+    updateKeyType();
+  }
   const form = document.getElementById('key-batch');
   const all = document.getElementById('select-keys');
   const items = form ? Array.from(form.querySelectorAll('input[name="ids"]')) : [];

@@ -128,8 +128,10 @@ func (s *Scheduler) deliverExternal(ctx context.Context, member string, req Requ
 			}
 		}
 	}()
-	if retry := s.external.admit(id, s.now); retry > 0 {
-		return delivery, &ConsumerRateLimit{RetryAfter: retry}
+	if !authed || !req.AdminKey {
+		if retry := s.external.admit(id, s.now); retry > 0 {
+			return delivery, &ConsumerRateLimit{RetryAfter: retry}
+		}
 	}
 	s.markDemand()
 	if _, exists := s.st.Gateways()[req.Gateway]; !exists {

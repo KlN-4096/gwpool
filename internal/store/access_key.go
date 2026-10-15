@@ -112,20 +112,30 @@ func (s *Store) ResolveIssuedAccessKey(secret string) (types.AccessKey, bool) {
 }
 
 func (s *Store) CreateAccessKeys(count int, label, note string, rpm, concurrency int) ([]types.CreatedAccessKey, error) {
-	return s.createAccessKeys("", count, label, note, rpm, concurrency)
+	return s.createAccessKeys("", count, label, note, rpm, concurrency, false)
 }
 
 // CreateAccessKeysOnce records only the request hash, never the form token or
 // plaintext secrets. Repeated POSTs cannot mint another batch, even after restart.
 func (s *Store) CreateAccessKeysOnce(requestID string, count int, label, note string, rpm, concurrency int) ([]types.CreatedAccessKey, error) {
+	return s.createAccessKeysOnce(requestID, count, label, note, rpm, concurrency, false)
+}
+
+// AdminKey is a distinct, explicitly selected consumer privilege. Existing keys
+// are never promoted by setting ordinary RPM/concurrency limits to zero.
+func (s *Store) CreateAdminKeysOnce(requestID string, count int, label, note string) ([]types.CreatedAccessKey, error) {
+	return s.createAccessKeysOnce(requestID, count, label, note, 0, 0, true)
+}
+
+func (s *Store) createAccessKeysOnce(requestID string, count int, label, note string, rpm, concurrency int, adminKey bool) ([]types.CreatedAccessKey, error) {
 	decoded, err := hex.DecodeString(requestID)
 	if err != nil || len(decoded) != sha256.Size {
 		return nil, errors.New("invalid creation request")
 	}
-	return s.createAccessKeys(requestID, count, label, note, rpm, concurrency)
+	return s.createAccessKeys(requestID, count, label, note, rpm, concurrency, adminKey)
 }
 
-func (s *Store) createAccessKeys(requestID string, count int, label, note string, rpm, concurrency int) ([]types.CreatedAccessKey, error) {
+func (s *Store) createAccessKeys(requestID string, count int, label, note string, rpm, concurrency int, adminKey bool) ([]types.CreatedAccessKey, error) {
 	label, note = strings.TrimSpace(label), strings.TrimSpace(note)
 	if count < 1 || count > types.AccessKeyBatchLimit || !validKeyText(label, 80, false) ||
 		!validKeyText(note, 1000, true) || !keyLimitsValid(rpm, concurrency) {
@@ -166,6 +176,9 @@ func (s *Store) createAccessKeys(requestID string, count int, label, note string
 		name := label
 		if name == "" {
 			name = "接入 Key"
+			if adminKey {
+				name = "AdminKey"
+			}
 		}
 		if count > 1 {
 			name += fmt.Sprintf(" %d", i+1)
@@ -174,7 +187,7 @@ func (s *Store) createAccessKeys(requestID string, count int, label, note string
 			Source: types.AccessKeyAdmin, SubjectID: id, Digest: hex.EncodeToString(sum[:]),
 			CreationID: requestID,
 			Suffix:     secret[len(secret)-6:], Label: name, Note: note, CreatedAt: now, UpdatedAt: now,
-			RPM: rpm, Concurrency: concurrency}
+			RPM: rpm, Concurrency: concurrency, AdminKey: adminKey}
 		next[key.ID], changes[key.ID] = key, key
 		created = append(created, types.CreatedAccessKey{Record: key, Key: secret})
 	}
@@ -221,6 +234,9 @@ func (s *Store) UpdateAccessKeys(ids []string, patch types.AccessKeyPatch) error
 		}
 		if !keyLimitsValid(key.RPM, key.Concurrency) {
 			return errors.New("invalid key limits")
+		}
+		if key.IsAdminKey() && (key.RPM != 0 || key.Concurrency != 0) {
+			return errors.New("AdminKey does not accept consumer limits")
 		}
 		if patch.Label != nil {
 			key.Label = strings.TrimSpace(*patch.Label)

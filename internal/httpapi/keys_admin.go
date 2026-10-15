@@ -98,6 +98,9 @@ func keyTime(at time.Time) string {
 }
 
 func keyLimitText(key types.AccessKey) string {
+	if key.IsAdminKey() {
+		return "AdminKey · 直接准入，免 Key 与成员消费限额"
+	}
 	if key.Source != types.AccessKeyAdmin {
 		return "不限 · 上传者豁免"
 	}
@@ -189,6 +192,9 @@ func (s *Server) managedKeyRows(store accessKeyStore, now time.Time) ([]managedK
 			}
 			if key.Concurrency > 0 {
 				row.LimitHint = strconv.Itoa(key.Concurrency) + " 并发"
+			}
+			if key.IsAdminKey() {
+				row.LimitBrief, row.LimitHint = "免消费限流", "AdminKey · 直接准入"
 			}
 		}
 		switch {
@@ -340,7 +346,7 @@ func (s *Server) renderKeys(w http.ResponseWriter, r *http.Request, created, mes
 	view.SourceDescription = map[string]string{
 		types.AccessKeyUpload: "上传者名下统一使用的接入 Key，不新增独立限流。",
 		types.AccessKeyLegacy: "旧版兼容：与单份凭证关联的历史 Key，仅保留原有接入和管理。",
-		types.AccessKeyAdmin:  "独立发放的消费 Key，无需上传凭据，可设置每把 Key 的限额。",
+		types.AccessKeyAdmin:  "独立发放普通 Key 或 AdminKey；AdminKey 免消费限额、直接准入，不授予后台登录权限。",
 	}[source]
 	view.ListURL = "/admin/keys?" + listQuery.Encode()
 	counts := map[string]int{}
@@ -461,15 +467,30 @@ func (s *Server) handleKeysMutation(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "仅管理员生成分类支持新建 Key", http.StatusBadRequest)
 			return
 		}
+		kind := form.Get("key_type")
+		if kind != "" && kind != "regular" && kind != "admin_key" {
+			http.Error(w, "Key 类型无效", http.StatusBadRequest)
+			return
+		}
 		requestID, valid := s.creationRequestID(form.Get("creation_token"))
 		count, e1 := strconv.Atoi(form.Get("count"))
-		rpm, e2 := parseKeyLimit(form, "rpm")
-		concurrency, e3 := parseKeyLimit(form, "concurrency")
+		var rpm, concurrency int
+		var e2, e3 error
+		if kind != "admin_key" {
+			rpm, e2 = parseKeyLimit(form, "rpm")
+			concurrency, e3 = parseKeyLimit(form, "concurrency")
+		}
 		if !valid || e1 != nil || e2 != nil || e3 != nil {
 			http.Error(w, "参数无效或生成表单已过期，请重新打开页面", http.StatusBadRequest)
 			return
 		}
-		keys, err := store.CreateAccessKeysOnce(requestID, count, form.Get("label"), form.Get("note"), rpm, concurrency)
+		var keys []types.CreatedAccessKey
+		var err error
+		if kind == "admin_key" {
+			keys, err = store.CreateAdminKeysOnce(requestID, count, form.Get("label"), form.Get("note"))
+		} else {
+			keys, err = store.CreateAccessKeysOnce(requestID, count, form.Get("label"), form.Get("note"), rpm, concurrency)
+		}
 		if err != nil {
 			http.Error(w, "未生成：参数不合法、重复提交或存储不可用。请核对当前列表后重试。", http.StatusConflict)
 			return
@@ -478,7 +499,15 @@ func (s *Server) handleKeysMutation(w http.ResponseWriter, r *http.Request) {
 		for i, key := range keys {
 			plain[i] = key.Key
 		}
-		s.renderKeys(w, r, strings.Join(plain, "\n"), "已生成 "+strconv.Itoa(len(keys))+" 把独立 Key")
+		label := "独立 Key"
+		if kind == "admin_key" {
+			label = "AdminKey"
+		}
+		s.renderKeys(w, r, strings.Join(plain, "\n"), "已生成 "+strconv.Itoa(len(keys))+" 把 "+label)
+		return
+	}
+	if form.Has("key_type") || form.Has("admin_key") {
+		http.Error(w, "Key 类型只能在生成时选择", http.StatusBadRequest)
 		return
 	}
 	if action != "enable" && action != "disable" && action != "revoke" && action != "edit" {

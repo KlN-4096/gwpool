@@ -17,6 +17,9 @@ function fixture(withExport = true, timeOptions = {}) {
     'created-keys': withExport ? exportValue : null, 'copy-keys': el(),
     'download-keys': el(), 'key-export-status': el(),
     'key-batchbar': el(), 'clear-key-selection': el(),
+    'key-create-type': {...el(), value:'regular'},
+    'key-create-rpm': {...el(), value:'120'},
+    'key-create-concurrency': {...el(), value:'2'},
   };
   const out = {};
   const context = {
@@ -53,6 +56,22 @@ test('selection is limited to this page and empty submit is blocked', () => {
   f.elements['clear-key-selection'].handlers.click();
   assert.equal(f.items.some(item => item.checked), false);
   assert.equal(f.elements['key-batchbar'].hidden, true);
+});
+
+test('AdminKey disables ordinary limits without losing them when switching back', () => {
+  const f = fixture(false), kind = f.elements['key-create-type'];
+  const rpm = f.elements['key-create-rpm'], concurrency = f.elements['key-create-concurrency'];
+  assert.equal(rpm.disabled, false);
+  kind.value = 'admin_key';
+  kind.handlers.change();
+  assert.equal(rpm.disabled, true);
+  assert.equal(concurrency.disabled, true);
+  kind.value = 'regular';
+  kind.handlers.change();
+  assert.equal(rpm.disabled, false);
+  assert.equal(concurrency.disabled, false);
+  assert.equal(rpm.value, '120');
+  assert.equal(concurrency.value, '2');
 });
 
 test('copy and download preserve only one plaintext key per line', async () => {

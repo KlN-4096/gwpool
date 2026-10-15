@@ -37,6 +37,9 @@ type AccessKey struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	RPM         int       `json:"rpm,omitempty"`
 	Concurrency int       `json:"concurrency,omitempty"`
+	// AdminKey bypasses consumer admission limits, not administrator login.
+	// Only independently issued keys may carry this immutable privilege.
+	AdminKey bool `json:"admin_key,omitempty"`
 }
 
 func AccessKeyID(source string, id int64) string {
@@ -53,6 +56,8 @@ func ParseAccessKeyID(id string) (source string, subject int64, ok bool) {
 }
 
 func (k AccessKey) Usable() bool { return !k.Disabled && k.RevokedAt.IsZero() }
+
+func (k AccessKey) IsAdminKey() bool { return k.Source == AccessKeyAdmin && k.AdminKey }
 
 // A patch cannot alter provenance, subject, secret, or creation time.
 type AccessKeyPatch struct {

@@ -25,7 +25,7 @@
 - `PairTarget`为全部已知网关数（含待恢复）；MinPairs/Spare只作空池引导提示，`spare>190`仍明确关闭维护。190只是旧关闭哨兵，不是发现上限；`renew_pairs`仍控制健康票续期及主动donor补充，动态地区停用不使现票或既有seed路线失效。
 - 托管需求统计按Slots/Accounts revision与LastDeliver cutoff复用；外部需求只保近期gateway集合，过期回收且乱序请求不能回退时间。恢复证据按账户/网关/票/铸票revision与启用出口复用，TTL不静态缓存。
 - 所有Key复用`/cookie`、`/gateways`原路径，仅接受新契约；明确member+gateway，只读与目录相同的freshPair/Rehome有效票。无Account/Slot准入、183秒避让、池端品质、代选/force/wait/count/消费现场铸票；缺参/旧参数400提示升级，只有release/消费者renew退役426，后台铸票保留。
-- 外部限频为完整成员摘要跨Key共享12/1秒、444/60秒；成功/缺票计数，拒绝不延窗，统计与准入分离。时间必须在限频锁内采样，保持窗口时序；并发/回收回归在external_delivery_test.go。
+- 外部限频为完整成员摘要跨普通Key共享12/1秒、444/60秒；成功/缺票计数，拒绝不延窗，统计与准入分离。仅`authed && Request.AdminKey`跳过此桶且不占普通桶，授权位只来自HTTP当次鉴权，不读客户端参数；取消/输入/有效票/需求/统计仍执行，不授予上游预算豁免。时间在限频锁内采样；回归见`external_delivery_test.go/admin_key_test.go`。
 - `routes`按身份摘要＋完整规范化地区＋bare/seed＋稳定出口配置摘要＋seed指纹建证据，随机SID/本地ID不重置。已知member跨AT刷新稳定；member未知按凭据摘要隔离，不声称跨刷新稳定。失败/低收益5min倍增至1h、24h过期、最多16384；这些是成本参数，不是测得固定期。
 - 续票/补货/探索共享路线在途与退避；换目标/用途不能绕过。最近B确实缺票/临期或需要donor可放行，连续同目标/同供给无收益仍等重检；B收益不清A未命中。bare不可执行且未花尝试时才可回退已有独立seed路线，不在真失败后追加第二任务。
 - 取票`markDemand`合并唤醒，最短5秒，走原后台锁/预算；唤醒绝不bootstrap或追加专门探索，匿名仍不在HTTP中自行铸票。

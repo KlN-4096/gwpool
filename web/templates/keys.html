@@ -34,7 +34,7 @@
         <thead><tr><th class="key-check"><input type="checkbox" id="select-keys" aria-label="选择本页可操作 Key" hidden data-js></th><th>名称 / 标识</th><th>状态</th>{{if eq .Source "upload"}}<th class="key-number">上传账号数</th>{{end}}{{if .IsAdminSource}}<th>限额</th>{{end}}<th class="key-number">近 60 秒</th><th class="key-number">累计请求</th><th>最后请求 <small data-key-timezone>UTC</small></th><th><span class="key-sr-only">详情</span></th></tr></thead>
         <tbody>{{range .Rows}}<tr data-key-row>
           <td class="key-check">{{if .Editable}}<input type="checkbox" name="ids" value="{{.Key.ID}}" aria-label="选择 {{.Key.Label}}">{{else}}<span class="key-muted" title="不可操作">—</span>{{end}}</td>
-          <td class="key-identity"><div class="key-identity-inner"><span class="key-avatar" aria-hidden="true">{{template "key-icon"}}</span><div><a class="key-name" href="{{.DetailURL}}" data-key-detail>{{.Key.Label}}</a><div class="key-subline"><span class="key-source key-source-{{.Key.Source}}">{{.Source}}</span><span class="key-mask">{{.Mask}}</span></div></div></div></td>
+          <td class="key-identity"><div class="key-identity-inner"><span class="key-avatar" aria-hidden="true">{{template "key-icon"}}</span><div><a class="key-name" href="{{.DetailURL}}" data-key-detail>{{.Key.Label}}</a><div class="key-subline"><span class="key-source key-source-{{.Key.Source}}">{{if .Key.IsAdminKey}}AdminKey{{else}}{{.Source}}{{end}}</span><span class="key-mask">{{.Mask}}</span></div></div></div></td>
           <td><span class="key-status key-status-{{.Status}}"><i aria-hidden="true"></i>{{.StatusText}}</span></td>
           {{if eq $.Source "upload"}}<td class="key-number">{{template "key-uploaded-accounts" .}}</td>{{end}}
           {{if $.IsAdminSource}}<td><span class="key-limit">{{.LimitBrief}}</span><small class="key-secondary">{{.LimitHint}}</small></td>{{end}}
@@ -58,18 +58,19 @@
 
 {{if .IsAdminSource}}
 <section id="key-create" class="key-panel" data-key-panel aria-labelledby="key-create-title">
-  <header class="key-panel-heading"><div><span class="key-eyebrow">新建接入</span><h2 id="key-create-title">生成独立 Key</h2><p>无需上传账号，生成后即可用于普通消费接入。</p></div><button type="button" class="key-close" data-key-close hidden data-key-dialog-control aria-label="关闭生成窗口">×</button></header>
+  <header class="key-panel-heading"><div><span class="key-eyebrow">新建接入</span><h2 id="key-create-title">生成 Key</h2><p>无需上传账号，选择普通 Key 或 AdminKey。</p></div><button type="button" class="key-close" data-key-close hidden data-key-dialog-control aria-label="关闭生成窗口">×</button></header>
   <form method="post" action="/admin/keys?source=admin">
     <input type="hidden" name="source" value="admin">
     <input type="hidden" name="action" value="create"><input type="hidden" name="creation_token" value="{{.CreationToken}}">
     <div class="key-panel-body key-form">
+      <label class="key-wide">Key 类型<select id="key-create-type" name="key_type"><option value="regular">普通 Key</option><option value="admin_key">AdminKey</option></select><small>AdminKey 直接准入，免 Key、成员消费限额及公共排队；不改变有效票要求。</small></label>
       <label>名称前缀<input name="label" maxlength="80" placeholder="例如：团队接入" autofocus><small>批量生成时自动追加序号</small></label>
       <label>生成数量<input name="count" type="number" value="1" min="1" max="1000" required><small>每次 1–1000 把</small></label>
-      <div class="key-form-section"><strong>独立限额</strong><span>填写 0 表示不限</span></div>
-      <label>每分钟请求上限<input name="rpm" type="number" value="0" min="0" max="600000" required><small>RPM · 按每把 Key 分别计算</small></label>
-      <label>并发上限<input name="concurrency" type="number" value="0" min="0" max="10000" required><small>同时处理的请求数</small></label>
+      <div class="key-form-section"><strong>普通 Key 独立限额</strong><span>0 表示不限；AdminKey 不使用此处限额</span></div>
+      <label>每分钟请求上限<input id="key-create-rpm" name="rpm" type="number" value="0" min="0" max="600000" required><small>RPM · 按每把普通 Key 分别计算</small></label>
+      <label>并发上限<input id="key-create-concurrency" name="concurrency" type="number" value="0" min="0" max="10000" required><small>同时处理的请求数</small></label>
       <label class="key-wide">备注 <span class="key-muted">可选</span><textarea name="note" maxlength="1000" rows="2" placeholder="用途、使用方或其他说明"></textarea></label>
-      <p class="key-form-note key-wide">仅提供普通消费权限，不授予管理员或托管凭据权限；不受公共开放门槛影响。</p>
+      <p class="key-form-note key-wide">两种 Key 都仅用于消费，不授予后台登录或托管凭据权限；不受公共开放门槛影响。类型生成后不可修改，可停用或撤销。</p>
     </div>
     <footer class="key-panel-footer"><button type="button" data-key-close hidden data-key-dialog-control>取消</button><button type="submit" class="key-primary">生成 Key</button></footer>
   </form>
@@ -94,12 +95,12 @@
     <div class="key-detail-stats"><div><span>近 60 秒</span><strong>{{.Metrics.RPM}}</strong><small>5 分钟 {{.Metrics.FiveMinutes}} 次</small></div><div><span>累计请求</span><strong>{{.Metrics.Usage.Totals.Requests}}</strong><small>在途 {{.Metrics.Active}}</small></div><div><span>成功写出票</span><strong>{{.Metrics.Usage.Totals.Tickets}}</strong><small>HTTP 2xx {{.Metrics.Usage.Totals.OK}}</small></div></div>
     <dl class="key-facts"><div><dt>归属</dt><dd>{{.Owner}}</dd></div>{{if eq .Key.Source "upload"}}<div><dt>上传账号数</dt><dd>{{template "key-uploaded-accounts" .}}</dd></div>{{end}}<div><dt>访问限额</dt><dd>{{.Limits}}</dd></div><div><dt>创建时间</dt><dd>{{.Created}} UTC</dd></div><div><dt>最后请求</dt><dd><time data-key-last-time="{{.LastISO}}" data-key-full-time{{if .LastISO}} datetime="{{.LastISO}}"{{end}}>{{.Last}}</time> <span data-key-timezone>UTC</span></dd></div></dl>
     {{if .Key.Note}}<div class="key-detail-note"><span>备注</span><p>{{.Key.Note}}</p></div>{{end}}
-    {{if .Editable}}<details class="key-detail-section" id="key-edit"><summary>编辑 Key <span>名称、备注{{if .AdminIssued}}与限额{{end}}</span></summary>
+    {{if .Editable}}<details class="key-detail-section" id="key-edit"><summary>编辑 Key <span>名称、备注{{if and .AdminIssued (not .Key.IsAdminKey)}}与限额{{end}}</span></summary>
       <form method="post" action="{{$.ListURL}}" class="key-form">
         <input type="hidden" name="source" value="{{.Key.Source}}">
         <input type="hidden" name="action" value="edit"><input type="hidden" name="ids" value="{{.Key.ID}}">
         <label class="key-wide">名称<input name="label" maxlength="100" value="{{.Key.Label}}"></label>
-        {{if .AdminIssued}}<label>每分钟请求上限<input name="rpm" type="number" min="0" max="600000" value="{{.Key.RPM}}"><small>0 表示不限</small></label><label>并发上限<input name="concurrency" type="number" min="0" max="10000" value="{{.Key.Concurrency}}"><small>0 表示不限</small></label>{{end}}
+        {{if and .AdminIssued (not .Key.IsAdminKey)}}<label>每分钟请求上限<input name="rpm" type="number" min="0" max="600000" value="{{.Key.RPM}}"><small>0 表示不限</small></label><label>并发上限<input name="concurrency" type="number" min="0" max="10000" value="{{.Key.Concurrency}}"><small>0 表示不限</small></label>{{end}}
         <label class="key-wide">备注<textarea name="note" maxlength="1000" rows="2">{{.Key.Note}}</textarea></label><div class="key-wide key-edit-actions"><button type="submit" class="key-primary">保存修改</button></div>
       </form>
     </details>{{end}}

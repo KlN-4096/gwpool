@@ -141,6 +141,9 @@ var ErrAccountUnusable = errors.New("这个账号用不了（不存在、已停�
 // 收成一个结构体而不是继续加参数：这四个旋钮全是外部输入，长度和范围的校验在 HTTP
 // 边界做完（见 httpapi），进到这里就当可信数据用。
 type Request struct {
+	// AdminKey is trusted server-side authorization, never a client parameter.
+	// It only bypasses consumer frequency limits; stock/input rules stay intact.
+	AdminKey bool
 	// Gateway 非空 = 点名一个网关。他点名是因为**他**知道自己没烧过那个落点。
 	Gateway string
 	// Exclude 是调用方要跳过的网关。它自己那本账（按凭证域身份算的）比池子的准，

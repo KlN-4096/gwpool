@@ -40,6 +40,10 @@ func (s *Server) serveExternalCookie(w http.ResponseWriter, r *http.Request, mem
 			return
 		}
 	}
+	// Never derive this privilege from account, headers or query flags. Only
+	// a usable, authenticated persisted AdminKey can bypass member admission.
+	caller, authorized := s.resolveCaller(r)
+	req.AdminKey = authorized && caller.key.IsAdminKey()
 	delivery, err := s.pool.DeliverAnonymous(r.Context(), member, req, authed)
 	if err != nil {
 		var limited *sched.ConsumerRateLimit
