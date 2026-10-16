@@ -2,7 +2,6 @@
 /cmd/routing-study/
 /internal/mint/routing_study.go
 /internal/mint/routing_study_test.go
-/docs/routing-research-findings.md
 
 # Existing local task notes only; new task notes remain visible to Git.
 /docs/tasks/admin-passkey-20261012.md
